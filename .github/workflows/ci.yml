@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15, ubuntu-24.04]
+        runner: [macos-15, ubuntu-24.04, windows-2025]
     steps:
       - uses: actions/checkout@v7
       - name: LLVM (macOS)
@@ -35,11 +35,39 @@ jobs:
           sudo /tmp/llvm.sh 21
           sudo apt-get install -y --no-install-recommends llvm-21-dev clang-21
           echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
+      # Windows: MSVC ABI through clang-cl (the code uses `__int128`), LLVM from conda-forge.
+      - name: LLVM (Windows)
+        if: runner.os == 'Windows'
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: llvm
+          create-args: >-
+            llvmdev=21
+            zstd-static
+            zlib
+          init-shell: bash
+          cache-environment: true
+      - name: Visual Studio environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
       - uses: xmake-io/github-action-setup-xmake@v1
         with:
           xmake-version: latest
-      - run: |
+      - name: Build and test
+        if: runner.os != 'Windows'
+        run: |
           xmake f -P . -y -m release
+          xmake -P . -y
+          xmake build -P . -y xlc-tests
+          xmake run -P . xlc-tests || echo "::warning::unit tests failed"
+      - name: Build and test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash -el {0}
+        run: |
+          export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
+          xmake f -P . -y -m release -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
           xmake build -P . -y xlc-tests
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"
