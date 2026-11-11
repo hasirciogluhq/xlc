@@ -1,5 +1,7 @@
 #include "sema/lower/lower.hpp"
 
+#include <array>
+
 namespace xlang::lower {
 
 // Statements (control flow, `defer`, `try`) and ownership (drop glue, drop flags, moves).
@@ -1331,6 +1333,7 @@ Lowerer::EP Lowerer::ternaryExpr(const Expr& e, const Type* expected) {
     };
     EP a;
     EP b;
+    ++lazy_; // only one branch runs: a `?` in either could not be hoisted
     if (isLit(then_ast) && !isLit(else_ast)) {
         b = expr(else_ast, expected);
         const Type want = b ? b->type : lower::unknownType();
@@ -1340,6 +1343,7 @@ Lowerer::EP Lowerer::ternaryExpr(const Expr& e, const Type* expected) {
         const Type want = a ? a->type : lower::unknownType();
         b = expr(else_ast, a ? &want : expected);
     }
+    --lazy_;
     if (!cond || !a || !b) {
         return nullptr;
     }
@@ -1427,6 +1431,22 @@ void Lowerer::lowerTupleLocal(const Stmt& s, std::vector<hir::Stmt>& out) {
 }
 
 void Lowerer::lowerStmt(const Stmt& s, std::vector<hir::Stmt>& out) {
+    // The statements of the kinds below evaluate their expressions once, in order, before they
+    // act: a `?` in them is hoisted in front. A loop condition runs every pass and a `defer`
+    // body later, so there `?` is refused.
+    using K = Stmt::Kind;
+    const bool hoists = std::ranges::contains(
+        std::array{K::Local, K::Assign, K::Return, K::Expr, K::If, K::Switch, K::Delete}, s.kind);
+    std::vector<hir::Stmt> prelude;
+    std::vector<hir::Stmt> body;
+    const auto saved = std::exchange(prelude_, hoists ? &prelude : nullptr);
+    lowerStmtBody(s, body);
+    prelude_ = saved;
+    std::ranges::move(prelude, std::back_inserter(out));
+    std::ranges::move(body, std::back_inserter(out));
+}
+
+void Lowerer::lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out) {
     hir::Stmt h;
     h.span = s.span;
     const Type boolean = Type::makeBool();
@@ -1627,7 +1647,9 @@ void Lowerer::lowerStmt(const Stmt& s, std::vector<hir::Stmt>& out) {
             break;
         }
         std::vector<hir::Stmt> lowered;
+        ++lazy_; // a deferred body runs at block exit: a `?` in it has no place to hoist to
         lowerStmt(inner, lowered);
+        --lazy_;
         // The deferred statement runs under a flag set here, so a panic unwinding through the
         // function runs exactly the defers that were registered and not yet run.
         const hir::LocalId flag = hiddenLocal("dfr", Type::makeBool(), s.span);

@@ -210,6 +210,8 @@ class Dumper {
         }
         case Expr::Kind::Ternary:
             return std::format("({} ? {} : {})", expr(*e.lhs), expr(*e.rhs), expr(*e.args[0]));
+        case Expr::Kind::Try:
+            return expr(*e.lhs) + "?";
         case Expr::Kind::Index:
             return std::format("{}[{}]", expr(*e.lhs), expr(*e.rhs));
         case Expr::Kind::Slice:

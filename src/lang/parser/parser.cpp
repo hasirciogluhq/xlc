@@ -1,6 +1,7 @@
 #include "xlang/lang/parser.h"
 
 #include <algorithm>
+#include <array>
 #include <format>
 #include <ranges>
 #include <string_view>
@@ -868,6 +869,26 @@ class Parser {
         return operand;
     }
 
+    /// A `?` that propagates (`f()?`) rather than starts a ternary: it touches the operand before
+    /// it, and what follows cannot be the first token of a ternary's value: the end of the line or
+    /// of the file, a closing or separating token (`;`, `)`, `]`, `}`, `,`, `.`, `{`, another
+    /// `?`), or an operator that only works between two operands (`f()? + 1`, `a? == b?`, `as`).
+    /// `-`, `*`, `&`, `!` and `~` start an expression, so `c ? -1 : 1` stays a ternary.
+    [[nodiscard]] bool tryOperatorAhead() const {
+        if (!at(TokenKind::Question) || !continues() || !adjacent(prev(), cur())) {
+            return false;
+        }
+        using enum TokenKind;
+        const Token& next = peek(1);
+        return next.newline_before ||
+               std::ranges::contains(
+                   std::array{Semicolon, RParen, RBracket, RBrace, LBrace, Comma, Colon, Dot, Question,
+                              End,
+                              Plus, Slash, Percent, Pipe, Caret, Shl, Shr, EqEq, NotEq, Lt, Le, Gt,
+                              Ge, AndAnd, OrOr, As, Assign, DotDot, DotDotEq},
+                   next.kind);
+    }
+
     ExprPtr parsePostfix(ExprPtr expr) {
         while (true) {
             if (at(TokenKind::LParen) && continues()) {
@@ -888,6 +909,14 @@ class Parser {
                 call->span = spanFrom(expr->span);
                 call->lhs = std::move(expr);
                 expr = std::move(call);
+            } else if (tryOperatorAhead()) {
+                // `e?`: written against the operand and followed by something that ends it, which
+                // no ternary (`c ? a : b`, an operand always follows its `?`) can be.
+                advance();
+                ExprPtr propagate = makeExpr(Expr::Kind::Try, expr->span);
+                propagate->span = spanFrom(expr->span);
+                propagate->lhs = std::move(expr);
+                expr = std::move(propagate);
             } else if (at(TokenKind::LBracket) && continues()) {
                 advance();
                 ++nl_depth_;

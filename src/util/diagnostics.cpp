@@ -292,6 +292,19 @@ constexpr std::size_t kLeadWidth = 40;
          "whose object is a local, a parameter or a temporary of the function leaves it pointing at a "
          "frame that is gone. This is always an error and cannot be allowed. Allocate the object with "
          "`new` and return the pointer: `local p := new CProvider()` then `return p`."},
+        {"E0761", Severity::Error, "`?` in a place that cannot run it first",
+         "`e?` is hoisted: the statement it is in runs `e` and the early `return` of its failure "
+         "before anything else. A loop condition (it runs every pass), the right side of `&&` or `||`, "
+         "a `?:` branch and a `defer` body may not run in order, so `?` is refused there. Bind the "
+         "value first: `local v = f()?`, then use `v`."},
+        {"E0762", Severity::Error, "`?` on a value that is not a success-or-failure enum",
+         "`e?` needs an enum of two variants: a success carrying one value and a failure carrying at "
+         "most one (`Ok(T)` / `Err(E)`), or `None` / `Some(T)`. `?` gives the success value, or "
+         "returns the failure from the function."},
+        {"E0763", Severity::Error, "`?` cannot return its failure from this function",
+         "`e?` returns the failure of `e` from the function, so the function must return an enum of "
+         "the same shape whose failure carries the same type (there is no conversion between error "
+         "types). Match the error type, or handle the failure with a `switch`."},
         {"W0701", Severity::Warning, "missing return",
          "Control can fall off the end of a function that returns a value: some path has no "
          "`return` (a loop that ends with `break`, an `if` without `else`, ...). Add a `return`, "

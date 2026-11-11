@@ -653,6 +653,7 @@ class Lowerer {
     // --- statements
     void lowerBlock(const Block& block, std::vector<hir::Stmt>& out, bool new_scope);
     void lowerStmt(const Stmt& s, std::vector<hir::Stmt>& out);
+    void lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out);
     void lowerAssign(const Expr& target,
                      const Expr& value,
                      const Span& span,
@@ -676,6 +677,13 @@ class Lowerer {
     /// first.
     void emitDefers(std::size_t from, std::vector<hir::Stmt>& out) const;
     EP ternaryExpr(const Expr& e, const Type* expected);
+    /// `e?`: hoists the evaluation of `e` and the early `return` of its failure into `prelude_`
+    /// (the statements run before the statement being lowered) and yields the success value.
+    EP tryExpr(const Expr& e);
+    /// Statements the statement being lowered runs first (`?` hoists there); null where nothing
+    /// may be hoisted (loop conditions, `defer`).
+    std::vector<hir::Stmt>* prelude_{nullptr};
+    int lazy_{0}; ///< inside an operand that may not run (`&&`/`||` right side, a ternary branch)
     hir::LocalId hiddenLocal(const char* prefix, const Type& type, const Span& span);
     hir::LocalId
     addLocal(const std::string& name, const Type& type, bool is_param, const Span& span);

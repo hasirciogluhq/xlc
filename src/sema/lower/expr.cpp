@@ -350,6 +350,8 @@ Lowerer::EP Lowerer::expr(const Expr& e, const Type* expected) {
         return binaryExpr(e, expected);
     case Expr::Kind::Ternary:
         return ternaryExpr(e, expected);
+    case Expr::Kind::Try:
+        return tryExpr(e);
     case Expr::Kind::Cast:
         return castExpr(e);
     case Expr::Kind::Call:
@@ -907,7 +909,9 @@ Lowerer::EP Lowerer::binaryExpr(const Expr& e, const Type* expected) {
     const Type boolean = Type::makeBool();
     if (op == BinaryOp::And || op == BinaryOp::Or) {
         EP l = coerce(expr(*e.lhs, &boolean), boolean, e.lhs->span);
+        ++lazy_; // the right side may not run: a `?` there could not be hoisted
         EP r = coerce(expr(*e.rhs, &boolean), boolean, e.rhs->span);
+        --lazy_;
         if (!l || !r) {
             return nullptr;
         }
@@ -1011,7 +1015,8 @@ Lowerer::EP Lowerer::binaryExpr(const Expr& e, const Type* expected) {
         }
         const bool eq_only = op == BinaryOp::Eq || op == BinaryOp::Ne;
         const bool scalar = l->type.kind == TypeKind::Pointer || l->type.kind == TypeKind::Bool ||
-                            l->type.kind == TypeKind::Enum || l->type.kind == TypeKind::FnPtr;
+                            l->type.kind == TypeKind::Enum || l->type.kind == TypeKind::FnPtr ||
+                            (l->type.kind == TypeKind::Str && eq_only); // bytes, not the address
         if (!lower::sameType(l->type, r->type) || !scalar ||
             (!eq_only && l->type.kind != TypeKind::Enum)) {
             err("E0709",

@@ -375,8 +375,50 @@ llvm::Value* Gen::genCast(const hir::Expr& e) {
     return castScalar(v, e.lhs->type, e.type);
 }
 
+llvm::Value* Gen::genStrCompare(const hir::Expr& e) {
+    // A `str` is `{ ptr, len }`. There is no C runtime to call, so the bytes are compared by an
+    // inline loop: lengths first, then index 0 up to len.
+    const unsigned word = ptrBits() / 8;
+    llvm::Type* usize = sty(Type::makeInt(0, false));
+    llvm::Value* a = genAddr(*e.lhs);
+    llvm::Value* b = genAddr(*e.rhs);
+    const auto len = [&](llvm::Value* s) {
+        return B_.CreateAlignedLoad(usize, byteOffset(s, word), llvm::Align(word));
+    };
+    const auto data = [&](llvm::Value* s) {
+        return B_.CreateAlignedLoad(ptrTy(), s, llvm::Align(word));
+    };
+    llvm::Value* n = len(a);
+    llvm::Value* pa = data(a);
+    llvm::Value* pb = data(b);
+    llvm::BasicBlock* start = B_.GetInsertBlock();
+    llvm::BasicBlock* head = llvm::BasicBlock::Create(ctx_, "streq.head", cur_fn_);
+    llvm::BasicBlock* body = llvm::BasicBlock::Create(ctx_, "streq.body", cur_fn_);
+    llvm::BasicBlock* end = llvm::BasicBlock::Create(ctx_, "streq.end", cur_fn_);
+    B_.CreateCondBr(B_.CreateICmpEQ(n, len(b)), head, end);
+    B_.SetInsertPoint(head);
+    llvm::PHINode* i = B_.CreatePHI(usize, 2);
+    i->addIncoming(llvm::ConstantInt::get(usize, 0), start);
+    B_.CreateCondBr(B_.CreateICmpUGE(i, n), end, body);
+    B_.SetInsertPoint(body);
+    llvm::Type* byte = llvm::Type::getInt8Ty(ctx_);
+    llvm::Value* x = B_.CreateLoad(byte, B_.CreateInBoundsGEP(byte, pa, {i}));
+    llvm::Value* y = B_.CreateLoad(byte, B_.CreateInBoundsGEP(byte, pb, {i}));
+    i->addIncoming(B_.CreateAdd(i, llvm::ConstantInt::get(usize, 1)), body);
+    B_.CreateCondBr(B_.CreateICmpNE(x, y), end, head);
+    B_.SetInsertPoint(end);
+    llvm::PHINode* equal = B_.CreatePHI(llvm::Type::getInt1Ty(ctx_), 3);
+    equal->addIncoming(B_.getInt1(false), start); // the lengths differ
+    equal->addIncoming(B_.getInt1(true), head);   // every byte matched
+    equal->addIncoming(B_.getInt1(false), body);  // a byte differs
+    return e.binary_op == BinaryOp::Eq ? static_cast<llvm::Value*>(equal) : B_.CreateNot(equal);
+}
+
 llvm::Value* Gen::genBinary(const hir::Expr& e) {
     const BinaryOp op = e.binary_op;
+    if (e.lhs->type.kind == TypeKind::Str && (op == BinaryOp::Eq || op == BinaryOp::Ne)) {
+        return genStrCompare(e);
+    }
     if (op == BinaryOp::And || op == BinaryOp::Or) {
         llvm::Value* l = genScalar(*e.lhs);
         if (llvm::isa<llvm::Constant>(l) && B_.GetInsertBlock() == nullptr) {

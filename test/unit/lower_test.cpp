@@ -1101,6 +1101,59 @@ void testUnsignedSpelling() {
 
 // `s[lo..hi]` lowers to a `Slice` of type `str`: a view, never a place. Bounds stay checked under
 // --safety=checked, and a base that is not `str`/`[u8; N]` is rejected.
+// ---- `e?`: the value of a success variant, or an early return of the failure
+
+void testTryOperator() {
+    constexpr std::string_view enums =
+        "enum Option<T> {\n None\n Some(T)\n}\n"
+        "enum Result<T, E> {\n Ok(T)\n Err(E)\n}\n";
+    const auto program = [&](std::string_view body) { return Lowered(std::string(enums) + std::string(body)); };
+    {
+        // A `Result` and an `Option` propagate in functions that return their own kind; a
+        // statement may hold several `?`, and they combine with operators.
+        Lowered ok = program(
+            "fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
+            "fn sum(a: i32, b: i32) -> Result<i32, i32> {\n"
+            "    local x = half(a)?\n"
+            "    return Result.Ok(x + half(b)? + half(a)?)\n"
+            "}\n"
+            "fn pick(o: Option<i32>) -> Option<i32> {\n"
+            "    local v = o?\n"
+            "    return Option.Some(v)\n"
+            "}\n"
+            "fn cond(a: i32) -> Result<i32, i32> {\n"
+            "    if half(a)? == 1 { return Result.Ok(1) }\n"
+            "    return Result.Ok(a > 0 ? 1 : 2)\n"
+            "}\n");
+        CHECK(!ok.diag->hasErrors());
+    }
+    // E0761: no statement to hoist into, or an operand that may not run.
+    CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
+                  "fn f(n: i32) -> Result<i32, i32> {\n while half(n)? > 0 { }\n return Result.Ok(0)\n}\n")
+              .failedWith("E0761"));
+    CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
+                  "fn f(n: i32) -> Result<bool, i32> {\n return Result.Ok(n > 0 && half(n)? > 0)\n}\n")
+              .failedWith("E0761"));
+    CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
+                  "fn f(n: i32) -> Result<i32, i32> {\n return Result.Ok(n > 0 ? half(n)? : 0)\n}\n")
+              .failedWith("E0761"));
+    // E0762: the operand is not a success-or-failure enum.
+    CHECK(program("fn f(n: i32) -> Result<i32, i32> {\n local x = n?\n return Result.Ok(x)\n}\n")
+              .failedWith("E0762"));
+    // E0763: the function cannot carry the failure.
+    CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
+                  "fn f(n: i32) -> i32 {\n return half(n)?\n}\n")
+              .failedWith("E0763"));
+    CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
+                  "fn f(n: i32) -> Result<i32, bool> {\n return Result.Ok(half(n)?)\n}\n")
+              .failedWith("E0763"));
+    // `==` and `!=` compare the bytes of two `str`; ordering stays an error.
+    CHECK(!program("fn f(a: str) -> bool { return a == \"x\" || a != \"yz\" }\n").diag->hasErrors());
+    CHECK(program("fn f(a: str) -> bool { return a < \"x\" }\n").failedWith("E0709"));
+    // A ternary is still a ternary: its `?` is followed by a value.
+    CHECK(!program("fn f(n: i32) -> i32 { return n > 0 ? -1 : 1 }\n").diag->hasErrors());
+}
+
 void testSlices() {
     {
         Lowered r("fn f(s: str) -> str {\n return s[1..3]\n}\n");
@@ -1160,6 +1213,7 @@ void runLowerTests() {
     RUN(testEnumsAndStaticAssertInBodies);
     RUN(testPayloadEnums);
     RUN(testGenericPayloadEnums);
+    RUN(testTryOperator);
     RUN(testModulesImportAndExport);
     RUN(testCyclicModules);
     RUN(testModulesShareTypes);

@@ -139,6 +139,8 @@ class Gen {
                                const Span& at);
     llvm::Value* genSyscall(const hir::Expr& e);
     llvm::Value* genBinary(const hir::Expr& e);
+    /// `a == b` / `a != b` on two `str` values: equal lengths and equal bytes (an `i1`).
+    llvm::Value* genStrCompare(const hir::Expr& e);
     llvm::Value* genCast(const hir::Expr& e);
     llvm::Value* castScalar(llvm::Value* v, const Type& from, const Type& to);
     llvm::Value* genNew(const hir::Expr& e);

@@ -72,6 +72,7 @@ struct Expr {
         StructLiteral, ///< type { fields }
         New,           ///< new T { fields } / new(lhs) T { fields }; lhs = memory pointer (placement); null = the `register(alloc)` function
         Ternary,       ///< lhs ? rhs : args[0]
+        Try,           ///< `lhs?`: the value of a success variant, or an early `return` of the failure
         MacroCall,     ///< text!( macro_args... ), arguments kept as raw token lists
         Spread,        ///< `..name` as a call argument: expands a parameter pack (text = pack name)
         AsmOperand,    ///< `in(reg) x` / `out("rax") y` / `inout(reg) z` inside `__builtin_asm(...)`:
