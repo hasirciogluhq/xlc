@@ -305,6 +305,22 @@ constexpr std::size_t kLeadWidth = 40;
          "`e?` returns the failure of `e` from the function, so the function must return an enum of "
          "the same shape whose failure carries the same type (there is no conversion between error "
          "types). Match the error type, or handle the failure with a `switch`."},
+        {"E0770", Severity::Error, "closure parameter type unknown",
+         "A closure parameter without a type takes it from the `fn(...)` type the closure is used "
+         "for: an argument, a typed `local`, a field or a `return`. Here nothing names one. Write "
+         "the type (`|x: i32| x * 2`), or give the closure a `fn(...)` context "
+         "(`local f: fn(i32) -> i32 = |x| x * 2`)."},
+        {"E0771", Severity::Error, "closure parameter count does not match",
+         "The closure is used where a `fn(...)` type is expected, and the type has a different "
+         "number of parameters than the closure. Write as many parameters as the type has."},
+        {"E0773", Severity::Error, "closure with captures where a function pointer is expected",
+         "A closure that uses variables of the enclosing function is a struct of those variables, "
+         "and a `fn(...)` pointer has no place to keep them. Take the closure as a generic "
+         "parameter (`fn apply<F>(f: F, x: i32)`), or pass the variable as an argument."},
+        {"E0774", Severity::Error, "`move` closure captures a value that needs drop",
+         "`move` copies the captured variables into the closure's struct, which is plain data and "
+         "cannot own a value that needs drop. Borrow the variable (write the closure without "
+         "`move`)."},
         {"W0701", Severity::Warning, "missing return",
          "Control can fall off the end of a function that returns a value: some path has no "
          "`return` (a loop that ends with `break`, an `if` without `else`, ...). Add a `return`, "
