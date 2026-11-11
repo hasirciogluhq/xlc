@@ -82,6 +82,19 @@ jobs:
           printf 'fn f(a: u8, b: u64) -> u32 { return 1 }\n' > smoke.xl
           build/windows/x64/release/xlc.exe --version
           build/windows/x64/release/xlc.exe smoke.xl --check
+          # Each declaration of testLayoutsMatchClang on its own, to find the one that crashes.
+          i=0
+          while IFS= read -r decl; do
+            i=$((i+1)); printf '%b\n' "$decl" > "layout$i.xl"
+            build/windows/x64/release/xlc.exe "layout$i.xl" --dump-layout > /dev/null 2>"layout$i.err" && echo "layout$i ok" || echo "layout$i FAILED (exit $?): $decl"
+          done <<'EOF'
+          @repr(c) struct Header { tag: u8\n length: u32\n id: u16 }
+          @repr(c) struct Mixed { a: i8\n b: f64\n c: i16\n d: *i32\n e: [u8; 5]\n f: bool }
+          @repr(c) @packed struct Packed { a: u8\n b: u32\n c: u16 }
+          @repr(c) @align(32) struct Aligned { a: u8\n b: u16 }
+          @repr(c) class Shape { id: i32\n virtual fn area(self) -> f64 { return 0.0 } }
+          @repr(c) class Plain { a: i32\n b: u8 }
+          EOF
           # The trace names the test that was running when the process died.
           XLC_TEST_TRACE=1 build/windows/x64/release/xlc-tests.exe 2>&1 | tail -n 5 || true
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"
