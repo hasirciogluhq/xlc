@@ -69,7 +69,9 @@ jobs:
           xmake f -P . -y -m release --policies=build.ccache:y
           xmake -P . -y
           xmake build -P . -y xlc-tests
+          # Platform-independent checks (parser, sema, HIR), then the compiler binary on this OS (test/e2e).
           xmake run -P . xlc-tests
+          test/e2e/run.sh "$(find build -type f -name xlc | head -n1)"
       - name: Build and test (Windows)
         if: runner.os == 'Windows'
         shell: bash -el {0}
@@ -78,8 +80,6 @@ jobs:
           xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
           xmake build -P . -y xlc-tests
-          # The compiler itself must start and analyze a file, not only the unit tests.
-          printf 'fn f(a: u8, b: u64) -> u32 { return 1 }\nstaticAssert(1 == 1, "x")\n' > smoke.xl
-          build/windows/x64/release/xlc.exe --version
-          build/windows/x64/release/xlc.exe smoke.xl --check
           xmake run -P . xlc-tests
+          # The compiler itself must start, build and run programs and link only the OS (test/e2e).
+          test/e2e/run.sh build/windows/x64/release/xlc.exe

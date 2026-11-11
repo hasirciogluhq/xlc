@@ -1,0 +1,5 @@
+// e2e: a source with no entry point, written as an object file for every target (run.sh, step 3). Only
+// the code generator for that CPU and object format is under test, so it must not need the host.
+export fn answer(a: i64, b: i64) -> i64 {
+    return a * b + sizeOf([]u8) as i64
+}

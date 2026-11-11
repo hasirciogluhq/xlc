@@ -1,0 +1,93 @@
+#!/bin/bash
+# End-to-end tests of the compiler binary itself, on the host it runs on: everything that depends on the
+# operating system or the CPU. (The C++ suite in test/unit holds the platform-independent checks.)
+#   test/e2e/run.sh [path/to/xlc]        (default: $XLC, else `xlc` on PATH)
+#
+# 1. The binary starts and reports the version in xmake.lua, and links only against the OS itself: a
+#    release is copied to machines that have none of the build machine's packages (a Homebrew `libz3.dylib`
+#    that is missing there makes `xlc --version` abort with a dyld error).
+# 2. It builds, links and runs native programs: each *.xl here is compiled with no stdlib and started.
+# 3. It writes an object file for every target it supports, whatever the host is.
+set -u
+here=$(cd "$(dirname "$0")" && pwd)
+xlc=${1:-${XLC:-xlc}}
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+pass=0; fail=0
+
+case "$(uname -s)" in
+  Darwin) os=macos ;;
+  Linux) os=linux ;;
+  MINGW* | MSYS* | CYGWIN*) os=windows ;;
+  *) echo "FAIL [e2e] unsupported OS $(uname -s)"; exit 1 ;;
+esac
+exe=; [ "$os" = windows ] && exe=.exe
+
+ok()  { echo "ok   [e2e/$1]"; pass=$((pass + 1)); }
+bad() { echo "FAIL [e2e/$1] $2"; fail=$((fail + 1)); }
+
+# --- 1. the binary --------------------------------------------------------------------------------------
+declared=$(sed -n 's/^local xlc_version = "\(.*\)"$/\1/p' "$here/../../xmake.lua")
+reported=$("$xlc" --version 2>&1)
+if [ "$reported" = "$declared" ]; then ok "version"; else bad "version" "reports '$reported', xmake.lua declares '$declared'"; fi
+
+# Dynamic libraries the binary needs, one per line; empty when the platform tool is missing.
+neededLibraries() {
+  local bin
+  bin=$(command -v "$xlc" || echo "$xlc")
+  case "$os" in
+    macos) otool -L "$bin" | tail -n +2 | awk '{ print $1 }' ;;
+    linux) readelf -d "$bin" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' ;;
+    windows) command -v dumpbin >/dev/null && dumpbin //dependents "$bin" | awk '/\.dll$/ { print $1 }' ;;
+  esac
+}
+# What the OS itself provides. Anything else is a package of the build machine.
+systemLibrary() {
+  case "$os:$1" in
+    macos:/usr/lib/* | macos:/System/*) return 0 ;;
+    linux:libc.so.* | linux:libm.so.* | linux:libdl.so.* | linux:libpthread.so.* | linux:librt.so.* | linux:libutil.so.*) return 0 ;;
+    linux:ld-linux-* | linux:libz.so.*) return 0 ;;   # zlib is part of every distribution's base system
+    windows:[Kk][Ee][Rr][Nn][Ee][Ll]32.[Dd][Ll][Ll] | windows:[Aa][Dd][Vv][Aa][Pp][Ii]32.[Dd][Ll][Ll]) return 0 ;;
+    windows:[Ss][Hh][Ee][Ll][Ll]32.[Dd][Ll][Ll] | windows:[Oo][Ll][Ee]32.[Dd][Ll][Ll] | windows:[Ww][Ss]2_32.[Dd][Ll][Ll]) return 0 ;;
+    windows:[Vv][Ee][Rr][Ss][Ii][Oo][Nn].[Dd][Ll][Ll] | windows:[Nn][Tt][Dd][Ll][Ll].[Dd][Ll][Ll] | windows:[Uu][Cc][Rr][Tt][Bb][Aa][Ss][Ee].[Dd][Ll][Ll]) return 0 ;;
+    windows:[Aa][Pp][Ii]-[Mm][Ss]-[Ww][Ii][Nn]-*) return 0 ;;
+    windows:[Vv][Cc][Rr][Uu][Nn][Tt][Ii][Mm][Ee]140*.[Dd][Ll][Ll] | windows:[Mm][Ss][Vv][Cc][Pp]140*.[Dd][Ll][Ll]) return 0 ;;
+  esac
+  return 1
+}
+foreign=
+while read -r lib; do
+  [ -n "$lib" ] && ! systemLibrary "$lib" && foreign="$foreign $lib"
+done < <(neededLibraries)
+if [ -z "$foreign" ]; then ok "links-only-system-libraries"; else bad "links-only-system-libraries" "needs$foreign"; fi
+
+# --- 2. native programs ---------------------------------------------------------------------------------
+# name | expected exit code | expected stdout (a `grep -F` substring) | runs on Windows
+programs=(
+  "exit|42||1"
+  "slice_types|0||1"
+  "write|0|xlc e2e write|0"
+)
+for row in "${programs[@]}"; do
+  IFS='|' read -r name code want on_windows <<<"$row"
+  [ "$os" = windows ] && [ "$on_windows" = 0 ] && { echo "skip [e2e/$name] not on Windows"; continue; }
+  if ! "$xlc" "$here/$name.xl" -o "$work/$name$exe" 2>"$work/$name.err"; then
+    bad "$name" "build"; cat "$work/$name.err"; continue
+  fi
+  out=$("$work/$name$exe" 2>&1); got=$?
+  if [ "$got" != "$code" ]; then bad "$name" "exit $got, want $code"; echo "$out"
+  elif [ -n "$want" ] && ! grep -qF "$want" <<<"$out"; then bad "$name" "stdout lacks '$want'"; echo "$out"
+  else ok "$name"; fi
+done
+
+# --- 3. every target ------------------------------------------------------------------------------------
+for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
+  if "$xlc" "$here/object.xl" --emit=obj --target "$target" -o "$work/t-$target.o" 2>"$work/t.err" && [ -s "$work/t-$target.o" ]; then
+    ok "object-$target"
+  else
+    bad "object-$target" "no object file"; cat "$work/t.err"
+  fi
+done
+
+echo "e2e: $pass passed, $fail failed"
+[ "$fail" = 0 ]

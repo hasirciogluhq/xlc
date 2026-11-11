@@ -76,6 +76,9 @@ struct Expr {
         Spread,        ///< `..name` as a call argument: expands a parameter pack (text = pack name)
         AsmOperand,    ///< `in(reg) x` / `out("rax") y` / `inout(reg) z` inside `__builtin_asm(...)`:
                        ///< text = in|out|inout, lhs = register spec, rhs = operand
+        TypeOperand,   ///< a slice type written where an argument is expected, `sizeOf([]i32)`: `type`
+                       ///< is the whole type (`[]T` cannot be told from an array literal by the name
+                       ///< path that carries the other type arguments)
     } kind{Kind::IntLiteral};
 
     Span span;

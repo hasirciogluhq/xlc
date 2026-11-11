@@ -167,6 +167,11 @@ std::optional<Type> Sema::exprToType(const Expr& expr) {
         t.span = expr.span;
         return t;
     }
+    case Expr::Kind::TypeOperand: {
+        Type t = expr.type;
+        t.span = expr.span;
+        return t;
+    }
     case Expr::Kind::Unary:
         if (expr.unary_op == UnaryOp::Deref) {
             if (auto inner = exprToType(*expr.lhs)) {

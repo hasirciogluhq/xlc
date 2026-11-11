@@ -267,6 +267,21 @@ void testConstantsAndEnums() {
     CHECK(v && v->int_value == 9);
 }
 
+// The size queries take any type, slices included: `[]T` and `[]mut T` are two words like `str`.
+void testSizeQueriesTakeSliceTypes() {
+    Analyzed a("staticAssert(sizeOf([]i32) == sizeOf(str), \"slice is a fat pointer\")\n"
+               "staticAssert(sizeOf([]i32) == 2 * sizeOf(*i32), \"two words\")\n"
+               "staticAssert(sizeOf([]mut i32) == sizeOf([]i32), \"mut is a permission\")\n"
+               "staticAssert(alignOf([]u8) == alignOf(*u8), \"pointer alignment\")\n"
+               "staticAssert(sizeOf(*[]i32) == 8, \"pointer to a slice\")\n"
+               "staticAssert(sizeOf([[]u8; 3]) == 3 * sizeOf([]u8), \"array of slices\")\n");
+    CHECK(!a.run.diag->hasErrors());
+    {
+        Analyzed bad("struct S { a: i32 }\nstaticAssert(offsetOf([]i32, ptr) == 0, \"no fields\")\n");
+        CHECK(bad.run.diag->errorCount() == 1);  // E0707: `offsetOf` needs a struct or class
+    }
+}
+
 void testSemaErrors() {
     {
         Analyzed a("staticAssert(1 == 2, \"boom\")\n");
@@ -421,6 +436,7 @@ void runSemaTests() {
     RUN(testLayoutsMatchClang);
     RUN(testDefaultSchemeReordersDeterministically);
     RUN(testConstantsAndEnums);
+    RUN(testSizeQueriesTakeSliceTypes);
     RUN(testSemaErrors);
     RUN(testAliasesResolve);
     RUN(testDeclareLayoutWarningsAndHistory);

@@ -1096,8 +1096,33 @@ class Parser {
         }
     }
 
+    /// `[]` directly followed, on the same line, by something that starts an element type
+    /// (`[]i32`, `[]mut u8`, `[]Point`, `[][]u8`, `[]*T`, `[]fn(i32)`) is the slice type, never the
+    /// empty array literal: no expression continues with a type name after `]`.
+    [[nodiscard]] bool atSliceType() const {
+        if (peekKind(1) != TokenKind::RBracket || peek(2).newline_before) {
+            return false;
+        }
+        switch (peekKind(2)) {
+        case TokenKind::PrimType:
+        case TokenKind::Ident:
+        case TokenKind::Star:
+        case TokenKind::LBracket:
+        case TokenKind::Fn:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     ExprPtr parseArrayLiteral() {
         const Span start = cur().span;
+        if (atSliceType()) {
+            ExprPtr operand = makeExpr(Expr::Kind::TypeOperand, start);
+            operand->type = parseType();
+            operand->span = spanFrom(start);
+            return operand;
+        }
         advance(); // '['
         ++nl_depth_;
         const bool saved_no_struct = no_struct_;

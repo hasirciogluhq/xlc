@@ -10,7 +10,7 @@
 -- The version below is the single source of truth: release tags must match it (`vX.Y.Z` or
 -- `vX.Y.Z-rc.N`, see .github/workflows/release.yml).
 
-local xlc_version = "1.0.0-rc.1"
+local xlc_version = "1.0.0-rc.2"
 
 set_project("xlc")
 set_version(xlc_version)
@@ -96,8 +96,31 @@ local function add_llvm(target)
         end
     end
     -- Whatever LLVM itself needs from the system (zlib, zstd, curses, ...), as llvm-config knows it.
+    -- The released binary must start on a machine that has none of the build machine's packages, so
+    -- a library outside the OS itself is linked as a static archive or left out:
+    --   z3, xml2  only LLVM parts the compiler never links use them (the Z3 constraint solver of
+    --             LLVMSupport, the Windows manifest tool); Homebrew's z3 has no archive at all.
+    --   zstd      linked from its archive (`libzstd.a`) where one is installed.
+    local skipped = {z3 = true, xml2 = true}
+    local static_dirs = {"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"}
     for _, lib in ipairs(query("--link-static --system-libs"):split("%s+")) do
-        if lib:startswith("-l") then
+        local name = lib:startswith("-l") and lib:sub(3) or path.basename(lib):gsub("^lib", ""):gsub("[%.%d]*%.dylib$", ""):gsub("%.so.*$", "")
+        if not is_plat("windows") and skipped[name] then
+            -- not linked
+        elseif not is_plat("windows") and name == "zstd" then
+            local archive
+            for _, dir in ipairs(static_dirs) do
+                if os.isfile(path.join(dir, "libzstd.a")) then
+                    archive = path.join(dir, "libzstd.a")
+                    break
+                end
+            end
+            if archive then
+                target:add("ldflags", archive, {force = true})
+            else
+                target:add("syslinks", "zstd")
+            end
+        elseif lib:startswith("-l") then
             target:add("syslinks", lib:sub(3))
         else
             add_lib(lib)

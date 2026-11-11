@@ -1085,6 +1085,13 @@ void testSlices() {
         Lowered bad("fn f(p: *u8) {\n local x = p[0..2]\n}\n");
         CHECK(bad.failedWith("E0709"));
     }
+    {
+        // A slice type is an argument of the size queries only, never a value.
+        Lowered ok("fn f() -> usize { return sizeOf([]i32) }\n");
+        CHECK(!ok.diag->hasErrors());
+        Lowered bad("fn f() { local x = []i32 }\n");
+        CHECK(bad.failedWith("E0709"));
+    }
 }
 
 }  // namespace

@@ -154,7 +154,9 @@ jobs:
           xmake f -P . -y -m release --policies=build.ccache:y
           xmake -P . -y
           xmake build -P . -y xlc-tests
-          xmake run -P . xlc-tests || echo "::warning::unit tests failed"
+          # A release is never built from a failing tree: the unit tests and the e2e run on this OS.
+          xmake run -P . xlc-tests
+          test/e2e/run.sh "$(find build -type f -name xlc | head -n1)"
 
       - name: Build (Windows)
         if: matrix.os == 'windows'
@@ -165,6 +167,9 @@ jobs:
           "$LLVM_CONFIG" --version
           xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
+          xmake build -P . -y xlc-tests
+          xmake run -P . xlc-tests
+          test/e2e/run.sh build/windows/x64/release/xlc.exe
 
       - name: Package (Unix)
         if: matrix.os != 'windows'

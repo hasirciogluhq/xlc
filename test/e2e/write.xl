@@ -1,0 +1,21 @@
+// e2e: a raw system call through `syscall(nr, args...)`, the part of the language that differs per OS and
+// CPU. `write(1, text, length)` puts the text on standard output; run.sh expects it there.
+//   Linux   x86-64: write = 1 (https://man7.org/linux/man-pages/man2/syscall.2.html)
+//   Linux   arm64:  write = 64 (the generic table, include/uapi/asm-generic/unistd.h)
+//   macOS   both:   write = 4 in the Unix class 2 (`0x2000000 | 4`, xnu bsd/kern/syscalls.master)
+// Windows has no stable system call numbers: run.sh does not run this program there.
+#if os == "linux" && arch == "x86_64"
+const sysWrite = 1
+#elif os == "linux" && arch == "aarch64"
+const sysWrite = 64
+#elif os == "macos"
+const sysWrite = 0x2000004
+#else
+staticAssert(false, "this OS has no stable system call numbers; leave write.xl out of the run")
+#endif
+
+@entry fn main() -> i32 {
+    local text = "xlc e2e write\n"
+    local written = syscall(sysWrite, 1, text.ptr, text.len)
+    return written == text.len as i64 ? 0 : 1
+}

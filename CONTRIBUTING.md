@@ -14,7 +14,9 @@
    ```
    xmake f -P . -m release && xmake -P .
    xmake build -P . xlc-tests && xmake run -P . xlc-tests
+   test/e2e/run.sh build/<platform>/<arch>/release/xlc
    ```
+   Unit tests (`test/unit`) are platform independent: parser, sema, layout, HIR, diagnostics. E2E tests (`test/e2e`) are platform related: the binary starts and links only the OS, programs are built, linked and run, one object per target. A compiler bug gets a unit test that fails without the fix; a bug that shows on one OS only also gets an e2e entry.
 4. Language behavior is exercised by the end-to-end tests in [xl-std](https://github.com/hasirciogluhq/xl-std) (`test/`); run them against your build for any semantic change.
 5. Update the documentation in [xlang-docs](https://github.com/hasirciogluhq/xlang-docs) for user-visible changes.
 6. Open a pull request against `main` and fill in the template.

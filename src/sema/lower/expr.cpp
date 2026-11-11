@@ -379,6 +379,12 @@ Lowerer::EP Lowerer::expr(const Expr& e, const Type* expected) {
             "inline asm operands are only valid inside `__builtin_asm`",
             "misplaced operand");
         return nullptr;
+    case Expr::Kind::TypeOperand:
+        err("E0709",
+            e.span,
+            "a type is only valid as the argument of `sizeOf`, `alignOf` and `offsetOf`",
+            "a type is not a value");
+        return nullptr;
     case Expr::Kind::Spread:
         // Expanded in the call of a pack function's instance; anywhere else it has no meaning.
         err("E0737",

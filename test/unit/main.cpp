@@ -530,6 +530,34 @@ void testSliceParsing() {
     CHECK(d.kind == Expr::Kind::Index);
 }
 
+// A slice type is a call argument (`sizeOf([]i32)`, `sizeOf([]mut i32)`, `sizeOf([][]u8)`); `[]` that
+// no type follows stays the empty array literal, also with a newline in between.
+void testSliceTypeAsArgument() {
+    Parsed p("fn f() {\n"
+             "    local a = sizeOf([]i32)\n"
+             "    local b = sizeOf([]mut i32)\n"
+             "    local c = sizeOf([][]u8)\n"
+             "    local d = sizeOf(*[]i32)\n"
+             "    local e = []\n"
+             "    local g = [\n"
+             "    ]\n"
+             "}\n");
+    CHECK(!p.engine.hasErrors());
+    const auto& fn = std::get<FnDecl>(p.program.items[0].decl);
+    const auto argument = [&](std::size_t statement) -> const Expr& {
+        return *fn.body.statements[statement].expr->args.at(0);
+    };
+    CHECK(argument(0).kind == Expr::Kind::TypeOperand);
+    CHECK(argument(0).type.kind == TypeKind::Slice && !argument(0).type.is_mutable);
+    CHECK(argument(1).kind == Expr::Kind::TypeOperand && argument(1).type.is_mutable);
+    CHECK(argument(2).kind == Expr::Kind::TypeOperand);
+    CHECK(argument(2).type.elem->kind == TypeKind::Slice);
+    CHECK(argument(3).kind == Expr::Kind::Unary);  // `*T`: a pointer type, as before
+    CHECK(argument(3).lhs->kind == Expr::Kind::TypeOperand);
+    CHECK(fn.body.statements[4].expr->kind == Expr::Kind::ArrayList);
+    CHECK(fn.body.statements[5].expr->kind == Expr::Kind::ArrayList);
+}
+
 }  // namespace
 
 void runSemaTests();
@@ -566,6 +594,7 @@ int main() {
     RUN(testOperatorPrecedenceAndCasts);
     RUN(testByteLiteralParsesAsExpr);
     RUN(testSliceParsing);
+    RUN(testSliceTypeAsArgument);
 
     if (xlang_test::failures() != 0) {
         std::cerr << xlang_test::failures() << " check(s) failed\n";

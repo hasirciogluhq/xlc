@@ -47,6 +47,7 @@ Requirements: [xmake](https://xmake.io), a C++23 compiler, and LLVM 20 or newer 
 ```
 xmake f -P . -m release && xmake -P .     # build/<plat>/<arch>/release/xlc
 xmake build -P . xlc-tests && xmake run -P . xlc-tests
+test/e2e/run.sh build/<plat>/<arch>/release/xlc
 ```
 
 Run xmake with `-P .` when this repository is checked out as a submodule: xmake otherwise picks
@@ -86,5 +87,6 @@ src/codegen/     HIR -> LLVM IR, optimization, object writers, C header
 src/driver/      linker driver and archiver
 src/util/        source files and diagnostics
 src/cli/         command line (`main.cpp`), output selection (`emit.cpp`), terminal color
-test/unit/       frontend/sema/HIR unit tests
+test/unit/       frontend/sema/HIR unit tests (platform independent)
+test/e2e/        the binary on the host OS: starts, links only the OS, builds and runs programs (platform related)
 ```

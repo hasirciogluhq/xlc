@@ -1,0 +1,13 @@
+// e2e: the size queries on slice types, evaluated by the generated program on the host. `[]T` and
+// `[]mut T` are a fat pointer, two words like `str`, so the numbers hold on every 64-bit target.
+// Exit status 0 when all hold, otherwise the number of the first failing check.
+global words: usize = sizeOf([]i32) / sizeOf(*i32)
+
+@entry fn main() -> i32 {
+    if sizeOf([]i32) != sizeOf(str) { return 1 }
+    if words != 2 { return 2 }
+    if sizeOf([]mut u8) != sizeOf([]u8) { return 3 }
+    if alignOf([]i64) != alignOf(*i64) { return 4 }
+    if sizeOf([[]u8; 3]) != 3 * sizeOf([]u8) { return 5 }
+    return 0
+}

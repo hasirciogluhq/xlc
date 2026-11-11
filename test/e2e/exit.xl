@@ -1,0 +1,6 @@
+// e2e: the smallest native program. The compiler builds an executable, the system linker links it and
+// the process ends with the entry function's result as its exit status (run.sh expects 42).
+// Needs no stdlib, so it runs the same on every OS.
+@entry fn main() -> i32 {
+    return 42
+}
