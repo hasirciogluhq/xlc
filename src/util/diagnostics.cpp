@@ -213,7 +213,7 @@ constexpr std::size_t kLeadWidth = 40;
          "A parameter pack has no index operator, because its elements have different types. "
          "Iterate it with `for x in name { }`, or pass it on with `..name`."},
         {"E0739", Severity::Error, "executable without an entry point",
-         "`--emit=exe` (and `xlang run`) needs exactly one `@entry` function with a body: the compiler "
+         "`--emit=exe` (and `xl run`) needs exactly one `@entry` function with a body: the compiler "
          "generates the program start code around it. A program without `@entry` cannot be linked as an "
          "executable. Mark `@entry fn main()`, or build the file with `--emit=obj`, `--emit=static` or "
          "`--emit=shared`."},
@@ -221,10 +221,10 @@ constexpr std::size_t kLeadWidth = 40;
          "The project manifest or lock file cannot be read or does not follow the format: a TOML syntax "
          "error, an unknown key, a dependency that is not named by a repository path such as "
          "`github.com/user/repo`, or a `[[native]]` entry without `link`. Fix the reported line; delete "
-         "xlang.lock and run `xlang package install` if the lock is damaged."},
+         "xlang.lock and run `xl install` if the lock is damaged."},
         {"E0741", Severity::Error, "package not installed",
          "A package that the build needs is not in `.xlang/cache`, or the cached copy does not match the "
-         "commit in xlang.lock. Builds never use the network: run `xlang package install` once."},
+         "commit in xlang.lock. Builds never use the network: run `xl install` once."},
         {"E0742", Severity::Error, "invalid version tag",
          "A dependency version must be `latest` (projects only) or a release tag: `vMAJOR.MINOR.PATCH` or "
          "`MAJOR.MINOR.PATCH`, for example `v1.2.0`. Pre-release (`-rc.1`) and `-test` tags are never "
@@ -239,7 +239,7 @@ constexpr std::size_t kLeadWidth = 40;
          "moved to another commit than the one recorded in xlang.lock. Release tags must never move."},
         {"E0745", Severity::Error, "import of an undeclared package",
          "The import path looks like a repository path (`github.com/user/repo/...`) but no file matches "
-         "and no `[dependencies]` entry of xlang.toml is a prefix of it. Run `xlang package install "
+         "and no `[dependencies]` entry of xlang.toml is a prefix of it. Run `xl install "
          "<repository>` to add it."},
         {"E0746", Severity::Error, "native file missing",
          "A `[[native]]` entry lists a file that does not exist in the package at the installed version. "
