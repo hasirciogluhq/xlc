@@ -564,12 +564,14 @@ void runSemaTests();
 void runLowerTests();
 void runOperatorTests();
 void runClosureTests();
+void runIteratorTests();
 
 int main() {
     RUN(runSemaTests);
     RUN(runLowerTests);
     RUN(runOperatorTests);
     RUN(runClosureTests);
+    RUN(runIteratorTests);
     RUN(testWarningContextAndTwoSidedLabels);
     RUN(testErrorContextIsWiderAndGutterIsAligned);
     RUN(testDistantMarksAreSeparatedAndNearOnesMerged);

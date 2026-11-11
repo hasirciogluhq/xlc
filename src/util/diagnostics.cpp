@@ -321,6 +321,23 @@ constexpr std::size_t kLeadWidth = 40;
          "`move` copies the captured variables into the closure's struct, which is plain data and "
          "cannot own a value that needs drop. Borrow the variable (write the closure without "
          "`move`)."},
+        {"E0775", Severity::Error, "type cannot be iterated",
+         "`for x in value` over a struct or class needs `fn next(self: *T) -> Option<U>` (the "
+         "value is its own iterator) or `fn iter(self: *T) -> I` where `I` has `next`. The type "
+         "has neither."},
+        {"E0776", Severity::Error, "`iter` does not return an iterator",
+         "`iter` must return a struct or class that has `next`; a type that only has `iter` gives "
+         "the loop nothing to call. Add `next` to the returned type."},
+        {"E0777", Severity::Error, "`next` cannot end a loop",
+         "`next` returns an enum with two variants, one carrying the item and one without data "
+         "(`Some(T)` / `None`); the variant without data ends the loop. A `Result` or any other "
+         "type has no end."},
+        {"W0770", Severity::Warning, "`next` takes `self` by value",
+         "Each call of `next` works on a copy of the iterator, so its position never advances and "
+         "the loop does not end. Write `fn next(self: *T)`."},
+        {"W0771", Severity::Warning, "`for` uses `iter`, not `next`",
+         "The type has both `iter` and `next`. `for` calls `iter` and starts from the beginning "
+         "every time; the position `next` keeps on the value itself is not used."},
         {"W0701", Severity::Warning, "missing return",
          "Control can fall off the end of a function that returns a value: some path has no "
          "`return` (a loop that ends with `break`, an `if` without `else`, ...). Add a `return`, "

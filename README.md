@@ -128,6 +128,42 @@ around it, so the next expression knows its return type.
 Diagnostics: `E0770` parameter type unknown, `E0771` wrong parameter count for the `fn(...)` type,
 `E0773` captures in a `fn(...)` position, `E0774` `move` of a type that needs drop.
 
+## Methods of structs and iterators
+
+`impl T { fn name(self: *T, ...) }` also holds the methods of a struct (not only operators). Each
+becomes the function `T.name`, and `value.name(...)` on a struct calls it: the address of `value`
+is passed when `self` is `*T`, the value when it is `T`. `impl<T> Box<T> { }` declares the type
+parameter; the parameters are written on the `impl`.
+
+`for x in value` over a struct or class uses two methods the compiler finds by name; it knows no
+library type, so a stdlib `Vec` is iterable by having them:
+
+| The type has | Behavior |
+| --- | --- |
+| `next` only | it is its own iterator; a second `for` over the same variable goes on where the first stopped |
+| `iter` and `next` (on what `iter` returns) | every `for` calls `iter` and starts from the beginning |
+| both `iter` and `next` on the same type | `iter` wins |
+| `iter` only | error `E0776`: nothing to call in the loop |
+| neither | error `E0775` |
+
+```
+impl<T> Vec<T> { fn iter(self: *Vec<T>) -> VecIter<T> { ... } }
+impl<T> VecIter<T> { fn next(self: *VecIter<T>) -> Option<T> { ... } }
+
+for x in v { }          // v.iter(), then iter.next() until it returns None
+```
+
+`next` returns an enum with two variants: one carrying the item and one without data (`Some(T)` /
+`None`, in either order). The variant without data ends the loop and `x` is the item itself
+(`for x, i in v` adds the index). `E0777` when `next` returns anything else (a `Result` has no end).
+`x` is the item by value, unlike an array or slice, where it is a pointer to the element.
+`for x in p` over a pointer to such a type iterates the pointee. A temporary (`for x in make()`)
+lives until the loop ends.
+
+Warnings: `W0770` `next` takes `self` by value (every call works on a copy, the loop never ends);
+`W0771` the type has `iter` and `next` and they differ in type: `for` uses `iter`, so the position
+`next` keeps is not used.
+
 ## Build
 
 Requirements: [xmake](https://xmake.io), a C++23 compiler, and LLVM 20 or newer with `llvm-config`

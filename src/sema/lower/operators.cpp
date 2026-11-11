@@ -180,6 +180,16 @@ Lowerer::EP Lowerer::operatorCall(const std::string& name,
                      takes([&](const Type& p) {
                          return p.kind == TypeKind::Pointer && p.elem && sameType(*p.elem, types.front());
                      });
+        if (cands.empty()) {
+            // Only generic overloads: the written first parameter says how it takes `self`.
+            const std::vector<const Item*>& items =
+                pick->overloads.empty() ? std::vector<const Item*>{pick->item} : pick->overloads;
+            by_pointer = std::ranges::any_of(items, [&](const Item* item) {
+                const auto* f = std::get_if<FnDecl>(&item->decl);
+                return f != nullptr && f->params.size() == arity &&
+                       f->params.front().type.kind == TypeKind::Pointer;
+            });
+        }
     }
     std::vector<ExprPtr> args;
     args.push_back(by_pointer ? astUnary(UnaryOp::AddrOf, std::move(receiver), span)

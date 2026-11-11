@@ -250,10 +250,10 @@ void testOperatorErrors() {
     Lowered wrong(std::string(kVec2) +
                   "fn main() { local a = Vec2 { x: 1.0, y: 1.0 }\n local b = a + true }\n");
     CHECK(wrong.failedWith("E0708"));
-    // An inherent impl holds operators only.
+    // An inherent impl also holds the methods of the struct (`V.len`).
     Lowered method("struct V { x: i32 }\n"
                    "impl V { fn len(self: V) -> i32 { return self.x } }\n");
-    CHECK(method.failedWith("E0002"));
+    CHECK(!method.diag->hasErrors());
     // `self: T` belongs to the inherent impl.
     Lowered typedSelf("class C { fn f(self: C) { } }\n");
     CHECK(typedSelf.failedWith("E0002"));
