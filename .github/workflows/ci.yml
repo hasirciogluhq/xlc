@@ -94,7 +94,22 @@ jobs:
           @repr(c) @align(32) struct Aligned { a: u8\n b: u16 }
           @repr(c) class Shape { id: i32\n virtual fn area(self) -> f64 { return 0.0 } }
           @repr(c) class Plain { a: i32\n b: u8 }
+          @repr(c) struct OnlyPtr { d: *i32 }
+          @repr(c) struct OnlyF64 { b: f64\n a: i8 }
+          @repr(c) struct OnlyArray { e: [u8; 5] }
+          staticAssert(1 == 1, "x")
+          define N = 4\nglobal t: [u8; N]
           EOF
           # The trace names the test that was running when the process died.
           XLC_TEST_TRACE=1 build/windows/x64/release/xlc-tests.exe 2>&1 | tail -n 5 || true
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"
+      - name: Upload Windows binaries
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: windows-binaries
+          path: |
+            build/windows/x64/release/xlc.exe
+            build/windows/x64/release/xlc-tests.exe
+            layout*.xl
+          retention-days: 3
