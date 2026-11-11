@@ -408,20 +408,20 @@ void testConfigParsing() {
 }  // namespace
 
 void runSemaTests() {
-    testSingleLineAndBlockConditionals();
-    testDefinesNestingAndDefined();
-    testPreprocessorErrors();
-    testConditionalInsideStructAndFunction();
-    testMacros();
-    testMacroErrors();
-    testMacroGeneratesItemsAndNested();
-    testLayoutsMatchClang();
-    testDefaultSchemeReordersDeterministically();
-    testConstantsAndEnums();
-    testSemaErrors();
-    testAliasesResolve();
-    testDeclareLayoutWarningsAndHistory();
-    testLayoutHistoryRoundTrip();
-    testConversionRules();
-    testConfigParsing();
+    RUN(testSingleLineAndBlockConditionals);
+    RUN(testDefinesNestingAndDefined);
+    RUN(testPreprocessorErrors);
+    RUN(testConditionalInsideStructAndFunction);
+    RUN(testMacros);
+    RUN(testMacroErrors);
+    RUN(testMacroGeneratesItemsAndNested);
+    RUN(testLayoutsMatchClang);
+    RUN(testDefaultSchemeReordersDeterministically);
+    RUN(testConstantsAndEnums);
+    RUN(testSemaErrors);
+    RUN(testAliasesResolve);
+    RUN(testDeclareLayoutWarningsAndHistory);
+    RUN(testLayoutHistoryRoundTrip);
+    RUN(testConversionRules);
+    RUN(testConfigParsing);
 }

@@ -75,8 +75,13 @@ jobs:
         shell: bash -el {0}
         run: |
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
-          "$LLVM_CONFIG" --link-static --system-libs; ls "$(dirname "$LLVM_CONFIG")/../lib" | grep -iE "zstd|zlib"
           xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
           xmake build -P . -y xlc-tests
+          # The compiler itself must start and analyze a file, not only the unit tests.
+          printf 'fn f(a: u8, b: u64) -> u32 { return 1 }\n' > smoke.xl
+          build/windows/x64/release/xlc.exe --version
+          build/windows/x64/release/xlc.exe smoke.xl --check
+          # The trace names the test that was running when the process died.
+          XLC_TEST_TRACE=1 build/windows/x64/release/xlc-tests.exe 2>&1 | tail -n 5 || true
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
 
@@ -30,4 +31,14 @@ inline int& failures() {
             std::cerr << __FILE__ << ":" << __LINE__ << ": CHECK_EQ failed: " #actual     \
                       << "\n--- actual ---\n" << a_ << "\n--- expected ---\n" << e_ << "\n"; \
         }                                                                                  \
+    } while (false)
+
+// Runs one test function. With XLC_TEST_TRACE set, its name is printed first, so the last name on
+// stderr identifies a test that crashes the process.
+#define RUN(test)                                                                          \
+    do {                                                                                   \
+        if (std::getenv("XLC_TEST_TRACE") != nullptr) {                                    \
+            std::cerr << "run " #test "\n";                                                \
+        }                                                                                  \
+        test();                                                                            \
     } while (false)
