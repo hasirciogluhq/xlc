@@ -31,7 +31,6 @@ Stmt cloneStmt(const Stmt& s, const TypeEnv& env) {
         c.expr2 = cloneExpr(*s.expr2, env);
     }
     c.has_compound_op = s.has_compound_op;
-    c.is_incdec = s.is_incdec;
     c.range_inclusive = s.range_inclusive;
     c.compound_op = s.compound_op;
     if (s.body) {
@@ -163,10 +162,6 @@ FnDecl instantiateFn(const FnDecl& generic, const TypeEnv& env) {
 
 Block copyBlock(const Block& block) {
     return cloneBlock(block, TypeEnv{});
-}
-
-ExprPtr copyExpr(const Expr& expr) {
-    return cloneExpr(expr, TypeEnv{});
 }
 
 Item instantiateItem(const Item& generic, const TypeEnv& env, const std::string& name) {

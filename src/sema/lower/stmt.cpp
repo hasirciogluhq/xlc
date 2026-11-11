@@ -756,9 +756,6 @@ void Lowerer::lowerAssign(const Expr& target_ast,
                           const Expr& value_ast,
                           const Span& span,
                           std::vector<hir::Stmt>& out) {
-    if (target_ast.kind == Expr::Kind::Index && userIndexAssign(target_ast, value_ast, span, out)) {
-        return; // `a[i] = v` through `operator[]=`
-    }
     EP target = expr(target_ast, nullptr);
     if (target && lower::isStrPlace(*target)) {
         err("E0716",
@@ -825,9 +822,6 @@ void Lowerer::assignTo(
 /// `t op= v`  =>  `t = t op v`; a target with side effects is evaluated once through a pointer.
 void Lowerer::lowerCompound(const Stmt& s, std::vector<hir::Stmt>& out) {
     if (!lower::astHasSideEffects(*s.target)) {
-        if (userCompound(s, *s.target, out)) {
-            return; // `operator+=` / `operator++` of a struct or class place
-        }
         const ExprPtr bin = lower::astBinary(
             s.compound_op, lower::cloneAst(*s.target), lower::cloneAst(*s.expr), s.span);
         lowerAssign(*s.target, *bin, s.span, out);
@@ -868,9 +862,6 @@ void Lowerer::lowerCompound(const Stmt& s, std::vector<hir::Stmt>& out) {
     bindLocal(name, id, ptr, s.span);
     const ExprPtr place =
         lower::astUnary(UnaryOp::Deref, lower::astName(name, s.target->span), s.target->span);
-    if (userCompound(s, *place, out)) {
-        return;
-    }
     const ExprPtr bin = lower::astBinary(
         s.compound_op,
         lower::astUnary(UnaryOp::Deref, lower::astName(name, s.target->span), s.target->span),

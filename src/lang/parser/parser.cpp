@@ -1542,7 +1542,6 @@ class Parser {
             stmt.kind = Stmt::Kind::Assign;
             stmt.target = std::move(lhs);
             if (incdec) {
-                stmt.is_incdec = true;
                 stmt.has_compound_op = true;
                 stmt.compound_op = *compound;
                 stmt.expr = makeExpr(Expr::Kind::IntLiteral, prev().span);
@@ -1791,9 +1790,7 @@ class Parser {
             addItem(program, s, parseInterface(s));
             return;
         case TokenKind::Impl:
-            if (auto impl = parseImpl(program, s)) {
-                addItem(program, s, std::move(*impl));
-            }
+            addItem(program, s, parseImpl(s));
             return;
         case TokenKind::Enum:
             addEnum(program, s, parseEnum(s));
@@ -1924,10 +1921,6 @@ class Parser {
                 advance();
                 param.name = "self";
                 param.is_self = true;
-                if (match(TokenKind::Colon)) { // `self: T` (inherent `impl` only, see parseMethod)
-                    param.type = parseType();
-                    param.typed_self = true;
-                }
             } else if (at(TokenKind::DotDot)) { // `..args`: the untyped trailing pack
                 advance();
                 param.name = expectIdent("a parameter pack name after `..`");
@@ -1971,78 +1964,16 @@ class Parser {
         (void)member;
     }
 
-    /// The operator a function name spells after `fn` (`fn +(...)`, `fn []=(...)`, `fn ()(...)`):
-    /// the token(s) are consumed and the function is named `operator<symbol>`. nullopt (nothing
-    /// consumed) when the next token is no operator. The table is `operatorFunctionName`.
-    std::optional<std::string> parseOperatorName() {
-        const auto simple = [&](std::string_view symbol) {
-            advance();
-            return std::string("operator") + std::string(symbol);
-        };
-        switch (cur().kind) {
-        case TokenKind::Plus: return simple("+");
-        case TokenKind::Minus: return simple("-");
-        case TokenKind::Star: return simple("*");
-        case TokenKind::Slash: return simple("/");
-        case TokenKind::Percent: return simple("%");
-        case TokenKind::Amp: return simple("&");
-        case TokenKind::Pipe: return simple("|");
-        case TokenKind::Caret: return simple("^");
-        case TokenKind::Shl: return simple("<<");
-        case TokenKind::Shr: return simple(">>");
-        case TokenKind::EqEq: return simple("==");
-        case TokenKind::NotEq: return simple("!=");
-        case TokenKind::Lt: return simple("<");
-        case TokenKind::Le: return simple("<=");
-        case TokenKind::Gt: return simple(">");
-        case TokenKind::Ge: return simple(">=");
-        case TokenKind::Bang: return simple("!");
-        case TokenKind::Tilde: return simple("~");
-        case TokenKind::PlusAssign: return simple("+=");
-        case TokenKind::MinusAssign: return simple("-=");
-        case TokenKind::StarAssign: return simple("*=");
-        case TokenKind::SlashAssign: return simple("/=");
-        case TokenKind::PercentAssign: return simple("%=");
-        case TokenKind::AmpAssign: return simple("&=");
-        case TokenKind::PipeAssign: return simple("|=");
-        case TokenKind::CaretAssign: return simple("^=");
-        case TokenKind::ShlAssign: return simple("<<=");
-        case TokenKind::ShrAssign: return simple(">>=");
-        case TokenKind::PlusPlus: return simple("++");
-        case TokenKind::MinusMinus: return simple("--");
-        case TokenKind::LBracket:
-            if (peekKind(1) != TokenKind::RBracket) {
-                return std::nullopt;
-            }
-            advance();
-            advance();
-            return match(TokenKind::Assign) ? "operator[]=" : "operator[]";
-        case TokenKind::LParen:
-            if (peekKind(1) != TokenKind::RParen || peekKind(2) != TokenKind::LParen) {
-                return std::nullopt;
-            }
-            advance();
-            advance();
-            return "operator()";
-        default:
-            return std::nullopt;
-        }
-    }
-
     FnDecl parseFn(const DeclStart& s, bool member) {
         FnDecl fn;
         Span fn_start = cur().span;
         expect(TokenKind::Fn, "`fn`");
         const Token& name_tok = cur();
-        const Span name_span = name_tok.span;
-        std::string name;
-        if (auto op = parseOperatorName()) {
-            name = std::move(*op);
-        } else if (at(TokenKind::Ident)) {
-            name = advance().text;
-        } else {
+        if (!at(TokenKind::Ident)) {
             expected("a function name");
         }
+        const std::string name = advance().text;
+        const Span name_span = name_tok.span;
         if (at(TokenKind::Lt)) {
             fn.generic_params = parseGenericParams();
         }
@@ -2213,7 +2144,7 @@ class Parser {
     }
 
     /// `[virtual|override] fn ...` inside class/interface/impl bodies.
-    FnDecl parseMethod(std::vector<Attribute> attrs, bool inherent = false) {
+    FnDecl parseMethod(std::vector<Attribute> attrs) {
         DeclStart ms;
         ms.start = attrs.empty() ? cur().span : attrs.front().span;
         ms.attributes = std::move(attrs);
@@ -2230,15 +2161,6 @@ class Parser {
         fn.span = spanFrom(ms.start);
         fn.attributes = ms.attributes;
         registerAllowScopes(fn.attributes, fn.span);
-        if (!inherent) {
-            for (const Param& p : fn.params) {
-                if (p.typed_self) {
-                    softError(p.span,
-                              "`self: T` is only written in an inherent `impl` (`impl T { ... }`)",
-                              "a class, interface or `impl ... for` method has an implicit `self`");
-                }
-            }
-        }
         return fn;
     }
 
@@ -2274,19 +2196,14 @@ class Parser {
         return decl;
     }
 
-    /// `impl Iface for T { ... }` becomes an `ImplDecl`. The inherent form `impl T { fn +(self: T,
-    /// o: T) -> T { } }` holds operator functions only; each becomes a module-level function named
-    /// `operator<symbol>` (`self` is its first parameter, `self` alone meaning `self: T`), so the
-    /// operator overloads like any function and nothing after the parser knows about the block.
-    /// Those functions are added to `program` and the result is empty.
-    std::optional<ImplDecl> parseImpl(Program& program, DeclStart& s) {
+    ImplDecl parseImpl(const DeclStart& s) {
         ImplDecl decl;
         advance(); // 'impl'
         if (at(TokenKind::Lt)) {
             decl.generic_params = parseGenericParams();
         }
         const Token& name_tok = cur();
-        decl.interface_path.push_back(expectIdent("an interface or type name"));
+        decl.interface_path.push_back(expectIdent("an interface name"));
         while (at(TokenKind::Dot) && peekKind(1) == TokenKind::Ident) {
             advance();
             decl.interface_path.push_back(advance().text);
@@ -2294,15 +2211,8 @@ class Parser {
         if (at(TokenKind::Lt)) {
             decl.interface_args = parseTypeArgs();
         }
-        const bool inherent = at(TokenKind::LBrace);
-        if (inherent) {
-            decl.target = Type::makeNamed(decl.interface_path);
-            decl.target.args = decl.interface_args;
-            decl.target.span = name_tok.span;
-        } else {
-            expect(TokenKind::For, "`for` and the implementing type");
-            decl.target = parseType();
-        }
+        expect(TokenKind::For, "`for` and the implementing type");
+        decl.target = parseType();
         expect(TokenKind::LBrace, "`{` with the methods of the impl");
         const int saved_depth = nl_depth_;
         nl_depth_ = 0;
@@ -2312,37 +2222,13 @@ class Parser {
             if (!at(TokenKind::Fn)) {
                 expected("`fn`");
             }
-            decl.methods.push_back(parseMethod(std::move(attrs), inherent));
+            decl.methods.push_back(parseMethod(std::move(attrs)));
         }
         nl_depth_ = saved_depth;
         advance(); // '}'
-        if (!inherent) {
-            std::string name = decl.interface_path.back();
-            finishDecl(decl, s, name, name_tok.span);
-            return decl;
-        }
-        for (FnDecl& m : decl.methods) {
-            if (!m.name.starts_with("operator")) {
-                softError(m.name_span,
-                          std::format("`{}` is not an operator: an inherent `impl` only holds "
-                                      "operator functions",
-                                      m.name),
-                          "write `fn +(self: T, ...)`, or put methods in a `class`");
-                continue;
-            }
-            for (Param& p : m.params) {
-                if (p.is_self) { // `self` alone is the target by value; `self: T` names its type
-                    p.is_self = false;
-                    if (!p.typed_self) {
-                        p.type = decl.target;
-                    }
-                }
-            }
-            m.generic_params.insert(
-                m.generic_params.begin(), decl.generic_params.begin(), decl.generic_params.end());
-            addItem(program, s, std::move(m));
-        }
-        return std::nullopt;
+        std::string name = decl.interface_path.back();
+        finishDecl(decl, s, name, name_tok.span);
+        return decl;
     }
 
     // --- enum / type / define ----------------------------------------------------------------
