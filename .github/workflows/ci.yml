@@ -17,7 +17,7 @@ jobs:
       matrix:
         runner: [macos-15, ubuntu-24.04, windows-2025]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
       - name: LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -38,7 +38,7 @@ jobs:
       # Windows: MSVC ABI through clang-cl (the code uses `__int128`), LLVM from conda-forge.
       - name: LLVM (Windows)
         if: runner.os == 'Windows'
-        uses: mamba-org/setup-micromamba@v3
+        uses: mamba-org/setup-micromamba@v3.2.1
         with:
           environment-name: llvm
           create-args: >-
@@ -49,16 +49,24 @@ jobs:
           cache-environment: true
       - name: Visual Studio environment (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
-      - uses: xmake-io/github-action-setup-xmake@v1
+      - uses: xmake-io/github-action-setup-xmake@v1.2.5
         with:
           xmake-version: latest
+          # xmake's own caches, one per OS/CPU: downloaded packages (cli11) and compiled objects.
+          actions-cache-folder: .xmake-cache
+          actions-cache-key: ci-${{ runner.os }}-${{ runner.arch }}
+          package-cache: true
+          package-cache-key: ci-${{ runner.os }}-${{ runner.arch }}
+          build-cache: true
+          build-cache-key: ci-${{ runner.os }}-${{ runner.arch }}
+          project-path: .
       - name: Build and test
         if: runner.os != 'Windows'
         run: |
-          xmake f -P . -y -m release
+          xmake f -P . -y -m release --policies=build.ccache:y
           xmake -P . -y
           xmake build -P . -y xlc-tests
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"
@@ -68,7 +76,7 @@ jobs:
         run: |
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
           "$LLVM_CONFIG" --link-static --system-libs; ls "$(dirname "$LLVM_CONFIG")/../lib" | grep -iE "zstd|zlib"
-          xmake f -P . -y -m release -p windows -a x64 --toolchain=clang-cl
+          xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
           xmake build -P . -y xlc-tests
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"

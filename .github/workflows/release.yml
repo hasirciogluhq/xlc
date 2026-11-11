@@ -38,7 +38,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
       - id: meta
@@ -81,7 +81,7 @@ jobs:
           - { runner: ubuntu-24.04-arm, os: linux,   arch: arm64 }
           - { runner: windows-2025,     os: windows, arch: amd64 }
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.meta.outputs.tag }}
 
@@ -117,7 +117,7 @@ jobs:
       # come from conda-forge, which builds them with MSVC.
       - name: Install dependencies (Windows)
         if: matrix.os == 'windows'
-        uses: mamba-org/setup-micromamba@v3
+        uses: mamba-org/setup-micromamba@v3.2.1
         with:
           environment-name: llvm
           create-args: >-
@@ -129,13 +129,21 @@ jobs:
 
       - name: Visual Studio environment (Windows)
         if: matrix.os == 'windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@v1.13.0
         with:
           arch: x64
 
-      - uses: xmake-io/github-action-setup-xmake@v1
+      - uses: xmake-io/github-action-setup-xmake@v1.2.5
         with:
           xmake-version: latest
+          # xmake's own caches, one per OS/CPU: downloaded packages (cli11) and compiled objects.
+          actions-cache-folder: .xmake-cache
+          actions-cache-key: release-${{ matrix.os }}-${{ matrix.arch }}
+          package-cache: true
+          package-cache-key: release-${{ matrix.os }}-${{ matrix.arch }}
+          build-cache: true
+          build-cache-key: release-${{ matrix.os }}-${{ matrix.arch }}
+          project-path: .
 
       - name: Build (Unix)
         if: matrix.os != 'windows'
@@ -143,7 +151,7 @@ jobs:
         run: |
           set -euo pipefail
           llvm-config --version
-          xmake f -P . -y -m release
+          xmake f -P . -y -m release --policies=build.ccache:y
           xmake -P . -y
           xmake build -P . -y xlc-tests
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"
@@ -155,7 +163,7 @@ jobs:
           set -euo pipefail
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
           "$LLVM_CONFIG" --version
-          xmake f -P . -y -m release -p windows -a x64 --toolchain=clang-cl
+          xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
 
       - name: Package (Unix)
@@ -178,7 +186,7 @@ jobs:
           bin="$(find build -type f -name xlc.exe | head -n1)"
           bash scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$bin"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: xlc-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
@@ -193,7 +201,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
           pattern: xlc-*
