@@ -47,8 +47,21 @@ local function add_llvm(target)
     end
     target:add("sysincludedirs", query("--includedir"))
     target:add("linkdirs", query("--libdir"))
+    -- llvm-config spells a library `-lLLVMCore` (Unix) or `LLVMCore.lib` / a full path (MSVC).
+    local function add_lib(lib)
+        if lib:startswith("-l") then
+            target:add("links", lib:sub(3))
+        elseif lib:endswith(".lib") then
+            if lib:find("[/\\]") then
+                target:add("linkdirs", path.directory(lib))
+            end
+            target:add("links", path.basename(lib))
+        elseif #lib > 0 and not lib:startswith("-") then
+            target:add("links", lib)
+        end
+    end
     for _, lib in ipairs(query("--link-static --libs aarch64 x86 passes irreader bitwriter object mc target codegen"):split("%s+")) do
-        target:add("links", (lib:gsub("^%-l", "")))
+        add_lib(lib)
     end
     -- Homebrew keeps zstd & co. outside the default linker search path.
     for _, dir in ipairs({"/opt/homebrew/lib", "/usr/local/lib"}) do
@@ -60,8 +73,8 @@ local function add_llvm(target)
     for _, lib in ipairs(query("--link-static --system-libs"):split("%s+")) do
         if lib:startswith("-l") then
             target:add("syslinks", lib:sub(3))
-        elseif #lib > 0 and not lib:startswith("-") then
-            target:add("links", lib)
+        else
+            add_lib(lib)
         end
     end
 end
@@ -85,6 +98,8 @@ target("xlc")
     -- Released binaries carry their C++ runtime: no libstdc++/libc++ DLL to install next to them.
     if is_plat("windows", "mingw") then
         add_syslinks("ws2_32", "ole32", "uuid", "version", "shell32", "advapi32")
+    end
+    if is_plat("mingw") then
         add_ldflags("-static", {force = true})
     elseif is_plat("linux") then
         add_ldflags("-static-libstdc++", "-static-libgcc", {force = true})

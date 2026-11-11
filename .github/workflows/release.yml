@@ -79,8 +79,7 @@ jobs:
           - { runner: macos-15-intel,   os: darwin,  arch: amd64 }
           - { runner: ubuntu-24.04,     os: linux,   arch: amd64 }
           - { runner: ubuntu-24.04-arm, os: linux,   arch: arm64 }
-          - { runner: windows-2025,     os: windows, arch: amd64, msystem: CLANG64,    prefix: mingw-w64-clang-x86_64 }
-          - { runner: windows-11-arm,   os: windows, arch: arm64, msystem: CLANGARM64, prefix: mingw-w64-clang-aarch64, experimental: true }
+          - { runner: windows-2025,     os: windows, arch: amd64 }
     steps:
       - uses: actions/checkout@v7
         with:
@@ -113,25 +112,28 @@ jobs:
           sudo apt-get install -y --no-install-recommends "llvm-${chosen}-dev" "clang-${chosen}"
           echo "/usr/lib/llvm-${chosen}/bin" >> "$GITHUB_PATH"
 
-      - name: Install dependencies (Windows, MSYS2)
+      # Windows is a native MSVC-ABI build: Visual Studio's headers, STL and linker, driven by
+      # clang-cl (the code uses `__int128`, which cl.exe does not have). LLVM's static libraries
+      # come from conda-forge, which builds them with MSVC.
+      - name: Install dependencies (Windows)
         if: matrix.os == 'windows'
-        uses: msys2/setup-msys2@v2
+        uses: mamba-org/setup-micromamba@v3
         with:
-          msystem: ${{ matrix.msystem }}
-          update: true
-          install: >-
-            ${{ matrix.prefix }}-clang
-            ${{ matrix.prefix }}-llvm
-            ${{ matrix.prefix }}-lld
-            ${{ matrix.prefix }}-zstd
-            ${{ matrix.prefix }}-zlib
-            ${{ matrix.prefix }}-xmake
-            ${{ matrix.prefix }}-cli11
-            zip
-            git
+          environment-name: llvm
+          create-args: >-
+            llvmdev=21
+            zstd-static
+            zlib
+          init-shell: bash
+          cache-environment: true
+
+      - name: Visual Studio environment (Windows)
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - uses: xmake-io/github-action-setup-xmake@v1
-        if: matrix.os != 'windows'
         with:
           xmake-version: latest
 
@@ -148,11 +150,12 @@ jobs:
 
       - name: Build (Windows)
         if: matrix.os == 'windows'
-        shell: msys2 {0}
+        shell: bash -el {0}
         run: |
           set -euo pipefail
-          llvm-config --version
-          xmake f -P . -y -m release -p mingw --toolchain=clang --sdk="$MSYSTEM_PREFIX"
+          export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
+          "$LLVM_CONFIG" --version
+          xmake f -P . -y -m release -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
 
       - name: Package (Unix)
@@ -167,7 +170,7 @@ jobs:
 
       - name: Package (Windows)
         if: matrix.os == 'windows'
-        shell: msys2 {0}
+        shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
