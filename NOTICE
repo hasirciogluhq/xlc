@@ -1,0 +1,6 @@
+xlc
+Copyright 2025-2026 The xlang authors
+
+This product is licensed under the Apache License, Version 2.0.
+
+It links LLVM (https://llvm.org), licensed under the Apache License v2.0 with LLVM Exceptions.

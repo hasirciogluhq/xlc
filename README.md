@@ -67,6 +67,14 @@ Assets are `xlc_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) and `checksums
 To cut a release: set `xlc_version` in `xmake.lua`, commit, then `git tag vX.Y.Z[-rc.N] && git push
 origin vX.Y.Z[-rc.N]`.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
+
 ## Layout
 
 ```
