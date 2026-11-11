@@ -27,7 +27,11 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           # LLVM 20 or newer (`Intrinsic::getOrInsertDeclaration`), from apt.llvm.org.
-          sudo apt-get update
+          # The runner's own Ubuntu mirror (azure.archive.ubuntu.com) is sometimes unreachable and apt would wait on every file of
+          # it for minutes: fail fast instead, and carry on, because the packages below are on the image or on apt.llvm.org.
+          printf 'Acquire::Retries "1";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' |
+            sudo tee /etc/apt/apt.conf.d/99-fail-fast >/dev/null
+          sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg \
             libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
