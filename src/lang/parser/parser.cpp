@@ -2342,10 +2342,11 @@ class Parser {
     }
 
     /// `impl Iface for T { ... }` becomes an `ImplDecl`. The inherent form `impl T { fn +(self: T,
-    /// o: T) -> T { } }` holds operator functions only; each becomes a module-level function named
-    /// `operator<symbol>` (`self` is its first parameter, `self` alone meaning `self: T`), so the
-    /// operator overloads like any function and nothing after the parser knows about the block.
-    /// Those functions are added to `program` and the result is empty.
+    /// o: T) -> T { } fn len(self: *T) -> usize { } }` holds operators and methods of a struct; each
+    /// becomes a module-level function named `operator<symbol>` or `T.name` (`self` is its first
+    /// parameter, `self` alone meaning `self: T`), so it overloads like any function and nothing
+    /// after the parser knows about the block. Those functions are added to `program` and the
+    /// result is empty.
     std::optional<ImplDecl> parseImpl(Program& program, DeclStart& s) {
         ImplDecl decl;
         advance(); // 'impl'
@@ -2390,12 +2391,9 @@ class Parser {
         }
         for (FnDecl& m : decl.methods) {
             if (!m.name.starts_with("operator")) {
-                softError(m.name_span,
-                          std::format("`{}` is not an operator: an inherent `impl` only holds "
-                                      "operator functions",
-                                      m.name),
-                          "write `fn +(self: T, ...)`, or put methods in a `class`");
-                continue;
+                // A method of a struct: the function `T.name`, found by `value.name(...)` and by
+                // `for x in value` (`iter`, `next`).
+                m.name = decl.target.path.back() + "." + m.name;
             }
             for (Param& p : m.params) {
                 if (p.is_self) { // `self` alone is the target by value; `self: T` names its type

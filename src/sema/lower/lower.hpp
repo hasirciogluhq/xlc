@@ -677,6 +677,26 @@ class Lowerer {
                                        const Span& span,
                                        std::vector<hir::Stmt>& out);
 
+    // --- methods of structs and iteration (iterate.cpp)
+    /// `T.name`: the function an inherent `impl T { fn name(...) }` makes of a struct's method.
+    [[nodiscard]] static std::string methodFunctionName(const Type& agg, const std::string& name);
+    /// Whether `agg` has a method `name`: a class method, or the function `T.name` taking the value
+    /// (or a pointer to it) as its only argument.
+    [[nodiscard]] bool hasMethod(const Type& agg, const std::string& name);
+    /// `receiver.name(rest...)` on a struct or class; `found` is false, with nothing diagnosed,
+    /// when `agg` has no such method.
+    [[nodiscard]] EP callMethod(ExprPtr receiver,
+                                const Type& agg,
+                                const std::string& name,
+                                std::vector<ExprPtr> rest,
+                                const Span& span,
+                                bool& found);
+    /// `for x in value` over a struct or class: the iterator protocol. `value` has `next` (it is
+    /// its own iterator, and a loop continues where the last one stopped) or `iter` (every loop
+    /// takes a new iterator from it, which has `next`); `iter` wins when both exist. `next` returns
+    /// an `Option`-like enum: one variant carrying the item, one without data that ends the loop.
+    void lowerIterate(const Stmt& s, EP value, std::vector<hir::Stmt>& out);
+
     // --- closures (closure.cpp)
     /// `|a, b| ...`: a function, plus a struct of the captured variables when it captures any. The
     /// value is the function (a `fn(...)` pointer) of a closure that captures nothing, else the
