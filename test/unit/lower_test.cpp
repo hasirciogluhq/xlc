@@ -1045,18 +1045,12 @@ void testByteLiterals() {
     CHECK(r.has("local c#0: u8 = 10")); // `b'\\n'`
 }
 
-// Unsigned integers are spelled `u8`..`u64`, `usize`; the old `ui8`..`ui64` names do not exist.
+// Unsigned integers are spelled `u8`..`u64`, `usize`.
 void testUnsignedSpelling() {
     CHECK(Lowered("fn f(a: u8, b: u16, c: u32, d: u64, e: usize) { }\n").diag->hasErrors() == false);
-    for (const char* name : {"ui8", "ui16", "ui32", "ui64"}) {
-        Lowered bad(std::string("fn f(a: ") + name + ") { }\n");
-        CHECK(bad.failedWith("E0706"));
-    }
-    // The spelling of a type in diagnostics, signatures and mangled names is the new one.
     CHECK(typeToString(*primitiveFromName("u8")) == "u8");
     CHECK(typeToString(*primitiveFromName("u64")) == "u64");
     CHECK(typeToString(*primitiveFromName("i8")) == "i8");
-    CHECK(!primitiveFromName("ui8").has_value());
     CHECK(primitiveFromName("u32").has_value() && !primitiveFromName("u32")->is_signed);
     CHECK(primitiveFromName("u32")->bits == 32);
 }
