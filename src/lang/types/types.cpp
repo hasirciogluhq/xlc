@@ -94,9 +94,9 @@ std::optional<Type> primitiveFromName(std::string_view name) {
     static constexpr Entry table[] = {
         {"i8", TypeKind::Int, 8, true},     {"i16", TypeKind::Int, 16, true},
         {"i32", TypeKind::Int, 32, true},   {"i64", TypeKind::Int, 64, true},
-        {"isize", TypeKind::Int, 0, true},  {"ui8", TypeKind::Int, 8, false},
-        {"ui16", TypeKind::Int, 16, false}, {"ui32", TypeKind::Int, 32, false},
-        {"ui64", TypeKind::Int, 64, false}, {"usize", TypeKind::Int, 0, false},
+        {"isize", TypeKind::Int, 0, true},  {"u8", TypeKind::Int, 8, false},
+        {"u16", TypeKind::Int, 16, false}, {"u32", TypeKind::Int, 32, false},
+        {"u64", TypeKind::Int, 64, false}, {"usize", TypeKind::Int, 0, false},
         {"f32", TypeKind::Float, 32, true}, {"f64", TypeKind::Float, 64, true},
         {"bool", TypeKind::Bool, 0, false}, {"void", TypeKind::Void, 0, false},
         {"str", TypeKind::Str, 0, false},
@@ -160,7 +160,7 @@ std::string typeToString(const Type& type) {
         if (type.bits == 0) {
             return type.is_signed ? "isize" : "usize";
         }
-        return std::format("{}{}", type.is_signed ? "i" : "ui", type.bits);
+        return std::format("{}{}", type.is_signed ? "i" : "u", type.bits);
     case TypeKind::Float: return std::format("f{}", type.bits);
     case TypeKind::Pointer: return "*" + (type.elem ? typeToString(*type.elem) : "?");
     case TypeKind::FnPtr: {
@@ -217,7 +217,7 @@ std::string mangleType(const Type& type) {
         if (type.bits == 0) {
             return type.is_signed ? "isize" : "usize";
         }
-        return std::format("{}{}", type.is_signed ? "i" : "ui", type.bits);
+        return std::format("{}{}", type.is_signed ? "i" : "u", type.bits);
     case TypeKind::Float: return std::format("f{}", type.bits);
     case TypeKind::Pointer: return "P" + (type.elem ? mangleType(*type.elem) : "void");
     case TypeKind::FnPtr: {

@@ -75,7 +75,7 @@ implicitConversion(const Type& from, const Type& to, bool in_unsafe, unsigned po
             r.status = ConversionStatus::Warn; // W0601
             return r;
         }
-        // Floats count as signed: `ui -> f` is E0601; `unsafe` accepts it (W0601 still applies).
+        // Floats count as signed: `u -> f` is E0601; `unsafe` accepts it (W0601 still applies).
         if (in_unsafe) {
             r.status = ConversionStatus::Warn;
             r.used_unsafe = true;

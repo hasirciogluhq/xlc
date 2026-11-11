@@ -758,7 +758,7 @@ void Lowerer::lowerAssign(const Expr& target_ast,
         err("E0716",
             target_ast.span,
             "cannot assign through a `str`; it is read-only",
-            "copy the bytes into a `[ui8; N]` or a `String`");
+            "copy the bytes into a `[u8; N]` or a `String`");
         target.reset();
     }
     if (target && target->readonly) {

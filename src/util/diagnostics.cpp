@@ -68,8 +68,8 @@ constexpr std::size_t kLeadWidth = 40;
          "group); remove the extra registration. A program registration replaces a library "
          "default of the same role."},
         {"E0503", Severity::Error, "`register` role contract not met",
-         "The registered symbol does not fit its role: `panic` is `fn(msg: *ui8)`, `alloc` is "
-         "`fn(size: usize, align: usize) -> *void`, `free` is `fn(p: *void)`, `unwind` is `fn(op: i32, snapshot: *usize, message: *ui8)`."},
+         "The registered symbol does not fit its role: `panic` is `fn(msg: *u8)`, `alloc` is "
+         "`fn(size: usize, align: usize) -> *void`, `free` is `fn(p: *void)`, `unwind` is `fn(op: i32, snapshot: *usize, message: *u8)`."},
         {"E0504", Severity::Error, "interface used without `impl`",
          "Interfaces are nominal: a type is usable as an interface only after "
          "`impl Interface for Type`, even when its method names match."},
@@ -77,7 +77,7 @@ constexpr std::size_t kLeadWidth = 40;
          "A local definition or import hides a `register`ed global name. The role binding is "
          "unaffected because it is bound by registration, not by name."},
         {"E0601", Severity::Error, "implicit signedness-changing conversion",
-         "An implicit conversion changes signedness (`ui <-> i`, `ui -> f`; floats count as "
+         "An implicit conversion changes signedness (`u <-> i`, `u -> f`; floats count as "
          "signed), or a binary operation mixes signedness. Use `as`, or write the expression "
          "inside an `unsafe { }` block."},
         {"E0701", Severity::Error, "constant array index out of bounds",
@@ -143,10 +143,10 @@ constexpr std::size_t kLeadWidth = 40;
          "`const NAME: T = ...` otherwise."},
         {"E0716", Severity::Error, "write to a read-only place",
          "A value that cannot change is assigned to: an element or field of a `str` (`s[i] = x`, "
-         "`s.len = n`), or the name of a `const`. Copy the bytes into a `[ui8; N]` local or a "
+         "`s.len = n`), or the name of a `const`. Copy the bytes into a `[u8; N]` local or a "
          "`String` to get a writable buffer."},
         {"E0717", Severity::Error, "string literal does not fit the array",
-         "A string literal initializes a `[ui8; N]` but has more than N bytes. Make the array "
+         "A string literal initializes a `[u8; N]` but has more than N bytes. Make the array "
          "longer, or use a `str` value instead."},
         {"E0726", Severity::Error, "reserved entry symbol",
          "A symbol named `_start`, `mainCRTStartup` or `_xl_initAll` was requested through `export(c)`, "
@@ -260,7 +260,7 @@ constexpr std::size_t kLeadWidth = 40;
          "payload has; a variant without data is written `E.B`."},
         {"E0752", Severity::Error, "invalid `@entry` function",
          "`@entry` marks a module-level function with no generics and a body, and a signature of no parameters "
-         "or exactly `argc: i32` and `argv: **ui8` in that order, returning void or i32. Methods and other "
+         "or exactly `argc: i32` and `argv: **u8` in that order, returning void or i32. Methods and other "
          "declarations cannot be the entry."},
         {"E0753", Severity::Error, "more than one `@entry` function",
          "A program has exactly one `@entry` function. Remove the second `@entry` attribute, or move the code "

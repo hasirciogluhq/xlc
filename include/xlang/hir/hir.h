@@ -29,7 +29,7 @@ enum class ExprKind {
     IntConst,     ///< int_value (two's complement bits), type Int/Enum
     FloatConst,   ///< float_value
     BoolConst,    ///< bool_value
-    StrConst,     ///< text; type `*ui8` (or an enum over `*ui8`), or `str` = { ptr, len }
+    StrConst,     ///< text; type `*u8` (or an enum over `*u8`), or `str` = { ptr, len }
     Nil,          ///< `nil`, typed as the pointer/function pointer it was converted to
     LocalRef,     ///< local
     GlobalRef,    ///< text = global name
@@ -138,7 +138,7 @@ struct Stmt {
     StmtKind kind{StmtKind::Expr};
     Span span;
     LocalId local{0};     ///< Local; Try: the snapshot buffer (`[usize; 32]`)
-    LocalId msg_local{0}; ///< Try: the message buffer (`[ui8; 256]`) the panic text is written to
+    LocalId msg_local{0}; ///< Try: the message buffer (`[u8; 256]`) the panic text is written to
     ExprPtr target;       ///< Assign
     ExprPtr value;        ///< Local init / Assign value / Return value / Expr / If,While condition
     std::vector<Stmt> body;

@@ -14,11 +14,11 @@ enum class TokenKind {
 
     // Literals and names
     Ident,
-    PrimType,  ///< i8 .. i64, isize, ui8 .. ui64, usize, f32, f64, bool, void
+    PrimType,  ///< i8 .. i64, isize, u8 .. u64, usize, f32, f64, bool, void
     Int,
     Float,
     String,
-    ByteLit,   ///< `b')'`: one byte (0..255) in `int_value`, typed `ui8`
+    ByteLit,   ///< `b')'`: one byte (0..255) in `int_value`, typed `u8`
 
     // Keywords
     Fn,

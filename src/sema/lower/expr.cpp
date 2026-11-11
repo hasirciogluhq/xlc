@@ -209,7 +209,7 @@ Lowerer::EP Lowerer::constExpr(const Expr& e, const Type* expected) {
 }
 
 /// A string literal takes its type from the context (see xlang-docs/language/index.md, "Strings"):
-/// `*ui8` (raw NUL-terminated bytes), `[ui8; N]` (a mutable zero-padded copy) or `str`.
+/// `*u8` (raw NUL-terminated bytes), `[u8; N]` (a mutable zero-padded copy) or `str`.
 Lowerer::EP
 Lowerer::stringLiteral(const std::string& text, const Type* expected, const Span& span) {
     const Type want = expected != nullptr ? resolved(*expected) : lower::unknownType();
@@ -633,7 +633,7 @@ Lowerer::EP Lowerer::fieldExpr(const Expr& e, const Type* expected) {
     }
     if (agg.kind == TypeKind::Str || agg.kind == TypeKind::Slice) {
         // `str` and a slice both have two read-only fields: `ptr` (index 0) and `len` (index 1).
-        // `str.ptr` narrows to `*ui8`; a slice's `ptr` carries the element type.
+        // `str.ptr` narrows to `*u8`; a slice's `ptr` carries the element type.
         Type field_type;
         std::uint32_t index = 0;
         if (e.text == "ptr") {
@@ -1965,7 +1965,7 @@ Lowerer::EP Lowerer::indexExpr(const Expr& e) {
 }
 
 /// `base[lo..hi]` / `base[lo..]` / `base[..hi]` / `base[..]`: a `str` view over the bytes `lo` up
-/// to `hi`, never a copy. `str` and `[ui8; N]` are the bases: a `str` is already a byte view, and
+/// to `hi`, never a copy. `str` and `[u8; N]` are the bases: a `str` is already a byte view, and
 /// an array of bytes borrows its storage. Both bounds are optional and default to 0 and the length.
 /// Under --safety=checked the node carries `checked`, so both bounds are compared against the base
 /// length at run time (`E0` at compile time only for constant bounds, below).
@@ -1978,7 +1978,7 @@ Lowerer::EP Lowerer::sliceExpr(const Expr& e) {
         return t.kind == TypeKind::Str || (t.kind == TypeKind::Array && t.elem &&
                                            t.elem->kind == TypeKind::Int && t.elem->bits == 8);
     };
-    // Slicing yields a slice type: `str`/`[ui8; N]` keeps its old `str` result for source
+    // Slicing yields a slice type: `str`/`[u8; N]` keeps its old `str` result for source
     // compatibility, while an array or an existing slice yields `[]T` over its element type.
     bool yields_str = false;
     Type result = Type::makeStr();

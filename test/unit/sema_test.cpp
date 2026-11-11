@@ -217,14 +217,14 @@ struct Analyzed {
 };
 
 void testLayoutsMatchClang() {
-    Analyzed a("@repr(c) struct Header { tag: ui8\n length: ui32\n id: ui16 }\n"
-               "@repr(c) struct Mixed { a: i8\n b: f64\n c: i16\n d: *i32\n e: [ui8; 5]\n f: bool }\n"
-               "@repr(c) @packed struct Packed { a: ui8\n b: ui32\n c: ui16 }\n"
-               "@repr(c) @align(32) struct Aligned { a: ui8\n b: ui16 }\n"
+    Analyzed a("@repr(c) struct Header { tag: u8\n length: u32\n id: u16 }\n"
+               "@repr(c) struct Mixed { a: i8\n b: f64\n c: i16\n d: *i32\n e: [u8; 5]\n f: bool }\n"
+               "@repr(c) @packed struct Packed { a: u8\n b: u32\n c: u16 }\n"
+               "@repr(c) @align(32) struct Aligned { a: u8\n b: u16 }\n"
                "@repr(c) class Shape { id: i32\n virtual fn area(self) -> f64 { return 0.0 } }\n"
-               "@repr(c) class Circle : Shape { radius: f64\n flag: ui8 }\n"
-               "@repr(c) class Plain { a: i32\n b: ui8 }\n"
-               "@repr(c) class Derived : Plain { c: ui8 }\n");
+               "@repr(c) class Circle : Shape { radius: f64\n flag: u8 }\n"
+               "@repr(c) class Plain { a: i32\n b: u8 }\n"
+               "@repr(c) class Derived : Plain { c: u8 }\n");
     CHECK(!a.run.diag->hasErrors());
     const auto header = a.sema->layoutOfName("Header", {});
     CHECK(header && header->size == 12 && header->align == 4 && header->fields[1].offset == 4);
@@ -243,7 +243,7 @@ void testLayoutsMatchClang() {
 }
 
 void testDefaultSchemeReordersDeterministically() {
-    Analyzed a("struct R { a: ui8\n b: ui64\n c: ui16\n d: ui32 }\n");
+    Analyzed a("struct R { a: u8\n b: u64\n c: u16\n d: u32 }\n");
     const auto r = a.sema->layoutOfName("R", {});
     CHECK(r && r->size == 16 && r->fields[1].offset == 0 && r->fields[3].offset == 8 &&
           r->fields[2].offset == 12 && r->fields[0].offset == 14);
@@ -253,14 +253,14 @@ void testConstantsAndEnums() {
     Analyzed a("define N = 4\n"
                "define M = N * 2 + 1\n"
                "enum E: i32 { A, B = 10, C }\n"
-               "enum S: *ui8 { X = \"x\" }\n"
+               "enum S: *u8 { X = \"x\" }\n"
                "staticAssert(M == 9, \"m\")\n"
                "staticAssert(E.C == 11, \"c\")\n"
                "staticAssert(MemoryOrder.seqCst == 4, \"order\")\n"
-               "staticAssert(sizeOf(i64) == 8 && sizeOf(usize) == 8 && sizeOf(*ui8) == 8, \"sizes\")\n"
-               "staticAssert((300 as ui8) == 44, \"wrap\")\n"
+               "staticAssert(sizeOf(i64) == 8 && sizeOf(usize) == 8 && sizeOf(*u8) == 8, \"sizes\")\n"
+               "staticAssert((300 as u8) == 44, \"wrap\")\n"
                "staticAssert(pointerWidth == 64, \"pw\")\n"
-               "global t: [ui8; M]\n");
+               "global t: [u8; M]\n");
     CHECK(!a.run.diag->hasErrors());
     const auto v = a.sema->evalConst(*std::get<DefineConstDecl>(a.run.program.items[1].decl).value);
     CHECK(v && v->int_value == 9);
@@ -276,7 +276,7 @@ void testSemaErrors() {
         CHECK(a.run.diag->hasErrors());
     }
     {
-        Analyzed a("enum S: *ui8 { X }\n");  // string enum needs values
+        Analyzed a("enum S: *u8 { X }\n");  // string enum needs values
         CHECK(a.run.diag->hasErrors());
     }
     {
@@ -284,7 +284,7 @@ void testSemaErrors() {
         CHECK(a.run.diag->hasErrors());
     }
     {
-        Analyzed a("global g: [ui8; unknownSize]\n");
+        Analyzed a("global g: [u8; unknownSize]\n");
         CHECK(a.run.diag->hasErrors());
     }
     {
@@ -298,7 +298,7 @@ void testSemaErrors() {
 }
 
 void testAliasesResolve() {
-    Analyzed a("type Byte = ui8\ntype Bytes = [Byte; 4]\nstruct S { b: Bytes\n c: Byte }\n"
+    Analyzed a("type Byte = u8\ntype Bytes = [Byte; 4]\nstruct S { b: Bytes\n c: Byte }\n"
                "staticAssert(sizeOf(S) == 5, \"s\")\n");
     CHECK(!a.run.diag->hasErrors());
 }

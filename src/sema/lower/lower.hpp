@@ -430,7 +430,7 @@ class Lowerer {
     /// Finds the `@init`, `@fini` and `@entry` functions of this module (E0729 / E0752 / E0753 when
     /// one does not fit).
     void checkHookFunctions();
-    /// Validates the signature of an `@entry` function: none, or `(argc: i32, argv: **ui8)`,
+    /// Validates the signature of an `@entry` function: none, or `(argc: i32, argv: **u8)`,
     /// returning void or i32.
     void checkEntrySignature(const FnDecl& f, const std::vector<Type>& params, const Type& ret);
     void run();

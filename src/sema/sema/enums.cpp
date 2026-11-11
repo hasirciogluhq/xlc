@@ -88,7 +88,7 @@ void Sema::checkEnum(const EnumDecl& decl) {
         error("E0705",
               decl.underlying.span.valid() ? decl.underlying.span : decl.name_span,
               std::format("`{}` cannot be the underlying type of an enum", typeToString(*under)),
-              "must hold a constant: integer, float, bool or *ui8");
+              "must hold a constant: integer, float, bool or *u8");
         return;
     }
     std::set<std::string> names;

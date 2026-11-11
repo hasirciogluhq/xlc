@@ -16,7 +16,7 @@ enum class ConversionStatus {
 
 struct ConversionResult {
     ConversionStatus status{ConversionStatus::Invalid};
-    /// With `unsafe` the signedness change was accepted (W0601 may still apply for `ui -> f`).
+    /// With `unsafe` the signedness change was accepted (W0601 may still apply for `u -> f`).
     bool used_unsafe{false};
     std::string note;
 };

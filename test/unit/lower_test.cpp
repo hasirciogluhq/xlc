@@ -99,11 +99,11 @@ void testImplicitConversionsBecomeCasts() {
 
 void testConversionDiagnostics() {
     {
-        Lowered r("fn f() { local n: ui8 = 5\n local m: i32 = n }\n");
+        Lowered r("fn f() { local n: u8 = 5\n local m: i32 = n }\n");
         CHECK(r.failedWith("E0601"));
     }
     {
-        Lowered r("fn f() { local n: ui8 = 5\n unsafe { local m: i32 = n } }\n");
+        Lowered r("fn f() { local n: u8 = 5\n unsafe { local m: i32 = n } }\n");
         CHECK(!r.diag->hasErrors());
     }
     {
@@ -121,7 +121,7 @@ void testConversionDiagnostics() {
         CHECK(r.diag->warningCount() == 0);
     }
     {
-        Lowered r("fn f() { local a: i32 = 1\n local b: ui32 = 2\n local c: i32 = a + b }\n");
+        Lowered r("fn f() { local a: i32 = 1\n local b: u32 = 2\n local c: i32 = a + b }\n");
         CHECK(r.failedWith("E0601"));
     }
 }
@@ -160,7 +160,7 @@ void testSyscallValidation() {
     {
         BuildConfig c;
         c.target = *parseTargetTriple("x86_64-unknown-linux-gnu");
-        Lowered ok("fn f(p: *ui8) -> i64 { return syscall(1, 1, p, 3) }\n", c);
+        Lowered ok("fn f(p: *u8) -> i64 { return syscall(1, 1, p, 3) }\n", c);
         CHECK(!ok.diag->hasErrors());
         CHECK(ok.has("(syscall 1:i32 1:i32 p#0 3:i32):i64"));
         Lowered many("fn f() -> i64 { return syscall(1, 1, 2, 3, 4, 5, 6, 7) }\n", c);
@@ -236,7 +236,7 @@ void testMethodsAreFunctionsWithSelf() {
 void testNewAndRegisteredAllocator() {
     const std::string types =
         "struct Point { x: i32, y: i32 }\n"
-        "global slab: [ui8; 64]\n";
+        "global slab: [u8; 64]\n";
     {
         Lowered r(types + "fn main() -> i32 { local p: *Point = new Point { x: 1, y: 2 }\n return p.x }\n");
         CHECK(r.failedWith("E0501"));
@@ -260,7 +260,7 @@ void testNewAndRegisteredAllocator() {
         CHECK(r.failedWith("E0503"));
     }
     {
-        Lowered r(types + "register(free) fn drop(p: *ui8) { }\n");
+        Lowered r(types + "register(free) fn drop(p: *u8) { }\n");
         CHECK(r.failedWith("E0503"));
     }
     {
@@ -278,7 +278,7 @@ void testNewAndRegisteredAllocator() {
 
 void testRegisterRoles() {
     {
-        Lowered r("register(panic) fn panic(msg: *ui8) { }\nregister(panic) fn panic2(msg: *ui8) { }\n");
+        Lowered r("register(panic) fn panic(msg: *u8) { }\nregister(panic) fn panic2(msg: *u8) { }\n");
         CHECK(r.failedWith("E0502"));
     }
     {
@@ -286,12 +286,12 @@ void testRegisterRoles() {
         CHECK(r.failedWith("E0503"));
     }
     {
-        Lowered r("register(panic) fn panic(msg: *ui8) { }\n");
+        Lowered r("register(panic) fn panic(msg: *u8) { }\n");
         CHECK(!r.diag->hasErrors());
         CHECK(r.module.panic_function == "panic");
     }
     {
-        Lowered r("register(panic) fn panic(msg: *ui8) { }\nfn f() { local panic: i32 = 1 }\n");
+        Lowered r("register(panic) fn panic(msg: *u8) { }\nfn f() { local panic: i32 = 1 }\n");
         CHECK(r.out.str().find("W0402") != std::string::npos);
     }
     {
@@ -350,12 +350,12 @@ void testInitFunctions() {
 void testGlobalInitializersAreConstant() {
     {
         Lowered r("define N = 4\n"
-                  "global table: [ui8; N]\n"
-                  "global first: *ui8 = &table[0]\n"
+                  "global table: [u8; N]\n"
+                  "global first: *u8 = &table[0]\n"
                   "global limit: usize = N * 2\n"
-                  "global banner: *ui8 = \"xlang\"\n");
+                  "global banner: *u8 = \"xlang\"\n");
         CHECK(!r.diag->hasErrors());
-        CHECK(r.has("global table: [ui8; 4]"));
+        CHECK(r.has("global table: [u8; 4]"));
         CHECK(r.has("global limit: usize = (* 4:usize 2:usize):usize"));
     }
     {
@@ -551,7 +551,7 @@ void testModulesShareTypes() {
 void testModuleRegistrationsAndMangling() {
     {
         Multi r({{"app/main.xl", "from \"rt\" import ping\nfn main() { panic(\"x\") }\n"},
-                 {"app/rt.xl", "export fn ping() { }\nregister(panic) fn panic(msg: *ui8) { }\n"}});
+                 {"app/rt.xl", "export fn ping() { }\nregister(panic) fn panic(msg: *u8) { }\n"}});
         CHECK(!r.diag->hasErrors());
         CHECK(r.module.panic_function == "rt::panic");
         CHECK(r.has("(call rt::panic"));
@@ -621,12 +621,12 @@ void testStrings() {
         CHECK(b.failedWith("E0716"));
     }
     {
-        Lowered b("fn f() {\n local b: [ui8; 2] = \"abc\"\n}\n");
+        Lowered b("fn f() {\n local b: [u8; 2] = \"abc\"\n}\n");
         CHECK(b.failedWith("E0717"));
     }
     {
-        Lowered b("fn f() {\n local b: [ui8; 3] = \"abc\"\n local s = \"x\\0y\"\n"
-                  " local n: usize = s.len\n local c: ui8 = s[1]\n}\n");
+        Lowered b("fn f() {\n local b: [u8; 3] = \"abc\"\n local s = \"x\\0y\"\n"
+                  " local n: usize = s.len\n local c: u8 = s[1]\n}\n");
         CHECK(!b.diag->hasErrors());
     }
     {
@@ -1040,24 +1040,24 @@ void testVariadicPacks() {
     }
 }
 
-// A byte literal lowers to a `ui8` constant, and it takes any integer context through the normal
+// A byte literal lowers to a `u8` constant, and it takes any integer context through the normal
 // widening: `0x1f`-style masks and `eq`-style comparisons need no `as`.
 void testByteLiterals() {
-    Lowered r("fn f() -> ui8 { return b')' }\n"
+    Lowered r("fn f() -> u8 { return b')' }\n"
               "fn g() -> i32 {\n local c = b'\\n'\n local n: i64 = b'x'\n"
-              " local m: ui8 = b')'\n return n as i32\n}\n");
+              " local m: u8 = b')'\n return n as i32\n}\n");
     CHECK(!r.diag->hasErrors());
-    CHECK(r.has("41:ui8"));            // `b')'` is 0x29 = 41
-    CHECK(r.has("local c#0: ui8 = 10")); // `b'\\n'`
-    CHECK(r.has("120:ui8"));            // `b'x'`
+    CHECK(r.has("41:u8"));            // `b')'` is 0x29 = 41
+    CHECK(r.has("local c#0: u8 = 10")); // `b'\\n'`
+    CHECK(r.has("120:u8"));            // `b'x'`
     {
-        Lowered bad("fn f() { local n: ui8 = 300 }\n");
+        Lowered bad("fn f() { local n: u8 = 300 }\n");
         CHECK(bad.failedWith("E0708"));  // narrowing still needs `as`, byte literals are not special
     }
 }
 
 // `s[lo..hi]` lowers to a `Slice` of type `str`: a view, never a place. Bounds stay checked under
-// --safety=checked, and a base that is not `str`/`[ui8; N]` is rejected.
+// --safety=checked, and a base that is not `str`/`[u8; N]` is rejected.
 void testSlices() {
     {
         Lowered r("fn f(s: str) -> str {\n return s[1..3]\n}\n");
@@ -1075,15 +1075,15 @@ void testSlices() {
     }
     {
         // Open-ended and array bases take the same node; a constant end past the array is E0701.
-        Lowered r("fn f(s: str, b: [ui8; 4]) {\n local x = s[2..]\n local y = b[..2]\n local z = b[0..]\n}\n");
+        Lowered r("fn f(s: str, b: [u8; 4]) {\n local x = s[2..]\n local y = b[..2]\n local z = b[0..]\n}\n");
         CHECK(!r.diag->hasErrors());
     }
     {
-        Lowered bad("fn f(b: [ui8; 4]) {\n local x = b[0..5]\n}\n");
+        Lowered bad("fn f(b: [u8; 4]) {\n local x = b[0..5]\n}\n");
         CHECK(bad.failedWith("E0701"));
     }
     {
-        Lowered bad("fn f(p: *ui8) {\n local x = p[0..2]\n}\n");
+        Lowered bad("fn f(p: *u8) {\n local x = p[0..2]\n}\n");
         CHECK(bad.failedWith("E0709"));
     }
     {

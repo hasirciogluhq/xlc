@@ -235,7 +235,7 @@ struct Parsed {
 };
 
 void testLexer() {
-    Fixture f("fn f(a: ui8) -> *i32 { return a != 0x1F && b <= 1_000 }\n"
+    Fixture f("fn f(a: u8) -> *i32 { return a != 0x1F && b <= 1_000 }\n"
               "#if debug\nlocal s = \"a\\n\\x41\" // comment\n");
     DiagnosticEngine engine(f.sources, f.out);
     const std::vector<Token> tokens = lex(f.sources, f.file, engine);
@@ -296,7 +296,7 @@ void testByteLiteralErrors() {
 void testParsesFunctionsAndTypes() {
     Parsed p("fn apply(f: fn(i32) -> i32, v: i32) -> i32 {\n"
              "    local a: [i32; 4] = [1, 2, 3, 4]\n"
-             "    local r: *ui8 = &a[0] as *ui8\n"
+             "    local r: *u8 = &a[0] as *u8\n"
              "    return f(v) + a[1] * 2\n"
              "}\n"
              "fn logValue(v: i32) { }\n");
@@ -369,7 +369,7 @@ void testReExports() {
 
 void testDeclareRegisterAndModifiers() {
     Parsed p("declare fn api(a: i32) -> i32\n"
-             "register(panic) fn panic(msg: *ui8) { }\n"
+             "register(panic) fn panic(msg: *u8) { }\n"
              "export(c) fn memcpy(d: *void) { }\n"
              "@repr(c)\n"
              "declare struct P { x: f64 }\n"
@@ -386,8 +386,8 @@ void testDeclareRegisterAndModifiers() {
 void testClassInterfaceImplEnum() {
     Parsed p("class Shape { id: i32\n virtual fn area(self) -> f64 { return 0.0 } }\n"
              "class Circle : Shape { r: f64\n override fn area(self) -> f64 { return 1.0 } }\n"
-             "interface Writer { fn write(self, buf: *ui8, len: usize) -> isize }\n"
-             "impl Writer for Circle { fn write(self, buf: *ui8, len: usize) -> isize { return 0 } }\n"
+             "interface Writer { fn write(self, buf: *u8, len: usize) -> isize }\n"
+             "impl Writer for Circle { fn write(self, buf: *u8, len: usize) -> isize { return 0 } }\n"
              "enum E: i32 { A, B = 5, C }\n");
     CHECK(!p.engine.hasErrors());
     CHECK(p.program.items.size() == 5);
@@ -403,7 +403,7 @@ void testClassInterfaceImplEnum() {
 void testDefineAndMacros() {
     Parsed p("define PAGE = 4096\n"
              "define square(x: expr) { x * x }\n"
-             "type Byte = ui8\n"
+             "type Byte = u8\n"
              "fn f() -> i32 { return square!(1 + 2) }\n");
     CHECK(!p.engine.hasErrors());
     CHECK(std::holds_alternative<DefineConstDecl>(p.program.items[0].decl));
@@ -501,7 +501,7 @@ void testOperatorPrecedenceAndCasts() {
 
 // A byte literal reaches the AST as a `ByteLiteral` holding the byte, not as an integer or a name.
 void testByteLiteralParsesAsExpr() {
-    Parsed p("fn f() -> ui8 { return b')' }\n");
+    Parsed p("fn f() -> u8 { return b')' }\n");
     CHECK(!p.engine.hasErrors());
     const auto& fn = std::get<FnDecl>(p.program.items[0].decl);
     const Expr& e = *fn.body.statements[0].expr;

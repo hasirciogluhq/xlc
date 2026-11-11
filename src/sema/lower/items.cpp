@@ -345,7 +345,7 @@ void Lowerer::checkRegistrations() {
                 ok = p.kind == TypeKind::Pointer && p.elem && p.elem->kind == TypeKind::Int &&
                      p.elem->bits == 8 && !p.elem->is_signed;
             }
-            why = "`register(panic)` needs `fn(msg: *ui8)` with no return type";
+            why = "`register(panic)` needs `fn(msg: *u8)` with no return type";
         } else if (role == "alloc") {
             ok = fn != nullptr && fn->params.size() == 2 && !fn->params[0].is_self &&
                  !fn->params[1].is_self && isVoidPointer(resolved(fn->return_type));
@@ -372,9 +372,9 @@ void Lowerer::checkRegistrations() {
                 };
                 ok = a.kind == TypeKind::Int && a.bits == 32 && a.is_signed &&
                      b.kind == TypeKind::Pointer && b.elem && b.elem->kind == TypeKind::Int &&
-                     b.elem->bits == 0 && !b.elem->is_signed && bytes(c); // `*usize`, `*ui8`
+                     b.elem->bits == 0 && !b.elem->is_signed && bytes(c); // `*usize`, `*u8`
             }
-            why = "`register(unwind)` needs `fn(op: i32, snapshot: *usize, message: *ui8)` with no "
+            why = "`register(unwind)` needs `fn(op: i32, snapshot: *usize, message: *u8)` with no "
                   "return type";
         } else {
             why = std::format("unknown role `{}`; known roles: panic, alloc, free, unwind", role);
@@ -507,7 +507,7 @@ void Lowerer::checkEntrySignature(const FnDecl& f,
         err("E0752",
             f.name_span,
             std::format("`@entry` function `{}` has an invalid signature", f.name),
-            "write `@entry fn name()` or `@entry fn name(argc: i32, argv: **ui8) -> i32`: "
+            "write `@entry fn name()` or `@entry fn name(argc: i32, argv: **u8) -> i32`: "
             "the return type is void or i32");
     }
 }

@@ -57,7 +57,7 @@ struct Expr {
         FloatLiteral,
         BoolLiteral,
         StringLiteral,
-        ByteLiteral,   ///< `b')'`: one byte, typed `ui8`; int_value holds the byte
+        ByteLiteral,   ///< `b')'`: one byte, typed `u8`; int_value holds the byte
         Name,          ///< identifier, including `self`
         Unary,
         Binary,

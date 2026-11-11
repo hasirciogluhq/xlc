@@ -15,7 +15,7 @@ struct Expr;
 enum class TypeKind {
     Void,
     Bool,
-    Int,      ///< i8..i64, isize, ui8..ui64, usize (see Type::bits / is_signed)
+    Int,      ///< i8..i64, isize, u8..u64, usize (see Type::bits / is_signed)
     Float,    ///< f32, f64
     Pointer,  ///< *T
     FnPtr,    ///< fn(A, B) -> R
@@ -24,7 +24,7 @@ enum class TypeKind {
     Struct,
     Class,
     Interface,
-    Str,      ///< built-in immutable view `{ ptr: *ui8, len: usize }`; never owns its bytes
+    Str,      ///< built-in immutable view `{ ptr: *u8, len: usize }`; never owns its bytes
     Slice,    ///< `[]T` / `[]mut T`: a non-owning fat pointer `{ ptr: *T, len: usize }` over `elem`;
               ///< `is_mutable` tells the two views apart (see xlang-docs/language/index.md)
     Tuple,    ///< `(A, B, ...)`: the product of `args` in declaration order; laid out like `@repr(c)`
@@ -74,11 +74,11 @@ struct Type {
     [[nodiscard]] static Type makeTuple(std::vector<Type> elements);
 };
 
-/// `i32`, `ui8`, `usize`, `f64`, `bool`, `void` -> the type; nullopt for any other name.
+/// `i32`, `u8`, `usize`, `f64`, `bool`, `void` -> the type; nullopt for any other name.
 [[nodiscard]] std::optional<Type> primitiveFromName(std::string_view name);
 [[nodiscard]] bool isPrimitiveTypeName(std::string_view name);
 
-/// Source-like spelling: `*ui8`, `[i32; 4]`, `fn(i32) -> i32`, `(i32, i64)`, `io.Writer`.
+/// Source-like spelling: `*u8`, `[i32; 4]`, `fn(i32) -> i32`, `(i32, i64)`, `io.Writer`.
 [[nodiscard]] std::string typeToString(const Type& type);
 
 /// Symbol-safe spelling for link names: no spaces, `[`, `;`, `*`, `(`, `,` or `<`. `*T` is `P<T>`,

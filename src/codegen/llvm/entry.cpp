@@ -95,7 +95,7 @@ void Gen::emitEntry() {
     // w19) across the teardown call. Every call keeps the stack 16-byte aligned at the call site.
     const std::string x86_result = returns_int ? "\tmovl %eax, %r12d\n" : "\txorl %r12d, %r12d\n";
     const std::string arm_result = returns_int ? "\tmov w19, w0\n" : "\tmov w19, #0\n";
-    // `@entry fn main(argc: i32, argv: **ui8)`: the stub keeps argc and argv in callee-saved
+    // `@entry fn main(argc: i32, argv: **u8)`: the stub keeps argc and argv in callee-saved
     // registers across `_xl_initAll`. Linux puts them on the initial stack (argc at `(%rsp)`, argv
     // at `8(%rsp)`,
     // `[sp]` and `[sp, #8]` on aarch64). macOS dyld calls the entry like C `main`: the arguments

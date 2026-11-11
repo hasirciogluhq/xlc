@@ -381,7 +381,7 @@ private:
 
     /// `b'x'`: exactly one byte, written as a printable character, a `\` escape, a `\xHH` pair or a
     /// `\u{...}` code point below 128. The byte lands in `int_value` (0..255), so the parser makes a
-    /// `ui8` literal from it without touching `text`.
+    /// `u8` literal from it without touching `text`.
     void scanByte() {
         Token t = begin(TokenKind::ByteLit);
         advance();  // 'b'
