@@ -21,7 +21,7 @@ jobs:
       - name: LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install llvm zstd
+          brew install llvm zstd lld
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
       - name: LLVM (Linux)
         if: runner.os == 'Linux'

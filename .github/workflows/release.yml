@@ -90,7 +90,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          brew install llvm zstd
+          brew install llvm zstd lld
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies (Linux)

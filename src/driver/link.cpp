@@ -120,6 +120,19 @@ namespace {
 #endif
 }
 
+/// Runs a command line built from `quote`d words through the shell and returns its status.
+/// Windows: `std::system` is `cmd.exe /c <command>`, and cmd strips the first and the last `"` of a
+/// command that starts with a quote and holds more than two of them, which breaks every path in it
+/// ("The filename, directory name, or volume label syntax is incorrect"). One more pair around the whole
+/// command is the documented fix (`cmd /?`, the `/c` rules).
+[[nodiscard]] int runShell(const std::string& command) {
+#if defined(_WIN32)
+    return std::system(("\"" + command + "\"").c_str());
+#else
+    return std::system(command.c_str());
+#endif
+}
+
 }  // namespace
 
 void link(const LinkRequest& r) {
@@ -196,7 +209,7 @@ void link(const LinkRequest& r) {
                 }
                 const std::string cmd = quote(dlltool.string()) + " -m " + quote(machine) + " -d " +
                                         quote(def.string()) + " -l " + quote(implib.string()) + " 2>&1";
-                const int rc = std::system(cmd.c_str());
+                const int rc = runShell(cmd);
                 std::filesystem::remove(def);
                 if (rc != 0) {
                     throw XlangError("cannot create the import library for `" + dll + "`");
@@ -241,7 +254,7 @@ void link(const LinkRequest& r) {
         command += " " + quote(a);
     }
     command += " 2>&1";
-    const int status = std::system(command.c_str());
+    const int status = runShell(command);
     for (const std::filesystem::path& tmp : temporaries) {
         std::filesystem::remove(tmp);
     }
