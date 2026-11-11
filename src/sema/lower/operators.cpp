@@ -160,6 +160,9 @@ Lowerer::EP Lowerer::operatorCall(const std::string& name,
             pick = &entry;
         }
     }
+    if (pick == nullptr && name == "operator()" && !entries.empty()) {
+        pick = &entries.front(); // a call with the wrong argument count: the call reports it
+    }
     if (pick == nullptr) {
         found = false;
         return nullptr;

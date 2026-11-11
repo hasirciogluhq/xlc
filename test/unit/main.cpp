@@ -563,11 +563,13 @@ void testSliceTypeAsArgument() {
 void runSemaTests();
 void runLowerTests();
 void runOperatorTests();
+void runClosureTests();
 
 int main() {
     RUN(runSemaTests);
     RUN(runLowerTests);
     RUN(runOperatorTests);
+    RUN(runClosureTests);
     RUN(testWarningContextAndTwoSidedLabels);
     RUN(testErrorContextIsWiderAndGutterIsAligned);
     RUN(testDistantMarksAreSeparatedAndNearOnesMerged);

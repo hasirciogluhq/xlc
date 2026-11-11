@@ -1,0 +1,49 @@
+name: LLVM (Linux, apt.llvm.org)
+description: >-
+  Installs the LLVM development libraries, clang and lld of one LLVM major version from apt.llvm.org and puts its `bin` on PATH.
+  The downloaded .deb files are cached (one cache per OS, CPU and week), and the Ubuntu mirrors are never contacted.
+
+inputs:
+  version:
+    description: LLVM major version, for example 23
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Cache key
+      id: key
+      shell: bash
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+    # apt keeps its downloads in a directory of the runner user, so the cache action (which does not run as root) can save and
+    # restore it. `apt-get install` reuses a cached file whose name and hash match and downloads only what is new.
+    - name: apt cache directory
+      shell: bash
+      run: |
+        mkdir -p "$HOME/apt-archives/partial"
+        printf 'Dir::Cache::archives "%s/apt-archives";\nAcquire::Retries "2";\nAcquire::http::Timeout "20";\nAcquire::https::Timeout "20";\n' "$HOME" |
+          sudo tee /etc/apt/apt.conf.d/99-xlc-ci >/dev/null
+
+    - uses: actions/cache@v6.1.0
+      with:
+        path: ~/apt-archives/*.deb
+        key: apt-llvm-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.key.outputs.week }}
+        restore-keys: apt-llvm-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Install LLVM ${{ inputs.version }}
+      shell: bash
+      env:
+        V: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # LLVM 20 or newer is needed (`Intrinsic::getOrInsertDeclaration`). The repository is added by hand and only its index is
+        # read: the runner's own Ubuntu mirror (azure.archive.ubuntu.com) is sometimes unreachable, and `llvm.sh` would also install
+        # lldb, whose dependency `libipt2` comes from that mirror. The libraries below are on the runner image already.
+        codename=$(lsb_release -cs)
+        wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+        echo "deb https://apt.llvm.org/$codename/ llvm-toolchain-$codename-$V main" | sudo tee "/etc/apt/sources.list.d/llvm-$V.list" >/dev/null
+        sudo apt-get update -o Dir::Etc::sourcelist="sources.list.d/llvm-$V.list" -o Dir::Etc::sourceparts="-" -o APT::Get::List-Cleanup="0"
+        sudo apt-get install -y --no-install-recommends "llvm-$V-dev" "clang-$V" "lld-$V" \
+          libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
+        echo "/usr/lib/llvm-$V/bin" >> "$GITHUB_PATH"

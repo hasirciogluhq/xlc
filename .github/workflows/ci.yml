@@ -18,31 +18,22 @@ jobs:
         runner: [macos-15, ubuntu-24.04, windows-2025]
     steps:
       - uses: actions/checkout@v7.0.1
+      # LLVM 23 on every OS, the newest release: Homebrew's `llvm` is always the newest, the Linux build uses apt.llvm.org through
+      # `.github/actions/apt-llvm` (its .deb files are cached) and Windows takes conda-forge's `llvmdev` (the environment is cached).
       - name: LLVM (macOS)
         if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ENV_HINTS: "1"
         run: |
           brew install llvm zstd lld
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
       - name: LLVM (Linux)
         if: runner.os == 'Linux'
-        run: |
-          # LLVM 20 or newer (`Intrinsic::getOrInsertDeclaration`), from apt.llvm.org.
-          # The runner's own Ubuntu mirror (azure.archive.ubuntu.com) is sometimes unreachable and apt would wait on every file of
-          # it for minutes: fail fast instead, and carry on, because the packages below are on the image or on apt.llvm.org.
-          printf 'Acquire::Retries "1";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' |
-            sudo tee /etc/apt/apt.conf.d/99-fail-fast >/dev/null
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg \
-            libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
-          # The apt.llvm.org repository is added by hand and only the needed packages are installed: `llvm.sh` also installs lldb,
-          # whose dependency `libipt2` comes from the Ubuntu mirror.
-          codename=$(lsb_release -cs)
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
-          echo "deb https://apt.llvm.org/$codename/ llvm-toolchain-$codename-21 main" |
-            sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends llvm-21-dev clang-21 lld-21
-          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
+        uses: ./.github/actions/apt-llvm
+        with:
+          version: "23"
       # Windows: MSVC ABI through clang-cl (the code uses `__int128`), LLVM from conda-forge.
       - name: LLVM (Windows)
         if: runner.os == 'Windows'
@@ -50,7 +41,7 @@ jobs:
         with:
           environment-name: llvm
           create-args: >-
-            llvmdev=21
+            llvmdev=23
             zstd-static
             zlib
           init-shell: bash
