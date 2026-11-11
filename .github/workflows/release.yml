@@ -98,18 +98,28 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
+          # The runner's own Ubuntu mirror is sometimes unreachable and apt would wait on every file of it for minutes: fail fast
+          # and carry on, because what is needed is on the image or on apt.llvm.org.
+          printf 'Acquire::Retries "1";\nAcquire::http::Timeout "15";\nAcquire::https::Timeout "15";\n' |
+            sudo tee /etc/apt/apt.conf.d/99-fail-fast >/dev/null
+          sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends build-essential ca-certificates curl git unzip wget \
             lsb-release software-properties-common gnupg libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
+          # The apt.llvm.org repository is added by hand and only the needed packages are installed: `llvm.sh` also installs lldb,
+          # whose dependency `libipt2` comes from the Ubuntu mirror.
+          codename=$(lsb_release -cs)
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           chosen=""
           for candidate in "${LLVM_VERSION}" 20; do
-            if sudo /tmp/llvm.sh "$candidate"; then chosen="$candidate"; break; fi
+            echo "deb https://apt.llvm.org/$codename/ llvm-toolchain-$codename-$candidate main" |
+              sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
+            sudo apt-get update || true
+            if sudo apt-get install -y --no-install-recommends "llvm-${candidate}-dev" "clang-${candidate}" "lld-${candidate}"; then
+              chosen="$candidate"; break
+            fi
             echo "LLVM $candidate is not available; trying the next one"
           done
           [ -n "$chosen" ] || { echo "error: no usable LLVM release found" >&2; exit 1; }
-          sudo apt-get install -y --no-install-recommends "llvm-${chosen}-dev" "clang-${chosen}"
           echo "/usr/lib/llvm-${chosen}/bin" >> "$GITHUB_PATH"
 
       # Windows is a native MSVC-ABI build: Visual Studio's headers, STL and linker, driven by

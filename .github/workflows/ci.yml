@@ -34,10 +34,14 @@ jobs:
           sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg \
             libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21
-          sudo apt-get install -y --no-install-recommends llvm-21-dev clang-21
+          # The apt.llvm.org repository is added by hand and only the needed packages are installed: `llvm.sh` also installs lldb,
+          # whose dependency `libipt2` comes from the Ubuntu mirror.
+          codename=$(lsb_release -cs)
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/$codename/ llvm-toolchain-$codename-21 main" |
+            sudo tee /etc/apt/sources.list.d/llvm-21.list >/dev/null
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends llvm-21-dev clang-21 lld-21
           echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
       # Windows: MSVC ABI through clang-cl (the code uses `__int128`), LLVM from conda-forge.
       - name: LLVM (Windows)
