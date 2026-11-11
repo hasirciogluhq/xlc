@@ -155,15 +155,25 @@ jobs:
           xmake f -P . -y -m release -p mingw --toolchain=clang --sdk="$MSYSTEM_PREFIX"
           xmake -P . -y
 
-      - name: Package
-        shell: ${{ matrix.os == 'windows' && 'msys2 {0}' || 'bash' }}
+      - name: Package (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          bin="$(find build -type f \( -name xlc -o -name xlc.exe \) | head -n1)"
-          chmod +x scripts/package.sh
+          bin="$(find build -type f -name xlc | head -n1)"
           scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$bin"
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="$(find build -type f -name xlc.exe | head -n1)"
+          bash scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$bin"
 
       - uses: actions/upload-artifact@v4
         with:
