@@ -20,8 +20,8 @@ namespace xlang::sema_detail {
         return "0";
     }
     const bool negative = v < 0;
-    unsigned __int128 u =
-        negative ? static_cast<unsigned __int128>(-(v + 1)) + 1 : static_cast<unsigned __int128>(v);
+    UInt128 u =
+        negative ? static_cast<UInt128>(-(v + 1)) + 1 : static_cast<UInt128>(v);
     std::string out;
     while (u != 0) {
         out += static_cast<char>('0' + static_cast<int>(u % 10));

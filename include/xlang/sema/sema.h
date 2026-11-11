@@ -23,7 +23,12 @@ class Lowerer;
 
 class Compilation;
 
-using Int128 = __int128;
+/// Wide integer for compile-time values. `aligned(8)` on a typedef lowers the alignment from the
+/// 16 bytes `__int128` asks for: with 16 the compiler stores it with `movaps`, which faults when a
+/// stack frame is not 16-aligned. That is what crashed `Sema::evalConst` on Windows (clang-cl,
+/// access violation at `movaps [r12+10h]`); 8 makes it use `movups`, which has no such rule.
+using Int128 = __int128 __attribute__((aligned(8)));
+using UInt128 = unsigned __int128 __attribute__((aligned(8)));
 
 /// Compile-time value (plan 3.6): literals, `define` constants, `-D` values, enum members and the
 /// layout queries.
