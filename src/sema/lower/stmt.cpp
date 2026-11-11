@@ -1071,6 +1071,11 @@ void Lowerer::lowerForEach(const Stmt& s, std::vector<hir::Stmt>& out) {
         return;
     }
     const Type iterable = it->type;
+    if (lower::isAggregate(iterable) ||
+        (iterable.kind == TypeKind::Pointer && iterable.elem && lower::isAggregate(*iterable.elem))) {
+        lowerIterate(s, std::move(it), out); // `next` / `iter`: the iterator protocol
+        return;
+    }
 
     const bool is_array = iterable.kind == TypeKind::Array;
     const bool is_view = iterable.kind == TypeKind::Str || iterable.kind == TypeKind::Slice;

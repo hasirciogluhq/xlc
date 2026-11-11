@@ -1572,6 +1572,7 @@ std::optional<Lowerer::MethodRef> Lowerer::findMethod(const Type& agg, const std
 
 Lowerer::EP Lowerer::methodCall(const Expr& e, const Expr& recv_ast) {
     const Expr& callee = *e.lhs;
+    const std::size_t mark = preludeMark();
     EP recv = expr(recv_ast, nullptr);
     if (!recv) {
         for (const ExprPtr& a : e.args) {
@@ -1632,6 +1633,23 @@ Lowerer::EP Lowerer::methodCall(const Expr& e, const Expr& recv_ast) {
         }
     }
     auto m = findMethod(agg, callee.text);
+    if (!m && lower::isAggregate(agg)) {
+        // A method of a struct (or a class without it) from an inherent `impl`: `T.name(self, ...)`.
+        cutPrelude(mark);
+        ExprPtr receiver = cloneAst(recv_ast);
+        if (through) {
+            receiver = lower::astUnary(UnaryOp::Deref, std::move(receiver), recv_ast.span);
+        }
+        std::vector<ExprPtr> rest;
+        for (const ExprPtr& a : e.args) {
+            rest.push_back(cloneAst(*a));
+        }
+        bool found = false;
+        EP c = callMethod(std::move(receiver), agg, callee.text, std::move(rest), e.span, found);
+        if (found) {
+            return c;
+        }
+    }
     if (!m) {
         err("E0709",
             callee.span,
