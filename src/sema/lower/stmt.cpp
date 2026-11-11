@@ -756,6 +756,9 @@ void Lowerer::lowerAssign(const Expr& target_ast,
                           const Expr& value_ast,
                           const Span& span,
                           std::vector<hir::Stmt>& out) {
+    if (target_ast.kind == Expr::Kind::Index && userIndexAssign(target_ast, value_ast, span, out)) {
+        return; // `a[i] = v` through `operator[]=`
+    }
     EP target = expr(target_ast, nullptr);
     if (target && lower::isStrPlace(*target)) {
         err("E0716",
@@ -822,6 +825,9 @@ void Lowerer::assignTo(
 /// `t op= v`  =>  `t = t op v`; a target with side effects is evaluated once through a pointer.
 void Lowerer::lowerCompound(const Stmt& s, std::vector<hir::Stmt>& out) {
     if (!lower::astHasSideEffects(*s.target)) {
+        if (userCompound(s, *s.target, out)) {
+            return; // `operator+=` / `operator++` of a struct or class place
+        }
         const ExprPtr bin = lower::astBinary(
             s.compound_op, lower::cloneAst(*s.target), lower::cloneAst(*s.expr), s.span);
         lowerAssign(*s.target, *bin, s.span, out);
@@ -862,6 +868,9 @@ void Lowerer::lowerCompound(const Stmt& s, std::vector<hir::Stmt>& out) {
     bindLocal(name, id, ptr, s.span);
     const ExprPtr place =
         lower::astUnary(UnaryOp::Deref, lower::astName(name, s.target->span), s.target->span);
+    if (userCompound(s, *place, out)) {
+        return;
+    }
     const ExprPtr bin = lower::astBinary(
         s.compound_op,
         lower::astUnary(UnaryOp::Deref, lower::astName(name, s.target->span), s.target->span),
@@ -1556,7 +1565,24 @@ void Lowerer::lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out) {
         return;
     case Stmt::Kind::Return: {
         h.kind = hir::StmtKind::Return;
-        if (s.expr) {
+        if (s.expr && inferring_ && lower::isUnknown(ret_)) {
+            // A closure without `->` and without a `fn(...)` context: the first `return` gives
+            // it its return type (a void value is only run).
+            EP v = expr(*s.expr, nullptr);
+            if (!v) {
+                return;
+            }
+            ret_ = v->type;
+            if (ret_.isVoid()) {
+                hir::Stmt run;
+                run.kind = hir::StmtKind::Expr;
+                run.span = s.span;
+                run.value = std::move(v);
+                out.push_back(std::move(run));
+            } else {
+                h.value = moveOut(std::move(v));
+            }
+        } else if (s.expr) {
             if (ret_.isVoid()) {
                 err("E0708",
                     s.expr->span,

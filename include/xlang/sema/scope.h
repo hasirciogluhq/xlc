@@ -47,6 +47,16 @@ public:
     /// Lookup restricted to the module scope (the outermost one).
     [[nodiscard]] const ScopeEntry* lookupModule(std::string_view name) const;
 
+    /// A stack that holds only the module scope of this one (the outermost): the scope a function
+    /// lowered inside another function sees.
+    [[nodiscard]] ScopeStack moduleOnly() const {
+        ScopeStack out;
+        if (!scopes_.empty()) {
+            out.scopes_.push_back(scopes_.front());
+        }
+        return out;
+    }
+
     [[nodiscard]] std::size_t depth() const { return scopes_.size(); }
     [[nodiscard]] ScopeKind innermost() const { return scopes_.back().kind; }
 

@@ -250,6 +250,24 @@ class Dumper {
                                e.lhs ? "(" + expr(*e.lhs) + ")" : std::string(),
                                typeToString(e.type),
                                fieldInits(e));
+        case Expr::Kind::Closure: {
+            std::string out = e.closure->is_move ? "move |" : "|";
+            for (std::size_t i = 0; i < e.closure->params.size(); ++i) {
+                const Param& p = e.closure->params[i];
+                out += (i != 0 ? ", " : "") + p.name;
+                if (p.has_type) {
+                    out += ": " + typeToString(p.type);
+                }
+            }
+            out += "|";
+            if (e.closure->has_return_type) {
+                out += " -> " + typeToString(e.closure->return_type);
+            }
+            const Block& body = e.closure->body;
+            return out + (e.closure->expr_body ? " " + expr(*body.statements.front().expr)
+                                               : std::format(" {{ {} statement(s) }}",
+                                                             body.statements.size()));
+        }
         case Expr::Kind::Spread:
             return ".." + e.text;
         case Expr::Kind::AsmOperand:

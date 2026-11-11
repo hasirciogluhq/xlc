@@ -788,6 +788,18 @@ std::vector<Lowerer::PreArg> Lowerer::preLowerArgs(const Expr& call) {
             p.literal = true;
             p.type = Type::makeStr();
             break;
+        case Expr::Kind::Closure:
+            // A closure with untyped parameters takes them from the parameter type of the
+            // overload that is chosen, so it is lowered with that type, like a literal.
+            if (std::ranges::any_of(a->closure->params,
+                                    [](const Param& param) { return !param.has_type; })) {
+                p.literal = true;
+                p.type = lower::unknownType();
+                break;
+            }
+            p.value = expr(*a, nullptr);
+            p.type = p.value ? p.value->type : lower::unknownType();
+            break;
         case Expr::Kind::Name:
             if (a->text == "nil") {
                 p.literal = true;
@@ -1086,6 +1098,8 @@ bool Lowerer::literalFits(const Expr& arg, const Type& param) {
     case Expr::Kind::Name:
         return arg.text == "nil" &&
                (param.kind == TypeKind::Pointer || param.kind == TypeKind::FnPtr);
+    case Expr::Kind::Closure:
+        return param.kind == TypeKind::FnPtr && param.params.size() == arg.closure->params.size();
     default:
         return false;
     }
@@ -1768,6 +1782,11 @@ void Lowerer::lowerFunction(const FnDecl& f,
     out.has_body = f.has_body;
     out.span = f.span;
     out.ret = resolved(f.return_type);
+    // A closure whose return type is not written takes it from its first `return` (see closure.cpp).
+    inferring_ = std::exchange(infer_request_, false);
+    if (inferring_) {
+        out.ret = lower::unknownType();
+    }
 
     fn_ = &out;
     in_ctor_ = !owner.empty() && self_type != nullptr && f.name == "init";
@@ -1918,6 +1937,12 @@ void Lowerer::lowerFunction(const FnDecl& f,
     scopes_.pop();
     fn_ = nullptr;
     in_ctor_ = false;
+    if (inferring_) {
+        // No `return` gave a value: the closure returns nothing.
+        out.ret = lower::isUnknown(ret_) ? Type::makeVoid() : ret_;
+        inferred_ret_ = out.ret;
+        inferring_ = false;
+    }
     mod_.functions.push_back(std::move(out));
 }
 

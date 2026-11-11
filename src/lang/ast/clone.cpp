@@ -31,6 +31,7 @@ Stmt cloneStmt(const Stmt& s, const TypeEnv& env) {
         c.expr2 = cloneExpr(*s.expr2, env);
     }
     c.has_compound_op = s.has_compound_op;
+    c.is_incdec = s.is_incdec;
     c.range_inclusive = s.range_inclusive;
     c.compound_op = s.compound_op;
     if (s.body) {
@@ -111,6 +112,19 @@ ExprPtr cloneExpr(const Expr& e, const TypeEnv& env) {
         c->generic_args.push_back(substituteType(t, env));
     }
     c->macro_args = e.macro_args;
+    if (e.closure) {
+        auto d = std::make_shared<ClosureData>();
+        d->params = e.closure->params;
+        for (Param& p : d->params) {
+            p.type = substituteType(p.type, env);
+        }
+        d->has_return_type = e.closure->has_return_type;
+        d->return_type = substituteType(e.closure->return_type, env);
+        d->is_move = e.closure->is_move;
+        d->expr_body = e.closure->expr_body;
+        d->body = cloneBlock(e.closure->body, env);
+        c->closure = std::move(d);
+    }
     return c;
 }
 
@@ -162,6 +176,10 @@ FnDecl instantiateFn(const FnDecl& generic, const TypeEnv& env) {
 
 Block copyBlock(const Block& block) {
     return cloneBlock(block, TypeEnv{});
+}
+
+ExprPtr copyExpr(const Expr& expr) {
+    return cloneExpr(expr, TypeEnv{});
 }
 
 Item instantiateItem(const Item& generic, const TypeEnv& env, const std::string& name) {

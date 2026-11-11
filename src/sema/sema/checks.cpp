@@ -78,6 +78,17 @@ void Sema::checkExpr(const Expr& e) {
             checkExpr(*f.value);
         }
     }
+    if (e.closure) {
+        for (const Param& p : e.closure->params) {
+            if (p.has_type) {
+                checkType(p.type, p.span);
+            }
+        }
+        if (e.closure->has_return_type) {
+            checkType(e.closure->return_type, e.span);
+        }
+        checkStatements(e.closure->body);
+    }
 }
 
 void Sema::checkStatements(const Block& block) {

@@ -5,6 +5,7 @@
 #include "xlang/util/source.h"
 
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <map>
 #include <memory>
@@ -44,6 +45,7 @@ struct Attribute {
 
 struct Expr;
 using ExprPtr = std::unique_ptr<Expr>;
+struct ClosureData;
 
 struct FieldInit {
     std::string name;
@@ -80,6 +82,7 @@ struct Expr {
         TypeOperand,   ///< a slice type written where an argument is expected, `sizeOf([]i32)`: `type`
                        ///< is the whole type (`[]T` cannot be told from an array literal by the name
                        ///< path that carries the other type arguments)
+        Closure,       ///< `|a: i32, b| -> i32 { ... }` / `|x| x + 1` / `move |x| ...`: see `closure`
     } kind{Kind::IntLiteral};
 
     Span span;
@@ -101,6 +104,9 @@ struct Expr {
     /// Name/Call/StructLiteral: explicit generic arguments (`max<i64>(a, b)`, `Pair<A, B> { }`).
     std::vector<Type> generic_args;
     std::vector<std::vector<Token>> macro_args;
+    /// Closure: the parameters and the body. Shared by value semantics: a copy of the expression
+    /// (`copyExpr`) gets a copy of this too.
+    std::shared_ptr<ClosureData> closure;
 };
 
 struct Block;
@@ -156,6 +162,9 @@ struct Stmt {
     ExprPtr expr2;     ///< ForRange: exclusive upper bound
     bool has_compound_op{false};
     BinaryOp compound_op{BinaryOp::Add};
+    /// The compound assignment is `x++` / `x--` (the value is the literal 1): a user type may
+    /// define `operator++` / `operator--` for it.
+    bool is_incdec{false};
     /// ForRange: the range is inclusive (`in a..=b` instead of `in a..b`).
     bool range_inclusive{false};
     std::unique_ptr<Block> body;       ///< If: then block; loops/Unsafe/Block: the block
@@ -194,7 +203,25 @@ struct Param {
     Type type;  ///< unused for `self` and for a pack
     bool is_self{false};
     bool is_pack{false};  ///< `..args`: the untyped trailing parameter pack (see xlang-docs/language/variadic.md)
+    /// `self: T` written in an inherent `impl`; the parser turns it into a plain parameter named
+    /// `self`, so later phases never see it.
+    bool typed_self{false};
+    /// False for a closure parameter written without a type (`|x| x + 1`): the type comes from the
+    /// context the closure is used in.
+    bool has_type{true};
     Span span;
+};
+
+/// A closure literal, `|a: i32, b| -> i32 { return a + b }` or `|x| x * 2`. Parameter types and the
+/// return type may be left out when the context names a `fn(...)` type. The lowering turns it
+/// into a function (and, when it captures variables, a struct that holds them).
+struct ClosureData {
+    std::vector<Param> params;  ///< `has_type` is false for a parameter written without a type
+    bool has_return_type{false};
+    Type return_type;
+    bool is_move{false};        ///< `move |x| ...`: captured variables are copied, not borrowed
+    bool expr_body{false};      ///< `|x| x * 2`: `body` is one Expr statement that is the value
+    Block body;
 };
 
 struct FieldDecl {
@@ -377,6 +404,17 @@ using TypeEnv = std::map<std::string, Type>;
 
 /// A deep copy of a block with no type parameters replaced (used to unroll a pack loop per element).
 [[nodiscard]] Block copyBlock(const Block& block);
+
+/// A deep copy of an expression with no type parameters replaced (operator and compound-assignment
+/// desugaring lowers an operand more than once).
+[[nodiscard]] ExprPtr copyExpr(const Expr& expr);
+
+/// Calls `on_stmt` for every statement and `on_expr` for every expression of `block`, parents
+/// before children, descending into the bodies of closures. Either callback may be empty, and
+/// may rewrite the node it is given (its children are visited afterwards).
+void walkAst(Block& block,
+             const std::function<void(Stmt&)>& on_stmt,
+             const std::function<void(Expr&)>& on_expr);
 
 struct Program {
     FileId file{kNoFile};

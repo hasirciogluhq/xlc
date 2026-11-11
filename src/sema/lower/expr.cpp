@@ -365,6 +365,8 @@ Lowerer::EP Lowerer::expr(const Expr& e, const Type* expected) {
         return arrayExpr(e, expected);
     case Expr::Kind::TupleLiteral:
         return tupleExpr(e, expected);
+    case Expr::Kind::Closure:
+        return closureExpr(e, expected);
     case Expr::Kind::StructLiteral:
         return structLiteral(e);
     case Expr::Kind::New:
@@ -800,6 +802,7 @@ Lowerer::EP Lowerer::fieldExpr(const Expr& e, const Type* expected) {
 }
 
 Lowerer::EP Lowerer::unaryExpr(const Expr& e, const Type* expected) {
+    const std::size_t mark = preludeMark();
     switch (e.unary_op) {
     case UnaryOp::Neg: {
         const Type* hint = nullptr;
@@ -813,6 +816,9 @@ Lowerer::EP Lowerer::unaryExpr(const Expr& e, const Type* expected) {
         EP v = expr(*e.lhs, hint);
         if (!v || lower::isUnknown(v->type)) {
             return v;
+        }
+        if (lower::isAggregate(v->type)) {
+            return userUnary(e, v->type, mark);
         }
         if (!(v->type.kind == TypeKind::Float ||
               (v->type.kind == TypeKind::Int && v->type.is_signed))) {
@@ -832,6 +838,9 @@ Lowerer::EP Lowerer::unaryExpr(const Expr& e, const Type* expected) {
         if (!v || lower::isUnknown(v->type)) {
             return v;
         }
+        if (lower::isAggregate(v->type)) {
+            return userUnary(e, v->type, mark);
+        }
         if (v->type.kind != TypeKind::Int) {
             err("E0709",
                 e.span,
@@ -846,7 +855,11 @@ Lowerer::EP Lowerer::unaryExpr(const Expr& e, const Type* expected) {
     }
     case UnaryOp::Not: {
         const Type boolean = Type::makeBool();
-        EP v = coerce(expr(*e.lhs, &boolean), boolean, e.lhs->span);
+        EP v = expr(*e.lhs, &boolean);
+        if (v && lower::isAggregate(v->type)) {
+            return userUnary(e, v->type, mark);
+        }
+        v = v ? coerce(std::move(v), boolean, e.lhs->span) : nullptr;
         if (!v) {
             return nullptr;
         }
@@ -862,6 +875,9 @@ Lowerer::EP Lowerer::unaryExpr(const Expr& e, const Type* expected) {
         }
         if (lower::isUnknown(v->type)) {
             return v;
+        }
+        if (lower::isAggregate(v->type)) {
+            return userUnary(e, v->type, mark);
         }
         if (v->type.kind != TypeKind::Pointer || !v->type.elem) {
             err("E0709",
@@ -907,6 +923,7 @@ Lowerer::EP Lowerer::unaryExpr(const Expr& e, const Type* expected) {
 Lowerer::EP Lowerer::binaryExpr(const Expr& e, const Type* expected) {
     const BinaryOp op = e.binary_op;
     const Type boolean = Type::makeBool();
+    const std::size_t mark = preludeMark();
     if (op == BinaryOp::And || op == BinaryOp::Or) {
         EP l = coerce(expr(*e.lhs, &boolean), boolean, e.lhs->span);
         ++lazy_; // the right side may not run: a `?` there could not be hoisted
@@ -953,6 +970,9 @@ Lowerer::EP Lowerer::binaryExpr(const Expr& e, const Type* expected) {
         b->lhs = std::move(l);
         b->rhs = std::move(r);
         return b;
+    }
+    if (lower::isAggregate(l->type) || lower::isAggregate(r->type)) {
+        return userBinary(e, l->type, r->type, mark); // `operator+` ... of a struct or class
     }
 
     if (op == BinaryOp::Shl || op == BinaryOp::Shr) {
@@ -1935,6 +1955,9 @@ Lowerer::EP Lowerer::callExpr(const Expr& e, const Type* expected) {
         }
         return c;
     }
+    if (lower::isAggregate(f->type)) {
+        return userCall(e, f->type); // `operator()`, and every closure that captures
+    }
     if (f->type.kind != TypeKind::FnPtr || !f->type.ret) {
         err("E0709",
             e.span,
@@ -1960,6 +1983,7 @@ Lowerer::EP Lowerer::callExpr(const Expr& e, const Type* expected) {
 }
 
 Lowerer::EP Lowerer::indexExpr(const Expr& e) {
+    const std::size_t mark = preludeMark();
     EP base = expr(*e.lhs, nullptr);
     EP idx = expr(*e.rhs, nullptr);
     if (!base || !idx) {
@@ -1970,6 +1994,9 @@ Lowerer::EP Lowerer::indexExpr(const Expr& e) {
         i->lhs = std::move(base);
         i->rhs = std::move(idx);
         return i;
+    }
+    if (lower::isAggregate(base->type)) {
+        return userIndex(e, base->type, mark); // `operator[]`
     }
     if (!lower::isUnknown(idx->type) && idx->type.kind != TypeKind::Int) {
         err("E0708",
