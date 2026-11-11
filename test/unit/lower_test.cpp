@@ -296,6 +296,20 @@ void testRegisterRoles() {
         CHECK(r.out.str().find("W0402") != std::string::npos);
     }
     {
+        Lowered r("register(args) fn args(argc: *i32) -> **u8 { return nil }\n");
+        CHECK(!r.diag->hasErrors());
+        CHECK(r.module.args_function == "args");
+        CHECK(r.has("register(args) args"));
+    }
+    {
+        Lowered r("register(args) fn args(argc: i32) -> **u8 { return nil }\n");
+        CHECK(r.failedWith("E0503"));
+    }
+    {
+        Lowered r("register(args) fn args(argc: *i32) -> *u8 { return nil }\n");
+        CHECK(r.failedWith("E0503"));
+    }
+    {
         // `start` is no longer a role: `@init` replaces it.
         Lowered r("register(start) fn start() { }\n");
         CHECK(r.failedWith("E0503"));

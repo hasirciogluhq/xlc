@@ -287,6 +287,9 @@ void dumpModule(std::ostream& out, const Module& m) {
     if (!m.unwind_function.empty()) {
         out << "register(unwind) " << m.unwind_function << '\n';
     }
+    if (!m.args_function.empty()) {
+        out << "register(args) " << m.args_function << '\n';
+    }
     for (const std::string& init : m.init_functions) {
         out << "init " << init << '\n';
     }

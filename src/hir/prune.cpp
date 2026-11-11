@@ -127,6 +127,7 @@ void markNamedHooks(Reachability& r, const Module& m) {
     r.markFunction(m.alloc_function);
     r.markFunction(m.free_function);
     r.markFunction(m.unwind_function);
+    r.markFunction(m.args_function);
     for (const std::string& n : m.init_functions) r.markFunction(n);
     for (const std::string& n : m.fini_functions) r.markFunction(n);
 }

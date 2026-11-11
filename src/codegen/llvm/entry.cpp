@@ -111,9 +111,23 @@ void Gen::emitEntry() {
     std::string text;
     if (t.os == "windows") {
         // The process ends through ntdll's `NtTerminateProcess` (the linker driver always imports
-        // it for Windows executables). Windows entries take no arguments yet.
+        // it for Windows executables).
+        // An entry with `argc`/`argv` gets them from the `register(args)` function (the OS passes
+        // only a command-line string): it runs after the boot functions, stores the count in the
+        // spare slot above the shadow space and returns the vector. The driver rejects an entry
+        // with parameters and no such function (E0755). rsi/rdi survive the calls (Win64).
+        std::string win_args;
+        if (takes_args) {
+            const llvm::Function* args_fn = functionNamed(hm_.args_function);
+            if (args_fn == nullptr) {
+                return;
+            }
+            win_args = "\tleaq 32(%rsp), %rcx\n\tcall " + args_fn->getName().str() +
+                       "\n\tmovq %rax, %rsi\n\tmovl 32(%rsp), %edi\n\tmovl %edi, %ecx\n"
+                       "\tmovq %rsi, %rdx\n";
+        }
         text = ".text\n.globl mainCRTStartup\nmainCRTStartup:\n\tsubq $40, %rsp\n\tcall " +
-               init_sym + "\n\tcall " + sym + "\n";
+               init_sym + "\n" + win_args + "\tcall " + sym + "\n";
         text += x86_result + "\tcall " + fini_sym + "\n\tmovl %r12d, %edx\n";
         text += "\tmovq $-1, %rcx\n\tcall NtTerminateProcess\n\tint3\n";
         // Without a C runtime nothing else defines the stack probe LLVM calls for frames over 4 KiB

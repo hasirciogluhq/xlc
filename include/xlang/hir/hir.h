@@ -265,6 +265,8 @@ struct Module {
     std::string free_function;   ///< `register(free)` function, empty = none (`delete p` is E0501)
     std::string unwind_function; ///< `register(unwind)` function, empty = none (no landing pads,
                                  ///< `try` is E0501)
+    std::string args_function; ///< `register(args)` function, empty = none (a Windows `@entry` with
+                               ///< `argc`/`argv` is E0755: the OS passes no argument vector)
     std::vector<std::string>
         init_functions; ///< `@init` functions in run order (library group first)
     std::vector<std::string> fini_functions; ///< `@fini` functions in the order they were declared;

@@ -268,9 +268,11 @@ constexpr std::size_t kLeadWidth = 40;
         {"E0754", Severity::Error, "`@entry` in a static library or object file",
          "Static libraries and object files have no entry point: the program that links them provides it. "
          "Remove `@entry`, use `@init` for startup work and `@fini` for teardown."},
-        {"E0755", Severity::Error, "`@entry` arguments on a shared library or Windows program",
-         "The `argc`/`argv` form of `@entry` is available for executables on Linux and macOS only. Shared "
-         "libraries and Windows programs take `@entry fn name()` with no parameters."},
+        {"E0755", Severity::Error, "`@entry` arguments the target cannot pass",
+         "The `argc`/`argv` form of `@entry` is available for executables. Shared libraries take "
+         "`@entry fn name()` with no parameters. A Windows program is started with a command-line string only, "
+         "so the arguments come from the `register(args)` function (`fn(argc: *i32) -> **u8`); the standard "
+         "library registers one, and a program built without it registers its own."},
         {"E0756", Severity::Error, "cannot infer the type arguments of a generic payload enum",
          "`Result.Ok(v)` names a variant of every instance of the enum, so the compiler needs the "
          "instance to build. Write the target type where the value is created, as in "

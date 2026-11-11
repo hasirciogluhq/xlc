@@ -64,7 +64,8 @@ void collectImports(const hir::Module& module, codegen::LinkRequest& req) {
 }
 
 /// Reports the entry-point rules (`@entry` exists for an executable, never for a library or object,
-/// takes no arguments for a DLL or a Windows program). True when the output may be produced.
+/// takes no arguments for a DLL, and a Windows program takes them only with `register(args)`). True
+/// when the output may be produced.
 [[nodiscard]] bool checkEntry(const hir::Module& module, const BuildConfig& config, DiagnosticEngine& diagnostics,
                               const EmitRequest& request) {
     const hir::Function* entry = nullptr;
@@ -84,11 +85,17 @@ void collectImports(const hir::Module& module, codegen::LinkRequest& req) {
                           "remove `@entry`: a library has no entry point, use `@init` for startup work or `@fini` "
                           "for teardown");
     } else if (entry != nullptr && entry->param_count > 0 &&
-               (output == codegen::Output::Shared || config.target.os == "windows")) {
+               (output == codegen::Output::Shared ||
+                (config.target.os == "windows" && module.args_function.empty()))) {
+        const bool shared = output == codegen::Output::Shared;
         diagnostics.error("E0755", entry->span,
-                          std::format("`@entry` on `{}` takes arguments, which {} does not pass", entry->name,
-                                      output == codegen::Output::Shared ? "a shared library" : "a Windows program"),
-                          "write `@entry fn name()` with no parameters");
+                          std::format("`@entry` on `{}` takes arguments, which {}", entry->name,
+                                      shared ? "a shared library does not pass"
+                                             : "a Windows program gets only from `register(args)`"),
+                          shared ? "write `@entry fn name()` with no parameters"
+                                 : "link the standard library (it registers the role), or write "
+                                   "`register(args) fn name(argc: *i32) -> **u8` that parses the "
+                                   "command line");
     } else {
         return true;
     }

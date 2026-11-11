@@ -376,8 +376,22 @@ void Lowerer::checkRegistrations() {
             }
             why = "`register(unwind)` needs `fn(op: i32, snapshot: *usize, message: *u8)` with no "
                   "return type";
+        } else if (role == "args") {
+            // `fn(argc: *i32) -> **u8`: stores the argument count and returns the argument vector.
+            ok = fn != nullptr && fn->params.size() == 1 && !fn->params[0].is_self;
+            if (ok) {
+                const Type a = resolved(fn->params[0].type);
+                const Type r = resolved(fn->return_type);
+                ok = a.kind == TypeKind::Pointer && a.elem && a.elem->kind == TypeKind::Int &&
+                     a.elem->bits == 32 && a.elem->is_signed && r.kind == TypeKind::Pointer &&
+                     r.elem && r.elem->kind == TypeKind::Pointer && r.elem->elem &&
+                     r.elem->elem->kind == TypeKind::Int && r.elem->elem->bits == 8 &&
+                     !r.elem->elem->is_signed; // `*i32`, `**u8`
+            }
+            why = "`register(args)` needs `fn(argc: *i32) -> **u8`";
         } else {
-            why = std::format("unknown role `{}`; known roles: panic, alloc, free, unwind", role);
+            why = std::format("unknown role `{}`; known roles: panic, alloc, free, unwind, args",
+                              role);
         }
         if (!ok) {
             err("E0503",
@@ -415,6 +429,8 @@ void Lowerer::checkRegistrations() {
             mod_.alloc_function = qname;
         } else if (role == "free") {
             mod_.free_function = qname;
+        } else if (role == "args") {
+            mod_.args_function = qname;
         } else {
             mod_.unwind_function = qname;
         }
