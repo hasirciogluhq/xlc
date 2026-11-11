@@ -100,6 +100,12 @@ jobs:
           staticAssert(1 == 1, "x")
           define N = 4\nglobal t: [u8; N]
           EOF
+          # Stack of the crash, when the Windows debugger is on the runner.
+          CDB="$(ls '/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe' 2>/dev/null || true)"
+          echo "cdb=$CDB"
+          if [ -n "$CDB" ]; then
+            "$CDB" -g -G -c "kb 40;.exr -1;.ecxr;q" build/windows/x64/release/xlc.exe layout10.xl --check 2>&1 | tail -n 60 || true
+          fi
           # The trace names the test that was running when the process died.
           XLC_TEST_TRACE=1 build/windows/x64/release/xlc-tests.exe 2>&1 | tail -n 5 || true
           xmake run -P . xlc-tests || echo "::warning::unit tests failed"
