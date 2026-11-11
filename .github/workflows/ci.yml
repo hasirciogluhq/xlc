@@ -69,7 +69,7 @@ jobs:
           xmake f -P . -y -m release --policies=build.ccache:y
           xmake -P . -y
           xmake build -P . -y xlc-tests
-          xmake run -P . xlc-tests || echo "::warning::unit tests failed"
+          xmake run -P . xlc-tests
       - name: Build and test (Windows)
         if: runner.os == 'Windows'
         shell: bash -el {0}
@@ -79,43 +79,7 @@ jobs:
           xmake -P . -y
           xmake build -P . -y xlc-tests
           # The compiler itself must start and analyze a file, not only the unit tests.
-          printf 'fn f(a: u8, b: u64) -> u32 { return 1 }\n' > smoke.xl
+          printf 'fn f(a: u8, b: u64) -> u32 { return 1 }\nstaticAssert(1 == 1, "x")\n' > smoke.xl
           build/windows/x64/release/xlc.exe --version
           build/windows/x64/release/xlc.exe smoke.xl --check
-          # Each declaration of testLayoutsMatchClang on its own, to find the one that crashes.
-          i=0
-          while IFS= read -r decl; do
-            i=$((i+1)); printf '%b\n' "$decl" > "layout$i.xl"
-            build/windows/x64/release/xlc.exe "layout$i.xl" --dump-layout > /dev/null 2>"layout$i.err" && echo "layout$i ok" || echo "layout$i FAILED (exit $?): $decl"
-          done <<'EOF'
-          @repr(c) struct Header { tag: u8\n length: u32\n id: u16 }
-          @repr(c) struct Mixed { a: i8\n b: f64\n c: i16\n d: *i32\n e: [u8; 5]\n f: bool }
-          @repr(c) @packed struct Packed { a: u8\n b: u32\n c: u16 }
-          @repr(c) @align(32) struct Aligned { a: u8\n b: u16 }
-          @repr(c) class Shape { id: i32\n virtual fn area(self) -> f64 { return 0.0 } }
-          @repr(c) class Plain { a: i32\n b: u8 }
-          @repr(c) struct OnlyPtr { d: *i32 }
-          @repr(c) struct OnlyF64 { b: f64\n a: i8 }
-          @repr(c) struct OnlyArray { e: [u8; 5] }
-          staticAssert(1 == 1, "x")
-          define N = 4\nglobal t: [u8; N]
-          EOF
-          # Stack of the crash, when the Windows debugger is on the runner.
-          CDB="$(ls '/c/Program Files (x86)/Windows Kits/10/Debuggers/x64/cdb.exe' 2>/dev/null || true)"
-          echo "cdb=$CDB"
-          if [ -n "$CDB" ]; then
-            "$CDB" -g -G -c "kb 40;.exr -1;.ecxr;q" build/windows/x64/release/xlc.exe layout10.xl --check 2>&1 | tail -n 60 || true
-          fi
-          # The trace names the test that was running when the process died.
-          XLC_TEST_TRACE=1 build/windows/x64/release/xlc-tests.exe 2>&1 | tail -n 5 || true
-          xmake run -P . xlc-tests || echo "::warning::unit tests failed"
-      - name: Upload Windows binaries
-        if: always() && runner.os == 'Windows'
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: windows-binaries
-          path: |
-            build/windows/x64/release/xlc.exe
-            build/windows/x64/release/xlc-tests.exe
-            layout*.xl
-          retention-days: 3
+          xmake run -P . xlc-tests
