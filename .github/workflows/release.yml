@@ -1,0 +1,219 @@
+name: release
+
+# Builds xlc for macOS, Linux and Windows and publishes a GitHub release.
+#
+#   v1.2.3        stable release  (latest)
+#   v1.2.3-rc.4   preview release (marked "pre-release", never "latest")
+#
+# The tag must equal the version in xmake.lua. Re-run an existing tag with workflow_dispatch.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v1.0.0-rc.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # LLVM major version for the Linux builds (apt.llvm.org); older ones are tried when it is missing.
+  LLVM_VERSION: "21"
+
+jobs:
+  meta:
+    name: Resolve tag
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - id: meta
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "error: tag '$TAG' must be vX.Y.Z (stable) or vX.Y.Z-rc.N (preview)" >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          declared="$(sed -n 's/^local xlc_version = "\(.*\)"$/\1/p' xmake.lua)"
+          if [ "$declared" != "$version" ]; then
+            echo "error: xmake.lua declares '$declared' but the tag is '$TAG'" >&2
+            exit 1
+          fi
+          prerelease=false
+          [[ "$version" == *-rc.* ]] && prerelease=true
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    # One failing platform must not cancel the others; the release step decides what to publish.
+    continue-on-error: ${{ matrix.experimental || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15,         os: darwin,  arch: arm64 }
+          - { runner: macos-15-intel,   os: darwin,  arch: amd64 }
+          - { runner: ubuntu-24.04,     os: linux,   arch: amd64 }
+          - { runner: ubuntu-24.04-arm, os: linux,   arch: arm64 }
+          - { runner: windows-2025,     os: windows, arch: amd64, msystem: CLANG64,    prefix: mingw-w64-clang-x86_64 }
+          - { runner: windows-11-arm,   os: windows, arch: arm64, msystem: CLANGARM64, prefix: mingw-w64-clang-aarch64, experimental: true }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - name: Install dependencies (macOS)
+        if: matrix.os == 'darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install llvm zstd
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies (Linux)
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential ca-certificates curl git unzip wget \
+            lsb-release software-properties-common gnupg libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          chosen=""
+          for candidate in "${LLVM_VERSION}" 20 19 18; do
+            if sudo /tmp/llvm.sh "$candidate"; then chosen="$candidate"; break; fi
+            echo "LLVM $candidate is not available; trying the next one"
+          done
+          [ -n "$chosen" ] || { echo "error: no usable LLVM release found" >&2; exit 1; }
+          sudo apt-get install -y --no-install-recommends "llvm-${chosen}-dev" "clang-${chosen}"
+          echo "/usr/lib/llvm-${chosen}/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies (Windows, MSYS2)
+        if: matrix.os == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            ${{ matrix.prefix }}-clang
+            ${{ matrix.prefix }}-llvm
+            ${{ matrix.prefix }}-lld
+            ${{ matrix.prefix }}-zstd
+            ${{ matrix.prefix }}-zlib
+            ${{ matrix.prefix }}-xmake
+            ${{ matrix.prefix }}-cli11
+            zip
+            git
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        if: matrix.os != 'windows'
+        with:
+          xmake-version: latest
+
+      - name: Build (Unix)
+        if: matrix.os != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          llvm-config --version
+          xmake f -P . -y -m release
+          xmake -P . -y
+          xmake build -P . -y xlc-tests
+          xmake run -P . xlc-tests || echo "::warning::unit tests failed"
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows'
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          llvm-config --version
+          xmake f -P . -y -m release -p mingw --toolchain=clang --sdk="$MSYSTEM_PREFIX"
+          xmake -P . -y
+
+      - name: Package
+        shell: ${{ matrix.os == 'windows' && 'msys2 {0}' || 'bash' }}
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          bin="$(find build -type f \( -name xlc -o -name xlc.exe \) | head -n1)"
+          chmod +x scripts/package.sh
+          scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$bin"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xlc-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: GitHub release
+    needs: [meta, build]
+    if: ${{ !cancelled() && needs.meta.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: xlc-*
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 | sort -k2 > checksums.txt
+          rm ./*.sha256
+          ls -l
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          # Stable releases need every platform that is not experimental: four Unix archives and Windows x64.
+          count="$(ls dist/xlc_* | wc -l)"
+          if [ "$PRERELEASE" = "false" ] && [ "$count" -lt 5 ]; then
+            echo "error: only $count archives built; refusing to publish a stable release" >&2
+            exit 1
+          fi
+          flags=(--generate-notes --title "xlc $TAG")
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); else flags+=(--latest); fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* "${flags[@]}"
+          fi

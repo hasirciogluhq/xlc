@@ -1,0 +1,6 @@
+/.xmake/
+/build/
+/dist/
+compile_commands.json
+.DS_Store
+.xlc-cache/

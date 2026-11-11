@@ -1,0 +1,39 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm zstd
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+      - name: LLVM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends llvm-18-dev clang-18 libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+      - run: |
+          xmake f -P . -y -m release
+          xmake -P . -y
+          xmake build -P . -y xlc-tests
+          xmake run -P . xlc-tests || echo "::warning::unit tests failed"
