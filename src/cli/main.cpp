@@ -24,7 +24,6 @@
 #include <filesystem>
 #include <format>
 #include <iostream>
-#include <print>
 #include <ranges>
 #include <string>
 #include <vector>
@@ -190,14 +189,13 @@ void declareOptions(CLI::App& app, Options& o) {
 /// "N error(s), M warning(s)" on stderr, red when there are errors.
 void printSummary(const xlang::DiagnosticEngine& diagnostics) {
     const xlang::cli::Palette c{xlang::cli::useColor(xlang::host::kStderrFd)};
-    std::println(std::cerr, "{}{} error(s), {} warning(s){}",
-                 diagnostics.hasErrors() ? c.boldRed() : c.boldYellow(), diagnostics.errorCount(),
-                 diagnostics.warningCount(), c.reset());
+    std::cerr << std::format("{}{} error(s), {} warning(s){}\n", diagnostics.hasErrors() ? c.boldRed() : c.boldYellow(),
+                             diagnostics.errorCount(), diagnostics.warningCount(), c.reset());
 }
 
 void printError(std::string_view message) {
     const xlang::cli::Palette c{xlang::cli::useColor(xlang::host::kStderrFd)};
-    std::println(std::cerr, "{}error:{} {}", c.boldRed(), c.reset(), message);
+    std::cerr << std::format("{}error:{} {}\n", c.boldRed(), c.reset(), message);
 }
 
 /// Splits `NAME=DIR` of `--module-root`.
@@ -226,9 +224,9 @@ void printError(std::string_view message) {
 
     xlang::BuildConfig config = buildConfig(o);
     if (o.print_cfg) {
-        std::println("target = \"{}\"", config.target.triple);
+        std::cout << std::format("target = \"{}\"\n", config.target.triple);
         for (const auto& [name, value] : config.resolved()) {
-            std::println("{} = {}", name, value.toString());
+            std::cout << std::format("{} = {}\n", name, value.toString());
         }
         return 0;
     }
