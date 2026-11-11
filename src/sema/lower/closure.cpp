@@ -1,5 +1,7 @@
 #include "sema/lower/lower.hpp"
 
+#include <utility>
+
 namespace xlang::lower {
 
 // Closures: `|a: i32, b| -> i32 { return a + b }`, `|x| x * 2`, `move |x| x + n`.
