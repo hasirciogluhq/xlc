@@ -133,7 +133,7 @@ ModuleInfo* Compilation::importTarget(ModuleInfo& from, const std::string& spec,
     const auto path = locate(spec, &from, at);
     ModuleInfo* target = nullptr;
     if (path) {
-        target = loadModule(*path, false);
+        target = loadModule(*path, false, from.is_library || rootOf(spec) != nullptr);
     } else {
         diag_.error("E0711",
                     at,
@@ -169,7 +169,7 @@ void Compilation::collectMacros(ModuleInfo& dep,
     }
 }
 
-ModuleInfo* Compilation::loadModule(const std::filesystem::path& path, bool is_root) {
+ModuleInfo* Compilation::loadModule(const std::filesystem::path& path, bool is_root, bool via_library) {
     const std::string norm = normalizedKey(path);
     if (const auto it = by_path_.find(norm); it != by_path_.end()) {
         return it->second.get();
@@ -183,8 +183,10 @@ ModuleInfo* Compilation::loadModule(const std::filesystem::path& path, bool is_r
         root_dir_ = path.parent_path();
     }
     m->key = keyFor(path, is_root);
-    m->is_library = std::ranges::any_of(
-        roots_, [&](const auto& r) { return norm.starts_with(normalizedKey(r.second) + "/"); });
+    m->is_library = !is_root && via_library &&
+                    std::ranges::any_of(roots_, [&](const auto& r) {
+                        return norm.starts_with(normalizedKey(r.second) + "/");
+                    });
     {
         std::string name = m->key;
         if (name.empty()) {
@@ -238,7 +240,7 @@ ModuleInfo* Compilation::loadModule(const std::filesystem::path& path, bool is_r
 }
 
 ModuleInfo* Compilation::loadRoot(const std::filesystem::path& path) {
-    return loadModule(path, true);
+    return loadModule(path, true, false);
 }
 
 }  // namespace xlang

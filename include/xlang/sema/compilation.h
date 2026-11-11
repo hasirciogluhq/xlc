@@ -86,7 +86,11 @@ private:
     [[nodiscard]] const std::pair<std::string, std::filesystem::path>* rootOf(const std::string& spec) const;
     [[nodiscard]] std::optional<std::filesystem::path> locate(const std::string& spec, const ModuleInfo* from,
                                                               const Span& at);
-    ModuleInfo* loadModule(const std::filesystem::path& path, bool is_root);
+    /// Loads (or finds) the module at `path`. `via_library` says it was reached by a module-root
+    /// name (`import "std/mem"`, `--import std`) or from a library module: only then, and only inside
+    /// a module root, is it a library module. Where the file lies is not enough: a program may live
+    /// inside a module root's directory (the stdlib's own tests do) and stays a program.
+    ModuleInfo* loadModule(const std::filesystem::path& path, bool is_root, bool via_library);
     ModuleInfo* importTarget(ModuleInfo& from, const std::string& spec, const Span& at);
     [[nodiscard]] std::string keyFor(const std::filesystem::path& path, bool is_root) const;
     void collectMacros(ModuleInfo& dep, MacroTable& table, std::set<const ModuleInfo*>& seen);

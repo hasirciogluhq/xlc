@@ -14,6 +14,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <string_view>
 
 namespace xlang::codegen {
 
@@ -160,6 +161,20 @@ void link(const LinkRequest& r) {
         tool = findTool({"ld.lld", "ld"});
         if (tool.empty()) {
             throw XlangError("no ELF linker found (`ld.lld` or `ld`); install one, or stop at `--emit=obj`");
+        }
+        // The system `ld` links its own CPU only; `ld.lld` links every one. Say so instead of letting
+        // the host `ld` fail with "file in wrong format".
+#if defined(__x86_64__) || defined(_M_X64)
+        constexpr std::string_view kHostArch = "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+        constexpr std::string_view kHostArch = "aarch64";
+#else
+        constexpr std::string_view kHostArch = "";
+#endif
+        if (tool.filename() != "ld.lld" && !kHostArch.empty() && t.arch != kHostArch) {
+            throw XlangError(std::format("linking for `{}` on a `{}` host needs `ld.lld` (LLVM's lld); install it, "
+                                         "or stop at `--emit=obj`",
+                                         t.arch, kHostArch));
         }
         args = {"-o", r.output.string(), "-nostdlib", "-static"};
         if (shared) {

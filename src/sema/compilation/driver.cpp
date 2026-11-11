@@ -69,7 +69,7 @@ std::optional<Sema::EntityRef> Compilation::findRegistered(const std::string& na
 void Compilation::finish() {
     for (const std::string& spec : implicit_) {
         if (const auto path = locate(spec, root_, Span{})) {
-            implicit_modules_.push_back(loadModule(*path, false));
+            implicit_modules_.push_back(loadModule(*path, false, rootOf(spec) != nullptr));
         } else {
             diag_.error("E0711", Span{}, std::format("module `{}` not found", spec),
                         "`--import` takes a module path: a `--module-root` name, or a path next to the root file");

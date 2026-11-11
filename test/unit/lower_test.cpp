@@ -497,6 +497,36 @@ void testCyclicModules() {
     }
 }
 
+// A module is a library module when it is reached through a module-root name or from a library
+// module, never because of where its file lies: a program may sit inside a root's directory (the
+// stdlib's own tests do, with `-M std=<the stdlib repository>`). The entry module is never a library,
+// and a program module that is not one would run its `@init` before the modules it imports.
+void testProgramInsideModuleRootIsNotLibrary() {
+    SourceManager sources;
+    std::ostringstream out;
+    BuildConfig config;
+    DiagnosticEngine diag(sources, out);
+    Compilation comp(sources, config, diag);
+    comp.addVirtualFile("lib/test/main.xl",
+                        "from \"dep\" import d\nfrom \"lib/util\" import u\nexport fn m() -> i32 { return 3 }\nfn main() -> i32 { return d() + u() }\n");
+    comp.addVirtualFile("lib/test/dep.xl", "from \"main\" import m\nexport fn d() -> i32 { return 1 }\n");
+    comp.addVirtualFile("lib/util.xl", "from \"lib/inner\" import i\nexport fn u() -> i32 { return i() }\n");
+    comp.addVirtualFile("lib/inner.xl", "export fn i() -> i32 { return 2 }\n");
+    comp.addModuleRoot("lib", "lib");
+    comp.loadRoot("lib/test/main.xl");
+    comp.finish();
+    CHECK(!diag.hasErrors());
+    std::map<std::string, bool> library;
+    for (const ModuleInfo* m : comp.order()) {
+        library[m->path.stem().string()] = m->is_library;
+    }
+    CHECK_EQ(library.size(), std::size_t{4});
+    CHECK(!library["main"]);   // the entry module
+    CHECK(!library["dep"]);    // imported by a plain name from a program module
+    CHECK(library["util"]);    // imported through the root's name
+    CHECK(library["inner"]);   // imported by a library module
+}
+
 void testModulesImportAndExport() {
     {
         Multi r({{"app/main.xl",
@@ -1098,6 +1128,7 @@ void testSlices() {
 
 void runLowerTests() {
     RUN(testScopeStack);
+    RUN(testProgramInsideModuleRootIsNotLibrary);
     RUN(testLowersPlainFunctions);
     RUN(testImplicitConversionsBecomeCasts);
     RUN(testConversionDiagnostics);
