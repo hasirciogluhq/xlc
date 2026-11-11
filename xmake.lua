@@ -60,6 +60,10 @@ local function add_llvm(target)
             -- static one so the binary needs no zstd.dll next to it.
             if name == "zstd.dll" or name == "zstd" then
                 name = "zstd_static"
+            elseif name == "z" then
+                name = "zlibstatic" -- conda's zlib: `zlib.lib` is the import library
+            elseif name == "xml2" then
+                return -- only LLVM's Windows manifest tool needs libxml2; it is not linked
             end
             target:add("links", name)
         elseif #lib > 0 and not lib:startswith("-") then
