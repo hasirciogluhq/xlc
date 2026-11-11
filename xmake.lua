@@ -73,6 +73,14 @@ local function add_llvm(target)
     for _, lib in ipairs(query("--link-static --libs aarch64 x86 passes irreader bitwriter object mc target codegen"):split("%s+")) do
         add_lib(lib)
     end
+    -- clang-cl does not link compiler-rt by itself: the 128-bit helpers (`__floattidf`, ...) that
+    -- `__int128` code needs live in clang_rt.builtins.
+    if is_plat("windows") then
+        local builtins = try { function () return os.iorun("clang-cl --print-libgcc-file-name") end }
+        if builtins and #builtins:trim() > 0 then
+            add_lib(builtins:trim())
+        end
+    end
     -- Homebrew keeps zstd & co. outside the default linker search path.
     for _, dir in ipairs({"/opt/homebrew/lib", "/usr/local/lib"}) do
         if os.isdir(dir) then
