@@ -137,30 +137,7 @@ namespace lower {
 
 /// Deep copy of an AST expression (used to desugar `a op= b` and `switch`).
 inline ExprPtr cloneAst(const Expr& e) {
-    auto c = std::make_unique<Expr>();
-    c->kind = e.kind;
-    c->span = e.span;
-    c->int_value = e.int_value;
-    c->float_value = e.float_value;
-    c->bool_value = e.bool_value;
-    c->text = e.text;
-    c->unary_op = e.unary_op;
-    c->binary_op = e.binary_op;
-    c->type = e.type;
-    c->macro_args = e.macro_args;
-    if (e.lhs) {
-        c->lhs = cloneAst(*e.lhs);
-    }
-    if (e.rhs) {
-        c->rhs = cloneAst(*e.rhs);
-    }
-    for (const ExprPtr& a : e.args) {
-        c->args.push_back(cloneAst(*a));
-    }
-    for (const FieldInit& f : e.fields) {
-        c->fields.push_back({f.name, cloneAst(*f.value), f.span});
-    }
-    return c;
+    return copyExpr(e);
 }
 
 /// An expression whose evaluation may have side effects (so it must not be evaluated twice).
@@ -649,6 +626,48 @@ class Lowerer {
     /// Signature text for diagnostics: `name(i32, str)`.
     [[nodiscard]] static std::string signatureOf(const std::string& name,
                                                  const std::vector<Type>& params);
+
+    // --- user-defined operators (operators.cpp). An operator is a function named `operator<symbol>`
+    // --- (`operator+`, `operator[]=`, `operator()`); `a + b` on a struct or class operand calls it.
+    /// Where the statement being lowered stands in its hoisted `?` statements: an operand lowered
+    /// only to learn its type is lowered again for the call, so its hoists are cut back to here.
+    [[nodiscard]] std::size_t preludeMark() const { return prelude_ != nullptr ? prelude_->size() : 0; }
+    void cutPrelude(std::size_t mark) {
+        if (prelude_ != nullptr && prelude_->size() > mark) {
+            prelude_->resize(mark);
+        }
+    }
+    /// The operator functions called `name` that can apply to operands of `types`: the one in
+    /// scope and the one next to each struct or class operand (found without an import).
+    [[nodiscard]] std::vector<ScopeEntry>
+    operatorEntries(const std::string& name, const std::vector<Type>& types, const Span& at);
+    /// Whether an operator `name` taking `arity` operands (self included) exists for `types`, as a
+    /// function or as a method of the class operand.
+    [[nodiscard]] bool
+    hasOperator(const std::string& name, std::size_t arity, const std::vector<Type>& types);
+    /// Calls the operator `name` on `receiver` (the first operand) and `rest`. `by_pointer` passes
+    /// the address of `receiver` (`+=`, `++`, `[]=`, `()`). A class receiver with a method of that
+    /// name calls the method. `found` is false, with nothing diagnosed, when no operator exists.
+    [[nodiscard]] EP operatorCall(const std::string& name,
+                                  ExprPtr receiver,
+                                  bool by_pointer,
+                                  std::vector<ExprPtr> rest,
+                                  const std::vector<Type>& types,
+                                  const Span& span,
+                                  bool& found);
+    [[nodiscard]] EP userBinary(const Expr& e, const Type& lt, const Type& rt, std::size_t mark);
+    [[nodiscard]] EP userUnary(const Expr& e, const Type& t, std::size_t mark);
+    [[nodiscard]] EP userIndex(const Expr& e, const Type& base, std::size_t mark);
+    [[nodiscard]] EP userCall(const Expr& e, const Type& callee);
+    /// `place op= value`, `place++`, `place--` on a struct or class place through `operator+=` /
+    /// `operator++` ...; false when the place is no such place or defines none (the caller then
+    /// lowers `place = place op value`).
+    [[nodiscard]] bool userCompound(const Stmt& s, const Expr& place, std::vector<hir::Stmt>& out);
+    /// `base[i] = v` through `operator[]=`; false when `base` is no struct or class with one.
+    [[nodiscard]] bool userIndexAssign(const Expr& target,
+                                       const Expr& value,
+                                       const Span& span,
+                                       std::vector<hir::Stmt>& out);
 
     // --- statements
     void lowerBlock(const Block& block, std::vector<hir::Stmt>& out, bool new_scope);

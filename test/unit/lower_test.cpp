@@ -1,4 +1,5 @@
 #include "check.h"
+#include "lowered.h"
 
 #include "xlang/hir/hir.h"
 #include "xlang/lang/types.h"
@@ -13,39 +14,7 @@ using namespace xlang;
 
 namespace {
 
-struct Lowered {
-    SourceManager sources;
-    std::ostringstream out;
-    BuildConfig config;
-    std::unique_ptr<DiagnosticEngine> diag;
-    Program program;
-    hir::Module module;
-    std::string hir_text;
-
-    explicit Lowered(std::string text, BuildConfig cfg = BuildConfig{}) : config(std::move(cfg)) {
-        const FileId file = sources.addFile("t.xl", std::move(text));
-        diag = std::make_unique<DiagnosticEngine>(sources, out);
-        program = parseSource(sources, file, config, *diag);
-        Sema sema(program, config, *diag);
-        if (!diag->hasErrors()) {
-            sema.analyze();
-        }
-        if (!diag->hasErrors()) {
-            module = sema.lower();
-            std::ostringstream h;
-            hir::dumpModule(h, module);
-            hir_text = h.str();
-        }
-        diag->flush();
-    }
-
-    [[nodiscard]] bool has(const std::string& needle) const {
-        return hir_text.find(needle) != std::string::npos;
-    }
-    [[nodiscard]] bool failedWith(const std::string& code) const {
-        return diag->hasErrors() && out.str().find(code) != std::string::npos;
-    }
-};
+using xlang_test::Lowered;
 
 std::size_t countOf(const std::string& text, const std::string& needle) {
     std::size_t n = 0;

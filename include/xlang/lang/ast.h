@@ -156,6 +156,9 @@ struct Stmt {
     ExprPtr expr2;     ///< ForRange: exclusive upper bound
     bool has_compound_op{false};
     BinaryOp compound_op{BinaryOp::Add};
+    /// The compound assignment is `x++` / `x--` (the value is the literal 1): a user type may
+    /// define `operator++` / `operator--` for it.
+    bool is_incdec{false};
     /// ForRange: the range is inclusive (`in a..=b` instead of `in a..b`).
     bool range_inclusive{false};
     std::unique_ptr<Block> body;       ///< If: then block; loops/Unsafe/Block: the block
@@ -194,6 +197,12 @@ struct Param {
     Type type;  ///< unused for `self` and for a pack
     bool is_self{false};
     bool is_pack{false};  ///< `..args`: the untyped trailing parameter pack (see xlang-docs/language/variadic.md)
+    /// `self: T` written in an inherent `impl`; the parser turns it into a plain parameter named
+    /// `self`, so later phases never see it.
+    bool typed_self{false};
+    /// False for a closure parameter written without a type (`|x| x + 1`): the type comes from the
+    /// context the closure is used in.
+    bool has_type{true};
     Span span;
 };
 
@@ -377,6 +386,10 @@ using TypeEnv = std::map<std::string, Type>;
 
 /// A deep copy of a block with no type parameters replaced (used to unroll a pack loop per element).
 [[nodiscard]] Block copyBlock(const Block& block);
+
+/// A deep copy of an expression with no type parameters replaced (operator and compound-assignment
+/// desugaring lowers an operand more than once).
+[[nodiscard]] ExprPtr copyExpr(const Expr& expr);
 
 struct Program {
     FileId file{kNoFile};
