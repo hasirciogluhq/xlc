@@ -23,15 +23,18 @@ class Lowerer;
 
 class Compilation;
 
-/// Wide integer for compile-time values. `aligned(8)` on a typedef lowers the alignment from the
-/// 16 bytes `__int128` asks for: with 16 the compiler stores it with `movaps`, which faults when a
-/// stack frame is not 16-aligned. That is what crashed `Sema::evalConst` on Windows (clang-cl,
-/// access violation at `movaps [r12+10h]`); 8 makes it use `movups`, which has no such rule.
-using Int128 = __int128 __attribute__((aligned(8)));
-using UInt128 = unsigned __int128 __attribute__((aligned(8)));
+/// Wide integer for compile-time values.
+using Int128 = __int128;
+using UInt128 = unsigned __int128;
 
 /// Compile-time value (plan 3.6): literals, `define` constants, `-D` values, enum members and the
 /// layout queries.
+// `__int128` asks for 16-byte alignment, so the compiler copies a ConstValue with `movaps`, which
+// faults on a 16-misaligned address. On Windows (clang-cl) `Sema::evalConst` crashed that way
+// (access violation at `movaps [r12+10h]`, found with cdb). `pack(8)` caps the member alignment, so
+// a ConstValue is 8-aligned and is copied with `movups`. (`aligned(8)` on a typedef does not lower
+// it: alignof stays 16.)
+#pragma pack(push, 8)
 struct ConstValue {
     enum class Kind { Int, Float, Bool, String } kind{Kind::Int};
     Int128 int_value{0};
@@ -45,6 +48,8 @@ struct ConstValue {
     [[nodiscard]] static ConstValue makeString(std::string v);
     [[nodiscard]] std::string toString() const;
 };
+#pragma pack(pop)
+static_assert(alignof(ConstValue) == 8, "ConstValue must not need 16-byte alignment (see above)");
 
 /// Single-module semantic services that do not need function bodies typed (plan phases 2 and
 /// 3.6/3.8): name table, type alias resolution, enums, constant evaluation, layouts,

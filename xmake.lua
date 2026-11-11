@@ -18,6 +18,9 @@ set_languages("c++23")
 set_warnings("all")
 if is_plat("windows") then
     set_symbols("debug") -- a PDB next to the exe: crash dumps and debuggers show function names
+    -- clang-cl produced a stack frame that was not 16-aligned around `__int128` code (see
+    -- `ConstValue`); every function realigns its frame instead of trusting the caller.
+    add_cxxflags("/clang:-mstackrealign", {tools = "clang_cl"})
 end
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build"})
