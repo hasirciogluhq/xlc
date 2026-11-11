@@ -67,6 +67,7 @@ jobs:
         shell: bash -el {0}
         run: |
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
+          "$LLVM_CONFIG" --link-static --system-libs; ls "$(dirname "$LLVM_CONFIG")/../lib" | grep -iE "zstd|zlib"
           xmake f -P . -y -m release -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
           xmake build -P . -y xlc-tests

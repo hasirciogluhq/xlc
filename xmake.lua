@@ -55,7 +55,13 @@ local function add_llvm(target)
             if lib:find("[/\\]") then
                 target:add("linkdirs", path.directory(lib))
             end
-            target:add("links", path.basename(lib))
+            local name = path.basename(lib)
+            -- llvm-config names the zstd *import* library (`zstd.dll.lib`); the release links the
+            -- static one so the binary needs no zstd.dll next to it.
+            if name == "zstd.dll" or name == "zstd" then
+                name = "zstd_static"
+            end
+            target:add("links", name)
         elseif #lib > 0 and not lib:startswith("-") then
             target:add("links", lib)
         end
