@@ -17,7 +17,7 @@ jobs:
       matrix:
         runner: [macos-15, ubuntu-24.04]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: LLVM (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -26,9 +26,15 @@ jobs:
       - name: LLVM (Linux)
         if: runner.os == 'Linux'
         run: |
+          # LLVM 20 or newer (`Intrinsic::getOrInsertDeclaration`), from apt.llvm.org.
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends llvm-18-dev clang-18 libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+          sudo apt-get install -y --no-install-recommends wget lsb-release software-properties-common gnupg \
+            libzstd-dev libffi-dev libncurses-dev zlib1g-dev libxml2-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y --no-install-recommends llvm-21-dev clang-21
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
       - uses: xmake-io/github-action-setup-xmake@v1
         with:
           xmake-version: latest

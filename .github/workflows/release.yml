@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # LLVM major version for the Linux builds (apt.llvm.org); older ones are tried when it is missing.
+  # LLVM major version for the Linux builds (apt.llvm.org); 20 is the oldest the code supports.
   LLVM_VERSION: "21"
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       prerelease: ${{ steps.meta.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.tag || github.ref_name }}
       - id: meta
@@ -82,7 +82,7 @@ jobs:
           - { runner: windows-2025,     os: windows, arch: amd64, msystem: CLANG64,    prefix: mingw-w64-clang-x86_64 }
           - { runner: windows-11-arm,   os: windows, arch: arm64, msystem: CLANGARM64, prefix: mingw-w64-clang-aarch64, experimental: true }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.meta.outputs.tag }}
 
@@ -105,7 +105,7 @@ jobs:
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
           chosen=""
-          for candidate in "${LLVM_VERSION}" 20 19 18; do
+          for candidate in "${LLVM_VERSION}" 20; do
             if sudo /tmp/llvm.sh "$candidate"; then chosen="$candidate"; break; fi
             echo "LLVM $candidate is not available; trying the next one"
           done
@@ -175,7 +175,7 @@ jobs:
           bin="$(find build -type f -name xlc.exe | head -n1)"
           bash scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$bin"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: xlc-${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
@@ -190,7 +190,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: xlc-*

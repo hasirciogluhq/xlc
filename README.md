@@ -41,8 +41,8 @@ xlc app.xl -M std=$HOME/.xlang/std --import std -DfeatureDefaultAllocator=true -
 
 ## Build
 
-Requirements: [xmake](https://xmake.io), a C++23 compiler, and LLVM with `llvm-config` (static
-libraries; `$LLVM_CONFIG` overrides the search).
+Requirements: [xmake](https://xmake.io), a C++23 compiler, and LLVM 20 or newer with `llvm-config`
+(static libraries; `$LLVM_CONFIG` overrides the search).
 
 ```
 xmake f -P . -m release && xmake -P .     # build/<plat>/<arch>/release/xlc
