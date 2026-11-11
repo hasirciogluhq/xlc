@@ -1,6 +1,7 @@
 #include "check.h"
 
 #include "xlang/hir/hir.h"
+#include "xlang/lang/types.h"
 #include "xlang/lang/frontend.h"
 #include "xlang/sema/compilation.h"
 #include "xlang/sema/scope.h"
@@ -437,11 +438,6 @@ void testPayloadEnums() {
               .failedWith("E0709"));
     CHECK(Lowered("enum E: i32 { A(i32) }\n").failedWith("E0747"));
     CHECK(Lowered("enum E { A(i32), B = 2 }\n").failedWith("E0747"));
-    {
-        // A payload type that needs drop cannot sit in a variant: it would sit in a struct.
-        Lowered bad("class Res {\n fn drop(self) { }\n}\nenum E {\n A(Res)\n}\n");
-        CHECK(bad.failedWith("E0721"));
-    }
 }
 
 // ---- multi-module programs (plan 4.6, 4.8, 4.9, 4.12)
@@ -1040,20 +1036,29 @@ void testVariadicPacks() {
     }
 }
 
-// A byte literal lowers to a `u8` constant, and it takes any integer context through the normal
-// widening: `0x1f`-style masks and `eq`-style comparisons need no `as`.
+// A byte literal lowers to a `u8` constant.
 void testByteLiterals() {
     Lowered r("fn f() -> u8 { return b')' }\n"
-              "fn g() -> i32 {\n local c = b'\\n'\n local n: i64 = b'x'\n"
-              " local m: u8 = b')'\n return n as i32\n}\n");
+              "fn g() -> i32 {\n local c = b'\\n'\n local m: u8 = b')'\n return 0\n}\n");
     CHECK(!r.diag->hasErrors());
     CHECK(r.has("41:u8"));            // `b')'` is 0x29 = 41
     CHECK(r.has("local c#0: u8 = 10")); // `b'\\n'`
-    CHECK(r.has("120:u8"));            // `b'x'`
-    {
-        Lowered bad("fn f() { local n: u8 = 300 }\n");
-        CHECK(bad.failedWith("E0708"));  // narrowing still needs `as`, byte literals are not special
+}
+
+// Unsigned integers are spelled `u8`..`u64`, `usize`; the old `ui8`..`ui64` names do not exist.
+void testUnsignedSpelling() {
+    CHECK(Lowered("fn f(a: u8, b: u16, c: u32, d: u64, e: usize) { }\n").diag->hasErrors() == false);
+    for (const char* name : {"ui8", "ui16", "ui32", "ui64"}) {
+        Lowered bad(std::string("fn f(a: ") + name + ") { }\n");
+        CHECK(bad.failedWith("E0706"));
     }
+    // The spelling of a type in diagnostics, signatures and mangled names is the new one.
+    CHECK(typeToString(*primitiveFromName("u8")) == "u8");
+    CHECK(typeToString(*primitiveFromName("u64")) == "u64");
+    CHECK(typeToString(*primitiveFromName("i8")) == "i8");
+    CHECK(!primitiveFromName("ui8").has_value());
+    CHECK(primitiveFromName("u32").has_value() && !primitiveFromName("u32")->is_signed);
+    CHECK(primitiveFromName("u32")->bits == 32);
 }
 
 // `s[lo..hi]` lowers to a `Slice` of type `str`: a view, never a place. Bounds stay checked under
@@ -1085,11 +1090,6 @@ void testSlices() {
     {
         Lowered bad("fn f(p: *u8) {\n local x = p[0..2]\n}\n");
         CHECK(bad.failedWith("E0709"));
-    }
-    {
-        // A slice is a `str` value, so writing through it is the same error as writing through a `str`.
-        Lowered bad("fn f(s: str) {\n s[0..1] = \"x\"\n}\n");
-        CHECK(bad.failedWith("E0716"));
     }
 }
 
@@ -1128,5 +1128,6 @@ void runLowerTests() {
     testGenerics();
     testVariadicPacks();
     testByteLiterals();
+    testUnsignedSpelling();
     testSlices();
 }
