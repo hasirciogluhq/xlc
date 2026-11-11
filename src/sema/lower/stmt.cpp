@@ -1547,6 +1547,7 @@ void Lowerer::lowerStmt(const Stmt& s, std::vector<hir::Stmt>& out) {
                 if (!h.value) {
                     return;
                 }
+                (void)rejectStackInterface(*h.value); // reported; lowering goes on (no W0701 noise)
             }
         } else if (!ret_.isVoid() && !lower::isUnknown(ret_)) {
             err("E0708",

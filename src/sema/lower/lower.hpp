@@ -731,6 +731,9 @@ class Lowerer {
     EP coerce(EP value, const Type& to, const Span& at);
     EP castTo(EP value, const Type& to, bool implicit);
     EP toInterface(EP value, const Type& iface, const Span& at);
+    /// E0760 when `value` is, or holds, an interface whose data pointer addresses a stack object of
+    /// this function; such a fat pointer dangles once the frame is gone. True when reported.
+    bool rejectStackInterface(const hir::Expr& value);
     [[nodiscard]] bool castable(const Type& from, const Type& to) const;
 
     // --- queries

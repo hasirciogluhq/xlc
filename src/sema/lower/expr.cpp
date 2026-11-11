@@ -85,6 +85,69 @@ Lowerer::EP Lowerer::toInterface(EP value, const Type& iface, const Span& at) {
     return out;
 }
 
+namespace {
+
+/// True when the place `e` lives in the current frame: a local or parameter, a temporary
+/// materialized for a droppable value, or a field/element of one (not reached through a pointer).
+[[nodiscard]] bool onStack(const hir::Expr& e) {
+    switch (e.kind) {
+    case hir::ExprKind::LocalRef:
+    case hir::ExprKind::Materialize: return true;
+    case hir::ExprKind::Field: return !e.through_pointer && e.lhs && onStack(*e.lhs);
+    case hir::ExprKind::Index:
+        return e.lhs && e.lhs->type.kind == TypeKind::Array && onStack(*e.lhs);
+    default: return false;
+    }
+}
+
+/// The first `ToInterface` under `e` (through casts, selects, tuples and struct literals) whose
+/// object is on the stack, or null.
+[[nodiscard]] const hir::Expr* stackInterface(const hir::Expr& e) {
+    const auto first = [](const auto& range, auto&& proj) -> const hir::Expr* {
+        for (const auto& item : range) {
+            const hir::Expr* part = proj(item);
+            if (const hir::Expr* sub = part ? stackInterface(*part) : nullptr) {
+                return sub;
+            }
+        }
+        return nullptr;
+    };
+    const auto id = [](const hir::ExprPtr& p) -> const hir::Expr* { return p.get(); };
+    switch (e.kind) {
+    case hir::ExprKind::ToInterface: {
+        const hir::Expr* obj = e.lhs.get();
+        return obj && obj->kind == hir::ExprKind::AddrOf && obj->lhs && onStack(*obj->lhs) ? &e
+                                                                                          : nullptr;
+    }
+    case hir::ExprKind::Cast: return e.lhs ? stackInterface(*e.lhs) : nullptr;
+    case hir::ExprKind::Select:
+        if (const hir::Expr* sub = e.rhs ? stackInterface(*e.rhs) : nullptr) {
+            return sub;
+        }
+        return first(e.args, id);
+    case hir::ExprKind::TupleLit: return first(e.args, id);
+    case hir::ExprKind::StructLit:
+        return first(e.fields, [](const hir::FieldInit& f) { return f.value.get(); });
+    default: return nullptr;
+    }
+}
+
+} // namespace
+
+bool Lowerer::rejectStackInterface(const hir::Expr& value) {
+    const hir::Expr* bad = stackInterface(value);
+    if (bad == nullptr) {
+        return false;
+    }
+    err("E0760",
+        bad->span,
+        std::format("cannot return a stack `{}` as `{}`: the fat pointer would dangle",
+                    bad->text,
+                    typeToString(bad->type)),
+        "allocate the object on the heap with `new` and return that pointer");
+    return true;
+}
+
 Lowerer::EP Lowerer::coerce(EP value, const Type& to, const Span& at) {
     if (!value) {
         return nullptr;

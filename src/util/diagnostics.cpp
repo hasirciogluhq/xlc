@@ -285,6 +285,11 @@ constexpr std::size_t kLeadWidth = 40;
         {"E0759", Severity::Error, "array of a payload enum that needs drop",
          "An array of an enum whose payload needs drop cannot own its elements, because arrays do not "
          "drop their elements. Use a `Vec<T>`, whose elements are dropped when it is dropped."},
+        {"E0760", Severity::Error, "stack object returned as an interface",
+         "An interface value is a fat pointer that borrows its object and owns nothing. Returning one "
+         "whose object is a local, a parameter or a temporary of the function leaves it pointing at a "
+         "frame that is gone. This is always an error and cannot be allowed. Allocate the object with "
+         "`new` and return the pointer: `local p := new CProvider()` then `return p`."},
         {"W0701", Severity::Warning, "missing return",
          "Control can fall off the end of a function that returns a value: some path has no "
          "`return` (a loop that ends with `break`, an `if` without `else`, ...). Add a `return`, "
