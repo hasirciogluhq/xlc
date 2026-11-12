@@ -118,6 +118,13 @@ void Artifact::writeIR(const std::filesystem::path& path) const {
     impl_->module->print(out, nullptr);
 }
 
+std::string Artifact::ir() const {
+    std::string text;
+    llvm::raw_string_ostream out(text);
+    impl_->module->print(out, nullptr);
+    return text;
+}
+
 void Artifact::writeBitcode(const std::filesystem::path& path) const {
     std::error_code ec;
     llvm::raw_fd_ostream out(path.string(), ec, llvm::sys::fs::OF_None);

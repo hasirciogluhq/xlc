@@ -1,0 +1,21 @@
+// e2e: registers the kernel writes besides the result, built with -O2 (run.sh). Two `write` calls pass the same pointer and
+// length: the optimizer may keep both in their argument registers for the second call only if the kernel leaves them alone.
+// XNU writes x1 (arm64, the pointer here) and rdx (x86-64, the length here) on every return, `uu_rval[1]` or 0
+// (xlang-docs std/syscalls/macos-xnu.md), so the second call fails with EFAULT or writes nothing unless the compiler declares
+// them written. Numbers as in write.xl; Windows has no stable system call numbers and does not run this program.
+#if os == "linux" && arch == "x86_64"
+const sysWrite = 1
+#elif os == "linux" && arch == "aarch64"
+const sysWrite = 64
+#elif os == "macos"
+const sysWrite = 0x2000004
+#else
+staticAssert(false, "this OS has no stable system call numbers; leave syscall_registers.xl out of the run")
+#endif
+
+@entry fn main() -> i32 {
+    local text = "xlc e2e registers\n"
+    local first = syscall(sysWrite, 1, text.ptr, text.len)
+    local second = syscall(sysWrite, 1, text.ptr, text.len)
+    return first == text.len as i64 && second == text.len as i64 ? 0 : 1
+}

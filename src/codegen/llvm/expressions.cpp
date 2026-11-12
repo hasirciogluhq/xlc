@@ -513,6 +513,84 @@ llvm::Value* Gen::genBinary(const hir::Expr& e) {
     return l;
 }
 
+namespace {
+
+/// How one target traps into its kernel (plan 5.3). `changed` lists every register the kernel may write besides `rflags`/`cpsr`
+/// and the trap's own clobbers, result first: each becomes an output of the asm, and the number or an argument passed in one
+/// of them is tied to that output. A register that is only clobbered could not also carry an input, and an input register that
+/// is not declared written lets the optimizer keep a value in it across the trap.
+struct SyscallAbi {
+    std::string_view text;                  ///< AT&T syntax; ends with the result as `-errno` where the kernel reports a carry
+    std::string_view number;                ///< register of the call number
+    std::vector<std::string_view> args;     ///< argument registers in order
+    std::vector<std::string_view> changed;  ///< registers the kernel writes, result first
+    std::string_view clobbers;
+};
+
+std::optional<SyscallAbi> syscallAbi(const TargetInfo& t) {
+    const bool x86 = t.arch == "x86_64";
+    if (t.os == "linux") {
+        // https://man7.org/linux/man-pages/man2/syscall.2.html: only the result register is written (x86-64 `syscall`
+        // itself also writes rcx and r11, and the kernel restores rflags from r11).
+        if (x86) {
+            return SyscallAbi{"syscall", "rax", {"rdi", "rsi", "rdx", "r10", "r8", "r9"}, {"rax"}, "~{rcx},~{r11},~{memory}"};
+        }
+        return SyscallAbi{"svc #0", "x8", {"x0", "x1", "x2", "x3", "x4", "x5"}, {"x0"}, "~{memory}"};
+    }
+    if (t.os == "macos") {
+        // XNU writes a second result register on every return, `uu_rval[1]` or 0, also on an error and when it carried an
+        // argument, and reports an error with the carry flag (xlang-docs std/syscalls/macos-xnu.md;
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/dev/arm/systemcalls.c,
+        // https://github.com/apple-oss-distributions/xnu/blob/main/bsd/dev/i386/systemcalls.c).
+        if (x86) {
+            return SyscallAbi{"syscall\n\tjnc 1f\n\tnegq %rax\n1:", "rax", {"rdi", "rsi", "rdx", "r10", "r8", "r9"},
+                              {"rax", "rdx"}, "~{rcx},~{r11},~{cc},~{memory}"};
+        }
+        return SyscallAbi{"svc #0x80\n\tb.cc 1f\n\tneg x0, x0\n1:", "x16", {"x0", "x1", "x2", "x3", "x4", "x5"},
+                          {"x0", "x1"}, "~{cc},~{memory}"};
+    }
+    if (t.os == "windows" && x86) {
+        // The NT system call interface is not documented; ntdll's stubs are ordinary functions, so the caller may assume
+        // nothing of the volatile registers rax, rcx, rdx, r8-r11 and the flags
+        // (https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention#callercallee-saved-registers).
+        return SyscallAbi{"syscall", "rax", {"r10", "rdx", "r8", "r9"}, {"rax", "r10", "rdx", "r8", "r9"},
+                          "~{rcx},~{r11},~{cc},~{memory}"};
+    }
+    return std::nullopt;
+}
+
+/// The asm call of one trap: `args[0]` is the number, the rest the arguments, each already 64 bits wide. Returns the result.
+llvm::Value* emitSyscallAsm(llvm::IRBuilder<>& b, const SyscallAbi& abi, const std::vector<llvm::Value*>& args) {
+    llvm::Type* i64 = b.getInt64Ty();
+    std::vector<std::string> parts;
+    for (const std::string_view reg : abi.changed) {
+        parts.push_back(std::format("={{{}}}", reg));
+    }
+    const auto input = [&](std::string_view reg) {
+        const auto it = std::ranges::find(abi.changed, reg);
+        parts.push_back(it == abi.changed.end() ? std::format("{{{}}}", reg)
+                                                : std::to_string(it - abi.changed.begin())); // tied to that output
+    };
+    input(abi.number);
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        input(abi.args[i - 1]);
+    }
+    std::string constraints;
+    for (const std::string& p : parts) {
+        constraints += p + ",";
+    }
+    constraints += abi.clobbers;
+    const std::vector<llvm::Type*> outs(abi.changed.size(), i64);
+    llvm::Type* ret = outs.size() == 1 ? i64 : static_cast<llvm::Type*>(llvm::StructType::get(b.getContext(), outs));
+    const std::vector<llvm::Type*> ins(args.size(), i64);
+    llvm::InlineAsm* ia = llvm::InlineAsm::get(llvm::FunctionType::get(ret, ins, false), std::string(abi.text), constraints,
+                                               true, false, llvm::InlineAsm::AD_ATT);
+    llvm::Value* call = b.CreateCall(ia, args);
+    return outs.size() == 1 ? call : b.CreateExtractValue(call, 0);
+}
+
+}  // namespace
+
 llvm::Value* Gen::genSyscall(const hir::Expr& e) {
     // Plan 5.3: arguments are converted to the register width; the result is `i64` with errors
     // as negative `-errno` on every target.
@@ -528,93 +606,21 @@ llvm::Value* Gen::genSyscall(const hir::Expr& e) {
         args.push_back(v);
     }
     const TargetInfo& t = in_.config.target;
-    const bool x86 = t.arch == "x86_64";
-    std::string constraints;
-    std::string text;
-    std::vector<llvm::Value*> inputs;
-    const std::size_t n = args.size() - 1; // arguments after the number
-    const auto addInput = [&](const std::string& reg, llvm::Value* v) {
-        constraints += (constraints.empty() ? "" : ",") + std::string("{") + reg + "}";
-        inputs.push_back(v);
-    };
-    llvm::Value* result = nullptr;
-    if (t.os == "linux" && x86) {
-        static const char* regs[] = {"rdi", "rsi", "rdx", "r10", "r8", "r9"};
-        constraints = "={rax}";
-        addInput("rax", args[0]);
-        for (std::size_t i = 0; i < n; ++i) {
-            addInput(regs[i], args[i + 1]);
-        }
-        constraints += ",~{rcx},~{r11},~{memory}";
-        text = "syscall";
-    } else if (t.os == "linux") { // aarch64
-        constraints = "={x0}";
-        addInput("x8", args[0]);
-        for (std::size_t i = 0; i < n; ++i) {
-            if (i == 0) {
-                constraints += ",0";
-                inputs.push_back(args[1]);
-            } else {
-                addInput("x" + std::to_string(i), args[i + 1]);
-            }
-        }
-        if (n == 0) {
-            // x0 is an output only; no input needed.
-        }
-        constraints += ",~{memory}";
-        text = "svc #0";
-    } else if (t.os == "macos" && x86) {
-        static const char* regs[] = {"rdi", "rsi", "rdx", "r10", "r8", "r9"};
-        constraints = "={rax}";
-        llvm::Value* nr = B_.CreateOr(args[0], llvm::ConstantInt::get(i64, 0x2000000));
-        addInput("rax", nr);
-        for (std::size_t i = 0; i < n; ++i) {
-            addInput(regs[i], args[i + 1]);
-        }
-        constraints += ",~{rcx},~{r11},~{cc},~{memory}";
-        text = "syscall\n\tjnc 1f\n\tnegq %rax\n1:";
-    } else if (t.os == "macos") { // aarch64
-        constraints = "={x0}";
-        addInput("x16", args[0]);
-        for (std::size_t i = 0; i < n; ++i) {
-            if (i == 0) {
-                constraints += ",0";
-                inputs.push_back(args[1]);
-            } else {
-                addInput("x" + std::to_string(i), args[i + 1]);
-            }
-        }
-        constraints += ",~{cc},~{memory}";
-        text = "svc #0x80\n\tb.cc 1f\n\tneg x0, x0\n1:";
-    } else if (t.os == "windows" && x86) {
-        if (n > 4) {
-            error(e.span,
-                  "`syscall` with more than 4 arguments on Windows is not supported yet (stack "
-                  "passing)");
-            return llvm::ConstantInt::get(i64, 0);
-        }
-        static const char* regs[] = {"r10", "rdx", "r8", "r9"};
-        constraints = "={rax}";
-        addInput("rax", args[0]);
-        for (std::size_t i = 0; i < n; ++i) {
-            addInput(regs[i], args[i + 1]);
-        }
-        constraints += ",~{rcx},~{r11},~{memory}";
-        text = "syscall";
-    } else {
+    const auto abi = syscallAbi(t);
+    if (!abi) {
         error(e.span, std::format("`syscall` is not supported on target `{}/{}`", t.os, t.arch));
         return llvm::ConstantInt::get(i64, 0);
     }
-    std::vector<llvm::Type*> in_types;
-    for (llvm::Value* v : inputs) {
-        in_types.push_back(v->getType());
+    const std::size_t n = args.size() - 1; // arguments after the number
+    if (n > abi->args.size()) {
+        error(e.span, std::format("`syscall` takes at most {} arguments on `{}/{}` (no stack passing yet)",
+                                  abi->args.size(), t.os, t.arch));
+        return llvm::ConstantInt::get(i64, 0);
     }
-    llvm::FunctionType* fty = llvm::FunctionType::get(i64, in_types, false);
-    const bool intel = false;
-    (void)intel;
-    llvm::InlineAsm* ia =
-        llvm::InlineAsm::get(fty, text, constraints, true, false, llvm::InlineAsm::AD_ATT);
-    result = B_.CreateCall(ia, inputs);
+    if (t.os == "macos" && t.arch == "x86_64") {
+        args[0] = B_.CreateOr(args[0], llvm::ConstantInt::get(i64, 0x2000000)); // BSD class (osfmk/mach/i386/syscall_sw.h)
+    }
+    llvm::Value* result = emitSyscallAsm(B_, *abi, args);
     if (t.os == "windows") {
         // NTSTATUS is the 32-bit `eax`, sign-extended.
         result = B_.CreateSExt(B_.CreateTrunc(result, llvm::Type::getInt32Ty(ctx_)), i64);

@@ -64,6 +64,8 @@ public:
     void optimize(int opt_level);
     /// `--emit=ir`: textual LLVM IR (`.ll`) with triple and data layout.
     void writeIR(const std::filesystem::path& path) const;
+    /// The same text as `writeIR`, in memory.
+    [[nodiscard]] std::string ir() const;
     /// `--emit=bc`
     void writeBitcode(const std::filesystem::path& path) const;
     /// `--emit=obj`; throws XlangError when the backend cannot emit the file.

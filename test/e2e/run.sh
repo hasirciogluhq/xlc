@@ -62,16 +62,18 @@ done < <(neededLibraries)
 if [ -z "$foreign" ]; then ok "links-only-system-libraries"; else bad "links-only-system-libraries" "needs$foreign"; fi
 
 # --- 2. native programs ---------------------------------------------------------------------------------
-# name | expected exit code | expected stdout (a `grep -F` substring) | runs on Windows
+# name | expected exit code | expected stdout (a `grep -F` substring) | runs on Windows | compiler flags
 programs=(
-  "exit|42||1"
-  "slice_types|0||1"
-  "write|0|xlc e2e write|0"
+  "exit|42||1|"
+  "slice_types|0||1|"
+  "write|0|xlc e2e write|0|"
+  "syscall_registers|0|xlc e2e registers|0|-O2"
 )
 for row in "${programs[@]}"; do
-  IFS='|' read -r name code want on_windows <<<"$row"
+  IFS='|' read -r name code want on_windows flags <<<"$row"
   [ "$os" = windows ] && [ "$on_windows" = 0 ] && { echo "skip [e2e/$name] not on Windows"; continue; }
-  if ! "$xlc" "$here/$name.xl" -o "$work/$name$exe" 2>"$work/$name.err"; then
+  # shellcheck disable=SC2086 # the flags column is a list of words
+  if ! "$xlc" "$here/$name.xl" $flags -o "$work/$name$exe" 2>"$work/$name.err"; then
     bad "$name" "build"; cat "$work/$name.err"; continue
   fi
   out=$("$work/$name$exe" 2>&1); got=$?

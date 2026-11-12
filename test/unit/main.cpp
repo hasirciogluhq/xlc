@@ -565,9 +565,11 @@ void runLowerTests();
 void runOperatorTests();
 void runClosureTests();
 void runIteratorTests();
+void runCodegenTests();
 
 int main() {
     RUN(runSemaTests);
+    RUN(runCodegenTests);
     RUN(runLowerTests);
     RUN(runOperatorTests);
     RUN(runClosureTests);
