@@ -10,7 +10,7 @@
 -- The version below is the single source of truth: release tags must match it (`vX.Y.Z` or
 -- `vX.Y.Z-rc.N`, see .github/workflows/release.yml).
 
-local xlc_version = "1.0.0-rc.4"
+local xlc_version = "1.0.0-rc.5"
 
 set_project("xlc")
 set_version(xlc_version)
