@@ -513,6 +513,10 @@ private:
             base = 2;
             advance();
             advance();
+        } else if (peek() == '0' && (peek(1) == 'o' || peek(1) == 'O')) {
+            base = 8; // `0o644`: a leading `0` alone stays decimal, so `0644` is never silently octal
+            advance();
+            advance();
         }
         const std::size_t digits_start = pos_;
         std::string digits;

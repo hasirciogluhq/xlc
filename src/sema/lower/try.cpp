@@ -15,7 +15,10 @@ namespace xlang::lower {
 // An expression cannot return, so the lowering is hoisted: the statement being lowered gets
 //     local try = e;  if try is failure { return Failure(try.payload) }  local ok = try.payload
 // in front of it (`prelude_`) and `ok` stands where `e?` was. Because of that, the `?` of a
-// statement run before its other operands, in the order written.
+// statement run before its other operands, in the order written. An operand that runs only on
+// some paths hoists into a prelude of its own that is placed on that path (`hoistedInto`): the
+// right side of `&&`/`||` and a `?:` branch become an `if`, a loop condition is tested at the top
+// of the body (`guardLoop`).
 
 namespace {
 
@@ -40,12 +43,18 @@ std::optional<Shape> shapeOfVariants(const std::vector<SumVariant>& v) {
 } // namespace
 
 Lowerer::EP Lowerer::tryExpr(const Expr& e) {
-    if (prelude_ == nullptr || lazy_ != 0) {
+    if (in_defer_ != 0) {
+        // A deferred statement runs while the block is being left, possibly while a `return`
+        // is already under way: a second, early return from there has no meaning.
         err("E0761",
             e.span,
-            "`?` cannot be used here",
-            "it hoists into a statement of its own: write it in a plain statement, not in a loop "
-            "condition, the right side of `&&` or `||`, a `?:` branch or a `defer`");
+            "`?` cannot be used in a `defer`",
+            "a deferred statement runs while the block is left and cannot return; handle the "
+            "failure with `switch` or `if` inside the deferred statement");
+        return nullptr;
+    }
+    if (prelude_ == nullptr) {
+        err("E0761", e.span, "`?` cannot be used here", "it needs a function body to return from");
         return nullptr;
     }
     EP inner = expr(*e.lhs, nullptr);

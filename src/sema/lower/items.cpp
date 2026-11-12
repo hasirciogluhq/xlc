@@ -2124,6 +2124,13 @@ bool Lowerer::lowerPendingInstances() {
     return any;
 }
 
+void Lowerer::lowerLazyMethod(const LowerShared::LazyMethod& m, const std::string& key) {
+    s_.setCurrentInstance(m.item);
+    lowerFunction(
+        *m.decl, m.item->modifiers, key, m.local_name, m.decl->attributes, m.cls_q, &m.self, m.overloaded);
+    s_.setCurrentInstance(nullptr);
+}
+
 void Lowerer::lowerBatch(const std::vector<const Item*>& items) {
     for (const Item* ip : items) {
         const Item& item = *ip;
@@ -2250,6 +2257,14 @@ void Lowerer::lowerBatch(const std::vector<const Item*>& items) {
                 }
                 if (m.name == "init") {
                     base_init_call_ = baseInitKey(*cl, s_);
+                }
+                if (s_.instanceInfo(cl->name) != nullptr && !m.is_virtual && !m.is_override &&
+                    m.name != "init" && m.name != "drop") {
+                    sh_.lazy_methods.emplace(
+                        key,
+                        LowerShared::LazyMethod{
+                            &s_, ip, &m, cl->name + "." + m.name, cq, self, overloaded});
+                    continue;
                 }
                 lowerFunction(m,
                               item.modifiers,
@@ -2649,6 +2664,85 @@ bool Lowerer::isRegisteredName(const std::string& name) const {
 
 namespace xlang {
 
+namespace {
+
+/// The functions an expression or statement names (calls, function values, constructions).
+void namedFunctions(const hir::Expr& e, std::set<std::string>& out) {
+    if (e.kind == hir::ExprKind::Call || e.kind == hir::ExprKind::CallVirtual ||
+        e.kind == hir::ExprKind::FuncRef || e.kind == hir::ExprKind::Construct) {
+        out.insert(e.text);
+    }
+    for (const hir::Expr* c : {e.lhs.get(), e.rhs.get()}) {
+        if (c != nullptr) {
+            namedFunctions(*c, out);
+        }
+    }
+    for (const hir::ExprPtr& a : e.args) {
+        namedFunctions(*a, out);
+    }
+    for (const hir::FieldInit& f : e.fields) {
+        if (f.value) {
+            namedFunctions(*f.value, out);
+        }
+    }
+    for (const hir::AsmOperand& op : e.asm_operands) {
+        if (op.value) {
+            namedFunctions(*op.value, out);
+        }
+    }
+}
+
+void namedFunctions(const hir::Stmt& s, std::set<std::string>& out) {
+    for (const hir::Expr* e : {s.target.get(), s.value.get()}) {
+        if (e != nullptr) {
+            namedFunctions(*e, out);
+        }
+    }
+    for (const auto* list : {&s.body, &s.else_body, &s.step}) {
+        for (const hir::Stmt& c : *list) {
+            namedFunctions(c, out);
+        }
+    }
+}
+
+/// Lowers the lazy methods (`LowerShared::lazy_methods`) that the functions lowered since the last
+/// call refer to; true when it lowered any.
+bool lowerReferencedMethods(lower::LowerShared& shared,
+                            const std::map<const Sema*, lower::Lowerer*>& by_sema) {
+    if (shared.lazy_methods.empty()) {
+        shared.lazy_scanned = shared.module.functions.size();
+        return false;
+    }
+    std::set<std::string> named;
+    for (; shared.lazy_scanned < shared.module.functions.size(); ++shared.lazy_scanned) {
+        const hir::Function& f = shared.module.functions[shared.lazy_scanned];
+        for (const auto* list : {&f.body, &f.unwind_body}) {
+            for (const hir::Stmt& s : *list) {
+                namedFunctions(s, named);
+            }
+        }
+    }
+    for (const hir::Global& g : shared.module.globals) {
+        if (g.init) {
+            namedFunctions(*g.init, named);
+        }
+    }
+    bool any = false;
+    for (const std::string& name : named) {
+        const auto it = shared.lazy_methods.find(name);
+        if (it == shared.lazy_methods.end()) {
+            continue;
+        }
+        const lower::LowerShared::LazyMethod m = it->second;
+        shared.lazy_methods.erase(it);
+        by_sema.at(m.owner)->lowerLazyMethod(m, name);
+        any = true;
+    }
+    return any;
+}
+
+} // namespace
+
 hir::Module lowerProgram(const std::vector<Sema*>& modules,
                          const std::vector<Sema*>& init_order,
                          const std::set<const Sema*>& library_modules) {
@@ -2676,12 +2770,14 @@ hir::Module lowerProgram(const std::vector<Sema*>& modules,
     }
     // Generic instances requested by one module can belong to another: lower until none is
     // left.
+    // A lazy method is lowered once a lowered function names it; its body can make new instances.
     bool more = true;
     while (more) {
         more = false;
         for (auto& l : lowerers) {
             more = l->lowerPendingInstances() || more;
         }
+        more = lowerReferencedMethods(shared, by_sema) || more;
     }
     for (auto& l : lowerers) {
         l->finish();

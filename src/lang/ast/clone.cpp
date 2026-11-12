@@ -144,6 +144,20 @@ FnDecl cloneFn(const FnDecl& f, const TypeEnv& env) {
     return c;
 }
 
+/// A method of a generic type's instance: the type's parameters are replaced, and a method that
+/// is generic itself stays generic (`fn map<U>` of `Box<T>` is `fn map<U>` of `Box<i32>`), so it
+/// is instantiated per call like the method of a plain class. A method parameter that shadows a
+/// type parameter keeps its own meaning.
+FnDecl cloneMethod(const FnDecl& m, const TypeEnv& env) {
+    TypeEnv own = env;
+    for (const std::string& p : m.generic_params) {
+        own.erase(p);
+    }
+    FnDecl c = cloneFn(m, own);
+    c.generic_params = m.generic_params;
+    return c;
+}
+
 }  // namespace
 
 Type substituteType(const Type& type, const TypeEnv& env) {
@@ -225,7 +239,7 @@ Item instantiateItem(const Item& generic, const TypeEnv& env, const std::string&
             c.fields.push_back(std::move(n));
         }
         for (const FnDecl& m : cl->methods) {
-            c.methods.push_back(cloneFn(m, env));
+            c.methods.push_back(cloneMethod(m, env));
         }
         c.opaque = cl->opaque;
         out.decl = std::move(c);
@@ -234,7 +248,7 @@ Item instantiateItem(const Item& generic, const TypeEnv& env, const std::string&
         static_cast<DeclBase&>(c) = *in;
         c.name = name;
         for (const FnDecl& m : in->methods) {
-            c.methods.push_back(cloneFn(m, env));
+            c.methods.push_back(cloneMethod(m, env));
         }
         c.opaque = in->opaque;
         out.decl = std::move(c);
@@ -248,7 +262,7 @@ Item instantiateItem(const Item& generic, const TypeEnv& env, const std::string&
         }
         c.target = substituteType(impl->target, env);
         for (const FnDecl& m : impl->methods) {
-            c.methods.push_back(cloneFn(m, env));
+            c.methods.push_back(cloneMethod(m, env));
         }
         out.decl = std::move(c);
     } else if (const auto* e = std::get_if<EnumDecl>(&generic.decl)) {

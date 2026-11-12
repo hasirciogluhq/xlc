@@ -928,12 +928,8 @@ void Lowerer::lowerFor(const Stmt& s, std::vector<hir::Stmt>& out) {
     hir::Stmt loop;
     loop.kind = hir::StmtKind::While;
     loop.span = s.span;
-    if (s.expr) {
-        loop.value = coerce(expr(*s.expr, &boolean), boolean, s.expr->span);
-    } else {
-        loop.value = mk(hir::ExprKind::BoolConst, boolean, s.span);
-        loop.value->bool_value = true;
-    }
+    std::vector<hir::Stmt> pre;
+    EP cond = s.expr ? loopCondition(*s.expr, pre) : boolConst(true, s.span);
     loops_.push_back({s.label, defers_.size()});
     lowerBlock(*s.body, loop.body, true);
     loops_.pop_back();
@@ -942,11 +938,65 @@ void Lowerer::lowerFor(const Stmt& s, std::vector<hir::Stmt>& out) {
     }
     defers_.pop_back();
     scopes_.pop();
-    if (!loop.value) {
+    if (!cond) {
         return;
     }
+    guardLoop(loop, std::move(pre), std::move(cond));
     block.body.push_back(std::move(loop));
     out.push_back(std::move(block));
+}
+
+std::optional<bool> Lowerer::dropTest(const Expr& cond) {
+    const bool negated = cond.kind == Expr::Kind::Unary && cond.unary_op == UnaryOp::Not && cond.lhs;
+    const Expr& call = negated ? *cond.lhs : cond;
+    if (call.kind != Expr::Kind::Call || !call.lhs || call.lhs->kind != Expr::Kind::Name ||
+        call.lhs->text != "__builtin_needsDrop") {
+        return std::nullopt;
+    }
+    const EP v = expr(call, nullptr);
+    if (!v || v->kind != hir::ExprKind::BoolConst) {
+        return std::nullopt;
+    }
+    return v->bool_value != negated;
+}
+
+Lowerer::EP Lowerer::loopCondition(const Expr& cond, std::vector<hir::Stmt>& pre) {
+    const Type boolean = Type::makeBool();
+    const auto saved = std::exchange(prelude_, in_defer_ != 0 ? prelude_ : &pre);
+    EP out = coerce(expr(cond, &boolean), boolean, cond.span);
+    prelude_ = saved;
+    return out;
+}
+
+void Lowerer::guardLoop(hir::Stmt& loop, std::vector<hir::Stmt> pre, EP cond) {
+    if (pre.empty()) {
+        loop.value = std::move(cond);
+        return;
+    }
+    hir::Stmt leave;
+    leave.kind = hir::StmtKind::If;
+    leave.span = loop.span;
+    EP n = mk(hir::ExprKind::Unary, Type::makeBool(), loop.span);
+    n->unary_op = UnaryOp::Not;
+    n->lhs = std::move(cond);
+    leave.value = std::move(n);
+    hir::Stmt brk;
+    brk.kind = hir::StmtKind::Break;
+    brk.span = loop.span;
+    leave.body.push_back(std::move(brk));
+    pre.push_back(std::move(leave));
+    loop.value = boolConst(true, loop.span);
+    if (loop.post_test) {
+        // `do { } while c`: the test follows the body, and `continue` reaches it through the step
+        // (a `do` loop has no step of its own). A `break` in the step leaves the loop.
+        std::ranges::move(pre, std::back_inserter(loop.step));
+        loop.post_test = false;
+        // The first pass must not test: `while true` with the test in the step runs the body
+        // first, exactly like the post-test loop.
+        return;
+    }
+    std::ranges::move(loop.body, std::back_inserter(pre));
+    loop.body = std::move(pre);
 }
 
 void Lowerer::lowerForRange(const Stmt& s, std::vector<hir::Stmt>& out) {
@@ -1090,7 +1140,10 @@ void Lowerer::lowerForEach(const Stmt& s, std::vector<hir::Stmt>& out) {
     if (iterable.elem) {
         elem_type = *iterable.elem;
     }
-    const Type elem_ptr = Type::makePointer(elem_type);
+    // A `str` is read-only, so its loop variable is the byte itself (`u8`); an array or a slice
+    // yields the element's address (`*T`), so a write through it reaches the owner.
+    const bool by_value = iterable.kind == TypeKind::Str;
+    const Type elem_ptr = by_value ? elem_type : Type::makePointer(elem_type);
 
     hir::Stmt block;
     block.kind = hir::StmtKind::Block;
@@ -1188,15 +1241,18 @@ void Lowerer::lowerForEach(const Stmt& s, std::vector<hir::Stmt>& out) {
         index->lvalue = true;
         index->lhs = baseRef();
         index->rhs = ref(idx, usize);
-        // The element is its address in the storage (`*T`), so a write through it reaches the
-        // owner.
-        EP addr = mk(hir::ExprKind::AddrOf, elem_ptr, s.span);
-        addr->lhs = std::move(index);
+        EP value;
+        if (by_value) {
+            value = std::move(index);
+        } else {
+            value = mk(hir::ExprKind::AddrOf, elem_ptr, s.span);
+            value->lhs = std::move(index);
+        }
         hir::Stmt d;
         d.kind = hir::StmtKind::Local;
         d.span = s.span;
         d.local = elem;
-        d.value = std::move(addr);
+        d.value = std::move(value);
         loop.body.push_back(std::move(d));
     }
     bindLocal(s.name, elem, elem_ptr, s.span);
@@ -1235,6 +1291,10 @@ void Lowerer::lowerForEach(const Stmt& s, std::vector<hir::Stmt>& out) {
 
 void Lowerer::lowerSwitch(const Stmt& s, std::vector<hir::Stmt>& out) {
     const Type boolean = Type::makeBool();
+    if (!s.expr) {
+        lowerConditionSwitch(s, out);
+        return;
+    }
     EP scrutinee = expr(*s.expr, nullptr);
     const auto sum = scrutinee ? sumOfType(scrutinee->type) : std::nullopt;
     if (scrutinee && sum) {
@@ -1338,6 +1398,59 @@ void Lowerer::lowerSwitch(const Stmt& s, std::vector<hir::Stmt>& out) {
     out.push_back(std::move(block));
 }
 
+void Lowerer::lowerConditionSwitch(const Stmt& s, std::vector<hir::Stmt>& out) {
+    const Type boolean = Type::makeBool();
+    // `switch { case c1, c2 { } case c3 { } default { } }` is the chain
+    // `if c1 || c2 { } else if c3 { } else { }`: the first arm whose condition holds runs.
+    struct Arm {
+        std::vector<hir::Stmt> pre; ///< what the condition hoists; it runs only when reached
+        EP cond;
+        std::vector<hir::Stmt> body;
+    };
+    std::vector<Arm> arms;
+    std::vector<hir::Stmt> default_body;
+    bool has_default = false;
+    for (const SwitchCase& c : s.cases) {
+        if (c.is_default) {
+            if (has_default) {
+                err("E0709", c.span, "a `switch` has more than one `default`", "remove the duplicate");
+            }
+            has_default = true;
+            lowerBlock(*c.body, default_body, true);
+            continue;
+        }
+        ExprPtr cond_ast;
+        for (const ExprPtr& v : c.values) {
+            cond_ast = cond_ast ? lower::astBinary(
+                                      BinaryOp::Or, std::move(cond_ast), lower::cloneAst(*v), v->span)
+                                : lower::cloneAst(*v);
+        }
+        Arm arm;
+        arm.cond = hoistedInto(
+            arm.pre, [&] { return coerce(expr(*cond_ast, &boolean), boolean, c.span); });
+        lowerBlock(*c.body, arm.body, true);
+        if (arm.cond) {
+            arms.push_back(std::move(arm));
+        }
+    }
+    // Built from the last arm back: each arm's hoisted statements run in the `else` of the arm
+    // before it, so a condition is evaluated only when every earlier one failed.
+    std::vector<hir::Stmt> chain = std::move(default_body);
+    for (std::size_t i = arms.size(); i-- > 0;) {
+        hir::Stmt ifs;
+        ifs.kind = hir::StmtKind::If;
+        ifs.span = s.span;
+        ifs.value = std::move(arms[i].cond);
+        ifs.body = std::move(arms[i].body);
+        ifs.else_body = std::move(chain);
+        chain = std::move(arms[i].pre);
+        chain.push_back(std::move(ifs));
+    }
+    for (hir::Stmt& c : chain) {
+        out.push_back(std::move(c));
+    }
+}
+
 Lowerer::EP Lowerer::ternaryExpr(const Expr& e, const Type* expected) {
     const Type boolean = Type::makeBool();
     EP cond = coerce(expr(*e.lhs, &boolean), boolean, e.lhs->span);
@@ -1348,17 +1461,18 @@ Lowerer::EP Lowerer::ternaryExpr(const Expr& e, const Type* expected) {
     };
     EP a;
     EP b;
-    ++lazy_; // only one branch runs: a `?` in either could not be hoisted
+    // Only one branch runs, so each hoists (`?`, `&temp()`) into a prelude of its own.
+    std::vector<hir::Stmt> pre_a;
+    std::vector<hir::Stmt> pre_b;
     if (isLit(then_ast) && !isLit(else_ast)) {
-        b = expr(else_ast, expected);
+        b = hoistedInto(pre_b, [&] { return expr(else_ast, expected); });
         const Type want = b ? b->type : lower::unknownType();
-        a = expr(then_ast, b ? &want : expected);
+        a = hoistedInto(pre_a, [&] { return expr(then_ast, b ? &want : expected); });
     } else {
-        a = expr(then_ast, expected);
+        a = hoistedInto(pre_a, [&] { return expr(then_ast, expected); });
         const Type want = a ? a->type : lower::unknownType();
-        b = expr(else_ast, a ? &want : expected);
+        b = hoistedInto(pre_b, [&] { return expr(else_ast, a ? &want : expected); });
     }
-    --lazy_;
     if (!cond || !a || !b) {
         return nullptr;
     }
@@ -1370,9 +1484,42 @@ Lowerer::EP Lowerer::ternaryExpr(const Expr& e, const Type* expected) {
         return nullptr;
     }
     const Type t = a->type;
-    b = coerce(std::move(b), t, else_ast.span);
+    b = hoistedInto(pre_b, [&] { return coerce(std::move(b), t, else_ast.span); });
     if (!b) {
         return nullptr;
+    }
+    if (!pre_a.empty() || !pre_b.empty()) {
+        // `local r; if cond { pre_a; r = a } else { pre_b; r = b }`: `r` starts zeroed and takes
+        // the chosen value raw (moved, nothing to drop first); it is dropped like a temporary.
+        const hir::LocalId r = hiddenLocal("sel", t, e.span);
+        hir::Stmt decl;
+        decl.kind = hir::StmtKind::Local;
+        decl.span = e.span;
+        decl.local = r;
+        prelude_->push_back(std::move(decl));
+        const auto store = [&](std::vector<hir::Stmt>& path, EP v) {
+            hir::Stmt set;
+            set.kind = hir::StmtKind::Assign;
+            set.span = e.span;
+            set.target = localRef(r, t, e.span);
+            set.target->lvalue = true;
+            set.value = needsDrop(t) ? moveOut(std::move(v)) : std::move(v);
+            path.push_back(std::move(set));
+            return std::move(path);
+        };
+        hir::Stmt branch;
+        branch.kind = hir::StmtKind::If;
+        branch.span = e.span;
+        branch.value = std::move(cond);
+        branch.body = store(pre_a, std::move(a));
+        branch.else_body = store(pre_b, std::move(b));
+        prelude_->push_back(std::move(branch));
+        if (needsDrop(t)) {
+            registerDrop(r, t, true, e.span, *prelude_);
+        }
+        EP out = localRef(r, t, e.span);
+        out->lvalue = true;
+        return out;
     }
     EP sel = mk(hir::ExprKind::Select, t, e.span);
     sel->lhs = std::move(cond);
@@ -1447,11 +1594,19 @@ void Lowerer::lowerTupleLocal(const Stmt& s, std::vector<hir::Stmt>& out) {
 
 void Lowerer::lowerStmt(const Stmt& s, std::vector<hir::Stmt>& out) {
     // The statements of the kinds below evaluate their expressions once, in order, before they
-    // act: a `?` in them is hoisted in front. A loop condition runs every pass and a `defer`
-    // body later, so there `?` is refused.
+    // act: a `?` in them is hoisted in front. A loop condition runs every pass, so it hoists into
+    // the loop body instead (`guardLoop`); a `defer` body runs later and refuses `?`.
     using K = Stmt::Kind;
-    const bool hoists = std::ranges::contains(
-        std::array{K::Local, K::Assign, K::Return, K::Expr, K::If, K::Switch, K::Delete}, s.kind);
+    const bool hoists = std::ranges::contains(std::array{K::Local,
+                                                         K::Assign,
+                                                         K::Return,
+                                                         K::Expr,
+                                                         K::If,
+                                                         K::Switch,
+                                                         K::Delete,
+                                                         K::ForEach,
+                                                         K::ForRange},
+                                              s.kind);
     std::vector<hir::Stmt> prelude;
     std::vector<hir::Stmt> body;
     const auto saved = std::exchange(prelude_, hoists ? &prelude : nullptr);
@@ -1634,10 +1789,12 @@ void Lowerer::lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out) {
         loops_.push_back({s.label, defers_.size()});
         lowerBlock(*s.body, h.body, true);
         loops_.pop_back();
-        h.value = coerce(expr(*s.expr, &boolean), boolean, s.expr->span);
-        if (!h.value) {
+        std::vector<hir::Stmt> pre;
+        EP cond = loopCondition(*s.expr, pre);
+        if (!cond) {
             return;
         }
+        guardLoop(h, std::move(pre), std::move(cond));
         break;
     }
     case Stmt::Kind::For:
@@ -1679,9 +1836,9 @@ void Lowerer::lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out) {
             break;
         }
         std::vector<hir::Stmt> lowered;
-        ++lazy_; // a deferred body runs at block exit: a `?` in it has no place to hoist to
+        ++in_defer_; // a deferred body runs at block exit: a `?` in it has no place to hoist to
         lowerStmt(inner, lowered);
-        --lazy_;
+        --in_defer_;
         // The deferred statement runs under a flag set here, so a panic unwinding through the
         // function runs exactly the defers that were registered and not yet run.
         const hir::LocalId flag = hiddenLocal("dfr", Type::makeBool(), s.span);
@@ -1743,6 +1900,17 @@ void Lowerer::lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out) {
         break;
     }
     case Stmt::Kind::If: {
+        if (const std::optional<bool> fixed = dropTest(*s.expr)) {
+            // `if __builtin_needsDrop<T>() { } else { }`: only the branch that runs is lowered, so
+            // each branch may use what only that kind of `T` has (`p.clone()` on a class).
+            h.kind = hir::StmtKind::Block;
+            if (*fixed) {
+                lowerBlock(*s.body, h.body, true);
+            } else if (s.else_body) {
+                lowerBlock(*s.else_body, h.body, true);
+            }
+            break;
+        }
         h.kind = hir::StmtKind::If;
         h.value = coerce(expr(*s.expr, &boolean), boolean, s.expr->span);
         lowerBlock(*s.body, h.body, true);
@@ -1756,13 +1924,15 @@ void Lowerer::lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out) {
     }
     case Stmt::Kind::While: {
         h.kind = hir::StmtKind::While;
-        h.value = coerce(expr(*s.expr, &boolean), boolean, s.expr->span);
+        std::vector<hir::Stmt> pre;
+        EP cond = loopCondition(*s.expr, pre);
         loops_.push_back({s.label, defers_.size()});
         lowerBlock(*s.body, h.body, true);
         loops_.pop_back();
-        if (!h.value) {
+        if (!cond) {
             return;
         }
+        guardLoop(h, std::move(pre), std::move(cond));
         break;
     }
     case Stmt::Kind::Continue:

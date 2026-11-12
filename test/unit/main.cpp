@@ -235,7 +235,7 @@ struct Parsed {
 };
 
 void testLexer() {
-    Fixture f("fn f(a: u8) -> *i32 { return a != 0x1F && b <= 1_000 }\n"
+    Fixture f("fn f(a: u8) -> *i32 { return a != 0x1F && b <= 1_000 && c == 0o755 && d == 0644 }\n"
               "#if debug\nlocal s = \"a\\n\\x41\" // comment\n");
     DiagnosticEngine engine(f.sources, f.out);
     const std::vector<Token> tokens = lex(f.sources, f.file, engine);
@@ -246,23 +246,29 @@ void testLexer() {
     bool saw_hex = false;
     bool saw_directive = false;
     bool saw_string = false;
+    bool saw_octal = false;
+    bool saw_decimal_zero = false;
     for (const Token& t : tokens) {
         saw_arrow |= t.kind == TokenKind::Arrow;
         saw_hex |= t.kind == TokenKind::Int && t.int_value == 0x1F;
+        saw_octal |= t.kind == TokenKind::Int && t.int_value == 0755;
+        saw_decimal_zero |= t.kind == TokenKind::Int && t.int_value == 644;
         saw_directive |= t.kind == TokenKind::DirIf && t.newline_before;
         saw_string |= t.kind == TokenKind::String && t.text == "a\nA";
     }
     CHECK(saw_arrow);
     CHECK(saw_hex);
+    CHECK(saw_octal);
+    CHECK(saw_decimal_zero);
     CHECK(saw_directive);
     CHECK(saw_string);
 }
 
 void testLexerErrors() {
-    Fixture f("local a = 1 $\nlocal s = \"open\nlocal n = 99999999999999999999\nx # if\n");
+    Fixture f("local a = 1 $\nlocal s = \"open\nlocal n = 99999999999999999999\nx # if\nlocal o = 0o78\n");
     DiagnosticEngine engine(f.sources, f.out);
     (void)lex(f.sources, f.file, engine);
-    CHECK(engine.errorCount() == 4);
+    CHECK(engine.errorCount() == 5);
 }
 
 // `b'x'`: one byte per literal, every escape form, and `b'` never read as the identifier `b`.

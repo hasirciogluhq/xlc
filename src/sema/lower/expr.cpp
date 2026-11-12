@@ -731,6 +731,24 @@ Lowerer::EP Lowerer::fieldExpr(const Expr& e, const Type* expected) {
         f->lhs = std::move(base);
         return f;
     }
+    if (agg.kind == TypeKind::Array && e.text == "len") {
+        // `[T; N].len` is the compile-time constant `N` as `usize`; the array itself is not read,
+        // so a base that would run code (`make().len`) is refused instead of being skipped.
+        const std::optional<std::uint64_t> n = arrayLength(s_, agg);
+        if (!n) {
+            return nullptr;
+        }
+        if (lower::astHasSideEffects(*e.lhs)) {
+            err("E0709",
+                e.span,
+                "`.len` of an array does not evaluate the array",
+                std::format("the length is the constant {}; bind the array to a local first, or "
+                            "write the constant",
+                            *n));
+            return nullptr;
+        }
+        return intConst(*n, Type::makeInt(0, false), e.span);
+    }
     if (!lower::isAggregate(agg) && agg.kind != TypeKind::Tuple) {
         err("E0709",
             e.span,
@@ -904,11 +922,31 @@ Lowerer::EP Lowerer::unaryExpr(const Expr& e, const Type* expected) {
             return v; // `&fn` is the function pointer itself
         }
         if (!lower::isUnknown(v->type) && !v->lvalue) {
-            err("E0709",
-                e.span,
-                "cannot take the address of this expression",
-                "not a place (variable, `*p`, field or element)");
-            return nullptr;
+            // `&make()`: the temporary is held in a hidden local declared in front of the
+            // statement, so the pointer stays valid until the enclosing block ends (where a
+            // droppable temporary is dropped). It is evaluated before the statement's other
+            // operands, like a `?`.
+            if (prelude_ == nullptr || in_defer_ != 0 || v->type.isVoid()) {
+                err("E0709",
+                    e.span,
+                    "cannot take the address of this expression",
+                    "not a place (variable, `*p`, field or element); bind the value to a local "
+                    "first");
+                return nullptr;
+            }
+            const Type t = v->type;
+            const hir::LocalId tmp = hiddenLocal("tmp", t, e.span);
+            hir::Stmt hold;
+            hold.kind = hir::StmtKind::Local;
+            hold.span = e.span;
+            hold.local = tmp;
+            hold.value = moveOut(std::move(v));
+            prelude_->push_back(std::move(hold));
+            if (needsDrop(t)) {
+                registerDrop(tmp, t, true, e.span, *prelude_);
+            }
+            v = localRef(tmp, t, e.span);
+            v->lvalue = true;
         }
         EP a = mk(hir::ExprKind::AddrOf,
                   lower::isUnknown(v->type) ? lower::unknownType() : Type::makePointer(v->type),
@@ -926,17 +964,48 @@ Lowerer::EP Lowerer::binaryExpr(const Expr& e, const Type* expected) {
     const std::size_t mark = preludeMark();
     if (op == BinaryOp::And || op == BinaryOp::Or) {
         EP l = coerce(expr(*e.lhs, &boolean), boolean, e.lhs->span);
-        ++lazy_; // the right side may not run: a `?` there could not be hoisted
-        EP r = coerce(expr(*e.rhs, &boolean), boolean, e.rhs->span);
-        --lazy_;
+        // The right side runs only when the left one does not decide: what it hoists (`?`,
+        // `&temp()`) goes on that path, `local t = l; if t { pre; t = r }` (`if !t` for `||`).
+        std::vector<hir::Stmt> pre;
+        EP r = hoistedInto(
+            pre, [&] { return coerce(expr(*e.rhs, &boolean), boolean, e.rhs->span); });
         if (!l || !r) {
             return nullptr;
         }
-        EP b = mk(hir::ExprKind::Binary, boolean, e.span);
-        b->binary_op = op;
-        b->lhs = std::move(l);
-        b->rhs = std::move(r);
-        return b;
+        if (pre.empty()) {
+            EP b = mk(hir::ExprKind::Binary, boolean, e.span);
+            b->binary_op = op;
+            b->lhs = std::move(l);
+            b->rhs = std::move(r);
+            return b;
+        }
+        const hir::LocalId t = hiddenLocal(op == BinaryOp::And ? "and" : "or", boolean, e.span);
+        hir::Stmt hold;
+        hold.kind = hir::StmtKind::Local;
+        hold.span = e.span;
+        hold.local = t;
+        hold.value = std::move(l);
+        prelude_->push_back(std::move(hold));
+        hir::Stmt branch;
+        branch.kind = hir::StmtKind::If;
+        branch.span = e.span;
+        branch.value = localRef(t, boolean, e.span);
+        if (op == BinaryOp::Or) {
+            EP n = mk(hir::ExprKind::Unary, boolean, e.span);
+            n->unary_op = UnaryOp::Not;
+            n->lhs = std::move(branch.value);
+            branch.value = std::move(n);
+        }
+        branch.body = std::move(pre);
+        hir::Stmt set;
+        set.kind = hir::StmtKind::Assign;
+        set.span = e.span;
+        set.target = localRef(t, boolean, e.span);
+        set.target->lvalue = true;
+        set.value = std::move(r);
+        branch.body.push_back(std::move(set));
+        prelude_->push_back(std::move(branch));
+        return localRef(t, boolean, e.span);
     }
     const bool is_cmp = op >= BinaryOp::Eq && op <= BinaryOp::Ge;
     const auto isLiteral = [](const Expr& x) {

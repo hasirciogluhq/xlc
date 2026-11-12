@@ -40,7 +40,7 @@ struct Lowerer::FnFrame {
     std::vector<hir::Stmt> unwind_entries;
     bool has_try;
     std::vector<hir::Stmt>* prelude;
-    int lazy;
+    int in_defer;
     std::map<hir::LocalId, hir::LocalId> drop_flags;
     std::string base_init_call;
     bool inferring;
@@ -59,7 +59,7 @@ struct Lowerer::FnFrame {
           unwind_entries(std::exchange(self.unwind_entries_, {})),
           has_try(std::exchange(self.has_try_, false)),
           prelude(std::exchange(self.prelude_, nullptr)),
-          lazy(std::exchange(self.lazy_, 0)),
+          in_defer(std::exchange(self.in_defer_, 0)),
           drop_flags(std::exchange(self.drop_flags_, {})),
           base_init_call(std::exchange(self.base_init_call_, {})),
           inferring(std::exchange(self.inferring_, false)),
@@ -81,7 +81,7 @@ struct Lowerer::FnFrame {
         l.unwind_entries_ = std::move(unwind_entries);
         l.has_try_ = has_try;
         l.prelude_ = prelude;
-        l.lazy_ = lazy;
+        l.in_defer_ = in_defer;
         l.drop_flags_ = std::move(drop_flags);
         l.base_init_call_ = std::move(base_init_call);
         l.inferring_ = inferring;

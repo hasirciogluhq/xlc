@@ -1714,7 +1714,10 @@ class Parser {
         Stmt stmt;
         stmt.kind = Stmt::Kind::Switch;
         advance(); // 'switch'
-        stmt.expr = parseCondition();
+        // `switch { case a < b { } ... }` has no subject: each `case` lists conditions instead.
+        if (!at(TokenKind::LBrace)) {
+            stmt.expr = parseCondition();
+        }
         expect(TokenKind::LBrace, "`{` opening the `switch` body");
         const int saved_depth = nl_depth_;
         const bool saved_no_struct = no_struct_;

@@ -726,6 +726,37 @@ void testGenerics() {
                   " return 0 }\n");
         CHECK(b.failedWith("E0725"));
     }
+    {
+        // A generic method of a generic class keeps its own type parameter in every instance of
+        // the class; a method parameter named like the class's keeps its own meaning.
+        Lowered b("class Box<T> {\n value: T\n fn init(self, v: T) { self.value = v }\n"
+                  " fn map<U>(self, f: fn(T) -> U) -> Box<U> { return Box<U>(f(self.value)) }\n"
+                  " fn pair<U>(self, other: U) -> (T, U) { return (self.value, other) }\n"
+                  " fn same<T>(self, x: T) -> T { return x }\n}\n"
+                  "fn wide(x: i32) -> i64 { return x as i64 }\n"
+                  "fn main() -> i32 {\n local b = Box<i32>(1)\n local m = b.map(wide)\n"
+                  " local p = b.pair(true)\n local s: bool = b.same(false)\n"
+                  " return m.value == 1 && p.1 && !s ? 0 : 1 }\n");
+        CHECK(!b.diag->hasErrors());
+    }
+    {
+        // A plain method of a generic class instance is lowered only when code names it, and
+        // `if __builtin_needsDrop<T>()` lowers only the branch that runs.
+        constexpr std::string_view holder =
+            "class Name {\n n: i32\n fn init(self) { self.n = 1 }\n fn drop(self) { }\n"
+            " fn clone(self) -> Name { return Name() }\n}\n"
+            "class Holder<T> {\n v: T\n fn init(self, v: T) { self.v = v }\n"
+            " fn copy(self) -> T {\n  if __builtin_needsDrop<T>() { return self.v.clone() }\n"
+            "  else { return self.v }\n }\n"
+            " fn twice(self) -> T { return self.v.twice() }\n}\n";
+        Lowered unused(std::string(holder) +
+                       "fn main() -> i32 {\n local h = Holder<i32>(3)\n local c = h.copy()\n"
+                       " local n = Holder<Name>(Name())\n local d = n.copy()\n return c }\n");
+        CHECK(!unused.diag->hasErrors());
+        Lowered used(std::string(holder) +
+                     "fn main() -> i32 {\n local h = Holder<i32>(3)\n return h.twice() }\n");
+        CHECK(used.failedWith("E0709"));
+    }
 }
 
 // ---- generic payload enums: `enum Boxed<T> { Empty Full(T) }` is one type per argument list
@@ -1096,15 +1127,26 @@ void testTryOperator() {
             "}\n");
         CHECK(!ok.diag->hasErrors());
     }
-    // E0761: no statement to hoist into, or an operand that may not run.
+    // An operand that runs only on some paths hoists onto that path: a loop condition, the right
+    // side of `&&`/`||`, a `?:` branch, a later `case` of a subject-less `switch`.
+    {
+        const auto ok = program(
+            "fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
+            "fn f(n: i32) -> Result<i32, i32> {\n"
+            "    while half(n)? > 0 { break }\n"
+            "    do { } while half(n)? < 0\n"
+            "    for local i = 0; i < half(n)?; i++ { }\n"
+            "    local a = n > 0 && half(n)? > 0 || half(n)? < 0\n"
+            "    local b = n > 0 ? half(n)? : 0\n"
+            "    switch { case n > 0 { } case half(n)? > 1 { } default { } }\n"
+            "    return Result.Ok(a ? b : 0)\n"
+            "}\n");
+        CHECK(!ok.diag->hasErrors());
+    }
+    // E0761: a deferred statement runs while the block is left and cannot return.
     CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
-                  "fn f(n: i32) -> Result<i32, i32> {\n while half(n)? > 0 { }\n return Result.Ok(0)\n}\n")
-              .failedWith("E0761"));
-    CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
-                  "fn f(n: i32) -> Result<bool, i32> {\n return Result.Ok(n > 0 && half(n)? > 0)\n}\n")
-              .failedWith("E0761"));
-    CHECK(program("fn half(n: i32) -> Result<i32, i32> { return Result.Ok(n) }\n"
-                  "fn f(n: i32) -> Result<i32, i32> {\n return Result.Ok(n > 0 ? half(n)? : 0)\n}\n")
+                  "fn g(n: i32) { }\n"
+                  "fn f(n: i32) -> Result<i32, i32> {\n defer g(half(n)?)\n return Result.Ok(0)\n}\n")
               .failedWith("E0761"));
     // E0762: the operand is not a success-or-failure enum.
     CHECK(program("fn f(n: i32) -> Result<i32, i32> {\n local x = n?\n return Result.Ok(x)\n}\n")
@@ -1121,6 +1163,42 @@ void testTryOperator() {
     CHECK(program("fn f(a: str) -> bool { return a < \"x\" }\n").failedWith("E0709"));
     // A ternary is still a ternary: its `?` is followed by a value.
     CHECK(!program("fn f(n: i32) -> i32 { return n > 0 ? -1 : 1 }\n").diag->hasErrors());
+}
+
+// `[T; N].len`, `for b in str` by value, a subject-less `switch` and `&temp()`.
+void testLanguageForms() {
+    const auto program = [](std::string_view body) { return Lowered(std::string(body)); };
+    CHECK(!program("fn f(p: *[i32; 4]) -> usize {\n"
+                   "    local a: [u8; 3] = [1, 2, 3]\n"
+                   "    local n: usize = a.len + p.len\n"
+                   "    return n\n"
+                   "}\n")
+               .diag->hasErrors());
+    // The array is not evaluated, so a base that runs code is refused.
+    CHECK(program("fn make() -> [i32; 2] { return [1, 2] }\nfn f() -> usize { return make().len }\n")
+              .failedWith("E0709"));
+    // A `str` yields `u8` values: arithmetic on the loop variable needs no dereference.
+    CHECK(!program("fn f(s: str) -> u32 {\n"
+                   "    local sum: u32 = 0\n"
+                   "    for b in s { sum += b as u32 }\n"
+                   "    return sum\n"
+                   "}\n")
+               .diag->hasErrors());
+    CHECK(program("fn f(s: str) -> u8 {\n for b in s { return *b }\n return 0\n}\n").failedWith("E0709"));
+    CHECK(!program("fn f(n: i32) -> i32 {\n"
+                   "    switch {\n"
+                   "        case n < 0 { return -1 }\n"
+                   "        case n == 0, n == 10 { return 0 }\n"
+                   "        default { }\n"
+                   "    }\n"
+                   "    return 1\n"
+                   "}\n")
+               .diag->hasErrors());
+    CHECK(!program("struct P { x: i32 }\n"
+                   "fn make() -> P { return P { x: 1 } }\n"
+                   "fn get(p: *P) -> i32 { return p.x }\n"
+                   "fn f() -> i32 { return get(&make()) }\n")
+               .diag->hasErrors());
 }
 
 void testSlices() {
@@ -1199,4 +1277,5 @@ void runLowerTests() {
     RUN(testByteLiterals);
     RUN(testUnsignedSpelling);
     RUN(testSlices);
+    RUN(testLanguageForms);
 }

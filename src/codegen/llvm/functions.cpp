@@ -210,8 +210,11 @@ void Gen::genStmt(const hir::Stmt& s) {
             B_.CreateBr(next_bb);
         }
         if (step_bb != nullptr) {
+            // A `break` in the step leaves this loop (a `do { } while c?` tests `c` there).
             B_.SetInsertPoint(step_bb);
+            loops_.push_back({cond_bb, end_bb});
             genStmts(s.step);
+            loops_.pop_back();
             if (!hasTerminator(B_.GetInsertBlock())) {
                 B_.CreateBr(cond_bb);
             }

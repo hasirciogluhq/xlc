@@ -457,7 +457,7 @@ class Dumper {
             break;
         }
         case Stmt::Kind::Switch: {
-            line(std::format("{}switch {}", attrs, expr(*s.expr)));
+            line(s.expr ? std::format("{}switch {}", attrs, expr(*s.expr)) : attrs + "switch");
             Scope scope(*this);
             for (const SwitchCase& c : s.cases) {
                 std::string head = c.is_default ? "default" : "case";

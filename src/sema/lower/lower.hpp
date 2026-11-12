@@ -393,6 +393,21 @@ struct LowerShared {
     std::set<std::string> init_fns; ///< qualified names of the `@init` functions
     std::set<std::string> fini_fns; ///< qualified names of the `@fini` functions
     std::string entry_fn;           ///< qualified name of the `@entry` function (empty = none yet)
+    /// A plain method of a generic class instance is lowered only once a lowered function refers
+    /// to it, like a member of a C++ class template: `Vec<Entry>` never lowers `clone` unless the
+    /// program calls it, so a body that needs something of `T` only binds the instances that use
+    /// it. Virtual methods, `init` and `drop` are lowered with the class.
+    struct LazyMethod {
+        Sema* owner{nullptr};
+        const Item* item{nullptr}; ///< the class instance
+        const FnDecl* decl{nullptr};
+        std::string local_name;
+        std::string cls_q;
+        Type self;
+        bool overloaded{false};
+    };
+    std::map<std::string, LazyMethod> lazy_methods; ///< by function name, until referred to
+    std::size_t lazy_scanned{0};                    ///< functions of `module` already searched
 
     /// `@init`, `@fini` and `@entry` functions are started by the generated code, never called by
     /// user code.
@@ -409,6 +424,8 @@ class Lowerer {
     void collectImpls();
     /// Lowers the generic instances created since the last call; true when there were any.
     bool lowerPendingInstances();
+    /// Lowers one method that was put aside in `LowerShared::lazy_methods` (this Lowerer owns it).
+    void lowerLazyMethod(const LowerShared::LazyMethod& m, const std::string& key);
     /// Ends the module scope (after every instance is lowered).
     void finish();
     void checkRegistrations();
@@ -739,6 +756,8 @@ class Lowerer {
     void lowerForRange(const Stmt& s, std::vector<hir::Stmt>& out);
     void lowerForEach(const Stmt& s, std::vector<hir::Stmt>& out);
     void lowerSwitch(const Stmt& s, std::vector<hir::Stmt>& out);
+    /// `switch { case cond { } ... }`: no subject, each `case` lists conditions (an `if` chain).
+    void lowerConditionSwitch(const Stmt& s, std::vector<hir::Stmt>& out);
     void lowerJump(const Stmt& s, std::vector<hir::Stmt>& out);
     /// Appends clones of the deferred statements of the frames `[from, defers_.size())`, innermost
     /// first.
@@ -747,10 +766,32 @@ class Lowerer {
     /// `e?`: hoists the evaluation of `e` and the early `return` of its failure into `prelude_`
     /// (the statements run before the statement being lowered) and yields the success value.
     EP tryExpr(const Expr& e);
-    /// Statements the statement being lowered runs first (`?` hoists there); null where nothing
-    /// may be hoisted (loop conditions, `defer`).
+    /// Statements the statement being lowered runs first (`?` and `&temp()` hoist there); null
+    /// outside a statement.
     std::vector<hir::Stmt>* prelude_{nullptr};
-    int lazy_{0}; ///< inside an operand that may not run (`&&`/`||` right side, a ternary branch)
+    int in_defer_{0}; ///< inside a `defer` body: it runs at block exit, so nothing may be hoisted
+    /// Lowers an operand that runs only on some paths (the right side of `&&`/`||`, a `?:` branch,
+    /// a loop condition, a later `case` condition) with a prelude of its own, `pre`; the caller
+    /// places `pre` on the operand's path. Inside a `defer` the current prelude stays, so `?` is
+    /// refused there as before.
+    template <class F> EP hoistedInto(std::vector<hir::Stmt>& pre, F&& lower) {
+        if (in_defer_ != 0 || prelude_ == nullptr) {
+            return lower();
+        }
+        const auto saved = std::exchange(prelude_, &pre);
+        EP out = lower();
+        prelude_ = saved;
+        return out;
+    }
+    /// The value of an `if` condition that is `__builtin_needsDrop<T>()` or its negation; nullopt
+    /// for any other condition. Such an `if` lowers only the branch that runs.
+    [[nodiscard]] std::optional<bool> dropTest(const Expr& cond);
+    /// A loop condition, lowered with its own prelude `pre` (a loop statement has none).
+    EP loopCondition(const Expr& cond, std::vector<hir::Stmt>& pre);
+    /// Sets the test of `loop`. With nothing hoisted it is the `while` condition; otherwise `pre`
+    /// and `if !cond { break }` run at the top of every pass (`while true { pre; if !cond break;
+    /// body }`), or after the body and `continue` for `do { } while`.
+    void guardLoop(hir::Stmt& loop, std::vector<hir::Stmt> pre, EP cond);
     hir::LocalId hiddenLocal(const char* prefix, const Type& type, const Span& span);
     hir::LocalId
     addLocal(const std::string& name, const Type& type, bool is_param, const Span& span);
