@@ -415,12 +415,26 @@ Lowerer::EP Lowerer::moveOut(EP value, bool fromSum) {
         return value;
     }
     if (value->kind == hir::ExprKind::LocalRef) {
-        const auto it = drop_flags_.find(value->local);
-        if (it == drop_flags_.end()) {
+        hir::LocalId flag;
+        if (const auto it = drop_flags_.find(value->local); it != drop_flags_.end()) {
+            flag = it->second;
+        } else if (const auto b = sum_bindings_.find(value->local); b != sum_bindings_.end()) {
+            // A `case` binding is a view of the payload the switched-on local still owns: taking
+            // it consumes that local (its flag), so the payload has one owner.
+            if (!b->second) {
+                err("E0720",
+                    value->span,
+                    "cannot move a payload out of a `switch` on a field or pointer",
+                    "switch on a local that owns the value (`switch r`, `r` taken by value), "
+                    "or use `?`");
+                return nullptr;
+            }
+            flag = *b->second;
+        } else {
             return value;
         }
         EP m = mk(hir::ExprKind::Move, value->type, value->span);
-        m->local = it->second;
+        m->local = flag;
         m->lhs = std::move(value);
         return m;
     }
@@ -1488,7 +1502,10 @@ Lowerer::EP Lowerer::ternaryExpr(const Expr& e, const Type* expected) {
     if (!b) {
         return nullptr;
     }
-    if (!pre_a.empty() || !pre_b.empty()) {
+    // A droppable result also takes this form: a `select` would evaluate both branches, so it
+    // could not move only the chosen local out (its drop flag stays set and frees the result).
+    if (!pre_a.empty() || !pre_b.empty() ||
+        (needsDrop(t) && prelude_ != nullptr && in_defer_ == 0)) {
         // `local r; if cond { pre_a; r = a } else { pre_b; r = b }`: `r` starts zeroed and takes
         // the chosen value raw (moved, nothing to drop first); it is dropped like a temporary.
         const hir::LocalId r = hiddenLocal("sel", t, e.span);

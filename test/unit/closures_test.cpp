@@ -88,6 +88,30 @@ void testGenericFunctionTakesAnyClosure() {
     CHECK(r.has("fn apply<fn(i32) -> i32>"));
 }
 
+void testGenericCallAlsoConvertsToAnInterface() {
+    // `F` is inferred while another argument (`&q`) converts to an interface parameter.
+    Lowered r("interface Shape { fn area(self) -> i32 }\n"
+              "struct Sq { s: i32 }\n"
+              "impl Shape for Sq { fn area(self) -> i32 { return self.s } }\n"
+              "class Calc {\n fn apply<F>(self, sh: Shape, f: F) -> i32 { return f(sh.area()) }\n}\n"
+              "fn apply2<F>(sh: Shape, f: F) -> i32 { return f(sh.area()) }\n"
+              "fn main() -> i32 {\n"
+              "    local q = Sq { s: 3 }\n"
+              "    local c = Calc { }\n"
+              "    local m = 2\n"
+              "    return c.apply(&q, |x: i32| x * m) + apply2(&q, |x: i32| x * m)\n"
+              "}\n");
+    CHECK(!r.diag->hasErrors());
+}
+
+void testKeywordAsMemberName() {
+    // After `fn` in a type body and after `.` a keyword is a name: `fn delete`, `c.delete(1)`.
+    Lowered r("class Client {\n fn delete(self, x: i32) -> i32 { return x }\n}\n"
+              "fn main() -> i32 {\n local c = Client { }\n return c.delete(1)\n}\n");
+    CHECK(!r.diag->hasErrors());
+    CHECK(r.has("Client.delete"));
+}
+
 void testNestedClosuresCaptureThroughEachOther() {
     Lowered r("fn main() -> i32 {\n"
               "    local k = 3\n"
@@ -174,6 +198,8 @@ void runClosureTests() {
     RUN(testCapturesAreBorrowedThroughAStruct);
     RUN(testMoveCopiesTheValue);
     RUN(testGenericFunctionTakesAnyClosure);
+    RUN(testGenericCallAlsoConvertsToAnInterface);
+    RUN(testKeywordAsMemberName);
     RUN(testNestedClosuresCaptureThroughEachOther);
     RUN(testLocalsOfTheClosureShadowTheOuterOnes);
     RUN(testClosureInsideAGenericFunction);

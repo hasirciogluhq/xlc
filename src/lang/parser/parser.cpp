@@ -152,6 +152,15 @@ class Parser {
         return advance().text;
     }
 
+    /// A member name: an identifier, or a word keyword where only a name can stand (after `fn` in a
+    /// class, interface or impl body, and after `.`), so `fn delete(...)` and `c.delete(url)` work.
+    [[nodiscard]] bool atMemberName() const {
+        const std::string& t = cur().text;
+        return at(TokenKind::Ident) ||
+               (!t.empty() && ((t[0] >= 'a' && t[0] <= 'z') || (t[0] >= 'A' && t[0] <= 'Z')) &&
+                !at(TokenKind::Int) && !at(TokenKind::Float));
+    }
+
     void softError(const Span& span, std::string message, std::string label) {
         diag_.error("E0002", span, std::move(message), std::move(label));
     }
@@ -971,7 +980,7 @@ class Parser {
                     expr = std::move(elem);
                     continue;
                 }
-                if (!at(TokenKind::Ident)) {
+                if (!atMemberName()) {
                     expected("a member name after `.`");
                 }
                 ExprPtr field = makeExpr(Expr::Kind::Field, expr->span);
@@ -2108,7 +2117,7 @@ class Parser {
         std::string name;
         if (auto op = parseOperatorName()) {
             name = std::move(*op);
-        } else if (at(TokenKind::Ident)) {
+        } else if (member ? atMemberName() : at(TokenKind::Ident)) {
             name = advance().text;
         } else {
             expected("a function name");

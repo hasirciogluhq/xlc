@@ -767,7 +767,18 @@ bool Lowerer::unifyParam(const Type& pattern,
         return true;
     }
     const auto concrete = owner.resolve(pattern);
-    return concrete && lower::sameType(*concrete, actual);
+    if (!concrete) {
+        return false;
+    }
+    if (lower::sameType(*concrete, actual)) {
+        return true;
+    }
+    // A parameter that names no type parameter takes any argument that converts to it (`&obj` to
+    // an interface, an integer widening); the call coerces and checks it after inference.
+    hir::Expr probe;
+    probe.type = actual;
+    probe.lvalue = true;
+    return convertible(probe, *concrete);
 }
 
 std::vector<Lowerer::PreArg> Lowerer::preLowerArgs(const Expr& call) {
@@ -1448,6 +1459,19 @@ void Lowerer::lowerSumSwitch(const Stmt& s, EP scrutinee, std::vector<hir::Stmt>
     block.span = s.span;
     scopes_.push(ScopeKind::Block);
     const hir::LocalId id = hiddenLocal("sw", self, s.span);
+    // Who owns the payloads the bindings view: a local with a drop flag (moving a binding out
+    // clears it), a place (nothing can be moved out), or a temporary (no entry: it is not dropped).
+    std::optional<std::optional<hir::LocalId>> owner;
+    if (scrutinee->kind == hir::ExprKind::LocalRef) {
+        if (const auto it = drop_flags_.find(scrutinee->local); it != drop_flags_.end()) {
+            owner = it->second;
+        } else if (const auto b = sum_bindings_.find(scrutinee->local); b != sum_bindings_.end()) {
+            owner = b->second;
+        }
+    } else if (scrutinee->kind == hir::ExprKind::Field || scrutinee->kind == hir::ExprKind::Index ||
+               scrutinee->kind == hir::ExprKind::Deref) {
+        owner = std::optional<hir::LocalId>{};
+    }
     {
         hir::Stmt d;
         d.kind = hir::StmtKind::Local;
@@ -1586,6 +1610,9 @@ void Lowerer::lowerSumSwitch(const Stmt& s, EP scrutinee, std::vector<hir::Stmt>
                 d.value = std::move(read);
                 arm.body.push_back(std::move(d));
                 bindLocal(name.text, local, field_type, name.span);
+                if (owner && needsDrop(field_type)) {
+                    sum_bindings_[local] = *owner;
+                }
             }
         }
         lowerBlock(*c.body, arm.body, true);
@@ -1807,6 +1834,7 @@ void Lowerer::lowerFunction(const FnDecl& f,
     entry_temps_.clear();
     entry_flags_.clear();
     unwind_entries_.clear();
+    sum_bindings_.clear();
     has_try_ = false;
     defers_.emplace_back();
     std::vector<Type> param_types;

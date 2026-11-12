@@ -804,6 +804,36 @@ void testGenericPayloadEnums() {
                    "fn main() -> i32 { return 0 }\n");
         CHECK(!ok.diag->hasErrors());
     }
+    {
+        // Moving a `case` binding out consumes the switched-on local (its flag is cleared), so the
+        // payload is not dropped twice; a switch on a place cannot give its payload away.
+        const std::string res = "class Res {\n fn drop(self) { }\n}\n"
+                                "enum Boxed {\n Empty\n Full(Res)\n}\n";
+        Lowered moved(res + "fn f(b: Boxed) -> Res {\n"
+                            "    switch b {\n"
+                            "        case Boxed.Full(v) { return v }\n"
+                            "        case Boxed.Empty { return Res() }\n"
+                            "    }\n"
+                            "}\n");
+        CHECK(!moved.diag->hasErrors());
+        CHECK(moved.has("= move#"));
+        CHECK(Lowered(res + "fn f(b: *Boxed, out: *Res) {\n"
+                            "    switch *b {\n"
+                            "        case Boxed.Full(v) { *out = v }\n"
+                            "        case Boxed.Empty { }\n"
+                            "    }\n"
+                            "}\n")
+                  .failedWith("E0720"));
+    }
+    {
+        // A ternary that picks a droppable local moves only the chosen value (an `if` into a
+        // hidden local), never a `select` that keeps the local's drop flag set.
+        Lowered r("class Res {\n fn drop(self) { }\n}\n"
+                  "fn f(flag: bool) -> Res {\n local s = Res()\n return flag ? s : Res()\n}\n");
+        CHECK(!r.diag->hasErrors());
+        CHECK(!r.has("select"));
+        CHECK(r.has("$sel"));
+    }
     CHECK(Lowered(std::string(boxed) + "fn main() -> i32 { return f(Boxed.Full) }\n")
               .failedWith("E0751"));
     CHECK(Lowered(std::string(boxed) + "fn main() -> i32 { local b: Boxed<i32> = Boxed.Full }\n"
