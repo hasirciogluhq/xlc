@@ -15,7 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15, ubuntu-24.04, windows-2025]
+        # Every host a release is built on (release.yml): Linux and macOS on x86-64 and arm64, Windows x86-64.
+        runner: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2025]
     steps:
       - uses: actions/checkout@v7.0.1
       # LLVM 23 on every OS, the newest release: Homebrew's `llvm` is always the newest, the Linux build uses apt.llvm.org through
