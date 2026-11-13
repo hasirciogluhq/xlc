@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <format>
+#include <optional>
 #include <ranges>
 #include <string_view>
 #include <utility>
@@ -57,6 +58,7 @@ class Parser {
             try {
                 parseItem(program);
             } catch (const ParseAbort&) {
+                restore(State{});
                 syncItem(start);
             }
         }
@@ -68,6 +70,35 @@ class Parser {
     }
 
   private:
+    /// The context flags that expression and statement parsing set and put back. A `ParseAbort`
+    /// skips the code that puts them back, so recovery restores the snapshot taken where it
+    /// resumes: otherwise a raised `nl_depth_` would let the next statements run on past their
+    /// line breaks.
+    struct State {
+        int nl_depth{0};
+        bool prefix_operand{false};
+        int prefix_nl_base{0};
+        bool no_struct{false};
+        bool for_header{false};
+        bool cast_type{false};
+        std::size_t open_ternaries{0};
+    };
+
+    [[nodiscard]] State state() const {
+        return {nl_depth_, prefix_operand_, prefix_nl_base_, no_struct_, for_header_, cast_type_,
+                open_ternaries_.size()};
+    }
+
+    void restore(const State& s) {
+        nl_depth_ = s.nl_depth;
+        prefix_operand_ = s.prefix_operand;
+        prefix_nl_base_ = s.prefix_nl_base;
+        no_struct_ = s.no_struct;
+        for_header_ = s.for_header;
+        cast_type_ = s.cast_type;
+        open_ternaries_.resize(s.open_ternaries);
+    }
+
     // ------------------------------------------------------------------------------------
     // Token access
 
@@ -223,7 +254,17 @@ class Parser {
         if (pos_ == start && !at(TokenKind::End) && !at(TokenKind::RBrace)) {
             advance();
         }
+        // Braces the failed statement opened and did not close (a `switch` body, a struct
+        // literal, a closure), counted from its start like `syncItem`, so the rest of them is
+        // skipped instead of being parsed as statements of the enclosing block.
         int depth = 0;
+        for (std::size_t i = start; i < pos_; ++i) {
+            if (tokens_[i].kind == TokenKind::LBrace) {
+                ++depth;
+            } else if (tokens_[i].kind == TokenKind::RBrace && depth > 0) {
+                --depth;
+            }
+        }
         while (!at(TokenKind::End)) {
             if (depth == 0 && (cur().newline_before || at(TokenKind::RBrace))) {
                 return;
@@ -363,12 +404,15 @@ class Parser {
     std::vector<Type> parseTypeArgs() {
         std::vector<Type> args;
         expect(TokenKind::Lt, "`<` starting the type arguments");
+        // Inside `<...>` a nested `<` always opens type arguments, also in the type of a cast.
+        const bool saved_cast = std::exchange(cast_type_, false);
         while (!at(TokenKind::Gt) && !at(TokenKind::Shr) && !at(TokenKind::End)) {
             args.push_back(parseType());
             if (!match(TokenKind::Comma)) {
                 break;
             }
         }
+        cast_type_ = saved_cast;
         closeAngle();
         return args;
     }
@@ -398,50 +442,95 @@ class Parser {
         }
     }
 
-    /// Whether the `<` at the cursor opens type arguments of an identifier in an expression: they
-    /// must close with `>` directly followed by `(` or `{`, and contain only type-like tokens.
-    /// Otherwise the `<` is a comparison.
-    [[nodiscard]] bool genericArgsAhead() const {
-        int depth = 0;
+    /// Index of the `>` that closes the angle brackets opened by the `<` at the cursor, when
+    /// everything in between is made of type tokens: names, primitives, `*`, `.`, `,`, array and
+    /// slice brackets with an integer length, tuple parentheses and `fn(...) -> R`. Nothing is
+    /// returned when another token comes first, or when a `)`/`]`/`>` has no opener inside.
+    [[nodiscard]] std::optional<std::size_t> typeArgsClose() const {
+        int angles = 0;
+        int groups = 0; // `(` and `[` inside the arguments
         for (std::size_t i = pos_; i < tokens_.size(); ++i) {
             switch (tokens_[i].kind) {
             case TokenKind::Lt:
-                ++depth;
+                ++angles;
                 break;
             case TokenKind::Gt:
-                --depth;
+                --angles;
                 break;
             case TokenKind::Shr:
-                depth -= 2;
+                angles -= 2;
+                break;
+            case TokenKind::LParen:
+            case TokenKind::LBracket:
+                ++groups;
+                break;
+            case TokenKind::RParen:
+            case TokenKind::RBracket:
+                if (--groups < 0) {
+                    return std::nullopt;
+                }
                 break;
             case TokenKind::Ident:
             case TokenKind::PrimType:
             case TokenKind::Star:
             case TokenKind::Comma:
             case TokenKind::Dot:
-            case TokenKind::LBracket:
-            case TokenKind::RBracket:
             case TokenKind::Int:
             case TokenKind::Semicolon:
+            case TokenKind::Fn:
+            case TokenKind::Arrow:
                 break;
             default:
-                return false;
+                return std::nullopt;
             }
-            if (depth < 0) {
-                return false;
+            if (angles < 0) {
+                return std::nullopt;
             }
-            if (depth == 0) {
-                // A `>` that ends a comparison needs a right operand, so after it these tokens
-                // can only close type arguments of a generic function value or call.
-                const bool ends_here = i + 1 >= tokens_.size() || tokens_[i + 1].newline_before;
-                const TokenKind next =
-                    i + 1 < tokens_.size() ? tokens_[i + 1].kind : TokenKind::End;
-                return ends_here || next == TokenKind::LParen || next == TokenKind::LBrace ||
-                       next == TokenKind::RParen || next == TokenKind::RBracket ||
-                       next == TokenKind::Comma || next == TokenKind::Semicolon;
+            if (angles == 0) {
+                // A `>` inside `(` or `[` cannot close the arguments: types never hold one there
+                // except as a nested argument list, which is already counted.
+                return groups == 0 ? std::optional{i} : std::nullopt;
             }
         }
-        return false;
+        return std::nullopt;
+    }
+
+    /// Whether the `<` at the cursor opens type arguments of an identifier in an expression: they
+    /// hold only type tokens (`typeArgsClose`) and the `>` is followed by what no comparison's right
+    /// operand starts with: `(`, `{`, `)`, `]`, `,`, `;` or the end of the line. Otherwise the `<`
+    /// is a comparison.
+    [[nodiscard]] bool genericArgsAhead() const {
+        const std::optional<std::size_t> close = typeArgsClose();
+        if (!close) {
+            return false;
+        }
+        const std::size_t i = *close;
+        if (i + 1 >= tokens_.size() || tokens_[i + 1].newline_before) {
+            return true;
+        }
+        using enum TokenKind;
+        return std::ranges::contains(std::array{LParen, LBrace, RParen, RBracket, Comma, Semicolon},
+                                     tokens_[i + 1].kind);
+    }
+
+    /// Whether the `<` after the type name of `x as T` opens type arguments (`x as Box<i32>`) rather
+    /// than comparing the cast value (`x as Idx < n`): they hold only type tokens (`typeArgsClose`)
+    /// and the `>` is not followed, on its line, by a token that starts an operand (a name, a
+    /// literal, `(`, `[`, `self`, `!`, `~`, a closure), which only a comparison `a < b > c` has.
+    [[nodiscard]] bool castTypeArgsAhead() const {
+        const std::optional<std::size_t> close = typeArgsClose();
+        if (!close) {
+            return false;
+        }
+        const std::size_t i = *close;
+        if (i + 1 >= tokens_.size() || tokens_[i + 1].newline_before) {
+            return true;
+        }
+        using enum TokenKind;
+        return !std::ranges::contains(std::array{Ident, PrimType, Int, Float, String, ByteLit, True,
+                                                 False, SelfKw, LParen, LBracket, Bang, Tilde, Pipe,
+                                                 OrOr, New, Fn},
+                                      tokens_[i + 1].kind);
     }
 
     Type parseType() {
@@ -534,7 +623,7 @@ class Parser {
                 path.push_back(advance().text);
             }
             type = Type::makeNamed(std::move(path));
-            if (at(TokenKind::Lt)) {
+            if (at(TokenKind::Lt) && (!cast_type_ || castTypeArgsAhead())) {
                 type.args = parseTypeArgs();
             }
             break;
@@ -555,8 +644,10 @@ class Parser {
     ExprPtr parseTernary() {
         ExprPtr cond = parseOr();
         if (at(TokenKind::Question) && continues()) {
+            open_ternaries_.push_back(pos_);
             advance();
             ExprPtr then_value = parseTernary();
+            open_ternaries_.pop_back();
             expect(TokenKind::Colon, "`:` between the two branches of `?`");
             ExprPtr else_value = parseTernary();
             ExprPtr e = makeExpr(Expr::Kind::Ternary, Span::merge(cond->span, else_value->span));
@@ -689,7 +780,9 @@ class Parser {
         ExprPtr value = parseUnary();
         while (at(TokenKind::As) && continues()) {
             advance();
-            Type target = parseType();
+            const bool saved_cast = std::exchange(cast_type_, true);
+            Type target = parseType(); // a `ParseAbort` here is undone by the recovery's `restore`
+            cast_type_ = saved_cast;
             ExprPtr e = makeExpr(Expr::Kind::Cast, Span::merge(value->span, prev().span));
             e->lhs = std::move(value);
             e->type = std::move(target);
@@ -878,11 +971,13 @@ class Parser {
         return operand;
     }
 
-    /// A `?` that propagates (`f()?`) rather than starts a ternary: it touches the operand before
-    /// it, and what follows cannot be the first token of a ternary's value: the end of the line or
-    /// of the file, a closing or separating token (`;`, `)`, `]`, `}`, `,`, `.`, `{`, another
-    /// `?`), or an operator that only works between two operands (`f()? + 1`, `a? == b?`, `as`).
-    /// `-`, `*`, `&`, `!` and `~` start an expression, so `c ? -1 : 1` stays a ternary.
+    /// A `?` that propagates (`f()?`) rather than starts a ternary. It must touch the operand
+    /// before it. Then it propagates when what follows cannot be the first token of a ternary's
+    /// value: the end of the line or of the file, a closing or separating token (`;`, `)`, `]`,
+    /// `}`, `,`, `.`, `{`, `:`, another `?`), or an operator that only works between two operands
+    /// (`f()? + 1`, `a? == b?`, `as`). Otherwise (`-`, `*`, `&`, a name, a literal follow) it is a
+    /// ternary only when its `:` follows (`ternaryColonAhead`): `c? -1 : 1` is a ternary,
+    /// `f()? - 1` and `f()? * 2` propagate.
     [[nodiscard]] bool tryOperatorAhead() const {
         if (!at(TokenKind::Question) || !continues() || !adjacent(prev(), cur())) {
             return false;
@@ -895,7 +990,61 @@ class Parser {
                               End,
                               Plus, Slash, Percent, Pipe, Caret, Shl, Shr, EqEq, NotEq, Lt, Le, Gt,
                               Ge, AndAnd, OrOr, As, Assign, DotDot, DotDotEq},
-                   next.kind);
+                   next.kind) ||
+               !ternaryColonAhead();
+    }
+
+    /// Net count of brackets (`(`, `[`, `{`) opened and not closed by the tokens `from` .. `to - 1`.
+    [[nodiscard]] int openBrackets(std::size_t from, std::size_t to) const {
+        int depth = 0;
+        for (std::size_t i = from; i < to; ++i) {
+            using enum TokenKind;
+            const TokenKind k = tokens_[i].kind;
+            depth += (k == LParen || k == LBracket || k == LBrace) ? 1
+                     : (k == RParen || k == RBracket || k == RBrace) ? -1
+                                                                       : 0;
+        }
+        return depth;
+    }
+
+    /// Whether the `?` at the cursor has a ternary `:` of its own after it. The scan stays at the
+    /// `?`'s bracket level and stops where the expression ends there: a line break outside
+    /// brackets, a `,` or `;`, a closing bracket of an outer level, a block `{` in a condition, or
+    /// the end of the file. Each `?` met on the way takes the next `:`. The `:` left over belong
+    /// to the ternaries whose then-branch encloses the cursor at this same level
+    /// (`open_ternaries_`); one more than those is this `?`'s own.
+    [[nodiscard]] bool ternaryColonAhead() const {
+        int owed = 0;
+        for (const std::size_t q : open_ternaries_) {
+            owed += openBrackets(q + 1, pos_) == 0 ? 1 : 0;
+        }
+        int depth = 0;
+        int pending = 0; // `?` met in the scan that still wait for their `:`
+        int colons = 0;  // `:` left over for this `?` and the enclosing ternaries
+        for (std::size_t i = pos_ + 1; i < tokens_.size(); ++i) {
+            const Token& t = tokens_[i];
+            using enum TokenKind;
+            if (depth == 0 && t.newline_before && nl_depth_ == 0) {
+                break;
+            }
+            if (t.kind == End || (depth == 0 && (t.kind == Comma || t.kind == Semicolon)) ||
+                (depth == 0 && t.kind == LBrace && no_struct_)) {
+                break;
+            }
+            if (t.kind == LParen || t.kind == LBracket || t.kind == LBrace) {
+                ++depth;
+            } else if (t.kind == RParen || t.kind == RBracket || t.kind == RBrace) {
+                if (depth == 0) {
+                    break;
+                }
+                --depth;
+            } else if (depth == 0 && t.kind == Question) {
+                ++pending;
+            } else if (depth == 0 && t.kind == Colon) {
+                pending > 0 ? --pending : ++colons;
+            }
+        }
+        return colons > owed;
     }
 
     ExprPtr parsePostfix(ExprPtr expr) {
@@ -1307,14 +1456,18 @@ class Parser {
         Block block;
         block.span = cur().span;
         expect(TokenKind::LBrace, "`{`");
-        const int saved_depth = nl_depth_;
-        const bool saved_no_struct = no_struct_;
+        // A block starts a fresh statement context: line breaks end statements again, `{` may
+        // start a struct literal, and a closure body inside a `for` header is not the header.
+        const State saved = state();
         nl_depth_ = 0;
         no_struct_ = false;
+        for_header_ = false;
+        prefix_operand_ = false;
+        cast_type_ = false;
+        const State inside = state();
         while (!at(TokenKind::RBrace)) {
             if (at(TokenKind::End)) {
-                nl_depth_ = saved_depth;
-                no_struct_ = saved_no_struct;
+                restore(saved);
                 failAt(cur(),
                        "unexpected end of file in a block",
                        "the block opened here is never closed",
@@ -1325,11 +1478,11 @@ class Parser {
             try {
                 block.statements.push_back(parseStatement());
             } catch (const ParseAbort&) {
+                restore(inside);
                 syncStatement(start);
             }
         }
-        nl_depth_ = saved_depth;
-        no_struct_ = saved_no_struct;
+        restore(saved);
         advance(); // '}'
         block.span = spanFrom(block.span);
         return block;
@@ -2819,6 +2972,10 @@ class Parser {
     int prefix_nl_base_{0};
     bool no_struct_{false};
     bool for_header_{false}; ///< parsing the init/step statements of a `for` header
+    bool cast_type_{false};  ///< parsing the type after `as` (see `castTypeArgsAhead`)
+    /// Token index of the `?` of every ternary whose then-branch is being parsed, innermost last
+    /// (see `ternaryColonAhead`).
+    std::vector<std::size_t> open_ternaries_;
     std::vector<Item>
         lambdas_; // function literals lifted out of expressions, appended to the program at the end
     int lambda_count_{0};

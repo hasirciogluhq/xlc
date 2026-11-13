@@ -564,6 +564,159 @@ void testSliceTypeAsArgument() {
     CHECK(fn.body.statements[5].expr->kind == Expr::Kind::ArrayList);
 }
 
+// The statements of the first function of `p`.
+const std::vector<Stmt>& bodyOf(const Parsed& p) {
+    return std::get<FnDecl>(p.program.items.at(0).decl).body.statements;
+}
+
+// `t.0.1` is two tuple accesses: a number right after `.` takes no fraction (`0.1` is not a float
+// there). Elsewhere `0.1` stays a float, and floats are read with `.` as the decimal point.
+void testTupleAccessChainAndFloats() {
+    Parsed p("fn f() -> i32 {\n"
+             "    local a = t.0.1\n"
+             "    local b = 0.1\n"
+             "    local c = 1_000.5e-3\n"
+             "    return a\n"
+             "}\n");
+    CHECK(!p.engine.hasErrors());
+    if (p.engine.hasErrors()) {
+        return; // the shape checks below would read a tree that is not there
+    }
+    const auto& body = bodyOf(p);
+    const Expr& a = *body.at(0).expr;
+    CHECK(a.kind == Expr::Kind::Field && a.text.empty() && a.int_value == 1);
+    CHECK(a.lhs->kind == Expr::Kind::Field && a.lhs->int_value == 0);
+    CHECK(a.lhs->lhs->kind == Expr::Kind::Name && a.lhs->lhs->text == "t");
+    CHECK(body.at(1).expr->kind == Expr::Kind::FloatLiteral && body.at(1).expr->float_value == 0.1);
+    CHECK(body.at(2).expr->float_value == 1.0005);
+    // `t.1e3` is no tuple position, and a float beyond `f64` is reported, not read as infinity.
+    Parsed bad("fn f() {\n    local a = t.1e3\n    local b = 1e999\n}\n");
+    CHECK(bad.engine.errorCount() == 2);
+}
+
+// Type arguments in an expression may hold tuple and function types: `id<(i32, i32)>(x)`,
+// `mk<fn(i32) -> i32>()`, `id<(Vec<i32>, i32)>(x)`. `a < (b + c)` stays a comparison.
+void testGenericArgsWithTupleAndFnTypes() {
+    Parsed p("fn f() {\n"
+             "    local a = id<(i32, i32)>((1, 2))\n"
+             "    local b = mk<fn(i32) -> i32>()\n"
+             "    local c = id<(Vec<i32>, [u8; 4])>(x)\n"
+             "    local d = a < (b + c)\n"
+             "}\n");
+    CHECK(!p.engine.hasErrors());
+    if (p.engine.hasErrors()) {
+        return; // the shape checks below would read a tree that is not there
+    }
+    const auto& body = bodyOf(p);
+    const Expr& a = *body.at(0).expr;
+    CHECK(a.kind == Expr::Kind::Call && a.lhs->generic_args.size() == 1);
+    CHECK(a.lhs->generic_args.at(0).kind == TypeKind::Tuple);
+    const Expr& b = *body.at(1).expr;
+    CHECK(b.kind == Expr::Kind::Call && b.lhs->generic_args.at(0).kind == TypeKind::FnPtr);
+    const Expr& c = *body.at(2).expr;
+    CHECK(c.kind == Expr::Kind::Call && c.lhs->generic_args.at(0).args.size() == 2);
+    const Expr& d = *body.at(3).expr;
+    CHECK(d.kind == Expr::Kind::Binary && d.binary_op == BinaryOp::Lt);
+}
+
+// After `as`, `<` opens type arguments only when they close with type tokens and no operand
+// follows the `>`: `x as Idx < 3` compares, `x as Box<i32>` and `p as *Node<T> == nil` cast.
+void testCastFollowedByComparison() {
+    Parsed p("fn f() {\n"
+             "    local a = x as Idx < 3\n"
+             "    local b = x as Idx < n\n"
+             "    local c = x as Box<i32>\n"
+             "    local d = p as *Node<T> == nil\n"
+             "    local e = x as Idx < n && y > m\n"
+             "    local g = f(x as Idx < n, m > k)\n"
+             "}\n");
+    CHECK(!p.engine.hasErrors());
+    if (p.engine.hasErrors()) {
+        return; // the shape checks below would read a tree that is not there
+    }
+    const auto& body = bodyOf(p);
+    for (const std::size_t i : {0, 1}) {
+        const Expr& e = *body.at(i).expr;
+        CHECK(e.kind == Expr::Kind::Binary && e.binary_op == BinaryOp::Lt);
+        CHECK(e.lhs->kind == Expr::Kind::Cast && e.lhs->type.args.empty());
+    }
+    const Expr& c = *body.at(2).expr;
+    CHECK(c.kind == Expr::Kind::Cast && c.type.args.size() == 1);
+    const Expr& d = *body.at(3).expr;
+    CHECK(d.kind == Expr::Kind::Binary && d.binary_op == BinaryOp::Eq);
+    CHECK(d.lhs->kind == Expr::Kind::Cast && d.lhs->type.elem->args.size() == 1);
+    CHECK(body.at(4).expr->binary_op == BinaryOp::And);
+    const Expr& g = *body.at(5).expr;
+    CHECK(g.kind == Expr::Kind::Call && g.args.size() == 2);
+    CHECK(g.args.at(0)->binary_op == BinaryOp::Lt && g.args.at(1)->binary_op == BinaryOp::Gt);
+}
+
+// A `?` against its operand followed by `-`, `*`, `&`, a name or a literal is a ternary only when
+// its own `:` follows: `f()? - 1` propagates, `c? -1 : 1` is a ternary, and inside a ternary's
+// then-branch the enclosing `:` is not taken (`c ? f()? - 1 : 0`).
+void testPropagationBeforeOperandTokens() {
+    Parsed p("fn f() {\n"
+             "    local a = g()? - 1\n"
+             "    local b = g()? * 2 & m\n"
+             "    local c = k? -1 : 1\n"
+             "    local d = k ? g()? - 1 : 0\n"
+             "    local e = g()? - 1 > 0 ? 10 : 20\n"
+             "    local h = q(g()? - 1, k? 1 : 2)\n"
+             "}\n");
+    CHECK(!p.engine.hasErrors());
+    if (p.engine.hasErrors()) {
+        return; // the shape checks below would read a tree that is not there
+    }
+    const auto& body = bodyOf(p);
+    const Expr& a = *body.at(0).expr;
+    CHECK(a.kind == Expr::Kind::Binary && a.binary_op == BinaryOp::Sub);
+    CHECK(a.lhs->kind == Expr::Kind::Try);
+    const Expr& b = *body.at(1).expr;
+    CHECK(b.binary_op == BinaryOp::BitAnd && b.lhs->lhs->kind == Expr::Kind::Try);
+    const Expr& c = *body.at(2).expr;
+    CHECK(c.kind == Expr::Kind::Ternary && c.lhs->kind == Expr::Kind::Name);
+    const Expr& d = *body.at(3).expr;
+    CHECK(d.kind == Expr::Kind::Ternary && d.rhs->kind == Expr::Kind::Binary);
+    CHECK(d.rhs->lhs->kind == Expr::Kind::Try);
+    const Expr& e = *body.at(4).expr;
+    CHECK(e.kind == Expr::Kind::Ternary && e.lhs->binary_op == BinaryOp::Gt);
+    CHECK(e.lhs->lhs->lhs->kind == Expr::Kind::Try);
+    const Expr& h = *body.at(5).expr;
+    CHECK(h.args.at(0)->lhs->kind == Expr::Kind::Try);
+    CHECK(h.args.at(1)->kind == Expr::Kind::Ternary);
+}
+
+// An error inside a `switch` arm skips the rest of the `switch` body: one error, and the
+// statements after the `switch` and the next function still parse.
+void testRecoverySkipsTheBracesTheStatementOpened() {
+    Parsed p("fn main() -> i32 {\n"
+             "    switch x {\n"
+             "        case 1 + { return 1 }\n"
+             "        case 2 { return 2 }\n"
+             "        default { return 0 }\n"
+             "    }\n"
+             "    local after = (1 +\n"
+             "    return 0\n"
+             "}\n"
+             "fn other() -> i32 { return 0 }\n");
+    CHECK_EQ(p.engine.errorCount(), std::size_t{2});
+    CHECK(p.program.items.size() == 2);
+    // A failure inside `( ... )` does not leave the parser in its "line breaks continue" mode:
+    // `*p = 2` stays its own statement instead of becoming `x * p = 2`.
+    Parsed q("fn f() {\n    local a = g(1,\n    local b = x\n    *p = 2\n}\n");
+    CHECK_EQ(q.engine.errorCount(), std::size_t{1});
+    CHECK(bodyOf(q).size() == 2);
+}
+
+// A block inside a `for` header (a closure body) ends its statements at line breaks again: `;`
+// and `{` end a statement only in the header itself.
+void testBlockInsideForHeaderIsNotTheHeader() {
+    Parsed p("fn f() {\n"
+             "    for local i = 0; run(|| { a() { } }); i++ { }\n"
+             "}\n");
+    CHECK(p.engine.hasErrors());
+}
+
 }  // namespace
 
 void runSemaTests();
@@ -609,6 +762,12 @@ int main() {
     RUN(testByteLiteralParsesAsExpr);
     RUN(testSliceParsing);
     RUN(testSliceTypeAsArgument);
+    RUN(testTupleAccessChainAndFloats);
+    RUN(testGenericArgsWithTupleAndFnTypes);
+    RUN(testCastFollowedByComparison);
+    RUN(testPropagationBeforeOperandTokens);
+    RUN(testRecoverySkipsTheBracesTheStatementOpened);
+    RUN(testBlockInsideForHeaderIsNotTheHeader);
 
     if (xlang_test::failures() != 0) {
         std::cerr << xlang_test::failures() << " check(s) failed\n";

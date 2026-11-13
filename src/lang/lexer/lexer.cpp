@@ -3,6 +3,7 @@
 #include "xlang/lang/types.h"
 
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <format>
@@ -504,6 +505,11 @@ private:
     void scanNumber() {
         Token t = begin(TokenKind::Int);
         const std::size_t start = pos_;
+        // Right after a `.` the number is a tuple position (`t.0.1` is `t`, `.`, `0`, `.`, `1`), so
+        // it never takes a fraction or an exponent: `0.1` there would swallow the second access.
+        const bool after_dot = !tokens_.empty() && tokens_.back().kind == TokenKind::Dot &&
+                               tokens_.back().span.end_line == t.span.line &&
+                               tokens_.back().span.end_column == t.span.column;
         unsigned base = 10;
         if (peek() == '0' && (peek(1) == 'x' || peek(1) == 'X')) {
             base = 16;
@@ -536,8 +542,8 @@ private:
         }
 
         bool is_float = false;
-        if (base == 10) {
-            if (peek() == '.' && std::isdigit(static_cast<unsigned char>(peek(1))) != 0) {
+        if (base == 10 && !after_dot) {
+            if (peek() == '.'&& std::isdigit(static_cast<unsigned char>(peek(1))) != 0) {
                 is_float = true;
                 digits += advance();
                 while (std::isdigit(static_cast<unsigned char>(peek())) != 0 || peek() == '_') {
@@ -580,7 +586,13 @@ private:
 
         if (is_float) {
             t.kind = TokenKind::Float;
-            t.float_value = std::strtod(digits.c_str(), nullptr);
+            // `from_chars` always reads `.` as the decimal point; `strtod` follows the C locale.
+            // https://en.cppreference.com/w/cpp/utility/from_chars
+            const auto [end, ec] =
+                std::from_chars(digits.data(), digits.data() + digits.size(), t.float_value);
+            if (ec == std::errc::result_out_of_range) {
+                error(t.span, "float literal is out of range", "does not fit in an `f64`");
+            }
             emit(std::move(t));
             return;
         }
