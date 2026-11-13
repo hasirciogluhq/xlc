@@ -131,8 +131,13 @@ void Gen::genStmt(const hir::Stmt& s) {
     }
     case hir::StmtKind::Assign: {
         if (isMem(s.target->type)) {
+            // The value is built in its own slot and copied, never built in the target: a
+            // literal or a constructor zeroes its destination before reading its operands, so
+            // `p = V(p.x + 1, p.y)` would read the zeroed fields. LLVM's memcpyopt drops the copy
+            // when the value cannot alias the target.
+            llvm::Value* src = genMem(*s.value);
             llvm::Value* dest = genAddr(*s.target);
-            genInto(*s.value, dest);
+            copyMem(dest, src, s.target->type);
         } else {
             llvm::Value* v = genScalar(*s.value);
             llvm::Value* dest = genAddr(*s.target);

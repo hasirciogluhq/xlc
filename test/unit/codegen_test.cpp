@@ -39,10 +39,29 @@ void testNeverIsNoreturn() {
     CHECK(contains(ir, "unreachable"));
 }
 
+// `h.p = V(h.p.x + dx, h.p.y)` and `p = P { x: p.y, y: p.x }` read the target they overwrite: the value
+// is built in its own slot and copied, because a constructor or a literal zeroes its destination
+// before it reads the operands (the target was built in place once and read back as zeros).
+void testAssignBuildsTheValueBeforeTheTarget() {
+    const std::string ir = irFor("x86_64-unknown-linux-gnu",
+                                 "class V {\n    x: i32\n    y: i32\n"
+                                 "    fn init(self, x: i32, y: i32) {\n        self.x = x\n        self.y = y\n    }\n}\n"
+                                 "class H {\n    p: V\n"
+                                 "    fn move(self, dx: i32) { self.p = V(self.p.x + dx, self.p.y) }\n}\n"
+                                 "export fn go(h: *H) { h.move(1) }\n"
+                                 "struct P {\n    x: i32\n    y: i32\n}\n"
+                                 "export fn swap(p: *P) { *p = P { x: p.y, y: p.x } }\n");
+    CHECK(contains(ir, "V_init$PN1V$i32$i32\"(ptr %tmp,"));
+    CHECK(contains(ir, "call void @llvm.memset.p0.i64(ptr align 4 %tmp, i8 0, i64 8"));
+    CHECK(contains(ir, ", ptr align 4 %tmp, i64 8, i1 false)"));
+    CHECK(ir.find("call void @llvm.memset.p0.i64(ptr align 4 %0, i8 0") == std::string::npos);
+}
+
 } // namespace
 
 void runCodegenTests() {
     RUN(testDarwinSyscallDeclaresTheSecondResult);
     RUN(testOtherSyscallRegisters);
     RUN(testNeverIsNoreturn);
+    RUN(testAssignBuildsTheValueBeforeTheTarget);
 }
