@@ -3,11 +3,12 @@
 #include "xlang/lang/types.h"
 
 #include <cctype>
-#include <charconv>
 #include <cmath>
 #include <cstdlib>
 #include <format>
 #include <limits>
+#include <locale>
+#include <sstream>
 #include <string_view>
 #include <unordered_map>
 
@@ -586,11 +587,14 @@ private:
 
         if (is_float) {
             t.kind = TokenKind::Float;
-            // `from_chars` always reads `.` as the decimal point; `strtod` follows the C locale.
-            // https://en.cppreference.com/w/cpp/utility/from_chars
-            const auto [end, ec] =
-                std::from_chars(digits.data(), digits.data() + digits.size(), t.float_value);
-            if (ec == std::errc::result_out_of_range) {
+            // Read in the classic locale, so `.` is the decimal point whatever the process locale
+            // is (`strtod` follows the C locale). Not `std::from_chars`: the libc++ of the macOS
+            // SDK has no floating-point overload. On overflow `num_get` sets `failbit`.
+            // https://en.cppreference.com/w/cpp/locale/num_get/get
+            std::istringstream in(digits);
+            in.imbue(std::locale::classic());
+            in >> t.float_value;
+            if (in.fail() || std::isinf(t.float_value)) {
                 error(t.span, "float literal is out of range", "does not fit in an `f64`");
             }
             emit(std::move(t));
