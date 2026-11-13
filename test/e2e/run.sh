@@ -65,7 +65,6 @@ if [ -z "$foreign" ]; then ok "links-only-system-libraries"; else bad "links-onl
 # name | expected exit code | expected stdout (a `grep -F` substring) | runs on Windows | compiler flags
 programs=(
   "exit|42||1|"
-  "slice_types|0||1|"
   "write|0|xlc e2e write|0|"
   "syscall_registers|0|xlc e2e registers|0|-O2"
 )

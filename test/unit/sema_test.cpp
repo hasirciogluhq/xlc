@@ -6,7 +6,6 @@
 #include "xlang/sema/layout.h"
 #include "xlang/sema/sema.h"
 
-#include <filesystem>
 #include <sstream>
 #include <variant>
 
@@ -364,11 +363,9 @@ void testLayoutHistoryRoundTrip() {
     rec.layout.align = 4;
     rec.layout.fields = {{"x", {}, 0, 4, 4, false}, {"y", {}, 4, 4, 4, false}};
     h.put(rec);
-    const std::string path =
-        (std::filesystem::temp_directory_path() / "xlc_layout_roundtrip.layout").string();
-    h.save(path);
-    const LayoutHistory loaded = LayoutHistory::load(path);
-    std::filesystem::remove(path);
+    std::stringstream text;
+    h.write(text);
+    const LayoutHistory loaded = LayoutHistory::read(text, "history");
     const LayoutRecord* r = loaded.find("Vec3");
     CHECK(r != nullptr && r->layout.size == 12 && r->layout.fields.size() == 2 &&
           r->layout.fields[1].offset == 4);

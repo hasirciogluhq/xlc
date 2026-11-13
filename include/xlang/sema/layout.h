@@ -3,6 +3,7 @@
 #include "xlang/lang/types.h"
 
 #include <cstdint>
+#include <iosfwd>
 #include <map>
 #include <string>
 #include <vector>
@@ -53,6 +54,9 @@ public:
     /// Missing file = empty history. Malformed lines throw XlangError.
     static LayoutHistory load(const std::string& path);
     void save(const std::string& path) const;
+    /// The text form `load` and `save` use; `source` names the input in an error.
+    static LayoutHistory read(std::istream& in, const std::string& source);
+    void write(std::ostream& out) const;
 
     void put(LayoutRecord record);
     [[nodiscard]] const LayoutRecord* find(const std::string& name) const;

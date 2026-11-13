@@ -43,6 +43,10 @@ void LayoutHistory::save(const std::string& path) const {
     if (!out) {
         throw XlangError(std::format("cannot write layout history `{}`", path));
     }
+    write(out);
+}
+
+void LayoutHistory::write(std::ostream& out) const {
     for (const auto& [name, record] : records_) {
         out << formatLayoutRecord(record);
     }
@@ -63,11 +67,12 @@ namespace {
 } // namespace
 
 LayoutHistory LayoutHistory::load(const std::string& path) {
-    LayoutHistory history;
     std::ifstream in(path);
-    if (!in) {
-        return history;
-    }
+    return in ? read(in, path) : LayoutHistory{};
+}
+
+LayoutHistory LayoutHistory::read(std::istream& in, const std::string& source) {
+    LayoutHistory history;
     std::string line;
     std::size_t number = 0;
     LayoutRecord current;
@@ -115,7 +120,7 @@ LayoutHistory LayoutHistory::load(const std::string& path) {
                 throw XlangError("unexpected line");
             }
         } catch (const std::exception&) {
-            throw XlangError(std::format("{}:{}: malformed layout record", path, number));
+            throw XlangError(std::format("{}:{}: malformed layout record", source, number));
         }
     }
     flush();
