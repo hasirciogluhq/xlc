@@ -157,7 +157,7 @@ void Gen::genStmt(const hir::Stmt& s) {
         } else if (e.kind == hir::ExprKind::AtomicStore || e.kind == hir::ExprKind::Fence ||
                    e.kind == hir::ExprKind::Asm) {
             (void)genScalar(e);
-        } else if (e.type.isVoid() || e.kind == hir::ExprKind::Call ||
+        } else if (!e.type.hasValue() || e.kind == hir::ExprKind::Call ||
                    e.kind == hir::ExprKind::CallIndirect || e.kind == hir::ExprKind::CallVirtual ||
                    e.kind == hir::ExprKind::CallItable || e.kind == hir::ExprKind::Syscall) {
             llvm::Value* mem = nullptr;

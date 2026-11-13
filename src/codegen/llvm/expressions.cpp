@@ -678,6 +678,13 @@ llvm::Value* Gen::genCallCommon(llvm::FunctionType* fty,
     if (mem_result != nullptr) {
         *mem_result = sret;
     }
+    if (ret.isNever()) {
+        // A `-> never` callee (direct, virtual, through a pointer or an interface) does not come
+        // back: the code after the call is unreachable.
+        call->setDoesNotReturn();
+        B_.CreateUnreachable();
+        B_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "after.never", cur_fn_));
+    }
     return call;
 }
 
@@ -699,14 +706,8 @@ llvm::Value* Gen::genCall(const hir::Expr& e, llvm::Value** mem_result) {
             args.push_back(a.get());
         }
         if (e.kind == hir::ExprKind::Call) {
-            llvm::Value* r =
-                genCallCommon(f->getFunctionType(), f, args, nullptr, e.type, mem_result, e.span);
-            if (!hm_.panic_function.empty() && e.text == hm_.panic_function) {
-                // The registered `panic` never returns (plan 4.12): the rest is unreachable.
-                B_.CreateUnreachable();
-                B_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "after.panic", cur_fn_));
-            }
-            return r;
+            return genCallCommon(
+                f->getFunctionType(), f, args, nullptr, e.type, mem_result, e.span);
         }
         // Virtual: args[0] is `self`; the target comes from the vtable slot.
         llvm::Value* self = genScalar(*args[0]);

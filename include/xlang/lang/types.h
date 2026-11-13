@@ -14,6 +14,7 @@ struct Expr;
 
 enum class TypeKind {
     Void,
+    Never,    ///< `-> never`: the function does not return; only a return type, has no value
     Bool,
     Int,      ///< i8..i64, isize, u8..u64, usize (see Type::bits / is_signed)
     Float,    ///< f32, f64
@@ -55,12 +56,16 @@ struct Type {
     Span span;
 
     [[nodiscard]] bool isVoid() const { return kind == TypeKind::Void; }
+    [[nodiscard]] bool isNever() const { return kind == TypeKind::Never; }
+    /// False for `void` and `never`: an expression of either type can only be run.
+    [[nodiscard]] bool hasValue() const { return !isVoid() && !isNever(); }
     [[nodiscard]] bool isInteger() const { return kind == TypeKind::Int; }
     [[nodiscard]] bool isFloat() const { return kind == TypeKind::Float; }
     [[nodiscard]] bool isPointer() const { return kind == TypeKind::Pointer; }
     [[nodiscard]] bool isSlice() const { return kind == TypeKind::Slice; }
 
     [[nodiscard]] static Type makeVoid();
+    [[nodiscard]] static Type makeNever();
     [[nodiscard]] static Type makeBool();
     [[nodiscard]] static Type makeInt(unsigned bits, bool is_signed);
     [[nodiscard]] static Type makeFloat(unsigned bits);

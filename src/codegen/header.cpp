@@ -188,7 +188,8 @@ std::string generateHeader(const hir::Module& module, const LayoutQuery& layout,
         if (params.empty()) {
             params = "void";
         }
-        o << declarator(f.ret, f.symbol.empty() ? f.name : f.symbol) << "(" << params << ");\n";
+        o << (f.ret.isNever() ? "_Noreturn " : "")
+          << declarator(f.ret, f.symbol.empty() ? f.name : f.symbol) << "(" << params << ");\n";
     }
     o << "\n#ifdef __cplusplus\n}\n#endif\n\n#endif /* " << guard << " */\n";
     return o.str();

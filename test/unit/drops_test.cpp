@@ -1,0 +1,100 @@
+#include "check.h"
+#include "lowered.h"
+
+// Ownership of compound values: what drops, in which order, and which moves are allowed.
+
+namespace {
+
+using xlang_test::Lowered;
+
+const std::string kRes = "class Res {\n    id: i32\n    fn drop(self) { }\n}\n";
+
+// A tuple owns its elements: one glue per tuple type drops them in reverse order.
+void testTupleDropsItsElements() {
+    const Lowered r(kRes + "fn f() {\n    local t = (Res { id: 1 }, 2, Res { id: 3 })\n}\n");
+    CHECK(!r.diag->hasErrors());
+    const std::string glue = "$tupleT";
+    CHECK(r.has(glue));
+    const std::size_t two = r.hir_text.find("(field.ptr 2 p#0)");
+    const std::size_t zero = r.hir_text.find("(field.ptr 0 p#0)");
+    CHECK(two != std::string::npos && zero != std::string::npos && two < zero);
+    CHECK(!r.has("(field.ptr 1 p#0)")); // the `i32` element needs no drop
+    const Lowered plain("fn f() {\n    local t = (1, 2)\n}\n");
+    CHECK(!plain.has("$tuple"));
+}
+
+// Building a tuple from a droppable local and taking one apart both move.
+void testTupleMovesInAndOut() {
+    const Lowered in(kRes + "fn f() {\n    local r = Res { id: 1 }\n    local t = (r, 2)\n}\n");
+    CHECK(!in.diag->hasErrors());
+    CHECK(in.has("move#"));
+    const Lowered out(kRes + "fn make() -> (Res, i32) { return (Res { id: 1 }, 2) }\n"
+                             "fn f() {\n    local t = make()\n    local (a, n) = t\n}\n");
+    CHECK(!out.diag->hasErrors());
+    CHECK(out.has("move#"));
+    CHECK(Lowered(kRes + "fn f(t: (Res, i32)) -> Res { return t.0 }\n").failedWith("E0720"));
+}
+
+// A tuple that needs drop cannot sit where nothing drops it.
+void testDroppableTupleInPlainPlaces() {
+    CHECK(Lowered(kRes + "struct S { t: (Res, i32) }\n").failedWith("E0721"));
+    CHECK(Lowered(kRes + "fn f() {\n    local a: [(Res, i32); 2]\n}\n").failedWith("E0721"));
+}
+
+const std::string kHeap = "register(alloc) fn alloc(size: usize, align: usize) -> *void { return nil }\n"
+                          "register(free) fn release(p: *void) { }\n";
+
+// A polymorphic class drops through vtable slot 0, which every class of the hierarchy fills with
+// its own glue (a C++ virtual destructor); the virtual methods follow it.
+void testPolymorphicClassDropsThroughItsVtable() {
+    const Lowered r(kHeap + "class Base {\n    virtual fn name(self) -> i32 { return 1 }\n}\n"
+                            "class Child : Base {\n    fn drop(self) { }\n"
+                            "    override fn name(self) -> i32 { return 2 }\n}\n"
+                            "fn f(p: *Base) { delete p }\n"
+                            "fn g(p: *Base) { __builtin_drop(p) }\n");
+    CHECK(!r.diag->hasErrors());
+    CHECK(r.has("fn Base$dropGlue(p: *Base)")); // exists although `Base` itself needs no drop
+    CHECK(r.has("(call.virtual Base$dropGlue[0] "));
+    CHECK(r.module.aggregates.size() >= 2);
+    for (const auto& a : r.module.aggregates) {
+        if (a.name == "Child") {
+            CHECK(a.vtable.size() == 2 && a.vtable[0].function == "Child$dropGlue" &&
+                  a.vtable[1].function == "Child.name");
+        }
+    }
+}
+
+// A `@repr(c)` root mirrors a C++ vtable: it gets no drop slot and drops statically.
+void testReprCVtableHasNoDropSlot() {
+    const Lowered r(kHeap + "@repr(c)\nclass Base {\n    virtual fn name(self) -> i32 { return 1 }\n"
+                            "    fn drop(self) { }\n}\n"
+                            "fn f(p: *Base) { delete p }\n");
+    CHECK(!r.diag->hasErrors());
+    CHECK(r.has("(call Base$dropGlue "));
+    for (const auto& a : r.module.aggregates) {
+        if (a.name == "Base") {
+            CHECK(a.vtable.size() == 1 && a.vtable[0].function == "Base.name");
+        }
+    }
+}
+
+// Dropping through a base without a vtable would skip the derived drop: E0766.
+void testStaticDropThatSkipsADerivedDropIsAnError() {
+    const std::string classes = "class Base {\n    id: i32\n}\n"
+                                "class Child : Base {\n    fn drop(self) { }\n}\n";
+    CHECK(Lowered(kHeap + classes + "fn f(p: *Base) { delete p }\n").failedWith("E0766"));
+    CHECK(Lowered(kHeap + classes + "fn f(p: *Base) { __builtin_drop(p) }\n").failedWith("E0766"));
+    const Lowered exact(kHeap + classes + "fn f(p: *Child) { delete p }\n");
+    CHECK(!exact.diag->hasErrors());
+}
+
+} // namespace
+
+void runDropTests() {
+    RUN(testTupleDropsItsElements);
+    RUN(testTupleMovesInAndOut);
+    RUN(testDroppableTupleInPlainPlaces);
+    RUN(testPolymorphicClassDropsThroughItsVtable);
+    RUN(testReprCVtableHasNoDropSlot);
+    RUN(testStaticDropThatSkipsADerivedDropIsAnError);
+}

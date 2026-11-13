@@ -11,6 +11,12 @@ Type Type::makeVoid() {
     return Type{};
 }
 
+Type Type::makeNever() {
+    Type t;
+    t.kind = TypeKind::Never;
+    return t;
+}
+
 Type Type::makeBool() {
     Type t;
     t.kind = TypeKind::Bool;
@@ -99,7 +105,7 @@ std::optional<Type> primitiveFromName(std::string_view name) {
         {"u64", TypeKind::Int, 64, false}, {"usize", TypeKind::Int, 0, false},
         {"f32", TypeKind::Float, 32, true}, {"f64", TypeKind::Float, 64, true},
         {"bool", TypeKind::Bool, 0, false}, {"void", TypeKind::Void, 0, false},
-        {"str", TypeKind::Str, 0, false},
+        {"never", TypeKind::Never, 0, false}, {"str", TypeKind::Str, 0, false},
     };
     for (const Entry& e : table) {
         if (e.name != name) {
@@ -110,6 +116,7 @@ std::optional<Type> primitiveFromName(std::string_view name) {
         case TypeKind::Float: return Type::makeFloat(e.bits);
         case TypeKind::Bool: return Type::makeBool();
         case TypeKind::Str: return Type::makeStr();
+        case TypeKind::Never: return Type::makeNever();
         default: return Type::makeVoid();
         }
     }
@@ -151,6 +158,7 @@ namespace {
 std::string typeToString(const Type& type) {
     switch (type.kind) {
     case TypeKind::Void: return "void";
+    case TypeKind::Never: return "never";
     case TypeKind::Bool: return "bool";
     case TypeKind::Str: return "str";
     case TypeKind::Slice:
@@ -172,7 +180,7 @@ std::string typeToString(const Type& type) {
             out += typeToString(type.params[i]);
         }
         out += ")";
-        if (type.ret && !type.ret->isVoid()) {
+        if (type.ret && !type.ret->isVoid()) { // `fn()` is `fn() -> void`; `-> never` is spelled
             out += " -> " + typeToString(*type.ret);
         }
         return out;
@@ -207,6 +215,7 @@ std::string typeToString(const Type& type) {
 std::string mangleType(const Type& type) {
     switch (type.kind) {
     case TypeKind::Void: return "void";
+    case TypeKind::Never: return "never";
     case TypeKind::Bool: return "bool";
     case TypeKind::Str: return "str";
     case TypeKind::Slice:

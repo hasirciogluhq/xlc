@@ -304,6 +304,22 @@ constexpr std::size_t kLeadWidth = 40;
          "`e?` returns the failure of `e` from the function, so the function must return an enum of "
          "the same shape whose failure carries the same type (there is no conversion between error "
          "types). Match the error type, or handle the failure with a `switch`."},
+        {"E0764", Severity::Error, "missing return",
+         "Control can reach the end of a function that has a return type: some path has no "
+         "`return` (a loop that ends with `break`, an `if` without `else`, ...). A `-> never` "
+         "function must not reach its end at all. End every path with `return`, an endless loop "
+         "or a call to a `-> never` function. A function without `->` returns `void` and needs no "
+         "`return`."},
+        {"E0765", Severity::Error, "invalid use of `never`",
+         "`never` is the return type of a function that does not return (it exits, traps or loops "
+         "forever). It is only written after `->`; a `-> never` function has no `return`, and a "
+         "call to it has no value."},
+        {"E0766", Severity::Error, "drop through a base pointer would skip a derived drop",
+         "`delete p` and `__builtin_drop(p)` with `p: *Base` run the drop of `Base` only when "
+         "`Base` has no virtual method, but a class derived from `Base` has its own `drop` or a "
+         "field that needs drop, and that part would never run. Give `Base` a virtual method: a "
+         "polymorphic class drops through its vtable, so the drop of the object's own class runs. "
+         "Or drop through a pointer to the derived class."},
         {"E0770", Severity::Error, "closure parameter type unknown",
          "A closure parameter without a type takes it from the `fn(...)` type the closure is used "
          "for: an argument, a typed `local`, a field or a `return`. Here nothing names one. Write "
@@ -337,10 +353,6 @@ constexpr std::size_t kLeadWidth = 40;
         {"W0771", Severity::Warning, "`for` uses `iter`, not `next`",
          "The type has both `iter` and `next`. `for` calls `iter` and starts from the beginning "
          "every time; the position `next` keeps on the value itself is not used."},
-        {"W0701", Severity::Warning, "missing return",
-         "Control can fall off the end of a function that returns a value: some path has no "
-         "`return` (a loop that ends with `break`, an `if` without `else`, ...). Add a `return`, "
-         "or end the path with a call to the registered `panic`."},
         {"W0601", Severity::Warning, "implicit signed integer to float conversion",
          "A signed integer is implicitly converted to `f32`/`f64` and precision may be lost. "
          "Write `as f64`, or silence with `@allow(W0601)` / `--allow=W0601`."},

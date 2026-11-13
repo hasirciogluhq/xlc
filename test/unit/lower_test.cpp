@@ -200,7 +200,7 @@ void testMethodsAreFunctionsWithSelf() {
     CHECK(!r.diag->hasErrors());
     CHECK(r.has("fn Shape.get(self: *Shape) -> i32"));
     CHECK(r.has("(call Shape.get s#0):i32"));
-    CHECK(r.has("(call.virtual Shape.area[0] s#0):f64"));
+    CHECK(r.has("(call.virtual Shape.area[1] s#0):f64")); // slot 0 is the drop glue
 }
 
 void testNewAndRegisteredAllocator() {
@@ -248,7 +248,7 @@ void testNewAndRegisteredAllocator() {
 
 void testRegisterRoles() {
     {
-        Lowered r("register(panic) fn panic(msg: *u8) { }\nregister(panic) fn panic2(msg: *u8) { }\n");
+        Lowered r("register(panic) fn panic(msg: *u8) -> never { while true { } }\nregister(panic) fn panic2(msg: *u8) -> never { while true { } }\n");
         CHECK(r.failedWith("E0502"));
     }
     {
@@ -256,12 +256,12 @@ void testRegisterRoles() {
         CHECK(r.failedWith("E0503"));
     }
     {
-        Lowered r("register(panic) fn panic(msg: *u8) { }\n");
+        Lowered r("register(panic) fn panic(msg: *u8) -> never { while true { } }\n");
         CHECK(!r.diag->hasErrors());
         CHECK(r.module.panic_function == "panic");
     }
     {
-        Lowered r("register(panic) fn panic(msg: *u8) { }\nfn f() { local panic: i32 = 1 }\n");
+        Lowered r("register(panic) fn panic(msg: *u8) -> never { while true { } }\nfn f() { local panic: i32 = 1 }\n");
         CHECK(r.out.str().find("W0402") != std::string::npos);
     }
     {
@@ -560,7 +560,7 @@ void testModulesShareTypes() {
 void testModuleRegistrationsAndMangling() {
     {
         Multi r({{"app/main.xl", "from \"rt\" import ping\nfn main() { panic(\"x\") }\n"},
-                 {"app/rt.xl", "export fn ping() { }\nregister(panic) fn panic(msg: *u8) { }\n"}});
+                 {"app/rt.xl", "export fn ping() { }\nregister(panic) fn panic(msg: *u8) -> never { while true { } }\n"}});
         CHECK(!r.diag->hasErrors());
         CHECK(r.module.panic_function == "rt::panic");
         CHECK(r.has("(call rt::panic"));
@@ -600,7 +600,7 @@ void testClassesAndInterfacesChecks() {
                   "class B : A { override fn f(self) -> i32 { return 2 } }\n"
                   "fn main() -> i32 { local b: B = B { }\n return b.f() }\n"}});
         CHECK(!r.diag->hasErrors());
-        CHECK(r.has("(call.virtual B.f[0] "));
+        CHECK(r.has("(call.virtual B.f[1] "));
     }
     {
         Multi r({{"app/main.xl", "class A { fn f(self) { } }\nclass B : A { override fn f(self) { } }\n"}});

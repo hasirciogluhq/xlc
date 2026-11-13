@@ -375,7 +375,7 @@ void testReExports() {
 
 void testDeclareRegisterAndModifiers() {
     Parsed p("declare fn api(a: i32) -> i32\n"
-             "register(panic) fn panic(msg: *u8) { }\n"
+             "register(panic) fn panic(msg: *u8) -> never { while true { } }\n"
              "export(c) fn memcpy(d: *void) { }\n"
              "@repr(c)\n"
              "declare struct P { x: f64 }\n"
@@ -725,6 +725,8 @@ void runOperatorTests();
 void runClosureTests();
 void runIteratorTests();
 void runCodegenTests();
+void runReturnTests();
+void runDropTests();
 
 int main() {
     RUN(runSemaTests);
@@ -733,6 +735,8 @@ int main() {
     RUN(runOperatorTests);
     RUN(runClosureTests);
     RUN(runIteratorTests);
+    RUN(runReturnTests);
+    RUN(runDropTests);
     RUN(testWarningContextAndTwoSidedLabels);
     RUN(testErrorContextIsWiderAndGutterIsAligned);
     RUN(testDistantMarksAreSeparatedAndNearOnesMerged);

@@ -37,7 +37,7 @@ void Gen::declareFunction(const hir::Function& f) {
     if (isMem(f.ret)) {
         fn->addParamAttr(0, llvm::Attribute::get(ctx_, llvm::Attribute::NoAlias));
     }
-    if (!hm_.panic_function.empty() && f.name == hm_.panic_function) {
+    if (f.ret.isNever()) {
         fn->addFnAttr(llvm::Attribute::NoReturn);
     }
     fns_[f.name] = fn;

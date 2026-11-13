@@ -57,6 +57,9 @@ std::optional<TypeLayout> Sema::layoutOf(const Type& type, const Span& at) {
     case TypeKind::Void:
         error("E0703", at, "`void` has no size", "sizeless type");
         return std::nullopt;
+    case TypeKind::Never:
+        error("E0703", at, "`never` has no size", "sizeless type");
+        return std::nullopt;
     case TypeKind::Enum:
         return layoutOf(*t.elem, at);
     case TypeKind::Array: {

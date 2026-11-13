@@ -27,6 +27,7 @@ bool Gen::isSigned(const Type& t) const {
 llvm::Type* Gen::sty(const Type& t) {
     switch (t.kind) {
     case TypeKind::Void:
+    case TypeKind::Never: // a `-> never` function is `void` plus the `noreturn` attribute
         return llvm::Type::getVoidTy(ctx_);
     case TypeKind::Bool:
         return llvm::Type::getInt1Ty(ctx_);
@@ -90,7 +91,7 @@ llvm::FunctionType* Gen::fnTypeFor(const std::vector<Type>& params, const Type& 
     llvm::Type* r = llvm::Type::getVoidTy(ctx_);
     if (isMem(ret)) {
         ps.push_back(ptrTy()); // sret
-    } else if (!ret.isVoid()) {
+    } else if (ret.hasValue()) {
         r = sty(ret);
     }
     for (const Type& p : params) {
@@ -137,6 +138,7 @@ llvm::DIType* Gen::di_basic(const Type& t) {
     case TypeKind::Float:
         return di_->createBasicType(name, t.bits, llvm::dwarf::DW_ATE_float);
     case TypeKind::Void:
+    case TypeKind::Never:
         return nullptr;
     default:
         return di_->createBasicType(name, ptrBits(), llvm::dwarf::DW_ATE_address);

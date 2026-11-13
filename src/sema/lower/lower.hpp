@@ -1,5 +1,12 @@
-// Internal header of the lowering pass (plan 4.1-4.12): the `Lowerer` class and the helpers the
-// parts in `lower_items.cpp`, `lower_stmt.cpp` and `lower_expr.cpp` share. Not installed.
+// Internal header of the lowering pass (plan 4.1-4.12): the `Lowerer` class and the helpers its
+// parts share. Not installed. The parts, one concern per file:
+//   program.cpp   whole-program entry (`lowerProgram`)      helpers.cpp  shared node/type helpers
+//   item/         module scope, roles, vtables, impls, globals, functions, aggregates, driver
+//   call/         overload resolution, calls, methods, builtins
+//   expr/         conversions, names, fields, operators, indexing, literals, closures, `?`
+//   stmt/         blocks, assignment, loops, `for` iteration, `switch`, ternary, tuples, `try`
+//   sum/          payload enums and their `switch`
+//   own/          ownership: which types need drop, drop glue, drop flags, moves, construction
 #pragma once
 
 #include "xlang/hir/hir.h"
@@ -21,7 +28,7 @@ namespace xlang {
 /// Lowers every module of one compilation: module scopes first, then the items of each, then the
 /// generic instances they requested (which can belong to another module), then the init/fini order.
 /// `library_modules` marks the modules of the library group (found through a module root), which the language treats
-/// specially. The definition is in `src/sema/lower/items.cpp` (`sema/lower`), and it is qualified
+/// specially. The definition is in `src/sema/lower/program.cpp`, and it is qualified
 /// there as `xlang::lowerProgram`: it sits in the outer namespace, because that is the name the
 /// compilation driver calls and the one the pass has always had.
 hir::Module lowerProgram(const std::vector<Sema*>& modules,
@@ -300,22 +307,21 @@ inline bool breaksOut(const std::vector<hir::Stmt>& body, std::uint32_t level) {
     return false;
 }
 
-/// True when control cannot fall off the end of `body` (every path returns, loops forever or
-/// calls a `noreturn` function).
-inline bool terminates(const std::vector<hir::Stmt>& body, const std::string& panic_fn) {
+/// True when control cannot fall off the end of `body` (every path returns, loops forever, runs a
+/// `noreturn` asm or calls a `-> never` function).
+inline bool terminates(const std::vector<hir::Stmt>& body) {
     for (const hir::Stmt& s : body) {
         switch (s.kind) {
         case hir::StmtKind::Return:
             return true;
         case hir::StmtKind::Block:
-            if (terminates(s.body, panic_fn)) {
+            if (terminates(s.body)) {
                 return true;
             }
             break;
         case hir::StmtKind::If:
         case hir::StmtKind::Try:
-            if (!s.else_body.empty() && terminates(s.body, panic_fn) &&
-                terminates(s.else_body, panic_fn)) {
+            if (!s.else_body.empty() && terminates(s.body) && terminates(s.else_body)) {
                 return true;
             }
             break;
@@ -329,8 +335,7 @@ inline bool terminates(const std::vector<hir::Stmt>& body, const std::string& pa
             if (s.value->kind == hir::ExprKind::Asm && s.value->noreturn) {
                 return true;
             }
-            if (s.value->kind == hir::ExprKind::Call && !panic_fn.empty() &&
-                s.value->text == panic_fn) {
+            if (s.value->type.isNever()) {
                 return true;
             }
             break;
@@ -391,6 +396,7 @@ struct LowerShared {
     };
     std::map<std::string, ClosureFn> closures;
     unsigned closure_count{0};     ///< unique suffix of the closures of the program
+    std::set<std::string> tuple_glues; ///< drop glues already emitted for tuple types
     std::set<std::string> init_fns; ///< qualified names of the `@init` functions
     std::set<std::string> fini_fns; ///< qualified names of the `@fini` functions
     std::string entry_fn;           ///< qualified name of the `@entry` function (empty = none yet)
@@ -504,6 +510,9 @@ class Lowerer {
     /// The drop glue of a payload enum: `switch` on the tag, then the payload of the live variant
     /// only. A variant whose payload needs no drop is not entered.
     void emitSumDropGlue(const std::string& qname, const StructDecl& sum, const Span& span);
+    /// The drop glue of a tuple type that needs drop (its elements in reverse order), emitted
+    /// once per program with internal linkage; returns its name.
+    [[nodiscard]] std::string tupleDropGlue(const Type& tuple, const Span& span);
     [[nodiscard]] EP localRef(hir::LocalId id, const Type& type, const Span& span);
     [[nodiscard]] EP boolConst(bool value, const Span& span);
     /// `glue(addr)`: runs the drop glue of `t` on the object at `addr`.
@@ -884,7 +893,21 @@ class Lowerer {
     void lowerImplInfo(const ImplInfo& info);
     [[nodiscard]] std::optional<Sema::EntityRef> entityOfType(const Type& t);
     void collectFields(const std::string& qname, std::vector<FieldInfo>& out);
+    /// The vtable of a class: base slots first; a polymorphic class has the `kDropSlot` first.
     [[nodiscard]] const std::vector<SlotInfo>& vtableOf(const std::string& qname);
+    /// The name of the hidden vtable slot holding the drop glue (`$` keeps it out of user names).
+    static constexpr std::string_view kDropSlot = "$drop";
+    /// True when `t` is a class whose drop goes through its vtable (it has the drop slot).
+    [[nodiscard]] bool dropsVirtually(const Type& t);
+    /// Drops the object `ptr` points to: through the vtable for a polymorphic class (the dynamic
+    /// class's glue), else the static glue. `t` is the pointee type.
+    [[nodiscard]] EP dropThrough(EP ptr, const Type& t, const Span& span);
+    /// True when dropping a `t` through a pointer does something: `t` needs drop, or it is
+    /// polymorphic (a derived object behind it may need drop).
+    [[nodiscard]] bool dropsThroughPointer(const Type& t);
+    /// A class of the program that derives from the non-polymorphic class `t` and adds its own
+    /// drop, which a drop through `*t` would skip (E0766); empty when there is none.
+    [[nodiscard]] std::string derivedDropLostThrough(const Type& t);
     [[nodiscard]] bool isConstValue(const hir::Expr& e, const hir::Expr** offender) const;
     [[nodiscard]] std::optional<std::uint64_t> arrayLength(Sema& sema, const Type& t);
     [[nodiscard]] const ScopeEntry* lookupName(const std::string& name);

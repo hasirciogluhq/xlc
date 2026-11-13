@@ -66,9 +66,20 @@ void testOtherSyscallRegisters() {
                    "\"={rax},={r10},={rdx},={r8},={r9},0,1,2,3,~{rcx},~{r11},~{cc},~{memory}\""));
 }
 
+// A `-> never` function is `noreturn`, and the code after every call of it is `unreachable`.
+void testNeverIsNoreturn() {
+    const std::string ir = irFor("x86_64-unknown-linux-gnu",
+                                 "export fn die() -> never { while true { } }\n"
+                                 "export fn f(c: bool) -> i32 {\n    if c { return 1 }\n    die()\n}\n");
+    CHECK(contains(ir, "; Function Attrs: noreturn nounwind\ndefine void @\"_xl$main$die\"()"));
+    CHECK(contains(ir, "call void @\"_xl$main$die\"() #"));
+    CHECK(contains(ir, "unreachable"));
+}
+
 } // namespace
 
 void runCodegenTests() {
     RUN(testDarwinSyscallDeclaresTheSecondResult);
     RUN(testOtherSyscallRegisters);
+    RUN(testNeverIsNoreturn);
 }
