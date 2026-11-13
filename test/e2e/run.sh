@@ -8,6 +8,7 @@
 #    that is missing there makes `xlc --version` abort with a dyld error).
 # 2. It builds, links and runs native programs: each *.xl here is compiled with no stdlib and started.
 # 3. It writes an object file for every target it supports, whatever the host is.
+# 4. `-o -` streams every text and binary output to stdout instead of creating a file named `-`.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 xlc=${1:-${XLC:-xlc}}
@@ -111,6 +112,15 @@ for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-apple-darwin aarch64-app
   else
     bad "object-$target" "no object file"; cat "$work/t.err"
   fi
+done
+
+# --- 4. stdout ------------------------------------------------------------------------------------------
+for row in "header|XLANG_OBJECT_H" "ir|answer"; do
+  IFS='|' read -r emit want <<<"$row"
+  out=$(cd "$work" && "$xlc" "$here/object.xl" --emit=$emit -o - 2>&1)
+  if [ -e "$work/-" ]; then bad "stdout-$emit" "wrote a file named '-'"; rm -f "$work/-"
+  elif ! grep -qF "$want" <<<"$out"; then bad "stdout-$emit" "no output"; echo "$out"
+  else ok "stdout-$emit"; fi
 done
 
 echo "e2e: $pass passed, $fail failed"

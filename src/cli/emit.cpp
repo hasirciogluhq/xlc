@@ -11,6 +11,7 @@
 #include <format>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <map>
 #include <ranges>
 
@@ -214,7 +215,15 @@ void emitOutput(Compilation& compilation, hir::Module& module, const BuildConfig
     if (request.emit == "header") {
         std::string guard = "XLANG_" + stem + "_H";
         std::ranges::transform(guard, guard.begin(), [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
-        std::ofstream(out) << codegen::generateHeader(module, layoutOf, guard);
+        const std::string text = codegen::generateHeader(module, layoutOf, guard);
+        if (out == "-") { // `-o -` streams, like the LLVM writers of ir, bc and obj
+            std::cout << text;
+            return;
+        }
+        std::ofstream file(out);
+        if (!(file << text)) {
+            throw XlangError("cannot write `" + out.string() + "`");
+        }
         return;
     }
     const bool linked = request.emit == "exe" || request.emit == "static" || request.emit == "shared";
