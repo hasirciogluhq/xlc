@@ -13,8 +13,9 @@
 
 namespace xlang_test {
 
-/// The unoptimized IR of `text` built for `triple` as an object file; empty after an error.
-inline std::string irFor(const std::string& triple, std::string text) {
+/// The IR of `text` built for `triple` as an object file, after the `-O<opt_level>` pipeline (none by
+/// default); empty after an error.
+inline std::string irFor(const std::string& triple, std::string text, int opt_level = 0) {
     xlang::SourceManager sources;
     std::ostringstream out;
     xlang::BuildConfig config;
@@ -37,7 +38,11 @@ inline std::string irFor(const std::string& triple, std::string text) {
         [&sema](const xlang::Type& t) { return sema.layoutOf(t, xlang::Span{}); }, "t",
         xlang::codegen::Output::Object};
     const auto artifact = xlang::codegen::generate(input);
-    return artifact ? artifact->ir() : std::string{};
+    if (!artifact) {
+        return {};
+    }
+    artifact->optimize(opt_level);
+    return artifact->ir();
 }
 
 /// `needle` is in `text`; prints the text when it is not.

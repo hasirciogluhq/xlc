@@ -57,6 +57,21 @@ void testAssignBuildsTheValueBeforeTheTarget() {
     CHECK(ir.find("call void @llvm.memset.p0.i64(ptr align 4 %0, i8 0") == std::string::npos);
 }
 
+// A negative literal of a type narrower than 64 bits keeps only its low bits. It was stored with the
+// high bits set, so IPSCCP merged `pick`'s returns into a range without 0 and folded the compare to
+// `false` (at -O2 `xl lc install` could not finish a TLS handshake).
+void testNegativeLiteralFitsItsType() {
+    const std::string ir = irFor("aarch64-apple-darwin",
+                                 "define OK = 0\ndefine BAD = -2\n"
+                                 "fn pick(a: i32) -> i32 {\n    if a == 1 {\n        return OK\n    }\n"
+                                 "    if a == 2 {\n        return BAD\n    }\n    return 5\n}\n"
+                                 "export fn isOk(a: i32) -> bool {\n    return pick(a) == 0\n}\n",
+                                 1);
+    CHECK(contains(ir, "@\"_xl$main$isOk$i32\"(i32 %a)"));
+    CHECK(contains(ir, "icmp eq i32 %a, 1"));
+    CHECK(ir.find("ret i1 false") == std::string::npos);
+}
+
 } // namespace
 
 void runCodegenTests() {
@@ -64,4 +79,5 @@ void runCodegenTests() {
     RUN(testOtherSyscallRegisters);
     RUN(testNeverIsNoreturn);
     RUN(testAssignBuildsTheValueBeforeTheTarget);
+    RUN(testNegativeLiteralFitsItsType);
 }
