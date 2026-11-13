@@ -67,7 +67,7 @@ void Lowerer::lowerFunction(const FnDecl& f,
     entry_temps_.clear();
     entry_flags_.clear();
     unwind_entries_.clear();
-    sum_bindings_.clear();
+    sum_views_.clear();
     has_try_ = false;
     defers_.emplace_back();
     std::vector<Type> param_types;

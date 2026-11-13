@@ -42,7 +42,7 @@ struct Lowerer::FnFrame {
     std::vector<hir::Stmt>* prelude;
     int in_defer;
     std::map<hir::LocalId, hir::LocalId> drop_flags;
-    std::map<hir::LocalId, std::optional<hir::LocalId>> sum_bindings;
+    std::set<hir::LocalId> sum_views;
     std::string base_init_call;
     bool inferring;
     ScopeStack scopes;
@@ -62,7 +62,7 @@ struct Lowerer::FnFrame {
           prelude(std::exchange(self.prelude_, nullptr)),
           in_defer(std::exchange(self.in_defer_, 0)),
           drop_flags(std::exchange(self.drop_flags_, {})),
-          sum_bindings(std::exchange(self.sum_bindings_, {})),
+          sum_views(std::exchange(self.sum_views_, {})),
           base_init_call(std::exchange(self.base_init_call_, {})),
           inferring(std::exchange(self.inferring_, false)),
           scopes(std::move(self.scopes_)) {
@@ -85,7 +85,7 @@ struct Lowerer::FnFrame {
         l.prelude_ = prelude;
         l.in_defer_ = in_defer;
         l.drop_flags_ = std::move(drop_flags);
-        l.sum_bindings_ = std::move(sum_bindings);
+        l.sum_views_ = std::move(sum_views);
         l.base_init_call_ = std::move(base_init_call);
         l.inferring_ = inferring;
         l.scopes_ = std::move(scopes);

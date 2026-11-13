@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <deque>
 #include <format>
+#include <functional>
 #include <iterator>
 #include <ranges>
 #include <set>
@@ -548,10 +549,10 @@ class Lowerer {
     /// The base class constructor a derived `init` runs first (empty = none).
     [[nodiscard]] std::string baseInitKey(const ClassDecl& cl, Sema& owner);
     std::map<hir::LocalId, hir::LocalId> drop_flags_; ///< droppable local -> its drop flag
-    /// A `case` binding of a droppable payload -> the drop flag of the local that owns the switched
-    /// value (moving the binding out clears it), or nullopt when the switch reads a place
-    /// (`*p`, a field), which cannot give its payload away (E0720).
-    std::map<hir::LocalId, std::optional<hir::LocalId>> sum_bindings_;
+    /// `case` bindings of a droppable payload of a `switch` on a place (`*p`, a field): views of a
+    /// payload the place keeps, so they cannot be moved out (E0720). A binding of an owned value
+    /// owns its payload instead and has a drop flag like any local.
+    std::set<hir::LocalId> sum_views_;
     /// Any type -> needsDrop. Structs are cached en route to their fields, so a payload enum that
     /// mentions another payload enum by value terminates instead of recursing.
     std::map<std::string, bool> needs_drop_;
@@ -749,7 +750,11 @@ class Lowerer {
     Type inferred_ret_;         ///< what the last inferring `lowerFunction` settled on
 
     // --- statements
-    void lowerBlock(const Block& block, std::vector<hir::Stmt>& out, bool new_scope);
+    /// `prologue` runs first inside the block's scope and defer frame (the bindings of a `case`).
+    void lowerBlock(const Block& block,
+                    std::vector<hir::Stmt>& out,
+                    bool new_scope,
+                    const std::function<void()>& prologue = {});
     void lowerStmt(const Stmt& s, std::vector<hir::Stmt>& out);
     void lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out);
     void lowerAssign(const Expr& target,

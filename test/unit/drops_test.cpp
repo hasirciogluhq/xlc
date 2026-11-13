@@ -88,6 +88,54 @@ void testStaticDropThatSkipsADerivedDropIsAnError() {
     CHECK(!exact.diag->hasErrors());
 }
 
+const std::string kTwo = kRes + "enum Two {\n    Empty\n    Pair(Res, Res)\n}\n"
+                                 "fn keep(r: Res) { }\n";
+
+// A `switch` on an owner takes the payload: the owner's flag is cleared and every payload value,
+// `_` included, lands in a local that drops on its own unless it is moved.
+void testPayloadSwitchOnAnOwnerTakesThePayload() {
+    const Lowered r(kTwo + "fn f(t: Two) {\n    switch t {\n"
+                           "        case Two.Pair(a, _) { keep(a) }\n"
+                           "        case Two.Empty { }\n    }\n}\n");
+    CHECK(!r.diag->hasErrors());
+    CHECK(r.has("local $payload"));                       // `_` still holds its droppable value
+    CHECK(r.has("(call Res$dropGlue (addr $payload"));    // and drops it at the arm's end
+    CHECK(r.has("(call keep move#"));                     // `a` is moved out
+    CHECK(r.has("(call Res$dropGlue (addr a#"));          // guarded by its own flag
+    const std::size_t entry = r.hir_text.find("    if (== (field tag $sw");
+    const std::size_t clear = r.hir_text.find("assign $live1#1 = false", entry);
+    CHECK(entry != std::string::npos && clear != std::string::npos);
+    // An arm that binds nothing droppable leaves the payload to its owner.
+    const Lowered view(kTwo + "fn f(t: Two) {\n    switch t {\n"
+                              "        case Two.Pair(_, _) { }\n        case Two.Empty { }\n    }\n}\n");
+    CHECK(!view.diag->hasErrors());
+    CHECK(!view.has("$payload"));
+}
+
+// A temporary scrutinee is held by the switch and dropped when it ends.
+void testPayloadSwitchOnATemporaryDropsIt() {
+    const Lowered r(kTwo + "fn make() -> Two { return Two.Empty }\n"
+                           "fn f() {\n    switch make() {\n"
+                           "        case Two.Pair(a, b) { keep(a) }\n"
+                           "        case Two.Empty { }\n    }\n}\n");
+    CHECK(!r.diag->hasErrors());
+    CHECK(r.has("(call Two$dropGlue (addr $sw"));
+    CHECK(r.has("(call Res$dropGlue (addr b#"));
+}
+
+// A `switch` on a place only lends the payload: reading is fine, moving it out is E0720.
+void testPayloadSwitchOnAPlaceLends() {
+    CHECK(Lowered(kTwo + "fn f(t: *Two) {\n    switch *t {\n"
+                         "        case Two.Pair(a, _) { keep(a) }\n"
+                         "        case Two.Empty { }\n    }\n}\n")
+              .failedWith("E0720"));
+    const Lowered read(kTwo + "fn f(t: *Two) -> i32 {\n    switch *t {\n"
+                              "        case Two.Pair(a, _) { return a.id }\n"
+                              "        case Two.Empty { return 0 }\n    }\n}\n");
+    CHECK(!read.diag->hasErrors());
+    CHECK(!read.has("(addr a#")); // a view: never dropped
+}
+
 } // namespace
 
 void runDropTests() {
@@ -97,4 +145,7 @@ void runDropTests() {
     RUN(testPolymorphicClassDropsThroughItsVtable);
     RUN(testReprCVtableHasNoDropSlot);
     RUN(testStaticDropThatSkipsADerivedDropIsAnError);
+    RUN(testPayloadSwitchOnAnOwnerTakesThePayload);
+    RUN(testPayloadSwitchOnATemporaryDropsIt);
+    RUN(testPayloadSwitchOnAPlaceLends);
 }

@@ -44,11 +44,17 @@ void Lowerer::bindLocal(const std::string& name,
     }
 }
 
-void Lowerer::lowerBlock(const Block& block, std::vector<hir::Stmt>& out, bool new_scope) {
+void Lowerer::lowerBlock(const Block& block,
+                         std::vector<hir::Stmt>& out,
+                         bool new_scope,
+                         const std::function<void()>& prologue) {
     if (new_scope) {
         scopes_.push(ScopeKind::Block);
     }
     defers_.emplace_back();
+    if (prologue) {
+        prologue();
+    }
     for (const Stmt& s : block.statements) {
         lowerStmt(s, out);
     }

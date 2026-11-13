@@ -79,18 +79,13 @@ Lowerer::EP Lowerer::moveOut(EP value, bool fromSum) {
         hir::LocalId flag;
         if (const auto it = drop_flags_.find(value->local); it != drop_flags_.end()) {
             flag = it->second;
-        } else if (const auto b = sum_bindings_.find(value->local); b != sum_bindings_.end()) {
-            // A `case` binding is a view of the payload the switched-on local still owns: taking
-            // it consumes that local (its flag), so the payload has one owner.
-            if (!b->second) {
-                err("E0720",
-                    value->span,
-                    "cannot move a payload out of a `switch` on a field or pointer",
-                    "switch on a local that owns the value (`switch r`, `r` taken by value), "
-                    "or use `?`");
-                return nullptr;
-            }
-            flag = *b->second;
+        } else if (sum_views_.contains(value->local)) {
+            err("E0720",
+                value->span,
+                "cannot move a payload out of a `switch` on a field or pointer",
+                "switch on a local that owns the value (`switch r`, `r` taken by value), "
+                "or use `?`");
+            return nullptr;
         } else {
             return value;
         }

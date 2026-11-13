@@ -19,26 +19,40 @@ void Lowerer::lowerSumSwitch(const Stmt& s, EP scrutinee, std::vector<hir::Stmt>
     block.span = s.span;
     scopes_.push(ScopeKind::Block);
     const hir::LocalId id = hiddenLocal("sw", self, s.span);
-    // Who owns the payloads the bindings view: a local with a drop flag (moving a binding out
-    // clears it), a place (nothing can be moved out), or a temporary (no entry: it is not dropped).
-    std::optional<std::optional<hir::LocalId>> owner;
+    // Who owns the payloads. An owned value (a local with a drop flag, or a temporary, which the
+    // switch holds with its own flag) gives its payload to an arm that binds a droppable value:
+    // the owner's flag is cleared on entry and every payload value of the variant lands in its own
+    // local with its own flag (Rust's by-value `match`). A place (field, element, pointee) only
+    // lends its payload: the bindings are views that cannot be moved out (`sum_views_`).
+    std::optional<hir::LocalId> owner_flag;
+    bool place = false;
+    bool temporary = false;
     if (scrutinee->kind == hir::ExprKind::LocalRef) {
         if (const auto it = drop_flags_.find(scrutinee->local); it != drop_flags_.end()) {
-            owner = it->second;
-        } else if (const auto b = sum_bindings_.find(scrutinee->local); b != sum_bindings_.end()) {
-            owner = b->second;
+            owner_flag = it->second;
+        } else {
+            place = sum_views_.contains(scrutinee->local);
         }
     } else if (scrutinee->kind == hir::ExprKind::Field || scrutinee->kind == hir::ExprKind::Index ||
                scrutinee->kind == hir::ExprKind::Deref) {
-        owner = std::optional<hir::LocalId>{};
+        place = true;
+    } else {
+        temporary = needsDrop(self);
     }
     {
         hir::Stmt d;
         d.kind = hir::StmtKind::Local;
         d.span = s.span;
         d.local = id;
-        d.value = std::move(scrutinee);
+        d.value = std::move(scrutinee); // a bitwise view; the owner keeps its flag
         block.body.push_back(std::move(d));
+    }
+    if (temporary) {
+        // The switch's own defer frame: the temporary is dropped when the switch ends (or is left
+        // by a jump), like a temporary at the end of its statement.
+        defers_.emplace_back();
+        registerDrop(id, self, true, s.span, block.body);
+        owner_flag = drop_flags_[id];
     }
     const auto tagIs = [&](std::size_t variant, const Span& at) {
         EP tag = mk(hir::ExprKind::Field, tag_type, at);
@@ -76,6 +90,8 @@ void Lowerer::lowerSumSwitch(const Stmt& s, EP scrutinee, std::vector<hir::Stmt>
         }
         Arm arm;
         scopes_.push(ScopeKind::Block);
+        // The bindings are made inside the arm's block, so their drops run when the arm ends.
+        std::function<void()> bind;
         for (const ExprPtr& value : c.values) {
             const bool call = value->kind == Expr::Kind::Call;
             const Expr& pattern = call ? *value->lhs : *value;
@@ -148,34 +164,54 @@ void Lowerer::lowerSumSwitch(const Stmt& s, EP scrutinee, std::vector<hir::Stmt>
                     "write `case E.A(x, y) { }`; use `_` to ignore a value");
                 continue;
             }
-            for (const std::size_t i : std::views::iota(std::size_t{0}, v.payload.size())) {
-                const Expr& name = *value->args[i];
-                if (name.text == "_") {
-                    continue;
+            bind = [this, &sum, &self, &arm, id, owner_flag, place, &args = value->args,
+                    variant = *variant, span = value->span] {
+                std::vector<Type> types;
+                for (const std::size_t i : std::views::iota(std::size_t{0}, args.size())) {
+                    types.push_back(sumPayloadRead(sum, id, self, variant, i, span)->type);
                 }
-                EP read = sumPayloadRead(sum, id, self, *variant, i, name.span);
-                const Type field_type = read->type;
-                // The binding owns the value: a droppable payload moves out of the enum. The
-                // switch held the scrutinee; once its live payload is taken the holder is dropped
-                // without it, so exactly one value exists.
-                read = moveOut(std::move(read), true);
-                if (read == nullptr) {
-                    continue;
+                // An arm that binds a droppable value takes the whole payload from its owner.
+                const bool takes =
+                    owner_flag && std::ranges::any_of(
+                                      std::views::iota(std::size_t{0}, args.size()), [&](auto i) {
+                                          return args[i]->text != "_" && needsDrop(types[i]);
+                                      });
+                if (takes) {
+                    hir::Stmt clear;
+                    clear.kind = hir::StmtKind::Assign;
+                    clear.span = span;
+                    clear.target = localRef(*owner_flag, Type::makeBool(), span);
+                    clear.value = boolConst(false, span);
+                    arm.body.push_back(std::move(clear));
                 }
-                const hir::LocalId local = addLocal(name.text, field_type, false, name.span);
-                hir::Stmt d;
-                d.kind = hir::StmtKind::Local;
-                d.span = name.span;
-                d.local = local;
-                d.value = std::move(read);
-                arm.body.push_back(std::move(d));
-                bindLocal(name.text, local, field_type, name.span);
-                if (owner && needsDrop(field_type)) {
-                    sum_bindings_[local] = *owner;
+                for (const std::size_t i : std::views::iota(std::size_t{0}, args.size())) {
+                    const Expr& name = *args[i];
+                    const bool named = name.text != "_";
+                    // `_` binds nothing, unless the arm took a droppable value it must still drop.
+                    if (!named && !(takes && needsDrop(types[i]))) {
+                        continue;
+                    }
+                    const hir::LocalId local = named
+                                                   ? addLocal(name.text, types[i], false, name.span)
+                                                   : hiddenLocal("payload", types[i], name.span);
+                    hir::Stmt d;
+                    d.kind = hir::StmtKind::Local;
+                    d.span = name.span;
+                    d.local = local;
+                    d.value = sumPayloadRead(sum, id, self, variant, i, name.span);
+                    arm.body.push_back(std::move(d));
+                    if (named) {
+                        bindLocal(name.text, local, types[i], name.span);
+                    }
+                    if (takes && needsDrop(types[i])) {
+                        registerDrop(local, types[i], true, name.span, arm.body);
+                    } else if (place && needsDrop(types[i])) {
+                        sum_views_.insert(local);
+                    }
                 }
-            }
+            };
         }
-        lowerBlock(*c.body, arm.body, true);
+        lowerBlock(*c.body, arm.body, true, bind);
         scopes_.pop();
         if (arm.cond) {
             arms.push_back(std::move(arm));
@@ -219,6 +255,10 @@ void Lowerer::lowerSumSwitch(const Stmt& s, EP scrutinee, std::vector<hir::Stmt>
         chain.push_back(std::move(ifs));
     }
     std::ranges::move(chain, std::back_inserter(block.body));
+    if (temporary) {
+        emitDefers(defers_.size() - 1, block.body);
+        defers_.pop_back();
+    }
     out.push_back(std::move(block));
 }
 
