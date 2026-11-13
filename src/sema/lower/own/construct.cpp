@@ -40,6 +40,17 @@ std::string Lowerer::baseInitKey(const ClassDecl& cl, Sema& owner) {
     return zeroArgInitOf(base->path.front());
 }
 
+bool Lowerer::namesClass(const ScopeEntry& entry) {
+    return entry.kind == ScopeEntry::Kind::Type && entry.item != nullptr &&
+           std::holds_alternative<ClassDecl>(entry.item->decl);
+}
+
+Lowerer::EP Lowerer::classConstruct(const Expr& e, const Expr& callee, const ScopeEntry& entry) {
+    const Sema& holder = entry.owner != nullptr ? *entry.owner : s_;
+    return holder.genericParamsOf(*entry.item).empty() ? constructCall(e, entry)
+                                                       : genericConstruct(e, callee, entry);
+}
+
 Lowerer::EP Lowerer::genericConstruct(const Expr& e, const Expr& callee, const ScopeEntry& entry) {
     Sema& owner = entry.owner != nullptr ? *entry.owner : s_;
     const std::string local = declBase(*entry.item).name;

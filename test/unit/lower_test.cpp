@@ -480,6 +480,28 @@ void testCyclicModules() {
     }
 }
 
+// A namespace member reached through `export *` is a type for `L.T` and a constructor for `L.T(args)`,
+// plain and generic (`std.String()`, `std.Vec<i32>()` once failed with "is a type, not a value").
+void testNamespaceConstructsThroughExportStar() {
+    Multi r({{"app/main.xl",
+              "import \"lib\" as L\n"
+              "fn f() -> L.Result<i32, i32> { return L.Result.Ok(1) }\n"
+              "fn main() -> i32 {\n"
+              "    local p = L.Point(2)\n"
+              "    local b: L.Box<i32> = L.Box<i32>(3)\n"
+              "    local r = f()\n"
+              "    return p.x + b.v\n"
+              "}\n"},
+             {"app/lib.xl", "export * from \"inner\"\n"},
+             {"app/inner.xl",
+              "export enum Result<T, E> {\n    Ok(T)\n    Err(E)\n}\n"
+              "export class Point {\n    x: i32\n    fn init(self, x: i32) { self.x = x }\n}\n"
+              "export class Box<T> {\n    v: T\n    fn init(self, v: T) { self.v = v }\n}\n"}});
+    CHECK(!r.diag->hasErrors());
+    CHECK(r.has("Point.init"));
+    CHECK(r.has("Box<i32>.init"));
+}
+
 // A module is a library module when it is reached through a module-root name or from a library
 // module, never because of where its file lies: a program may sit inside a root's directory (the
 // stdlib's own tests do, with `-M std=<the stdlib repository>`). The entry module is never a library,
@@ -1293,6 +1315,7 @@ void runLowerTests() {
     RUN(testTryOperator);
     RUN(testModulesImportAndExport);
     RUN(testCyclicModules);
+    RUN(testNamespaceConstructsThroughExportStar);
     RUN(testModulesShareTypes);
     RUN(testModuleRegistrationsAndMangling);
     RUN(testClassesAndInterfacesChecks);

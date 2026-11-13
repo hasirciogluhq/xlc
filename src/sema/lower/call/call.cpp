@@ -132,13 +132,8 @@ Lowerer::EP Lowerer::callExpr(const Expr& e, const Type* expected) {
                 return builtinCall(e, name);
             }
         }
-        if (entry != nullptr && entry->kind == ScopeEntry::Kind::Type && entry->item != nullptr &&
-            std::holds_alternative<ClassDecl>(entry->item->decl)) {
-            const Sema& holder = entry->owner != nullptr ? *entry->owner : s_;
-            if (!holder.genericParamsOf(*entry->item).empty()) {
-                return genericConstruct(e, callee, *entry); // `Vec<i32>(args)`
-            }
-            return constructCall(e, *entry); // `T(args)` builds a class
+        if (entry != nullptr && namesClass(*entry)) {
+            return classConstruct(e, callee, *entry); // `T(args)`, `Vec<i32>(args)`
         }
         if (entry != nullptr) {
             if (EP c = callEntry(e, *entry, name)) {
@@ -172,6 +167,9 @@ Lowerer::EP Lowerer::callExpr(const Expr& e, const Type* expected) {
             const ScopeEntry* member = namespaceMember(*head, callee.text, callee.span, true);
             if (member == nullptr) {
                 return nullptr;
+            }
+            if (namesClass(*member)) {
+                return classConstruct(e, callee, *member); // `ns.T(args)`, `ns.Vec<i32>(args)`
             }
             if (EP c = callEntry(e, *member, callee.text)) {
                 return c;

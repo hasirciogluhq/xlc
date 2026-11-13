@@ -539,6 +539,11 @@ class Lowerer {
     [[nodiscard]] EP materializeTemp(EP value, const Span& span);
     void lowerDropAssign(EP target, EP value, const Span& span, std::vector<hir::Stmt>& out);
     [[nodiscard]] EP constructCall(const Expr& e, const ScopeEntry& entry);
+    /// True when `entry` names a class, so `entry(args)` is a constructor call.
+    [[nodiscard]] static bool namesClass(const ScopeEntry& entry);
+    /// `T(args)`, `Vec<i32>(args)`, `ns.T(args)`: builds an object of the class `entry` names;
+    /// `callee` carries the type arguments of a generic class.
+    [[nodiscard]] EP classConstruct(const Expr& e, const Expr& callee, const ScopeEntry& entry);
     /// `Vec<i32>(args)`: the constructor of the instance of a generic class.
     [[nodiscard]] EP genericConstruct(const Expr& e, const Expr& callee, const ScopeEntry& entry);
     /// Resolves and lowers the `init` a `T(args)` / `new T(args)` of class `t` calls (key empty
