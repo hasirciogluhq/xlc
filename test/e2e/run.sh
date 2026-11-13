@@ -12,6 +12,8 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 xlc=${1:-${XLC:-xlc}}
+# A relative path is made absolute: section 4 runs the compiler from inside the work directory.
+case "$xlc" in */*) xlc="$(cd "$(dirname "$xlc")" && pwd)/$(basename "$xlc")" ;; esac
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 pass=0; fail=0
