@@ -1,0 +1,120 @@
+// e2e: structs by value across the C boundary, both ways, on the host's C convention (SysV x86-64,
+// AAPCS64 or Microsoft x64; see src/codegen/llvm/c_abi/). run.sh builds c_abi.c with the host C
+// compiler and links it in. xlang calls the C functions (`declare`), then C calls the xlang ones
+// (`export(c)`) from `c_abi_run`. Exit 0 when every value came back right, else the number of the
+// first wrong call (1..20 here, 101.. in C).
+
+@repr(c)
+struct Pair {
+    a: i32
+    b: i32
+}
+@repr(c)
+struct Vec2 {
+    x: f32
+    y: f32
+}
+@repr(c)
+struct Mixed {
+    n: i64
+    d: f64
+}
+@repr(c)
+struct Rgb {
+    r: u8
+    g: u8
+    b: u8
+}
+@repr(c)
+struct Tri {
+    x: f32
+    y: f32
+    z: f32
+}
+@repr(c)
+struct Quad {
+    a: f64
+    b: f64
+    c: f64
+    d: f64
+}
+@repr(c)
+struct Big {
+    a: i64
+    b: i64
+    c: i64
+    d: i64
+}
+@repr(c)
+struct Two64 {
+    a: i64
+    b: i64
+}
+
+declare fn cPair(p: Pair) -> Pair
+declare fn cVec2(v: Vec2) -> Vec2
+declare fn cMixed(m: Mixed) -> Mixed
+declare fn cRgb(c: Rgb) -> Rgb
+declare fn cTri(t: Tri) -> Tri
+declare fn cQuad(q: Quad) -> Quad
+declare fn cBig(b: Big) -> Big
+declare fn cSpill5(a: i64, b: i64, c: i64, d: i64, e: i64, p: Two64, f: i64) -> i64
+declare fn cSpill7(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64, p: Two64, f: i64) -> i64
+declare fn cWiden(a: i8, b: u8, c: i16, d: bool) -> i32
+declare fn cNarrow() -> i8
+declare fn c_abi_run() -> i32
+
+export(c) fn xlPair(p: Pair) -> Pair {
+    return Pair { a: p.b, b: p.a }
+}
+export(c) fn xlVec2(v: Vec2) -> Vec2 {
+    return Vec2 { x: v.x + v.y, y: v.y - v.x }
+}
+export(c) fn xlMixed(m: Mixed) -> Mixed {
+    return Mixed { n: m.n + 1, d: m.d * 2.0 }
+}
+export(c) fn xlRgb(c: Rgb) -> Rgb {
+    return Rgb { r: c.r + 1, g: c.g + 1, b: c.b + 1 }
+}
+export(c) fn xlTri(t: Tri) -> Tri {
+    return Tri { x: t.x * 2.0, y: t.y * 2.0, z: t.z * 2.0 }
+}
+export(c) fn xlQuad(q: Quad) -> Quad {
+    return Quad { a: q.a + q.b + q.c + q.d, b: q.a, c: q.b, d: q.c }
+}
+export(c) fn xlBig(b: Big) -> Big {
+    return Big { a: b.a + b.b + b.c + b.d, b: b.b, c: b.c, d: b.d }
+}
+export(c) fn xlSpill5(a: i64, b: i64, c: i64, d: i64, e: i64, p: Two64, f: i64) -> i64 {
+    return a * 10000000 + b * 1000000 + c * 100000 + d * 10000 + e * 1000 + p.a * 100 + p.b * 10 + f
+}
+export(c) fn xlSpill7(a: i64, b: i64, c: i64, d: i64, e: i64, g: i64, h: i64, p: Two64, f: i64) -> i64 {
+    return a * 100000000 + b * 10000000 + c * 1000000 + d * 100000 + e * 10000 + g * 1000 + h * 100 +
+        p.a * 10 + p.b + f
+}
+export(c) fn xlSmall(a: i8, b: u16) -> i16 {
+    return (a as i32 + b as i32) as i16
+}
+
+@entry fn main() -> i32 {
+    local p = cPair(Pair { a: 1, b: 2 })
+    if p.a != 10 || p.b != 20 { return 1 }
+    local v = cVec2(Vec2 { x: 1.5, y: 2.25 })
+    if v.x != 2.25 || v.y != 1.5 { return 2 }
+    local m = cMixed(Mixed { n: 7, d: 0.5 })
+    if m.n != 8 || m.d != 1.0 { return 3 }
+    local c = cRgb(Rgb { r: 1, g: 2, b: 3 })
+    if c.r != 13 || c.g != 2 || c.b != 11 { return 4 }
+    local t = cTri(Tri { x: 1.0, y: 2.0, z: 3.0 })
+    if t.x != 3.0 || t.y != 2.0 || t.z != 1.0 { return 5 }
+    local q = cQuad(Quad { a: 1.0, b: 2.0, c: 3.0, d: 4.0 })
+    if q.a != 4.0 || q.b != 3.0 || q.c != 2.0 || q.d != 1.0 { return 6 }
+    local b = cBig(Big { a: 1, b: 2, c: 3, d: 4 })
+    if b.a != 4 || b.b != 3 || b.c != 2 || b.d != 101 { return 7 }
+    if cSpill5(1, 2, 3, 4, 5, Two64 { a: 6, b: 7 }, 8) != 12345678 { return 8 }
+    if cSpill7(1, 2, 3, 4, 5, 6, 7, Two64 { a: 8, b: 9 }, 1) != 123456790 { return 9 }
+    local minus: i8 = -1
+    if cWiden(minus, 200, -300, true) != 899 { return 10 }
+    if cNarrow() != -5 { return 11 }
+    return c_abi_run()
+}

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "../artifact.h"
+#include "codegen/llvm/c_abi/c_abi.hpp"
 
 #include "xlang/util/error.h"
 
@@ -27,6 +28,7 @@
 #include <cstdlib>
 #include <format>
 #include <map>
+#include <optional>
 #include <ranges>
 #include <set>
 
@@ -99,6 +101,35 @@ class Gen {
     [[nodiscard]] const TypeLayout* layoutOf(const Type& t);
     [[nodiscard]] llvm::FunctionType* fnTypeFor(const std::vector<Type>& params, const Type& ret);
     [[nodiscard]] bool isSigned(const Type& t) const;
+    /// `zeroext`/`signext` for a scalar narrower than 32 bits (C callers widen these), else none.
+    [[nodiscard]] std::optional<llvm::Attribute::AttrKind> extensionOf(const Type& t) const;
+    /// `[size x i8]`: the memory image of an aggregate (alloca, `byval`, `sret` type).
+    [[nodiscard]] llvm::Type* bytesOf(const Type& t);
+
+    // ---- the C convention (c_abi/signature.cpp): `export(c)` definitions and `declare` imports
+    [[nodiscard]] static bool usesCAbi(const hir::Function& f) { return f.export_c || f.declared; }
+    [[nodiscard]] c_abi::Value cValue(const Type& t);
+    void flatten(const Type& t, std::uint64_t base, c_abi::Value& out);
+    [[nodiscard]] std::pair<c_abi::Signature, llvm::FunctionType*>
+    cFunctionType(const std::vector<Type>& params, const Type& ret);
+    /// Parameter and result attributes: `sret`, `byval`/`align`, `noalias`, `zeroext`/`signext`.
+    /// `c` is null for the xlang convention, where `params` follow the result slot.
+    [[nodiscard]] llvm::AttributeList signatureAttributes(const std::vector<Type>& params,
+                                                          const Type& ret,
+                                                          const c_abi::Signature* c);
+    /// The callee side: the parameter locals of a C-convention function (its prologue).
+    void bindCParams(const hir::Function& f, const c_abi::Signature& c);
+    /// The callee side: `return value` of a C-convention function.
+    void returnC(const hir::Expr& value);
+    /// The caller side: a direct call of a C-convention function.
+    llvm::Value* genCCall(llvm::Function* callee,
+                          const c_abi::Signature& c,
+                          const std::vector<const hir::Expr*>& args,
+                          const Type& ret,
+                          llvm::Value** mem_result,
+                          const Span& at);
+    /// A temporary that holds `t` and is big enough to load or store `coerce` from it.
+    llvm::AllocaInst* coerceSlot(const Type& t, llvm::Type* coerce);
 
     // ---- module level
     void declareFunction(const hir::Function& f);
@@ -137,6 +168,8 @@ class Gen {
                                const Type& ret,
                                llvm::Value** mem_result,
                                const Span& at);
+    /// After a call: a `-> never` callee does not come back, so the code after it is unreachable.
+    void afterCall(llvm::CallInst* call, const Type& ret);
     llvm::Value* genSyscall(const hir::Expr& e);
     llvm::Value* genBinary(const hir::Expr& e);
     /// `a == b` / `a != b` on two `str` values: equal lengths and equal bytes (an `i1`).
@@ -183,12 +216,14 @@ class Gen {
     std::map<std::string, const hir::Function*> hir_fns_;
     std::map<std::string, const hir::Global*> hir_globals_;
     std::map<std::string, std::unique_ptr<TypeLayout>> layouts_;
+    std::map<std::string, c_abi::Signature> c_sigs_; ///< C-convention functions, by HIR name
 
     // per-function state
     const hir::Function* cur_{nullptr};
     llvm::Function* cur_fn_{nullptr};
     std::vector<llvm::Value*> locals_;
     llvm::Value* sret_{nullptr};
+    const c_abi::Signature* cur_c_{nullptr}; ///< the current function uses the C convention
     struct LoopTargets {
         llvm::BasicBlock* cont; ///< where `continue` goes (step block, or the condition)
         llvm::BasicBlock* brk;  ///< where `break` goes

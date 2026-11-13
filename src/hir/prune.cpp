@@ -134,18 +134,21 @@ void markNamedHooks(Reachability& r, const Module& m) {
 
 }  // namespace
 
-std::size_t pruneUnreachable(Module& module, bool keepExports) {
+std::size_t pruneUnreachable(Module& module, KeepExports keep) {
     Reachability r(module);
+    const auto kept = [keep](bool exported, bool export_c) {
+        return export_c ? keep != KeepExports::None : exported && keep == KeepExports::All;
+    };
 
     // Functions the program owns at run time, whether or not code calls them.
     for (const Function& f : module.functions) {
-        if (f.is_entry || f.is_init || f.is_fini || f.registered || isImplicitLibcall(f.symbol)) {
+        if (f.is_entry || f.is_init || f.is_fini || f.registered || isImplicitLibcall(f.symbol) ||
+            kept(f.exported, f.export_c)) {
             r.markFunction(f.name);
         }
-        if (keepExports && (f.exported || f.export_c)) r.markFunction(f.name);
     }
     for (const Global& g : module.globals) {
-        if (g.registered || (keepExports && (g.exported || g.export_c))) r.markGlobal(g.name);
+        if (g.registered || kept(g.exported, g.export_c)) r.markGlobal(g.name);
     }
     markNamedHooks(r, module);
 

@@ -82,6 +82,29 @@ for row in "${programs[@]}"; do
   else ok "$name"; fi
 done
 
+# --- 2b. the C convention -------------------------------------------------------------------------------
+# c_abi.xl and its C peer c_abi.c pass structs by value both ways; the peer is built by the host C
+# compiler (clang-cl on Windows, `$CC` or `cc` elsewhere) without libc and linked into the program.
+if [ "$os" = windows ]; then cc_cmd=clang-cl; else cc_cmd=${CC:-cc}; fi
+if ! command -v "$cc_cmd" >/dev/null 2>&1; then
+  echo "skip [e2e/c_abi] no C compiler ($cc_cmd)"
+else
+  if [ "$os" = windows ]; then
+    peer=c_abi_peer.obj
+    (cd "$work" && clang-cl -nologo -O2 -GS- -Zl -c -Fo"$peer" -- "$here/c_abi.c") >"$work/c_abi.err" 2>&1
+  else
+    peer=c_abi_peer.o
+    "$cc_cmd" -O2 -fPIC -fno-stack-protector -c "$here/c_abi.c" -o "$work/$peer" >"$work/c_abi.err" 2>&1
+  fi
+  if [ $? != 0 ]; then bad "c_abi" "C peer"; cat "$work/c_abi.err"
+  elif ! "$xlc" "$here/c_abi.xl" "$work/$peer" --allow W0301 -o "$work/c_abi$exe" 2>"$work/c_abi.err"; then
+    bad "c_abi" "build"; cat "$work/c_abi.err"
+  else
+    "$work/c_abi$exe"; got=$?
+    if [ "$got" = 0 ]; then ok "c_abi"; else bad "c_abi" "call $got came back wrong (see c_abi.xl, c_abi.c)"; fi
+  fi
+fi
+
 # --- 3. every target ------------------------------------------------------------------------------------
 for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc; do
   if "$xlc" "$here/object.xl" --emit=obj --target "$target" -o "$work/t-$target.o" 2>"$work/t.err" && [ -s "$work/t-$target.o" ]; then

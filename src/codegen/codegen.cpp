@@ -5,7 +5,8 @@
 // Value model: scalars (integers, floats, bool, pointers, function pointers, enums over scalars)
 // are SSA values; aggregates (struct, class, array, interface fat pointers) live in memory and
 // expressions of those types evaluate to the *address* of the object. Passing and returning
-// aggregates is by pointer (callee gets its own copy / an sret slot).
+// aggregates is by pointer (callee gets its own copy / an sret slot), except for `export(c)` and
+// `declare` functions, which follow the target's C convention (`codegen/llvm/c_abi/`).
 
 #include "artifact.h"
 

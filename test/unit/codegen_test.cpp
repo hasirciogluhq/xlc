@@ -1,49 +1,12 @@
 #include "check.h"
+#include "ir.h"
 
-#include "xlang/codegen/codegen.h"
-#include "xlang/lang/frontend.h"
-#include "xlang/sema/sema.h"
-
-#include <sstream>
-#include <string>
-
-// LLVM IR for a given target: what the generator writes depends only on the source and the triple, not on the host.
+// The IR the generator writes for one target (see ir.h).
 
 namespace {
 
-/// The unoptimized IR of `text` built for `triple` as an object file; empty after an error.
-std::string irFor(const std::string& triple, std::string text) {
-    xlang::SourceManager sources;
-    std::ostringstream out;
-    xlang::BuildConfig config;
-    config.target = *xlang::parseTargetTriple(triple);
-    xlang::DiagnosticEngine diag(sources, out);
-    const xlang::FileId file = sources.addFile("t.xl", std::move(text));
-    xlang::Program program = xlang::parseSource(sources, file, config, diag);
-    xlang::Sema sema(program, config, diag);
-    if (!diag.hasErrors()) {
-        sema.analyze();
-    }
-    if (diag.hasErrors()) {
-        diag.flush();
-        std::cerr << out.str();
-        return {};
-    }
-    const xlang::hir::Module module = sema.lower();
-    const xlang::codegen::CodegenInput input{module, config, sources, diag,
-                                             [&sema](const xlang::Type& t) { return sema.layoutOf(t, xlang::Span{}); },
-                                             "t", xlang::codegen::Output::Object};
-    const auto artifact = xlang::codegen::generate(input);
-    return artifact ? artifact->ir() : std::string{};
-}
-
-bool contains(const std::string& text, const std::string& needle) {
-    const bool found = text.find(needle) != std::string::npos;
-    if (!found) {
-        std::cerr << "--- missing `" << needle << "` in ---\n" << text << "\n";
-    }
-    return found;
-}
+using xlang_test::contains;
+using xlang_test::irFor;
 
 constexpr const char* kWrite = "export fn f(p: *u8, n: usize) -> i64 { return syscall(4, 1, p, n) }\n";
 

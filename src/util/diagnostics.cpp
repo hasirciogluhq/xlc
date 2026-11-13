@@ -48,9 +48,10 @@ constexpr std::size_t kLeadWidth = 40;
         {"W0301", Severity::Warning, "declared symbol not resolved in this compilation",
          "The symbol is `declare`d but not defined in this compilation; it will be looked up at "
          "link time."},
-        {"E0302", Severity::Error, "type not expressible in C used in `export(c)`",
-         "`export(c)` signatures accept only C-compatible types: integers, `f32/f64`, `bool`, "
-         "`*T`, `@repr(c)` structs, function pointers and integer-based enums."},
+        {"E0302", Severity::Error, "type not expressible in C used in `export(c)` or `declare`",
+         "`export(c)` and `declare` signatures follow the target's C calling convention and accept "
+         "only C-compatible types: integers, `f32/f64`, `bool`, `*T`, `@repr(c)` structs, function "
+         "pointers and integer-based enums."},
         {"W0401", Severity::Warning, "same entity imported/exported through two paths",
          "Not an error (it is one entity), but two paths may silently conflict later if one of "
          "them defines its own symbol. Import through a single path or use `import * as ns`."},
@@ -347,6 +348,11 @@ constexpr std::size_t kLeadWidth = 40;
          "`next` returns an enum with two variants, one carrying the item and one without data "
          "(`Some(T)` / `None`); the variant without data ends the loop. A `Result` or any other "
          "type has no end."},
+        {"E0778", Severity::Error, "C-convention function that passes a struct used as a value",
+         "A call through a `fn(...)` pointer passes a struct as the address of a copy (the xlang "
+         "convention). An `export(c)` or `declare` function that takes or returns a struct by "
+         "value follows the C convention, so it can only be called by name. Call it directly, or "
+         "change it to take and return the struct through a pointer."},
         {"W0770", Severity::Warning, "`next` takes `self` by value",
          "Each call of `next` works on a copy of the iterator, so its position never advances and "
          "the loop does not end. Write `fn next(self: *T)`."},

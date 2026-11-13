@@ -436,6 +436,9 @@ class Lowerer {
     void lowerLazyMethod(const LowerShared::LazyMethod& m, const std::string& key);
     /// Ends the module scope (after every instance is lowered).
     void finish();
+    /// E0778: an `export(c)`/`declare` function that passes a struct by value used as a `fn(...)`
+    /// value (run once over the whole program, see item/c_abi.cpp).
+    void checkCFunctionValues();
     void checkRegistrations();
     /// Finds the `@init`, `@fini` and `@entry` functions of this module (E0729 / E0752 / E0753 when
     /// one does not fit).

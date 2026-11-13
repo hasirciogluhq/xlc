@@ -21,7 +21,17 @@ void Gen::declareFunction(const hir::Function& f) {
     for (std::uint32_t i = 0; i < f.param_count; ++i) {
         params.push_back(f.locals[i].type);
     }
-    llvm::FunctionType* fty = fnTypeFor(params, f.ret);
+    // `export(c)` and `declare` functions follow the target's C convention (c_abi/); every other
+    // function the xlang one (an aggregate travels as the address of a copy).
+    const c_abi::Signature* c = nullptr;
+    llvm::FunctionType* fty = nullptr;
+    if (usesCAbi(f)) {
+        auto [sig, type] = cFunctionType(params, f.ret);
+        c = &(c_sigs_[f.name] = std::move(sig));
+        fty = type;
+    } else {
+        fty = fnTypeFor(params, f.ret);
+    }
     llvm::GlobalValue::LinkageTypes link = llvm::GlobalValue::InternalLinkage;
     const bool root_main = f.module.empty() && f.name == "main";
     if (f.exported || f.declared || root_main || !f.has_body || in_.only_module) {
@@ -29,14 +39,12 @@ void Gen::declareFunction(const hir::Function& f) {
     }
     llvm::Function* fn =
         llvm::Function::Create(fty, link, f.symbol.empty() ? f.name : f.symbol, mod_);
+    fn->setAttributes(signatureAttributes(params, f.ret, c));
     fn->addFnAttr(llvm::Attribute::NoUnwind);
     // No implicit library-call idioms: `memcpy`/`memset` are ordinary xl code (plan 7.2).
     fn->addFnAttr("no-builtins");
     // Frame pointers everywhere: stdlib context switches rely on a stable frame layout.
     fn->addFnAttr("frame-pointer", "all");
-    if (isMem(f.ret)) {
-        fn->addParamAttr(0, llvm::Attribute::get(ctx_, llvm::Attribute::NoAlias));
-    }
     if (f.ret.isNever()) {
         fn->addFnAttr(llvm::Attribute::NoReturn);
     }

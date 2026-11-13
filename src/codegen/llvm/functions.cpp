@@ -47,10 +47,14 @@ void Gen::defineFunction(const hir::Function& f) {
 
     auto arg = fn->arg_begin();
     sret_ = nullptr;
-    if (isMem(f.ret)) {
+    const auto c = c_sigs_.find(f.name);
+    cur_c_ = c != c_sigs_.end() ? &c->second : nullptr;
+    if (cur_c_ != nullptr) {
+        bindCParams(f, *cur_c_);
+    } else if (isMem(f.ret)) {
         sret_ = &*arg++;
     }
-    for (std::uint32_t i = 0; i < f.param_count; ++i, ++arg) {
+    for (std::uint32_t i = 0; cur_c_ == nullptr && i < f.param_count; ++i, ++arg) {
         const Type& pt = f.locals[i].type;
         arg->setName(f.locals[i].name);
         if (isMem(pt)) {
@@ -79,6 +83,7 @@ void Gen::defineFunction(const hir::Function& f) {
     ensureTerminated();
     emitPad(f);
     escape_ = false;
+    cur_c_ = nullptr;
     cur_sp_ = nullptr;
     B_.SetCurrentDebugLocation(llvm::DebugLoc());
     cur_ = nullptr;
@@ -137,7 +142,9 @@ void Gen::genStmt(const hir::Stmt& s) {
     }
     case hir::StmtKind::Return: {
         if (s.value) {
-            if (isMem(cur_->ret)) {
+            if (cur_c_ != nullptr) {
+                returnC(*s.value);
+            } else if (isMem(cur_->ret)) {
                 genInto(*s.value, sret_);
                 B_.CreateRetVoid();
             } else {

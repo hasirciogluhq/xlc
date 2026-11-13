@@ -195,9 +195,13 @@ void emitIncremental(Compilation& compilation, hir::Module& module, const BuildC
 
 void emitOutput(Compilation& compilation, hir::Module& module, const BuildConfig& config, SourceManager& sources,
                 DiagnosticEngine& diagnostics, const EmitRequest& request) {
-    // Plan 24: only what the roots reach is code-generated and linked. Executables keep no exports;
-    // libraries and objects keep every `export` as part of their interface.
-    hir::pruneUnreachable(module, request.emit != "exe");
+    // Plan 24: only what the roots reach is code-generated and linked. Libraries and objects keep
+    // every `export` as part of their interface; an executable keeps its `export(c)` functions only
+    // when it links prebuilt objects (they may call back into it), and nothing else.
+    hir::pruneUnreachable(module,
+                          request.emit != "exe"     ? hir::KeepExports::All
+                          : request.inputs.empty() ? hir::KeepExports::None
+                                                   : hir::KeepExports::C);
     Sema& root = *compilation.rootSema();
     const codegen::LayoutQuery layoutOf = [&root](const Type& t) { return root.layoutOf(t, Span{}); };
     const fs::path out =

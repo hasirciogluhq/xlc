@@ -104,7 +104,8 @@ void Lowerer::lowerFunction(const FnDecl& f,
     for (const OwnedParam& p : owned_params) {
         registerDrop(p.id, p.type, true, p.span, prologue);
     }
-    if (mods.export_c) {
+    if (mods.export_c || mods.declared) {
+        // Both follow the target's C convention (codegen/llvm/c_abi/).
         bool ok = cCompatible(s_, out.ret);
         for (const Type& t : param_types) {
             ok = ok && cCompatible(s_, t);
@@ -112,7 +113,8 @@ void Lowerer::lowerFunction(const FnDecl& f,
         if (!ok) {
             err("E0302",
                 f.name_span,
-                "`export(c)` signature uses a type that C cannot express",
+                std::format("`{}` signature uses a type that C cannot express",
+                            mods.export_c ? "export(c)" : "declare"),
                 "integers, floats, bool, pointers, function pointers, `@repr(c)` structs and "
                 "integer enums only");
         }

@@ -24,6 +24,25 @@ bool Gen::isSigned(const Type& t) const {
     return t.kind == TypeKind::Int && t.is_signed;
 }
 
+std::optional<llvm::Attribute::AttrKind> Gen::extensionOf(const Type& t) const {
+    // C callers widen `bool`, `char` and `short` arguments and results to 32 bits: Apple arm64
+    // requires it of the caller, and clang and GCC do it (and rely on it) on x86-64. Every function
+    // carries the attribute, so a `fn(...)` pointer to C or from C agrees as well.
+    const Type& s = t.kind == TypeKind::Enum && t.elem ? *t.elem : t;
+    if (s.kind == TypeKind::Bool) {
+        return llvm::Attribute::ZExt;
+    }
+    if (s.kind == TypeKind::Int && s.bits != 0 && s.bits < 32) {
+        return s.is_signed ? llvm::Attribute::SExt : llvm::Attribute::ZExt;
+    }
+    return std::nullopt;
+}
+
+llvm::Type* Gen::bytesOf(const Type& t) {
+    return llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx_),
+                                std::max<std::uint64_t>(sizeAlign(t).first, 1));
+}
+
 llvm::Type* Gen::sty(const Type& t) {
     switch (t.kind) {
     case TypeKind::Void:

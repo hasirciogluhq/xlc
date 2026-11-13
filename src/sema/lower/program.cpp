@@ -125,6 +125,9 @@ hir::Module lowerProgram(const std::vector<Sema*>& modules,
     for (auto& l : lowerers) {
         l->finish();
     }
+    if (!lowerers.empty()) {
+        lowerers.front()->checkCFunctionValues();
+    }
     for (Sema* s : init_order) {
         for (const std::string& name : by_sema.at(s)->initFunctions()) {
             shared.module.init_functions.push_back(name);

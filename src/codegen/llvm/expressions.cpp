@@ -655,6 +655,7 @@ llvm::Value* Gen::genCallCommon(llvm::FunctionType* fty,
                                 llvm::Value** mem_result,
                                 const Span& at) {
     std::vector<llvm::Value*> av;
+    std::vector<Type> types;
     llvm::Value* sret = nullptr;
     if (isMem(ret)) {
         sret = makeTemp(ret);
@@ -662,8 +663,10 @@ llvm::Value* Gen::genCallCommon(llvm::FunctionType* fty,
     }
     if (self != nullptr) {
         av.push_back(self);
+        types.push_back(Type::makePointer(Type::makeVoid()));
     }
     for (const hir::Expr* a : args) {
+        types.push_back(a->type);
         if (isMem(a->type)) {
             // The callee owns its argument: pass a copy.
             llvm::AllocaInst* tmp = makeTemp(a->type);
@@ -675,9 +678,15 @@ llvm::Value* Gen::genCallCommon(llvm::FunctionType* fty,
     }
     setLoc(at);
     llvm::CallInst* call = B_.CreateCall(fty, callee, av);
+    call->setAttributes(signatureAttributes(types, ret, nullptr));
     if (mem_result != nullptr) {
         *mem_result = sret;
     }
+    afterCall(call, ret);
+    return call;
+}
+
+void Gen::afterCall(llvm::CallInst* call, const Type& ret) {
     if (ret.isNever()) {
         // A `-> never` callee (direct, virtual, through a pointer or an interface) does not come
         // back: the code after the call is unreachable.
@@ -685,7 +694,6 @@ llvm::Value* Gen::genCallCommon(llvm::FunctionType* fty,
         B_.CreateUnreachable();
         B_.SetInsertPoint(llvm::BasicBlock::Create(ctx_, "after.never", cur_fn_));
     }
-    return call;
 }
 
 llvm::Value* Gen::genCall(const hir::Expr& e, llvm::Value** mem_result) {
@@ -704,6 +712,10 @@ llvm::Value* Gen::genCall(const hir::Expr& e, llvm::Value** mem_result) {
         }
         for (const hir::ExprPtr& a : e.args) {
             args.push_back(a.get());
+        }
+        if (const auto c = c_sigs_.find(e.text);
+            e.kind == hir::ExprKind::Call && c != c_sigs_.end()) {
+            return genCCall(f, c->second, args, e.type, mem_result, e.span);
         }
         if (e.kind == hir::ExprKind::Call) {
             return genCallCommon(

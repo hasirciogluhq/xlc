@@ -35,6 +35,67 @@ bool Lowerer::cCompatible(Sema& sema, const Type& t) {
     }
 }
 
+void Lowerer::checkCFunctionValues() {
+    // A call through a `fn(...)` pointer uses the xlang convention, where a struct travels as the
+    // address of a copy. An `export(c)` or `declare` function that takes or returns a struct by
+    // value follows the C convention instead (codegen/llvm/c_abi/), so it can only be called by
+    // name; its address would be called the wrong way.
+    std::map<std::string_view, const hir::Function*> by_name;
+    for (const hir::Function& f : mod_.functions) {
+        by_name.emplace(f.name, &f);
+    }
+    const auto passesStruct = [](const hir::Function& f) {
+        return lower::isAggregate(f.ret) ||
+               std::ranges::any_of(f.locals | std::views::take(f.param_count),
+                                   [](const hir::Local& l) { return lower::isAggregate(l.type); });
+    };
+    std::function<void(const hir::Expr&)> expr;
+    std::function<void(const hir::Stmt&)> stmt;
+    expr = [&](const hir::Expr& e) {
+        if (const auto it = by_name.find(e.text);
+            e.kind == hir::ExprKind::FuncRef && it != by_name.end() &&
+            (it->second->export_c || it->second->declared) && passesStruct(*it->second)) {
+            err("E0778",
+                e.span,
+                std::format("`{}` passes a struct by value in the C convention and cannot be a "
+                            "`fn(...)` value",
+                            e.text),
+                "call it by name, or take and return the struct through a pointer");
+        }
+        for (const hir::Expr* c : {e.lhs.get(), e.rhs.get()}) {
+            if (c != nullptr) {
+                expr(*c);
+            }
+        }
+        for (const hir::ExprPtr& a : e.args) {
+            expr(*a);
+        }
+        for (const hir::FieldInit& f : e.fields) {
+            if (f.value) {
+                expr(*f.value);
+            }
+        }
+    };
+    stmt = [&](const hir::Stmt& s) {
+        for (const hir::Expr* e : {s.target.get(), s.value.get()}) {
+            if (e != nullptr) {
+                expr(*e);
+            }
+        }
+        for (const auto* list : {&s.body, &s.else_body, &s.step}) {
+            std::ranges::for_each(*list, stmt);
+        }
+    };
+    for (const hir::Function& f : mod_.functions) {
+        std::ranges::for_each(f.body, stmt);
+    }
+    for (const hir::Global& g : mod_.globals) {
+        if (g.init) {
+            expr(*g.init);
+        }
+    }
+}
+
 void Lowerer::assignSymbol(const std::vector<Attribute>& attrs,
                            bool export_c,
                            bool declared,

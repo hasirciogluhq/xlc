@@ -727,10 +727,12 @@ void runIteratorTests();
 void runCodegenTests();
 void runReturnTests();
 void runDropTests();
+void runCAbiTests();
 
 int main() {
     RUN(runSemaTests);
     RUN(runCodegenTests);
+    RUN(runCAbiTests);
     RUN(runLowerTests);
     RUN(runOperatorTests);
     RUN(runClosureTests);
