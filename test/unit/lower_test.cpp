@@ -2,12 +2,14 @@
 #include "lowered.h"
 
 #include "xlang/hir/hir.h"
+#include "xlang/hir/prune.h"
 #include "xlang/lang/types.h"
 #include "xlang/lang/frontend.h"
 #include "xlang/sema/compilation.h"
 #include "xlang/sema/scope.h"
 #include "xlang/sema/sema.h"
 
+#include <algorithm>
 #include <sstream>
 
 using namespace xlang;
@@ -224,6 +226,15 @@ void testNewAndRegisteredAllocator() {
         CHECK(r.has("(new Point registered"));
         CHECK(r.module.alloc_function == "grab");
         CHECK(r.module.free_function == "drop");
+    }
+    {
+        // `new C(args)` runs `C.init`, so pruning keeps it (it once removed it: "unknown function C.init").
+        Lowered r(types + "register(alloc) fn grab(size: usize, align: usize) -> *void { return nil }\n"
+                          "class C {\n    fd: i32\n    fn init(self, fd: i32) { self.fd = fd }\n}\n"
+                          "@entry fn main() -> i32 {\n    local c = new C(5)\n    return c.fd\n}\n");
+        CHECK(!r.diag->hasErrors());
+        hir::pruneUnreachable(r.module, hir::KeepExports::None);
+        CHECK(std::ranges::any_of(r.module.functions, [](const hir::Function& f) { return f.name == "C.init"; }));
     }
     {
         Lowered r(types + "register(alloc) fn grab(size: i32) -> *void { return nil }\n");

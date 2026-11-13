@@ -78,6 +78,7 @@ private:
             case ExprKind::CallVirtual:
             case ExprKind::FuncRef:
             case ExprKind::Construct:
+            case ExprKind::New: // `new C(args)` names the `init` it runs in `text`
                 markFunction(e.text);
                 break;
             case ExprKind::GlobalRef:
