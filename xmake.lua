@@ -41,8 +41,18 @@ local function find_llvm_config()
             table.insert(candidates, path.join(prefix, "opt/llvm/bin/llvm-config"))
         end
     end
+    -- The versioned llvm.org installs: newest first, so a distribution's older llvm-dev
+    -- (`/usr/lib/llvm-17`) never wins over the installed one (`/usr/lib/llvm-23`).
+    local versioned = {}
     for _, dir in ipairs(os.dirs("/usr/lib/llvm-*/bin") or {}) do
-        table.insert(candidates, path.join(dir, "llvm-config"))
+        local ver = tonumber(dir:match("llvm%-(%d+)"))
+        if ver and os.isfile(path.join(dir, "llvm-config")) then
+            table.insert(versioned, {ver, path.join(dir, "llvm-config")})
+        end
+    end
+    table.sort(versioned, function (a, b) return a[1] > b[1] end)
+    for _, c in ipairs(versioned) do
+        table.insert(candidates, c[2])
     end
     table.insert(candidates, "/usr/bin/llvm-config")
     for _, c in ipairs(candidates) do

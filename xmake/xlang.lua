@@ -37,6 +37,12 @@ end
 rule("xlang.object")
     set_extensions(".xl")
     on_buildcmd_file(function (target, batchcmds, sourcefile, opt)
+        -- No `.xl` object on Windows: the released xlc there cannot lower `try` (E0714), which
+        -- every stdlib-importing program reaches, so nothing can be compiled. The archives keep
+        -- only their C++ objects, which is all the unit tests need.
+        if target:plat() == "windows" then
+            return
+        end
         local objectfile = target:objectfile(sourcefile)
         -- The raw compiler (`$XLC`, else `$XL_XL` when that is not the `xl` driver) takes the
         -- file directly and needs the stdlib mapped in with `-M std`; the `xl` driver resolves
