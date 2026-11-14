@@ -19,6 +19,13 @@ jobs:
         runner: [macos-15, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm, windows-2025]
     steps:
       - uses: actions/checkout@v7.0.1
+      # The toolchain from GitHub releases, exactly as the xl repository installs it
+      # (hasirciogluhq/xlang/.github/actions/toolchain): the `xl` tool binary-only by the
+      # release's install script, the compiler `xlc` and the stdlib, each the newest release.
+      # The released `xlc` compiles the xlang parts of this repository (src/bootstrap.xl,
+      # src/lang/compiler.xl) and is the rung the bootstrap binary is built from.
+      - id: toolchain
+        uses: hasirciogluhq/xlang/.github/actions/toolchain@development
       # LLVM 23 on every OS, the newest release: Homebrew's `llvm` is always the newest, the Linux build uses apt.llvm.org through
       # `.github/actions/apt-llvm` (its .deb files are cached) and Windows takes conda-forge's `llvmdev` (the environment is cached).
       - name: LLVM (macOS)
@@ -73,6 +80,11 @@ jobs:
           git diff --exit-code -- COMPILER-TAGS.md
       - name: Build and test
         if: runner.os != 'Windows'
+        env:
+          # `xl build` (the wrapper) drives the released compiler and stdlib: `XLC` and
+          # `XLANG_STD` name them (the install script installs the binary only).
+          XLC: ${{ steps.toolchain.outputs.xlc-bin }}
+          XLANG_STD: ${{ steps.toolchain.outputs.std }}
         run: |
           xmake f -P . -y -m release --policies=build.ccache:y
           xmake -P . -y
@@ -83,6 +95,9 @@ jobs:
       - name: Build and test (Windows)
         if: runner.os == 'Windows'
         shell: bash -el {0}
+        env:
+          XLC: ${{ steps.toolchain.outputs.xlc-bin }}
+          XLANG_STD: ${{ steps.toolchain.outputs.std }}
         run: |
           ./scripts/tags.sh check
           ./scripts/tags.sh sync

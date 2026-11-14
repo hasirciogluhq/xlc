@@ -1,0 +1,13 @@
+// The bootstrap entry of the xlc compiler: the same CLI as src/main.xl, entered through a plain
+// C `main` instead of `@entry`. This is the rung of the bootstrap ladder: the released `xlc`
+// that builds this repository can neither link `--crt` nor emit an `@entry` function to an
+// object file (E0754), so the bootstrap binary is linked by the platform C++ driver from this
+// object plus the constructor shim src/bootstrap.cpp and the module archives. The bootstrap
+// then builds the real binary from src/main.xl with `--crt`. Compiled only by the build; it
+// ships in no release.
+from "std/os/args" import fromArgv
+from "cli" import run
+
+export(c) fn main(argc: i32, argv: **u8) -> i32 {
+    return run(fromArgv(argc, argv))
+}

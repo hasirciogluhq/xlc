@@ -173,19 +173,39 @@ target("xlc-lang")
     add_xlang_object("src/lang/compiler.xl")
 target_end()
 
+-- The bootstrap rung of the ladder: the released `xlc` that builds this repository can neither
+-- link `--crt` nor emit an `@entry` function to an object file (E0754), so the compiler binary
+-- of this tree is built in two steps. The bootstrap is a plain C++ link (xmake's own linker):
+-- the CLI entry src/bootstrap.xl (`export(c) fn main`, the same `run` as src/main.xl), the
+-- constructor shim src/bootstrap.cpp and the module archives. It ships in no release; the
+-- `xlc` target below builds the real binary from src/main.xl with `--crt` through it.
+target("xlc-bootstrap")
+    set_kind("binary")
+    set_default(false)
+    set_basename("xlc-bootstrap")
+    add_files("src/bootstrap.cpp")
+    add_xlang_object("src/bootstrap.xl")
+    add_xlc_modules()
+    on_load(add_llvm)
+    if is_plat("linux") then
+        -- Released binaries carry their C++ runtime: no libstdc++ DSO to install next to them.
+        add_ldflags("-static-libstdc++", "-static-libgcc", {force = true})
+    end
+
 -- The binary: the CLI is xlang code (`src/main.xl`, `@entry fn main`) and the C++ backend joins
 -- it as the static archives of the modules above. `xlc` performs the final link itself in its
 -- `--crt` mode: the boot hooks become image constructors/destructors and the platform C++
 -- compiler driver brings the CRT startup files, libc, the C++ runtime and the
--- static-initializer runners. The `xlc` that compiles and links is `XL_XL` (default `xl` on
--- PATH); until the released `xlc` speaks `--crt`, point `XL_XL` at a bootstrap build of this
--- tree (a plain `clang++` link of `src/main.xl.o` plus a constructor stub and the archives).
--- The stdlib comes from the `xl-std` submodule checkout when it exists (local development),
--- else from the newest stdlib the toolchain installed (`~/.xlang/std/<version>`).
+-- static-initializer runners. The `xlc` that compiles and links is `XL_XL`: the bootstrap
+-- binary built by the `xlc-bootstrap` target above, or `$XL_XL` to bootstrap from another
+-- compiler that speaks `--crt`. The stdlib comes from `$XLANG_STD` first of all (on CI the
+-- toolchain action sets it), else the `xl-std` submodule checkout when it exists (local
+-- development), else the newest stdlib the toolchain installed (`~/.xlang/std/<version>`).
 target("xlc")
     set_kind("binary")
     set_default(true)
     set_basename("xlc")
+    add_deps("xlc-bootstrap")
     add_deps("xlc-backend")
     add_includedirs("include", "src")
     on_load(function (target)
@@ -230,7 +250,7 @@ target("xlc")
     end)
     on_build(function (target, opt)
         import("core.project.depend")
-        local xlcbin = os.getenv("XL_XL") or "xl"
+        local xlcbin = os.getenv("XL_XL") or target:dep("xlc-bootstrap"):targetfile()
         local out = target:targetfile()
         local archives = {}
         for _, module in ipairs(xlc_modules) do

@@ -85,6 +85,13 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.meta.outputs.tag }}
+      # The toolchain from GitHub releases, exactly as the xl repository installs it
+      # (hasirciogluhq/xlang/.github/actions/toolchain): the `xl` tool binary-only by the
+      # release's install script, the compiler `xlc` and the stdlib, each the newest release.
+      # The released `xlc` compiles the xlang parts of this repository (src/bootstrap.xl,
+      # src/lang/compiler.xl) and is the rung the bootstrap binary is built from.
+      - id: toolchain
+        uses: hasirciogluhq/xlang/.github/actions/toolchain@development
 
       - name: Install dependencies (macOS)
         if: matrix.os == 'darwin'
@@ -141,6 +148,11 @@ jobs:
       - name: Build (Unix)
         if: matrix.os != 'windows'
         shell: bash
+        env:
+          # `xl build` (the wrapper) drives the released compiler and stdlib: `XLC` and
+          # `XLANG_STD` name them (the install script installs the binary only).
+          XLC: ${{ steps.toolchain.outputs.xlc-bin }}
+          XLANG_STD: ${{ steps.toolchain.outputs.std }}
         run: |
           set -euo pipefail
           llvm-config --version
@@ -154,6 +166,9 @@ jobs:
       - name: Build (Windows)
         if: matrix.os == 'windows'
         shell: bash -el {0}
+        env:
+          XLC: ${{ steps.toolchain.outputs.xlc-bin }}
+          XLANG_STD: ${{ steps.toolchain.outputs.std }}
         run: |
           set -euo pipefail
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
