@@ -1,0 +1,75 @@
+// The C ABI shared by the xlang parts of the compiler (the lexer, the preprocessor).
+//
+// Every struct here is the layout of a struct in include/xlang/lang/lexer_c.h or
+// include/xlang/lang/preprocess_c.h, field for field. A part fills its result and hands it to
+// C++; the C++ side copies what it keeps and releases the whole block through the result's
+// `block` handle, so nothing on this side is freed behind C++'s back.
+
+/// One token; field for field the `XlcLexToken` of lexer_c.h.
+/// `text` points into a block the caller owns; it is not NUL-terminated.
+@repr(c)
+export struct CToken {
+    kind: i32
+    text: *u8
+    textLen: u32
+    intValue: u64
+    floatValue: f64
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+    newlineBefore: u32 ///< 0 or 1
+}
+
+/// One lexical or preprocessing error; the `XlcLexError` of lexer_c.h. The code that reports it
+/// (`E0001` for the lexer, `E0003` for the preprocessor) is a fact of the caller, not of the
+/// struct, so it does not cross the boundary.
+@repr(c)
+export struct CError {
+    message: *u8
+    messageLen: u32
+    label: *u8
+    labelLen: u32
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+}
+
+/// The `XlcLexResult` of lexer_c.h: the lexer's frozen outcome, plus the handle
+/// `xlcLexFree` releases.
+@repr(c)
+export struct CResult {
+    tokens: *CToken
+    tokenCount: u32
+    errors: *CError
+    errorCount: u32
+    block: *u8
+}
+
+/// One definition that crossed the boundary: a name and its value. The value fields are flat so
+/// the layout matches `XlcDefine` of preprocess_c.h field for field with no nested padding.
+@repr(c)
+export struct CDefine {
+    name: *u8
+    nameLen: u32
+    kind: i32      ///< V_BOOL, V_INT or V_STRING
+    intValue: i64  ///< the value when `kind` is V_INT; 0 or 1 when V_BOOL
+    bytes: *u8     ///< the bytes when `kind` is V_STRING; not NUL-terminated
+    strLen: u32
+}
+
+/// The `XlcPreprocessResult` of preprocess_c.h: the tokens that survive preprocessing, the
+/// errors collected on the way, and the handle `xlcPreprocessFree` releases.
+@repr(c)
+export struct CPreResult {
+    tokens: *CToken
+    tokenCount: u32
+    errors: *CError
+    errorCount: u32
+    block: *u8
+}
+
+export const V_BOOL: i32 = 0
+export const V_INT: i32 = 1
+export const V_STRING: i32 = 2

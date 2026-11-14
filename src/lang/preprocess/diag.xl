@@ -1,0 +1,41 @@
+// The diagnostic sink of the preprocessor: the E0003 records of one run and the strings behind
+// them. The C++ side stamps the code and the file onto what lands here.
+//
+// The sink is its own class so the condition parser and the structure walk can share it without
+// importing each other.
+from "std" import String, Vec
+from "../abi" import CError
+
+export class DiagSink {
+    errors: Vec<CError>
+    /// The `String`s the recorded errors point into; dropped with the sink.
+    owned: Vec<String>
+
+    fn init(self) {
+        self.errors = Vec<CError>()
+        self.owned = Vec<String>()
+    }
+
+    /// Records one error at the given span, unless `quiet` is above zero: a nested directive peek
+    /// parses a condition only to find where its body starts, and its failures stay silent.
+    fn fail(self, quiet: i32, line: u32, column: u32, endLine: u32, endColumn: u32,
+            message: String, label: String) {
+        if quiet > 0 {
+            return
+        }
+        local msg = message.clone()
+        local lbl = label.clone()
+        self.errors.push(CError {
+            message: msg.ptr,
+            messageLen: msg.len as u32,
+            label: lbl.ptr,
+            labelLen: lbl.len as u32,
+            line: line,
+            column: column,
+            endLine: endLine,
+            endColumn: endColumn,
+        })
+        self.owned.push(msg)
+        self.owned.push(lbl)
+    }
+}

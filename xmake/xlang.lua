@@ -1,17 +1,19 @@
--- The xlang lexer as one build unit.
+-- The xlang parts of the compiler (the lexer, the preprocessor) as one build unit.
 --
--- `src/lang/lexer/*.xl` is compiled by an installed `xl` into one object, and that object is
--- linked into `xlc-core`. `src/lang/lexer/lexer.cpp` bridges the C ABI on the C++ side.
+-- `src/lang/compiler.xl` is the entry: it imports `src/lang/lexer/*.xl` and
+-- `src/lang/preprocess/*.xl`, so one object carries them all. The installed `xl` builds the
+-- object, and `src/lang/lexer/lexer.cpp` and `src/lang/preprocess/preprocess.cpp` bridge the C
+-- ABI on the C++ side (include/xlang/lang/lexer_c.h, preprocess_c.h).
 --
 -- `XL_XL` selects the `xl` binary (default: `xl` on PATH). A missing or failing `xl` fails the
 -- build instead of linking a stale object.
 --
--- Loaded from the root `xmake.lua` with `includes("xmake/lexer.lua")`.
+-- Loaded from the root `xmake.lua` with `includes("xmake/xlang.lua")`.
 
--- The lexer entry file: it imports the rest, so one object carries them all.
-local xlang_lexer_entry = "src/lang/lexer/lexer.xl"
+-- The entry file: it imports the rest, so one object carries them all.
+local xlang_entry = "src/lang/compiler.xl"
 
-rule("xlang.lexer")
+rule("xlang.object")
     set_extensions(".xl")
     on_buildcmd_file(function (target, batchcmds, sourcefile, opt)
         local objectfile = target:objectfile(sourcefile)
@@ -22,20 +24,20 @@ rule("xlang.lexer")
         -- The object is not a toolchain product, so the linker does not know it: register it on
         -- the target's object list, the way the built-in `utils.bin2obj` rule does.
         table.insert(target:objectfiles(), objectfile)
-        -- `xl` emits no depfile, so watch every `.xl` next to the entry: the entry imports its
-        -- siblings, and a change to any of them must rebuild the object.
+        -- `xl` emits no depfile, so watch every `.xl` under `src/lang`: the entry imports the
+        -- lexer and the preprocessor trees, and a change to any of them must rebuild the object.
         batchcmds:add_depfiles(sourcefile)
-        for _, importfile in ipairs(os.files(path.join(path.directory(sourcefile), "*.xl"))) do
+        for _, importfile in ipairs(os.files("src/lang/**/*.xl")) do
             batchcmds:add_depfiles(importfile)
         end
         batchcmds:set_depmtime(os.mtime(objectfile))
         batchcmds:set_depcache(target:dependfile(objectfile))
     end)
 
--- Adds the xlang lexer to a target. Call inside a `target(...)` block. The object the rule
+-- Adds the xlang object to a target. Call inside a `target(...)` block. The object the rule
 -- builds lands on the target's standard object path, so the linker picks it up like any other
 -- object of the target.
-function add_xlang_lexer()
-    add_rules("xlang.lexer")
-    add_files(xlang_lexer_entry)
+function add_xlang_object()
+    add_rules("xlang.object")
+    add_files(xlang_entry)
 end

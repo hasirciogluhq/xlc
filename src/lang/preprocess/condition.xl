@@ -1,0 +1,416 @@
+// The condition of a conditional-compilation directive: the little expression grammar of `#if`
+// and its evaluation against the definition tables.
+//
+// The C++ original reports failures by throwing; here a parse or an evaluation that fails returns
+// `nil` (an `Option` without payload) after the diagnostic is recorded, which keeps the same
+// control flow without the `unwind` role. Errors inside a nested directive peek are suppressed
+// with `quiet`, exactly like the original.
+from "std" import String, Vec, format
+from "std/str" import fromParts
+from "../abi" import CToken, V_BOOL, V_INT, V_STRING
+from "../lexer/tokens" import K_INT, K_STRING, K_TRUE, K_FALSE, K_MINUS, K_BANG, K_LPAREN,
+    K_RPAREN, K_IDENT, K_EQ_EQ, K_NOT_EQ, K_LT, K_LE, K_GT, K_GE, K_AND_AND, K_OR_OR, K_DIR_IFDEF,
+    K_DIR_IFNDEF
+from "../lexer/describe" import describeToken, tokenKindName
+from "../preprocess/defines" import Value, ConfigDefines, FileDefines, constBool, constInt,
+    constStr, kindName, valueStr, compareValues, V_MISSING
+from "../preprocess/diag" import DiagSink
+
+/// The kind of a condition node.
+export const N_LITERAL: i32 = 0
+export const N_NAME: i32 = 1
+export const N_DEFINED: i32 = 2
+export const N_NOT: i32 = 3
+export const N_BINARY: i32 = 4
+
+/// One node of a condition tree. The name is a view into a token text; the node itself is owned
+/// by the arena of the preprocessor run and is deleted with it.
+export struct CondNode {
+    kind: i32
+    literal: Value
+    namePtr: *u8
+    nameLen: u32
+    op: i32 ///< the operator token kind of a N_BINARY
+    lhs: *CondNode
+    rhs: *CondNode
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+}
+
+/// The condition of one directive: its tree and the first token after it.
+export struct Condition {
+    node: *CondNode ///< nil when the condition failed to parse
+    next: usize
+}
+
+/// Where the condition parser stands: a token range plus the open-parenthesis depth, which lets
+/// an operator continue a condition across a line break inside parentheses.
+export struct Cursor {
+    pos: usize
+    end: usize
+    parenDepth: i32
+}
+
+/// The parser and evaluator. `tok` reads the token array the preprocessor holds; the definition
+/// tables come from the preprocessor state.
+export class CondParser {
+    toks: *CToken
+    count: usize
+    defs: *ConfigDefines
+    fileDefines: *FileDefines
+    /// Errors inside a nested directive peek are not reported while this is above zero.
+    quiet: i32
+    /// Every node allocated for the conditions of this run, for one bulk delete.
+    arena: Vec<*CondNode>
+    /// The sink of the diagnostics: owned by the preprocessor that drives this parser.
+    errors: *DiagSink
+
+    fn init(self, toks: *CToken, count: usize, defs: *ConfigDefines, fileDefines: *FileDefines,
+            errors: *DiagSink) {
+        self.toks = toks
+        self.count = count
+        self.defs = defs
+        self.fileDefines = fileDefines
+        self.quiet = 0
+        self.arena = Vec<*CondNode>()
+        self.errors = errors
+    }
+
+    /// Records one E0003 at the given span, unless a nested peek suppressed it.
+    fn fail(self, line: u32, column: u32, endLine: u32, endColumn: u32, message: String,
+            label: String) {
+        self.errors.fail(self.quiet, line, column, endLine, endColumn, message, label)
+    }
+
+    fn tok(self, i: usize) -> CToken {
+        return *((self.toks as usize + i * sizeOf(CToken)) as *CToken)
+    }
+
+    /// An operator token may continue the condition: on the same line, or inside parentheses.
+    fn continues(self, c: *Cursor) -> bool {
+        return c.pos < c.end && (self.tok(c.pos).newlineBefore == 0 || c.parenDepth > 0)
+    }
+
+    fn newNode(self, t: CToken) -> *CondNode {
+        local n = new CondNode {
+            kind: N_LITERAL,
+            literal: Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 },
+            namePtr: nil,
+            nameLen: 0,
+            op: 0,
+            lhs: nil,
+            rhs: nil,
+            line: t.line,
+            column: t.column,
+            endLine: t.endLine,
+            endColumn: t.endColumn,
+        }
+        self.arena.push(n)
+        return n
+    }
+
+    fn binary(self, op: i32, lhs: *CondNode, rhs: *CondNode) -> *CondNode {
+        local n = new CondNode {
+            kind: N_BINARY,
+            literal: Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 },
+            namePtr: nil,
+            nameLen: 0,
+            op: op,
+            lhs: lhs,
+            rhs: rhs,
+            line: lhs.line,
+            column: lhs.column,
+            endLine: rhs.endLine,
+            endColumn: rhs.endColumn,
+        }
+        self.arena.push(n)
+        return n
+    }
+
+    /// `||` over `&&` over comparison over unary over primary.
+    fn parseOr(self, c: *Cursor) -> *CondNode {
+        local lhs = self.parseAnd(c)
+        if lhs == nil { return nil }
+        while self.continues(c) && self.tok(c.pos).kind == K_OR_OR {
+            c.pos = c.pos + 1
+            local rhs = self.parseAnd(c)
+            if rhs == nil { return nil }
+            lhs = self.binary(K_OR_OR, lhs, rhs)
+        }
+        return lhs
+    }
+
+    fn parseAnd(self, c: *Cursor) -> *CondNode {
+        local lhs = self.parseCompare(c)
+        if lhs == nil { return nil }
+        while self.continues(c) && self.tok(c.pos).kind == K_AND_AND {
+            c.pos = c.pos + 1
+            local rhs = self.parseCompare(c)
+            if rhs == nil { return nil }
+            lhs = self.binary(K_AND_AND, lhs, rhs)
+        }
+        return lhs
+    }
+
+    fn parseCompare(self, c: *Cursor) -> *CondNode {
+        local lhs = self.parseUnary(c)
+        if lhs == nil { return nil }
+        if self.continues(c) {
+            local k = self.tok(c.pos).kind
+            if k == K_EQ_EQ || k == K_NOT_EQ || k == K_LT || k == K_LE || k == K_GT || k == K_GE {
+                c.pos = c.pos + 1
+                local rhs = self.parseUnary(c)
+                if rhs == nil { return nil }
+                return self.binary(k, lhs, rhs)
+            }
+        }
+        return lhs
+    }
+
+    fn parseUnary(self, c: *Cursor) -> *CondNode {
+        if c.pos >= c.end {
+            local last = self.tok(c.end - 1)
+            self.fail(last.line, last.column, last.endLine, last.endColumn,
+                      String("expected a condition"), String("condition ends here"))
+            return nil
+        }
+        local t = self.tok(c.pos)
+        if t.kind == K_BANG {
+            c.pos = c.pos + 1
+            local n = self.newNode(t)
+            n.kind = N_NOT
+            local inner = self.parseUnary(c)
+            if inner == nil { return nil }
+            n.lhs = inner
+            return n
+        }
+        return self.parsePrimary(c)
+    }
+
+    fn parsePrimary(self, c: *Cursor) -> *CondNode {
+        local t = self.tok(c.pos)
+        local n = self.newNode(t)
+        if t.kind == K_INT {
+            n.kind = N_LITERAL
+            n.literal = constInt(t.intValue as i64)
+            c.pos = c.pos + 1
+            return n
+        }
+        if t.kind == K_MINUS && c.pos + 1 < c.end && self.tok(c.pos + 1).kind == K_INT {
+            n.kind = N_LITERAL
+            n.literal = constInt(-(self.tok(c.pos + 1).intValue as i64))
+            c.pos = c.pos + 2
+            return n
+        }
+        if t.kind == K_STRING {
+            n.kind = N_LITERAL
+            n.literal = constStr(t.text, t.textLen)
+            c.pos = c.pos + 1
+            return n
+        }
+        if t.kind == K_TRUE || t.kind == K_FALSE {
+            n.kind = N_LITERAL
+            n.literal = constBool(t.kind == K_TRUE)
+            c.pos = c.pos + 1
+            return n
+        }
+        if t.kind == K_LPAREN {
+            c.pos = c.pos + 1
+            c.parenDepth = c.parenDepth + 1
+            local inner = self.parseOr(c)
+            c.parenDepth = c.parenDepth - 1
+            if inner == nil { return nil }
+            if c.pos >= c.end || self.tok(c.pos).kind != K_RPAREN {
+                if c.pos < c.end {
+                    local bad = self.tok(c.pos)
+                    self.fail(bad.line, bad.column, bad.endLine, bad.endColumn,
+                              String("expected `)` in the condition"),
+                              String("unclosed parenthesis"))
+                } else {
+                    self.fail(t.line, t.column, t.endLine, t.endColumn,
+                              String("expected `)` in the condition"),
+                              String("unclosed parenthesis"))
+                }
+                return nil
+            }
+            c.pos = c.pos + 1
+            return inner
+        }
+        if t.kind == K_IDENT {
+            local text = fromParts(t.text, t.textLen as usize)
+            if text == "defined" && c.pos + 3 < c.end && self.tok(c.pos + 1).kind == K_LPAREN && self.tok(c.pos + 2).kind == K_IDENT && self.tok(c.pos + 3).kind == K_RPAREN {
+                n.kind = N_DEFINED
+                local name = self.tok(c.pos + 2)
+                n.namePtr = name.text
+                n.nameLen = name.textLen
+                n.line = name.line
+                n.column = name.column
+                n.endLine = name.endLine
+                n.endColumn = name.endColumn
+                c.pos = c.pos + 4
+                return n
+            }
+            n.kind = N_NAME
+            n.namePtr = t.text
+            n.nameLen = t.textLen
+            c.pos = c.pos + 1
+            return n
+        }
+        self.fail(t.line, t.column, t.endLine, t.endColumn,
+                  format("expected a condition, found {}", describeToken(t).asStr()),
+                  String("not valid in a conditional-compilation condition"))
+        return nil
+    }
+
+    // --- evaluation ------------------------------------------------------------------------
+
+    /// The value of the name in the conditions: `-D` and builtins win over a file `define`.
+    fn nameValue(self, namePtr: *u8, nameLen: u32) -> Value {
+        local name = fromParts(namePtr, nameLen as usize)
+        local v = self.defs.lookup(name)
+        if v.kind != V_MISSING {
+            return v
+        }
+        return self.fileDefines.lookup(name)
+    }
+
+    fn definedName(self, namePtr: *u8, nameLen: u32) -> bool {
+        local name = fromParts(namePtr, nameLen as usize)
+        return self.defs.isDefined(name) || self.fileDefines.isDefined(name)
+    }
+
+    /// The truth of a value as a condition: 1 for a true bool or integer, 0 for a false one, -1
+    /// when the value is a string and the diagnostic was recorded.
+    fn truth(self, v: Value, line: u32, column: u32, endLine: u32, endColumn: u32) -> i32 {
+        if v.kind == V_BOOL {
+            return v.intValue != 0 ? 1 : 0
+        }
+        if v.kind == V_INT {
+            return v.intValue != 0 ? 1 : 0
+        }
+        self.fail(line, column, endLine, endColumn, String("a string is not a condition"),
+                  String("compare it with `==` or use `defined(...)`"))
+        return -1
+    }
+
+    /// The value of a condition tree, or a value of kind `V_MISSING` when a diagnostic was
+    /// recorded (or suppressed inside a nested peek). `&&` and `||` short-circuit like the C++
+    /// original.
+    fn evaluate(self, n: *CondNode) -> Value {
+        if n.kind == N_LITERAL {
+            return n.literal
+        }
+        if n.kind == N_DEFINED {
+            return constBool(self.definedName(n.namePtr, n.nameLen))
+        }
+        if n.kind == N_NAME {
+            local v = self.nameValue(n.namePtr, n.nameLen)
+            if v.kind == V_MISSING {
+                local name = fromParts(n.namePtr, n.nameLen as usize)
+                self.fail(n.line, n.column, n.endLine, n.endColumn,
+                          format("`{}` is not defined", name),
+                          String("unknown name in a condition"))
+                return v
+            }
+            return v
+        }
+        if n.kind == N_NOT {
+            local l = self.evaluate(n.lhs)
+            if l.kind == V_MISSING { return l }
+            local t = self.truth(l, n.lhs.line, n.lhs.column, n.lhs.endLine, n.lhs.endColumn)
+            if t < 0 { return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 } }
+            return constBool(t == 0)
+        }
+        // N_BINARY.
+        if n.op == K_AND_AND {
+            local l = self.evaluate(n.lhs)
+            if l.kind == V_MISSING { return l }
+            local lt = self.truth(l, n.lhs.line, n.lhs.column, n.lhs.endLine, n.lhs.endColumn)
+            if lt < 0 { return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 } }
+            if lt == 0 {
+                return constBool(false)
+            }
+            local r = self.evaluate(n.rhs)
+            if r.kind == V_MISSING { return r }
+            local rt = self.truth(r, n.rhs.line, n.rhs.column, n.rhs.endLine, n.rhs.endColumn)
+            if rt < 0 { return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 } }
+            return constBool(rt == 1)
+        }
+        if n.op == K_OR_OR {
+            local l = self.evaluate(n.lhs)
+            if l.kind == V_MISSING { return l }
+            local lt = self.truth(l, n.lhs.line, n.lhs.column, n.lhs.endLine, n.lhs.endColumn)
+            if lt < 0 { return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 } }
+            if lt == 1 {
+                return constBool(true)
+            }
+            local r = self.evaluate(n.rhs)
+            if r.kind == V_MISSING { return r }
+            local rt = self.truth(r, n.rhs.line, n.rhs.column, n.rhs.endLine, n.rhs.endColumn)
+            if rt < 0 { return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 } }
+            return constBool(rt == 1)
+        }
+        local l = self.evaluate(n.lhs)
+        if l.kind == V_MISSING { return l }
+        local r = self.evaluate(n.rhs)
+        if r.kind == V_MISSING { return r }
+        if l.kind != r.kind {
+            self.fail(n.line, n.column, n.endLine, n.endColumn,
+                      format("cannot compare {} with {}", kindName(l), kindName(r)),
+                      String("operands have different kinds"))
+            return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 }
+        }
+        local cmp = compareValues(l, r)
+        if n.op == K_EQ_EQ { return constBool(cmp == 0) }
+        if n.op == K_NOT_EQ { return constBool(cmp != 0) }
+        if n.op == K_LT { return constBool(cmp < 0) }
+        if n.op == K_LE { return constBool(cmp <= 0) }
+        if n.op == K_GT { return constBool(cmp > 0) }
+        return constBool(cmp >= 0)
+    }
+
+    /// The condition of the directive at `i`: `#ifdef NAME` / `#ifndef NAME` take one name, the
+    /// others take a full expression on their line. `node` is nil when a diagnostic was recorded.
+    fn condition(self, i: usize, end: usize) -> Condition {
+        local d = self.tok(i)
+        if d.kind == K_DIR_IFDEF || d.kind == K_DIR_IFNDEF {
+            if i + 1 >= end || self.tok(i + 1).kind != K_IDENT || self.tok(i + 1).newlineBefore != 0 {
+                self.fail(d.line, d.column, d.endLine, d.endColumn,
+                          format("`{}` needs a name", tokenKindName(d.kind).asStr()),
+                          String("expected a name after the directive"))
+                return Condition { node: nil, next: i }
+            }
+            local named = self.tok(i + 1)
+            local n = self.newNode(named)
+            n.kind = N_DEFINED
+            n.namePtr = named.text
+            n.nameLen = named.textLen
+            if d.kind == K_DIR_IFNDEF {
+                local neg = self.newNode(named)
+                neg.kind = N_NOT
+                neg.lhs = n
+                return Condition { node: neg, next: i + 2 }
+            }
+            return Condition { node: n, next: i + 2 }
+        }
+        if i + 1 >= end || self.tok(i + 1).newlineBefore != 0 {
+            self.fail(d.line, d.column, d.endLine, d.endColumn,
+                      format("`{}` needs a condition", tokenKindName(d.kind).asStr()),
+                      String("expected a condition after the directive"))
+            return Condition { node: nil, next: i }
+        }
+        local c = Cursor { pos: i + 1, end: end, parenDepth: 0 }
+        local n = self.parseOr(&c)
+        return Condition { node: n, next: c.pos }
+    }
+
+    /// Releases every node of the run. The trees are dead once their branch is decided.
+    fn dropArena(self) {
+        for i in 0..self.arena.length() {
+            local p = *self.arena.get(i)
+            delete p
+        }
+    }
+}

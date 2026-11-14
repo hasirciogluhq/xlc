@@ -7,7 +7,8 @@
 // 1-based and count bytes. `line`/`column` are the cursor now; `begin` freezes it at a token's
 // first byte and `finish` closes the span at the cursor.
 from "std" import String, Vec
-from "../lexer/tokens" import CToken, CError
+from "../abi" import CToken, CError
+from "../lexer/tokens" import K_END
 from "../lexer/chars" import isTriviaSpace
 
 export class Scanner {

@@ -138,7 +138,7 @@ which keeps the view in the same commit as the tag it came from.
 <!-- written by scripts/tags.sh sync; every line below is a tag found in src/ and
      include/, grouped by tag and then by file. Do not edit inside the markers. -->
 
-### @grammar (109)
+### @grammar (107)
 
 ```
 include/xlang/lang/ast.h:21:/// @grammar the five prefix operators: `-e`, `!e`, `*e`, `&e`, `~e`
@@ -240,8 +240,6 @@ src/lang/parser/types.cpp:178:/// @grammar `*T` is written with a star, never a 
 src/lang/parser/types.cpp:179:/// @grammar `(T)` without the trailing comma is `T` in parentheses, not a one-element tuple
 src/lang/parser/types.cpp:180:/// @grammar `[T; N]` keeps N as an expression, parsed with `no_struct_` cleared
 src/lang/parser/types.cpp:181:/// @grammar `never` is accepted here and rejected later with E0765 unless it is a return type
-src/lang/preprocess/preprocess.cpp:545:/// @grammar `#if`, `#elif`, `#else`, `#endif`, `#ifdef`, `#ifndef`, `#error`, resolved against the
-src/lang/preprocess/preprocess.cpp:546:/// @grammar build definitions (`-DNAME=VALUE`, `-UNAME`) before the parser sees the tokens
 src/sema/lower/call/builtins.cpp:7:/// @grammar `syscall(nr, args...)`, returning `i64`: a negative result is `-errno`, so the caller checks the sign rather than a separate error out.
 src/sema/lower/call/builtins.cpp:68:/// @grammar `__builtin_atomicLoad(p, order)`, `__builtin_atomicStore(p, v, order)`, `__builtin_atomicXchg(p, v, order)`, `__builtin_atomicCas(p, expected, new, order)`, `__builtin_atomicAdd(p, v, order)`.
 src/sema/lower/call/builtins.cpp:69:/// @grammar `__builtin_read(p)`, `__builtin_write(p, v)`, `__builtin_drop(p)`, `__builtin_needsDrop<T>()`, `__builtin_fence(order)`, `__builtin_unwindPads()`, `__builtin_unwindPadCount()`, `__builtin_asm(...)`.
@@ -356,5 +354,5 @@ include/xlang/mir/mir.h:29:// @todo MIR does not yet carry what only code genera
 src/mir/dataflow/forward.hpp:25:/// @cost each block is processed once per change of its entry fact: at most (lattice height) times.
 ```
 
-Total: 178 tag lines.
+Total: 176 tag lines.
 <!-- END COLLECTED TAGS -->

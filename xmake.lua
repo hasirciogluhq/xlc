@@ -128,11 +128,13 @@ local function add_llvm(target)
     end
 end
 
--- The lexer is written in xlang (`src/lang/lexer/*.xl`) and reached from C++ through the C ABI in
--- `include/xlang/lang/lexer_c.h`. `xmake/lexer.lua` turns the entry file into one object with an
--- installed `xl`; the object is then linked into `xlc-core`. `src/lang/lexer/lexer.cpp` is no longer
--- compiled and stays on disk as the reference the port was checked against.
-includes("xmake/lexer.lua")
+-- The lexer and the preprocessor are written in xlang (`src/lang/lexer/*.xl`,
+-- `src/lang/preprocess/*.xl`) and reached from C++ through the C ABIs in
+-- `include/xlang/lang/lexer_c.h` and `include/xlang/lang/preprocess_c.h`. `xmake/xlang.lua`
+-- turns the entry file `src/lang/compiler.xl` into one object with an installed `xl`; the object
+-- is then linked into `xlc-core`. `src/lang/lexer/lexer.cpp` and
+-- `src/lang/preprocess/preprocess.cpp` only bridge the C ABI.
+includes("xmake/xlang.lua")
 
 -- Everything except `main.cpp`, so the unit tests link the same code.
 target("xlc-core")
@@ -141,8 +143,9 @@ target("xlc-core")
     add_files("src/analysis/**.cpp", "src/codegen/**.cpp", "src/driver/**.cpp", "src/hir/**.cpp",
               "src/lang/**.cpp", "src/mir/**.cpp", "src/sema/**.cpp", "src/util/**.cpp",
               "src/cli/console.cpp", "src/cli/emit.cpp")
-    -- The scanner itself is the xlang object; lexer.cpp only bridges the C ABI.
-    add_xlang_lexer()
+    -- The scanner and the directive walk are the xlang object; lexer.cpp and preprocess.cpp only
+    -- bridge the C ABI.
+    add_xlang_object()
     add_includedirs("include", "src", {public = true})
     add_packages("cli11", {public = true})
     on_load(add_llvm)

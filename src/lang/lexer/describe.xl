@@ -1,0 +1,146 @@
+// The spelling of a token kind and the human-readable description of a token, for diagnostics.
+//
+// The C++ side has the same two functions (src/lang/lexer/lexer.cpp); the preprocessor on this
+// side needs them for its own messages, and the two copies must word for word agree.
+//
+// Both lookups are if-chains, like the keyword tables of keywords.xl: the `K_*` kinds are runtime
+// constants (they cross the C boundary as plain numbers), so they cannot be `switch` cases.
+from "std" import String, format
+from "std/str" import fromParts
+from "../abi" import CToken
+from "../lexer/tokens" import K_END, K_IDENT, K_PRIM_TYPE, K_INT, K_FLOAT, K_STRING, K_BYTE_LIT,
+    K_FN, K_LOCAL, K_RETURN, K_IF, K_ELSE, K_WHILE, K_CONTINUE, K_BREAK, K_DO, K_SWITCH, K_CASE,
+    K_DEFAULT, K_DEFER, K_TRY, K_CATCH, K_UNSAFE, K_IMPORT, K_FROM, K_AS, K_EXPORT, K_DECLARE,
+    K_REGISTER, K_GLOBAL, K_CONST, K_DELETE, K_STRUCT, K_CLASS, K_INTERFACE, K_IMPL, K_ENUM,
+    K_TYPE, K_DEFINE, K_NEW, K_VIRTUAL, K_OVERRIDE, K_SELF_KW, K_FOR, K_EXCEPT, K_TRUE, K_FALSE,
+    K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET, K_COMMA, K_COLON,
+    K_COLON_ASSIGN, K_SEMICOLON, K_DOT, K_ARROW, K_AT, K_BANG, K_PLUS, K_MINUS, K_STAR, K_SLASH,
+    K_PERCENT, K_AMP, K_PIPE, K_CARET, K_TILDE, K_SHL, K_SHR, K_ASSIGN, K_EQ_EQ, K_NOT_EQ, K_LT,
+    K_LE, K_GT, K_GE, K_AND_AND, K_OR_OR, K_DOT_DOT, K_DOT_DOT_EQ, K_QUESTION, K_PLUS_ASSIGN,
+    K_MINUS_ASSIGN, K_STAR_ASSIGN, K_SLASH_ASSIGN, K_PERCENT_ASSIGN, K_AMP_ASSIGN, K_PIPE_ASSIGN,
+    K_CARET_ASSIGN, K_SHL_ASSIGN, K_SHR_ASSIGN, K_PLUS_PLUS, K_MINUS_MINUS, K_DIR_IF, K_DIR_ELIF,
+    K_DIR_ELSE, K_DIR_ENDIF, K_DIR_IFDEF, K_DIR_IFNDEF, K_DIR_ERROR
+
+/// The name of one token kind as a diagnostic names it: `fn`, `:=`, `end of file`.
+export fn tokenKindName(kind: i32) -> String {
+    if kind == K_END { return String("end of file") }
+    if kind == K_IDENT { return String("identifier") }
+    if kind == K_PRIM_TYPE { return String("type name") }
+    if kind == K_INT { return String("integer literal") }
+    if kind == K_FLOAT { return String("float literal") }
+    if kind == K_STRING { return String("string literal") }
+    if kind == K_BYTE_LIT { return String("byte literal") }
+    if kind == K_FN { return String("fn") }
+    if kind == K_LOCAL { return String("local") }
+    if kind == K_RETURN { return String("return") }
+    if kind == K_IF { return String("if") }
+    if kind == K_ELSE { return String("else") }
+    if kind == K_WHILE { return String("while") }
+    if kind == K_CONTINUE { return String("continue") }
+    if kind == K_BREAK { return String("break") }
+    if kind == K_DO { return String("do") }
+    if kind == K_SWITCH { return String("switch") }
+    if kind == K_CASE { return String("case") }
+    if kind == K_DEFAULT { return String("default") }
+    if kind == K_DEFER { return String("defer") }
+    if kind == K_TRY { return String("try") }
+    if kind == K_CATCH { return String("catch") }
+    if kind == K_UNSAFE { return String("unsafe") }
+    if kind == K_IMPORT { return String("import") }
+    if kind == K_FROM { return String("from") }
+    if kind == K_AS { return String("as") }
+    if kind == K_EXPORT { return String("export") }
+    if kind == K_DECLARE { return String("declare") }
+    if kind == K_REGISTER { return String("register") }
+    if kind == K_GLOBAL { return String("global") }
+    if kind == K_CONST { return String("const") }
+    if kind == K_DELETE { return String("delete") }
+    if kind == K_STRUCT { return String("struct") }
+    if kind == K_CLASS { return String("class") }
+    if kind == K_INTERFACE { return String("interface") }
+    if kind == K_IMPL { return String("impl") }
+    if kind == K_ENUM { return String("enum") }
+    if kind == K_TYPE { return String("type") }
+    if kind == K_DEFINE { return String("define") }
+    if kind == K_NEW { return String("new") }
+    if kind == K_VIRTUAL { return String("virtual") }
+    if kind == K_OVERRIDE { return String("override") }
+    if kind == K_SELF_KW { return String("self") }
+    if kind == K_FOR { return String("for") }
+    if kind == K_EXCEPT { return String("except") }
+    if kind == K_TRUE { return String("true") }
+    if kind == K_FALSE { return String("false") }
+    if kind == K_LPAREN { return String("(") }
+    if kind == K_RPAREN { return String(")") }
+    if kind == K_LBRACE { return String("{") }
+    if kind == K_RBRACE { return String("}") }
+    if kind == K_LBRACKET { return String("[") }
+    if kind == K_RBRACKET { return String("]") }
+    if kind == K_COMMA { return String(",") }
+    if kind == K_COLON { return String(":") }
+    if kind == K_COLON_ASSIGN { return String(":=") }
+    if kind == K_SEMICOLON { return String(";") }
+    if kind == K_DOT { return String(".") }
+    if kind == K_ARROW { return String("->") }
+    if kind == K_AT { return String("@") }
+    if kind == K_BANG { return String("!") }
+    if kind == K_PLUS { return String("+") }
+    if kind == K_MINUS { return String("-") }
+    if kind == K_STAR { return String("*") }
+    if kind == K_SLASH { return String("/") }
+    if kind == K_PERCENT { return String("%") }
+    if kind == K_AMP { return String("&") }
+    if kind == K_PIPE { return String("|") }
+    if kind == K_CARET { return String("^") }
+    if kind == K_TILDE { return String("~") }
+    if kind == K_SHL { return String("<<") }
+    if kind == K_SHR { return String(">>") }
+    if kind == K_ASSIGN { return String("=") }
+    if kind == K_EQ_EQ { return String("==") }
+    if kind == K_NOT_EQ { return String("!=") }
+    if kind == K_LT { return String("<") }
+    if kind == K_LE { return String("<=") }
+    if kind == K_GT { return String(">") }
+    if kind == K_GE { return String(">=") }
+    if kind == K_AND_AND { return String("&&") }
+    if kind == K_OR_OR { return String("||") }
+    if kind == K_DOT_DOT { return String("..") }
+    if kind == K_DOT_DOT_EQ { return String("..=") }
+    if kind == K_QUESTION { return String("?") }
+    if kind == K_PLUS_ASSIGN { return String("+=") }
+    if kind == K_MINUS_ASSIGN { return String("-=") }
+    if kind == K_STAR_ASSIGN { return String("*=") }
+    if kind == K_SLASH_ASSIGN { return String("/=") }
+    if kind == K_PERCENT_ASSIGN { return String("%=") }
+    if kind == K_AMP_ASSIGN { return String("&=") }
+    if kind == K_PIPE_ASSIGN { return String("|=") }
+    if kind == K_CARET_ASSIGN { return String("^=") }
+    if kind == K_SHL_ASSIGN { return String("<<=") }
+    if kind == K_SHR_ASSIGN { return String(">>=") }
+    if kind == K_PLUS_PLUS { return String("++") }
+    if kind == K_MINUS_MINUS { return String("--") }
+    if kind == K_DIR_IF { return String("#if") }
+    if kind == K_DIR_ELIF { return String("#elif") }
+    if kind == K_DIR_ELSE { return String("#else") }
+    if kind == K_DIR_ENDIF { return String("#endif") }
+    if kind == K_DIR_IFDEF { return String("#ifdef") }
+    if kind == K_DIR_IFNDEF { return String("#ifndef") }
+    if kind == K_DIR_ERROR { return String("#error") }
+    return String("?")
+}
+
+/// The human-readable spelling of one token for a diagnostic: "`fn`", "identifier `x`", ...
+export fn describeToken(t: CToken) -> String {
+    local text = fromParts(t.text, t.textLen as usize)
+    if t.kind == K_END { return String("end of file") }
+    if t.kind == K_IDENT { return format("identifier `{}`", text) }
+    if t.kind == K_PRIM_TYPE { return format("type `{}`", text) }
+    if t.kind == K_INT || t.kind == K_FLOAT { return format("number `{}`", text) }
+    if t.kind == K_STRING { return String("string literal") }
+    if t.kind == K_BYTE_LIT { return format("byte literal `{}`", t.intValue) }
+    local name = tokenKindName(t.kind)
+    local out = String("`")
+    out.append(name)
+    out.append(String("`"))
+    return out
+}

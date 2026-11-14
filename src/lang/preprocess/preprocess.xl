@@ -1,0 +1,377 @@
+// The preprocessor: conditional compilation over the token stream (plan 3.1-3.3, 3.5).
+//
+// `#if/#elif/#else/#endif/#ifdef/#ifndef/#error` are removed; tokens of inactive regions are
+// dropped (they were only lexed). A body on the same line as the condition is the rest of that
+// line and has no `#endif`; a body starting on a later line needs `#endif`. `define NAME =
+// literal` lines seen in active code are visible to later conditions unless `-D` already defines
+// NAME (the CLI wins).
+//
+// The C++ side sees `xlcPreprocess` and `xlcPreprocessFree` only
+// (include/xlang/lang/preprocess_c.h); everything here is the implementation behind them.
+from "std" import String, Vec, format
+from "std/str" import fromParts
+from "../abi" import CToken, CDefine, CPreResult
+from "../lexer/tokens" import K_EXPORT, K_DEFINE, K_IDENT, K_ASSIGN, K_INT, K_STRING, K_TRUE,
+    K_FALSE, K_END, K_DIR_IF, K_DIR_ELIF, K_DIR_ELSE, K_DIR_ENDIF, K_DIR_IFDEF, K_DIR_IFNDEF,
+    K_DIR_ERROR
+from "../lexer/describe" import tokenKindName
+from "../preprocess/defines" import ConfigDefines, FileDefines, constBool, constInt, constStr,
+    V_MISSING
+from "../preprocess/diag" import DiagSink
+from "../preprocess/condition" import CondParser, CondNode, N_LITERAL
+
+/// True when the token kind is one of the seven directives.
+fn isDirective(k: i32) -> bool {
+    return k >= K_DIR_IF && k <= K_DIR_ERROR
+}
+
+/// True for the three directive kinds that open a conditional.
+fn opensConditional(k: i32) -> bool {
+    return k == K_DIR_IF || k == K_DIR_IFDEF || k == K_DIR_IFNDEF
+}
+
+/// One branch of a block-form conditional: its condition (`nil` for `#else`), the token range it
+/// covers and the span of its `#if`/`#elif`/`#else` line.
+struct Branch {
+    cond: *CondNode
+    begin: usize
+    end: usize
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+}
+
+/// One pass over the tokens of one file: directives resolved, inactive regions dropped.
+class Preprocessor {
+    toks: Vec<CToken>
+    defs: *ConfigDefines
+    fileDefines: *FileDefines
+    out: Vec<CToken>
+    sink: *DiagSink
+    parser: *CondParser
+
+    fn init(self, tokens: *CToken, count: u32, defs: *CDefine, defCount: u32) {
+        self.toks = Vec<CToken>()
+        for i in 0..count as usize {
+            local p = (tokens as usize + i * sizeOf(CToken)) as *CToken
+            self.toks.push(*p)
+        }
+        local configDefs = new ConfigDefines(defs, defCount)
+        self.defs = configDefs
+        self.fileDefines = new FileDefines()
+        self.out = Vec<CToken>()
+        self.sink = new DiagSink()
+        self.parser = new CondParser(self.toks.data, self.toks.length(), self.defs,
+                                     self.fileDefines, self.sink)
+    }
+
+    /// The end (exclusive) of the line holding `first`: the first later token that starts a line.
+    fn lineEnd(self, first: usize, end: usize) -> usize {
+        local i = first + 1
+        while i < end && self.toks.get(i).newlineBefore == 0 {
+            i = i + 1
+        }
+        return i
+    }
+
+    /// Records one E0003 through the sink (the code and the file are the C++ side's business).
+    fn fail(self, line: u32, column: u32, endLine: u32, endColumn: u32, message: String,
+            label: String) {
+        self.sink.fail(0, line, column, endLine, endColumn, message, label)
+    }
+
+    /// Records `define NAME = literal` (line start, active code) for later conditions. The name
+    /// and the string value are views into the input token texts, which live for the whole call.
+    fn noteDefine(self, i: usize, end: usize) {
+        local k = i
+        if self.toks.get(k).kind == K_EXPORT && k + 1 < end {
+            k = k + 1
+        }
+        if self.toks.get(k).kind != K_DEFINE || k + 3 >= end || self.toks.get(k + 1).kind != K_IDENT || self.toks.get(k + 2).kind != K_ASSIGN {
+            return
+        }
+        local v = self.toks.get(k + 3)
+        local single = k + 4 >= end || self.toks.get(k + 4).newlineBefore != 0
+        if !single {
+            return
+        }
+        local name = self.toks.get(k + 1)
+        if v.kind == K_INT {
+            self.fileDefines.put(fromParts(name.text, name.textLen as usize),
+                                 constInt(v.intValue as i64))
+        } else if v.kind == K_STRING {
+            self.fileDefines.put(fromParts(name.text, name.textLen as usize),
+                                 constStr(v.text, v.textLen))
+        } else if v.kind == K_TRUE {
+            self.fileDefines.put(fromParts(name.text, name.textLen as usize), constBool(true))
+        } else if v.kind == K_FALSE {
+            self.fileDefines.put(fromParts(name.text, name.textLen as usize), constBool(false))
+        }
+    }
+
+    /// Reports `#error` and its message string, when the region is active.
+    fn directiveError(self, i: usize, end: usize, active: bool) {
+        if !active {
+            return
+        }
+        local message = String("#error")
+        if i + 1 < end && self.toks.get(i + 1).kind == K_STRING && self.toks.get(i + 1).newlineBefore == 0 {
+            message = String(fromParts(self.toks.get(i + 1).text,
+                                       self.toks.get(i + 1).textLen as usize))
+        }
+        local t = self.toks.get(i)
+        self.fail(t.line, t.column, t.endLine, t.endColumn, message,
+                  String("`#error` directive reached"))
+    }
+
+    /// Walks `begin..end`, emitting the active tokens and handling the directives.
+    fn process(self, begin: usize, end: usize, active: bool) {
+        local i = begin
+        while i < end {
+            local t = self.toks.get(i)
+            if !isDirective(t.kind) {
+                if active {
+                    self.noteDefine(i, end)
+                    self.out.push(*t)
+                }
+                i = i + 1
+                continue
+            }
+            if opensConditional(t.kind) {
+                i = self.conditional(i, end, active)
+            } else if t.kind == K_DIR_ERROR {
+                self.directiveError(i, end, active)
+                i = self.lineEnd(i, end)
+            } else {
+                self.fail(t.line, t.column, t.endLine, t.endColumn,
+                          format("`{}` without a matching `#if`", tokenKindName(t.kind).asStr()),
+                          String("no open conditional here"))
+                i = self.lineEnd(i, end)
+            }
+        }
+    }
+
+    /// Handles the conditional that opens at `i` and returns the index to continue from.
+    fn conditional(self, i: usize, end: usize, active: bool) -> usize {
+        local opener = self.toks.get(i)
+        local cond = self.parser.condition(i, end)
+        if cond.node == nil {
+            // Malformed condition: drop the line and treat the body as inactive.
+            local next = self.lineEnd(i, end)
+            if next < end && self.toks.get(next).newlineBefore != 0 {
+                return self.skipBlock(next, end)
+            }
+            return next
+        }
+
+        local body = cond.next
+        local singleLine = body < end && self.toks.get(body).newlineBefore == 0
+        if singleLine {
+            local lineEnd = self.lineEnd(body, end)
+            local take = false
+            if active {
+                local v = self.parser.evaluate(cond.node)
+                if v.kind != V_MISSING {
+                    local t = self.parser.truth(v, cond.node.line, cond.node.column,
+                                                cond.node.endLine, cond.node.endColumn)
+                    if t > 0 {
+                        take = true
+                    }
+                }
+            }
+            if take {
+                local first = self.out.length()
+                self.process(body, lineEnd, true)
+                if self.out.length() > first {
+                    self.out.get(first).newlineBefore = 1
+                }
+            }
+            return lineEnd
+        }
+
+        // Block form: split into branches at depth 0.
+        local branches = Vec<Branch>()
+        branches.push(Branch {
+            cond: cond.node,
+            begin: body,
+            end: body,
+            line: opener.line,
+            column: opener.column,
+            endLine: opener.endLine,
+            endColumn: opener.endColumn,
+        })
+        local j = body
+        local depth: i32 = 0
+        local closed = false
+        while j < end {
+            local k = self.toks.get(j).kind
+            if opensConditional(k) {
+                // A single-line nested conditional has no `#endif`; its condition parses only to
+                // tell the two forms apart, so its failures stay silent.
+                local nestedSingle = false
+                self.parser.quiet = self.parser.quiet + 1
+                local nested = self.parser.condition(j, end)
+                self.parser.quiet = self.parser.quiet - 1
+                if nested.node != nil {
+                    nestedSingle = nested.next < end && self.toks.get(nested.next).newlineBefore == 0
+                } else {
+                    nestedSingle = true
+                }
+                if !nestedSingle {
+                    depth = depth + 1
+                }
+                j = j + 1
+                continue
+            }
+            if k == K_DIR_ENDIF {
+                if depth == 0 {
+                    local last = branches.last()
+                    last.end = j
+                    closed = true
+                    j = j + 1
+                    break
+                }
+                depth = depth - 1
+                j = j + 1
+                continue
+            }
+            if (k == K_DIR_ELIF || k == K_DIR_ELSE) && depth == 0 {
+                local last = branches.last()
+                last.end = j
+                local here = self.toks.get(j)
+                local next = Branch {
+                    cond: nil,
+                    begin: j + 1,
+                    end: j + 1,
+                    line: here.line,
+                    column: here.column,
+                    endLine: here.endLine,
+                    endColumn: here.endColumn,
+                }
+                local after = j + 1
+                if k == K_DIR_ELIF {
+                    local parsed = self.parser.condition(j, end)
+                    if parsed.node != nil {
+                        next.cond = parsed.node
+                        after = parsed.next
+                    } else {
+                        // A malformed `#elif` condition is a branch that never runs.
+                        local falseNode = self.parser.newNode(*here)
+                        falseNode.kind = N_LITERAL
+                        falseNode.literal = constBool(false)
+                        next.cond = falseNode
+                        after = self.lineEnd(j, end)
+                    }
+                }
+                next.begin = after
+                next.end = after
+                branches.push(next)
+                j = after
+                continue
+            }
+            j = j + 1
+        }
+        if !closed {
+            self.fail(opener.line, opener.column, opener.endLine, opener.endColumn,
+                      String("`#if` is never closed"), String("no matching `#endif`"))
+            local last = branches.last()
+            last.end = end
+        }
+
+        local taken = false
+        for b in 0..branches.length() {
+            local branch = branches.get(b)
+            local take = false
+            if !taken {
+                if branch.cond == nil {
+                    take = true
+                } else if active {
+                    local v = self.parser.evaluate(branch.cond)
+                    if v.kind != V_MISSING {
+                        local t = self.parser.truth(v, branch.cond.line, branch.cond.column,
+                                                    branch.cond.endLine, branch.cond.endColumn)
+                        if t > 0 {
+                            take = true
+                        }
+                    }
+                }
+            }
+            if take {
+                taken = true
+            }
+            self.process(branch.begin, branch.end, active && take)
+        }
+        return j
+    }
+
+    /// Skips a block-form conditional starting at `i` (used after a malformed condition).
+    fn skipBlock(self, i: usize, end: usize) -> usize {
+        local depth: i32 = 0
+        for j in i..end {
+            local k = self.toks.get(j).kind
+            if opensConditional(k) {
+                depth = depth + 1
+            } else if k == K_DIR_ENDIF {
+                if depth == 0 {
+                    return j + 1
+                }
+                depth = depth - 1
+            }
+        }
+        return end
+    }
+
+    /// Runs the walk over the whole token array and hands the C++ side a frozen result.
+    fn run(self) -> CPreResult {
+        local result = CPreResult { tokens: nil, tokenCount: 0, errors: nil, errorCount: 0,
+                                    block: nil }
+        if self.toks.length() > 0 && self.toks.last().kind == K_END {
+            self.process(0, self.toks.length() - 1, true)
+            self.out.push(*self.toks.last())
+        } else {
+            self.process(0, self.toks.length(), true)
+        }
+        if self.out.length() > 0 {
+            result.tokens = self.out.data
+            result.tokenCount = self.out.length() as u32
+        }
+        if self.sink.errors.length() > 0 {
+            result.errors = self.sink.errors.data
+            result.errorCount = self.sink.errors.length() as u32
+        }
+        return result
+    }
+}
+
+/// The heap block `xlcPreprocess` returns: everything the result points into, plus the
+/// `String`s behind the error messages. `xlcPreprocessFree` drops exactly this.
+class PreBlock {
+    pre: *Preprocessor
+    result: CPreResult
+}
+
+/// `xlcPreprocess`: resolve the directives of `tokenCount` tokens against `defCount` definitions
+/// and hand the C++ side a frozen result. The spans carry lines and columns only; the caller
+/// stamps its own file onto them.
+export(c) fn xlcPreprocess(tokens: *CToken, tokenCount: u32, defines: *CDefine,
+                           defineCount: u32) -> CPreResult {
+    local pre = new Preprocessor(tokens, tokenCount, defines, defineCount)
+    local block = new PreBlock {
+        pre: pre,
+        result: CPreResult { tokens: nil, tokenCount: 0, errors: nil, errorCount: 0, block: nil },
+    }
+    block.result = block.pre.run()
+    block.result.block = block as *u8
+    return block.result
+}
+
+/// `xlcPreprocessFree`: release what `xlcPreprocess` allocated. The block is dropped with the
+/// preprocessor, which deletes the condition arena and drops the token, error and message
+/// vectors.
+export(c) fn xlcPreprocessFree(result: CPreResult) {
+    if result.block == nil { return }
+    local block = result.block as *PreBlock
+    block.pre.parser.dropArena()
+    delete block
+}

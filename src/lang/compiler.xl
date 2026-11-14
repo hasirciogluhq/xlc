@@ -1,0 +1,6 @@
+// The entry of the xlang part of xlc: one object compiled by an installed `xl`
+// (xmake/xlang.lua) that carries the lexer and the preprocessor and exposes their C entry
+// points. Everything reachable from here is linked; the C++ side sees only the `xlc*` functions
+// of include/xlang/lang/lexer_c.h and preprocess_c.h.
+from "lexer/lexer" import xlcLex, xlcLexFree
+from "preprocess/preprocess" import xlcPreprocess, xlcPreprocessFree

@@ -1,56 +1,10 @@
-// The token vocabulary of the lexer and its C boundary.
+// The token vocabulary of the lexer and the preprocessor.
 //
 // `TokenKind` lives in C++ (include/xlang/lang/lexer.h); this file is the xlang mirror of it. The
-// two lists must agree number for number: K_END is the C++ `TokenKind::End`, K_FN is `Fn`, and so
-// on down the enum. A new token is one line in each file.
+// C++ list and this list must agree number for number: K_END is the C++ `TokenKind::End`, K_FN is
+// `Fn`, and so on down the enum. A new token is one line in each file.
 //
-// The `@repr(c)` structs are the layouts of include/xlang/lang/lexer_c.h, field for field. The
-// scanner fills them and hands them over; the C++ side copies what it keeps and never frees them
-// itself (the whole block goes back through `xlcLexFree`).
-
-// --- The C boundary ---------------------------------------------------------------------------
-
-/// One token; field for field the `XlcLexToken` of lexer_c.h.
-/// `text` points into the block the caller owns; it is not NUL-terminated.
-@repr(c)
-export struct CToken {
-    kind: i32
-    text: *u8
-    textLen: u32
-    intValue: u64
-    floatValue: f64
-    line: u32
-    column: u32
-    endLine: u32
-    endColumn: u32
-    newlineBefore: u32 ///< 0 or 1
-}
-
-/// One lexical error; the `XlcLexError` of lexer_c.h.
-@repr(c)
-export struct CError {
-    message: *u8
-    messageLen: u32
-    label: *u8
-    labelLen: u32
-    line: u32
-    column: u32
-    endLine: u32
-    endColumn: u32
-}
-
-/// The `XlcLexResult` of lexer_c.h: two blocks the callee allocated, plus the handle
-/// `xlcLexFree` releases. `block` is opaque here; lexer.xl gives it its real type.
-@repr(c)
-export struct CResult {
-    tokens: *CToken
-    tokenCount: u32
-    errors: *CError
-    errorCount: u32
-    block: *u8
-}
-
-// --- Token kinds ------------------------------------------------------------------------------
+// The structs that cross the C ABI live in ../abi.xl.
 // The order is the order of `enum class TokenKind` in lexer.h. Do not reorder: the numbers cross
 // the C boundary.
 

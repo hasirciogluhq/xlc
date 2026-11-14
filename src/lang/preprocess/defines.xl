@@ -1,0 +1,136 @@
+// The definition tables of the preprocessor: the value type of a `#if` operand, the `-D` and
+// builtin definitions that crossed the C ABI, and the `define NAME = literal` lines collected
+// from the file itself.
+//
+// Nothing here owns the bytes it points at: a definition value is a view into the token texts of
+// the input or into the C++ side's definition strings, both of which live for the whole call.
+// Only the error messages of the preprocessor are owned (see preprocess.xl).
+from "std" import String, Vec
+from "std/str" import fromParts, compare
+from "../abi" import CDefine, V_BOOL, V_INT, V_STRING
+
+/// The kind of a name no table holds, so a lookup can answer without an `Option`.
+export const V_MISSING: i32 = -1
+
+/// One value of a condition: a bool, an integer or a string.
+export struct Value {
+    kind: i32
+    intValue: i64
+    ptr: *u8
+    len: u32
+}
+
+export fn constBool(v: bool) -> Value {
+    return Value { kind: V_BOOL, intValue: v ? 1 : 0, ptr: nil, len: 0 }
+}
+
+export fn constInt(v: i64) -> Value {
+    return Value { kind: V_INT, intValue: v, ptr: nil, len: 0 }
+}
+
+/// A string value viewed at `p` for `len` bytes; the caller keeps the bytes alive.
+export fn constStr(p: *u8, len: u32) -> Value {
+    return Value { kind: V_STRING, intValue: 0, ptr: p, len: len }
+}
+
+/// The value of a definition table entry: a name view and its value.
+export struct Define {
+    namePtr: *u8
+    nameLen: u32
+    value: Value
+}
+
+/// The name of a value's kind, as a diagnostic names it.
+export fn kindName(v: Value) -> str {
+    if v.kind == V_BOOL { return "bool" }
+    if v.kind == V_INT { return "integer" }
+    if v.kind == V_STRING { return "string" }
+    return "?"
+}
+
+/// The bytes of a string value as a `str` view.
+export fn valueStr(v: Value) -> str {
+    return fromParts(v.ptr, v.len as usize)
+}
+
+/// The `-D` and builtin definitions of one compilation, as they crossed the C ABI. The array is
+/// borrowed and stays alive for the whole call; lookups scan it linearly, which is fine for the
+/// handful of definitions a build carries.
+export class ConfigDefines {
+    defs: Vec<CDefine>
+
+    fn init(self, defs: *CDefine, count: u32) {
+        self.defs = Vec<CDefine>()
+        for i in 0..count as usize {
+            local d = (defs as usize + i * sizeOf(CDefine)) as *CDefine
+            self.defs.push(*d)
+        }
+    }
+
+    /// The value of the definition called `name`, or `V_MISSING` in `kind` of the result.
+    fn lookup(self, name: str) -> Value {
+        for i in 0..self.defs.length() {
+            local d = self.defs.get(i)
+            if fromParts(d.name, d.nameLen as usize) == name {
+                return Value { kind: d.kind, intValue: d.intValue,
+                               ptr: d.bytes, len: d.strLen }
+            }
+        }
+        return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 }
+    }
+
+    /// True when any definition, `-D` or builtin, is called `name`.
+    fn isDefined(self, name: str) -> bool {
+        return self.lookup(name).kind != V_MISSING
+    }
+}
+
+/// The `define NAME = literal` lines of the file. Later conditions see them; a `-D` of the same
+/// name wins. The names are views into the input token texts.
+export class FileDefines {
+    defines: Vec<Define>
+
+    fn init(self) {
+        self.defines = Vec<Define>()
+    }
+
+    /// Records or replaces `name` with `value`.
+    fn put(self, name: str, value: Value) {
+        for i in 0..self.defines.length() {
+            local d = self.defines.get(i)
+            if fromParts(d.namePtr, d.nameLen as usize) == name {
+                d.value = value
+                return
+            }
+        }
+        self.defines.push(Define { namePtr: name.ptr, nameLen: name.len as u32, value: value })
+    }
+
+    /// The value of the definition called `name`, or `V_MISSING` in `kind` of the result.
+    fn lookup(self, name: str) -> Value {
+        for i in 0..self.defines.length() {
+            local d = self.defines.get(i)
+            if fromParts(d.namePtr, d.nameLen as usize) == name {
+                local v = d.value
+                return Value { kind: v.kind, intValue: v.intValue, ptr: v.ptr, len: v.len }
+            }
+        }
+        return Value { kind: V_MISSING, intValue: 0, ptr: nil, len: 0 }
+    }
+
+    /// True when a file `define` is called `name`.
+    fn isDefined(self, name: str) -> bool {
+        return self.lookup(name).kind != V_MISSING
+    }
+}
+
+/// Three-way comparison of two values of the same kind: negative, zero or positive.
+export fn compareValues(l: Value, r: Value) -> i32 {
+    if l.kind == V_BOOL {
+        return (l.intValue != 0 ? 1 : 0) - (r.intValue != 0 ? 1 : 0)
+    }
+    if l.kind == V_INT {
+        return l.intValue < r.intValue ? -1 : (l.intValue > r.intValue ? 1 : 0)
+    }
+    return compare(valueStr(l), valueStr(r))
+}
