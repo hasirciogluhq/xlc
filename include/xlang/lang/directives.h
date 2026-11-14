@@ -8,7 +8,8 @@
 
 namespace xlang {
 
-/// Conditional compilation over the token stream (plan 3.1-3.3, 3.5).
+/// Conditional compilation over the token stream: the directive walk (plan 3.1-3.3, 3.5). This is
+/// the C++ face of the seam in directives_c.h; the walk itself is src/lang/preprocess/*.xl.
 ///
 /// `#if/#elif/#else/#endif/#ifdef/#ifndef/#error` are removed; tokens of inactive regions are
 /// dropped (they were only lexed). A body on the same line as the condition is the rest of that

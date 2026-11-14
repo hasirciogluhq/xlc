@@ -2,6 +2,8 @@
 
 #include <format>
 #include <ostream>
+#include <cstdio>
+#include <cstdlib>
 #include <sstream>
 #include <type_traits>
 

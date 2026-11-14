@@ -1,10 +1,11 @@
 // The entry of the xlang part of xlc: one object compiled by an installed `xl`
 // (xmake/xlang.lua) that carries the lexer, the preprocessor, the macro expander and the HIR dump
 // and prune, and exposes their C entry points. Everything reachable from here is linked; the C++
-// side sees only the `xlc*` functions of include/xlang/lang/lexer_c.h, preprocess_c.h and
+// side sees only the `xlc*` functions of include/xlang/lang/lexer_c.h, directives_c.h and
 // macro_c.h.
 from "lexer/lexer" import xlcLex, xlcLexFree
 from "preprocess/preprocess" import xlcPreprocess, xlcPreprocessFree
 from "macro/expand" import xlcExpandMacros, xlcExpandMacrosFree
 from "../hir/dump" import xlcHirDump, xlcHirDumpFree
 from "../hir/prune" import xlcHirPrune, xlcHirPruneFree
+from "parser/parser" import xlcParse

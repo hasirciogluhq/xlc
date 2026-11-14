@@ -137,7 +137,7 @@ end
 
 -- The xlang parts of the compiler (the lexer, the preprocessor, the macro expander) are compiled
 -- by an installed `xl` into one object, reached from C++ through the C ABIs in
--- `include/xlang/lang/lexer_c.h`, `preprocess_c.h` and `macro_c.h`. `xmake/xlang.lua` turns the
+-- `include/xlang/lang/lexer_c.h`, `directives_c.h` and `macro_c.h`. `xmake/xlang.lua` turns the
 -- entry file into one object.
 includes("xmake/xlang.lua")
 
@@ -187,7 +187,7 @@ for _, module in ipairs(xlc_modules) do
 end
 
 -- `xlc-lang` also carries the xlang object: the scanner, the directive walk and the macro
--- expander; lexer.cpp, preprocess.cpp and macro.cpp only bridge the C ABI.
+-- expander; lexer.cpp, directives_bridge.cpp and macro.cpp only bridge the C ABI.
 target("xlc-lang")
     add_xlang_object("src/lang/compiler.xl")
 target_end()

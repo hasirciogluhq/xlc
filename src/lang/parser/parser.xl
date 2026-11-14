@@ -1,0 +1,4126 @@
+// The parser: token access, error reporting, recovery, the driver and every grammar rule (the
+// C++ src/lang/parser/ files, in the same order). One file because an `impl` block cannot extend
+// a class from another file yet (see xlang-docs/known-limitations.md); the section comments name
+// the C++ file each section ports.
+//
+// The input is the frozen token array the C++ side passes over the C boundary (the same
+// `CToken` records the lexer produced, preprocessed and macro-expanded); it always ends with an
+// end-of-file token, which the bridge guarantees. The output is the flat AST of ../ast/ast.xl in
+// the arenas of ../ast/build.xl. A syntax error is recorded and raises `panic`, which the
+// statement and item recovery sites catch, so one run reports many problems.
+
+from "std" import String, Vec, format
+from "std/io" import eprint
+from "std/str" import fromParts, eq, view, startsWith
+from "../abi" import CToken
+from "../lexer/tokens" import K_END, K_IDENT, K_PRIM_TYPE, K_INT, K_FLOAT, K_STRING, K_BYTE_LIT
+from "../lexer/tokens" import K_FN, K_LOCAL, K_RETURN, K_IF, K_ELSE, K_WHILE, K_CONTINUE, K_BREAK
+from "../lexer/tokens" import K_DO, K_SWITCH, K_CASE, K_DEFAULT, K_DEFER, K_TRY, K_CATCH, K_UNSAFE
+from "../lexer/tokens" import K_IMPORT, K_FROM, K_AS, K_EXPORT, K_DECLARE, K_REGISTER, K_GLOBAL
+from "../lexer/tokens" import K_CONST, K_DELETE, K_STRUCT, K_CLASS, K_INTERFACE, K_IMPL, K_ENUM
+from "../lexer/tokens" import K_TYPE, K_DEFINE, K_NEW, K_VIRTUAL, K_OVERRIDE, K_SELF_KW, K_FOR
+from "../lexer/tokens" import K_EXCEPT, K_TRUE, K_FALSE
+from "../lexer/tokens" import K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET
+from "../lexer/tokens" import K_COMMA, K_COLON, K_COLON_ASSIGN, K_SEMICOLON, K_DOT, K_ARROW, K_AT
+from "../lexer/tokens" import K_BANG, K_PLUS, K_MINUS, K_STAR, K_SLASH, K_PERCENT, K_AMP, K_PIPE
+from "../lexer/tokens" import K_CARET, K_TILDE, K_LT, K_GT, K_LE, K_GE, K_EQ_EQ, K_NOT_EQ
+from "../lexer/tokens" import K_AND_AND, K_OR_OR, K_SHL, K_SHR, K_ASSIGN, K_DOT_DOT, K_DOT_DOT_EQ
+from "../lexer/tokens" import K_PLUS_ASSIGN, K_MINUS_ASSIGN, K_STAR_ASSIGN, K_SLASH_ASSIGN
+from "../lexer/tokens" import K_PERCENT_ASSIGN, K_AMP_ASSIGN, K_PIPE_ASSIGN, K_CARET_ASSIGN
+from "../lexer/tokens" import K_SHL_ASSIGN, K_SHR_ASSIGN, K_PLUS_PLUS, K_MINUS_MINUS, K_QUESTION
+from "../lexer/tokens" import K_DIR_IF, K_DIR_ERROR
+from "../lexer/describe" import describeToken
+from "../ast/ast" import XStr, XSpan, XAttrArg, XAttr, XParam, XFieldInit, XClosure, XExpr
+from "../ast/ast" import XSwitchCase, XStmt, XBlock, XType, XField, XSumVariant, XEnumMember
+from "../ast/ast" import XMacroParam, XImportName, XTok, XTokList, XDecl, XItem, XErrLabel
+from "../ast/ast" import XErr, XProgram
+from "../ast/ast" import XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL, XE_STRING_LITERAL
+from "../ast/ast" import XE_BYTE_LITERAL, XE_NAME, XE_UNARY, XE_BINARY, XE_CALL, XE_INDEX
+from "../ast/ast" import XE_SLICE, XE_FIELD, XE_CAST, XE_ARRAY_LIST, XE_ARRAY_REPEAT
+from "../ast/ast" import XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW, XE_TERNARY, XE_TRY
+from "../ast/ast" import XE_MACRO_CALL, XE_SPREAD, XE_ASM_OPERAND, XE_TYPE_OPERAND, XE_CLOSURE
+from "../ast/ast" import XIMP_MODULE, XIMP_STAR, XIMP_STAR_AS, XIMP_NAMES, XEF_STAR, XEF_STAR_AS, XEF_NAMES
+from "../ast/ast" import XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF, XU_BITNOT
+from "../ast/ast" import XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE
+from "../ast/ast" import XB_GT, XB_GE, XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL
+from "../ast/ast" import XB_SHR
+from "../ast/ast" import XS_LOCAL, XS_DELETE, XS_CONST, XS_ASSIGN, XS_RETURN, XS_EXPR, XS_IF
+from "../ast/ast" import XS_WHILE, XS_DO_WHILE, XS_FOR, XS_FOR_RANGE, XS_FOR_PACK, XS_FOR_EACH
+from "../ast/ast" import XS_SWITCH, XS_DEFER, XS_TRY, XS_CONTINUE, XS_BREAK, XS_UNSAFE
+from "../ast/ast" import XS_BLOCK
+from "../ast/ast" import XT_VOID, XT_NEVER, XT_BOOL, XT_INT, XT_FLOAT, XT_POINTER, XT_FN_PTR
+from "../ast/ast" import XT_ARRAY, XT_ENUM, XT_STRUCT, XT_CLASS, XT_INTERFACE, XT_STR
+from "../ast/ast" import XT_SLICE, XT_TUPLE, XT_NAMED
+from "../ast/ast" import XD_FN, XD_GLOBAL, XD_STRUCT, XD_CLASS, XD_INTERFACE, XD_IMPL, XD_ENUM
+from "../ast/ast" import XD_TYPE_ALIAS, XD_DEFINE_CONST, XD_DEFINE_MACRO, XD_IMPORT
+from "../ast/ast" import XD_EXPORT_FROM, XD_MACRO_CALL, XD_TOP_LEVEL_CALL, XD_FN_ALIAS
+from "../ast/ast" import XAA_IDENT, XAA_INT, XAA_STRING
+from "../ast/ast" import XMP_EXPR, XMP_TYPE, XMP_IDENT, XMP_BLOCK, XMP_ITEMS
+from "../ast/ast" import XF_MODULE, XF_STAR, XF_STAR_AS, XF_NAMES
+from "../ast/build" import Ast
+
+/// The modifiers of one item (`export`, `export(c)`, `declare`, `register`).
+export class Modifiers {
+    exported: bool
+    exportC: bool
+    declared: bool
+    registered: bool
+    registerRole: String
+
+    fn init(self) {
+        self.exported = false
+        self.exportC = false
+        self.declared = false
+        self.registered = false
+        self.registerRole = String("")
+    }
+}
+
+/// The start of one item: its attributes (a range in the attribute arena), modifiers and span.
+export class DeclStart {
+    attrsFirst: u32
+    attrsCount: u32
+    mods: Modifiers
+    start: XSpan
+
+    fn init(self) {
+        self.attrsFirst = 0
+        self.attrsCount = 0
+        self.mods = Modifiers()
+    }
+}
+
+/// The context flags that expression and statement parsing set and put back. A raised `panic`
+/// skips the code that puts them back, so recovery restores the snapshot taken where it resumes:
+/// otherwise a raised `nlDepth` would let the next statements run on past their line breaks.
+export class ParseState {
+    nlDepth: i32
+    prefixOperand: u32
+    prefixNlBase: i32
+    noStruct: u32
+    forHeader: u32
+    castType: u32
+    openTernaries: usize
+
+    fn init(self) {
+        self.nlDepth = 0
+        self.prefixOperand = 0
+        self.prefixNlBase = 0
+        self.noStruct = 0
+        self.forHeader = 0
+        self.castType = 0
+        self.openTernaries = 0
+    }
+}
+
+/// The recursive-descent parser over one frozen token array.
+export class Parser {
+    toks: *CToken
+    count: usize
+    pos: usize
+    b: *Ast
+    nlDepth: i32
+    /// A prefix `*`/`&` operand is being parsed: `continues()` ignores the parentheses opened
+    /// inside it, so a newline in front of a binary `&`/`*` ends the operand at its line.
+    prefixOperand: bool
+    prefixNlBase: i32
+    noStruct: bool
+    forHeader: bool ///< parsing the init/step statements of a `for` header
+    castType: bool  ///< parsing the type after `as` (see `castTypeArgsAhead`)
+    /// Token index of the `?` of every ternary whose then-branch is being parsed, innermost last
+    /// (see `ternaryColonAhead`).
+    openTernaries: Vec<usize>
+    /// Declaration indices of the function literals lifted out of expressions, appended to the
+    /// items at the end of the run.
+    lambdas: Vec<i32>
+    lambdaCount: i32
+    /// Stable bytes for the tokens `closeAngle` rewrites (`>>` giving up its first character),
+    /// so the rewritten token's text points somewhere that outlives the parse.
+    splitBuf: Vec<u8>
+
+    fn init(self, toks: *CToken, count: usize, b: *Ast) {
+        self.toks = toks
+        self.count = count
+        self.pos = 0
+        self.b = b
+        self.nlDepth = 0
+        self.prefixOperand = false
+        self.prefixNlBase = 0
+        self.noStruct = false
+        self.forHeader = false
+        self.castType = false
+        self.openTernaries = Vec<usize>()
+        self.lambdas = Vec<i32>()
+        self.lambdaCount = 0
+        // Reserved once, so `closeAngle` always has stable bytes to point a rewritten token at.
+        self.splitBuf = Vec<u8>()
+        self.splitBuf.reserve(8)
+    }
+
+    fn cur(self) -> CToken {
+        return self.toks[self.pos]
+    }
+
+    fn peek(self, ahead: usize) -> CToken {
+        local i: usize = self.pos + ahead
+        if i >= self.count {
+            i = self.count - 1
+        }
+        return self.toks[i]
+    }
+
+    fn peekKind(self, ahead: usize) -> i32 {
+        return self.peek(ahead).kind
+    }
+
+    fn at(self, kind: i32) -> bool {
+        return self.toks[self.pos].kind == kind
+    }
+
+    fn prev(self) -> CToken {
+        local i: usize = self.pos == 0 ? 0 : self.pos - 1
+        return self.toks[i]
+    }
+
+    fn advance(self) -> CToken {
+        local t: CToken = self.toks[self.pos]
+        if self.pos + 1 < self.count {
+            self.pos = self.pos + 1
+        }
+        return t
+    }
+
+    fn match(self, kind: i32) -> bool {
+        if self.at(kind) {
+            self.advance()
+            return true
+        }
+        return false
+    }
+
+    /// The text of a token as a `str` view into the frozen token block.
+    fn textOf(self, t: CToken) -> str {
+        return fromParts(t.text, t.textLen as usize)
+    }
+
+    fn curText(self) -> str {
+        return self.textOf(self.cur())
+    }
+
+    /// The current token may continue the expression/statement being parsed: it is on the same
+    /// line, or we are inside `(...)`/`[...]` where line breaks do not end anything. While a prefix
+    /// `*` or `&` operand is being parsed, the operand's own `(...)` is not counted, so a newline
+    /// in front of a binary `&`/`*` ends the operand instead of turning the next argument into its
+    /// right side.
+    fn continues(self) -> bool {
+        if self.cur().newlineBefore != 0 && self.prefixOperand {
+            return self.nlDepth > self.prefixNlBase
+        }
+        return self.cur().newlineBefore == 0 || self.nlDepth > 0
+    }
+
+    fn adjacent(self, a: CToken, b: CToken) -> bool {
+        return a.endLine == b.line && a.endColumn == b.column
+    }
+
+    /// The range from the start of `start` to the end of the previous token.
+    fn spanFrom(self, start: XSpan) -> XSpan {
+        return self.b.merge(start, self.b.spanOf(self.prev()))
+    }
+
+    fn spanOfCur(self) -> XSpan {
+        return self.b.spanOf(self.cur())
+    }
+
+    /// The snapshot of the context flags, taken where a recovery resumes.
+    fn state(self) -> ParseState {
+        local s = ParseState()
+        s.nlDepth = self.nlDepth
+        s.prefixOperand = self.prefixOperand ? 1 : 0
+        s.prefixNlBase = self.prefixNlBase
+        s.noStruct = self.noStruct ? 1 : 0
+        s.forHeader = self.forHeader ? 1 : 0
+        s.castType = self.castType ? 1 : 0
+        s.openTernaries = self.openTernaries.length()
+        return s
+    }
+
+    fn restore(self, s: ParseState) {
+        self.nlDepth = s.nlDepth
+        self.prefixOperand = s.prefixOperand != 0
+        self.prefixNlBase = s.prefixNlBase
+        self.noStruct = s.noStruct != 0
+        self.forHeader = s.forHeader != 0
+        self.castType = s.castType != 0
+        while self.openTernaries.length() > s.openTernaries {
+            self.openTernaries.pop()
+        }
+    }
+
+    /// Reports a syntax error and aborts the parse of the current statement or item; the
+    /// recovery site catches the panic, resynchronizes and keeps going.
+    fn failAt(self, t: CToken, msg: String, label: String, detail: String, fix: String) {
+        self.b.error(self.b.spanOf(t), msg.asStr(), label.asStr(), detail.asStr(), fix.asStr())
+        panic("parse-abort")
+    }
+
+    fn expected(self, what: str) {
+        local msg = format("expected {}, found {}", String(what), describeToken(self.cur()))
+        local label = format("expected {} here", String(what))
+        self.failAt(self.cur(), msg, label, String(""), String(""))
+    }
+
+    fn expect(self, kind: i32, what: str) -> CToken {
+        if !self.at(kind) {
+            self.expected(what)
+        }
+        return self.advance()
+    }
+
+    fn expectIdent(self, what: str) -> str {
+        if !self.at(K_IDENT) {
+            self.expected(what)
+        }
+        return self.textOf(self.advance())
+    }
+
+    /// A member name: an identifier, or a word keyword where only a name can stand (after `fn` in a
+    /// class, interface or impl body, and after `.`), so `fn delete(...)` and `c.delete(url)` work.
+    fn atMemberName(self) -> bool {
+        local t = self.curText()
+        local head: u8 = t.len > 0 ? t[0] : 0
+        return self.at(K_IDENT) ||
+            (t.len > 0 && ((head >= 97 && head <= 122) || (head >= 65 && head <= 90)) &&
+             !self.at(K_INT) && !self.at(K_FLOAT))
+    }
+
+    /// Records a syntax error without aborting: parsing continues.
+    fn softError(self, span: XSpan, msg: String, label: String) {
+        self.b.error(span, msg.asStr(), label.asStr(), "", "")
+    }
+
+    /// The token kinds an item can start with (the recovery scan stops at one).
+    fn startsItem(self, kind: i32) -> bool {
+        return kind == K_AT || kind == K_EXPORT || kind == K_DECLARE || kind == K_REGISTER ||
+            kind == K_FN || kind == K_GLOBAL || kind == K_CONST || kind == K_STRUCT ||
+            kind == K_CLASS || kind == K_INTERFACE || kind == K_IMPL || kind == K_ENUM ||
+            kind == K_TYPE || kind == K_DEFINE || kind == K_IMPORT || kind == K_FROM
+    }
+
+    /// Skips the rest of a failed item: past its unclosed braces, to the next item start on a
+    /// fresh line.
+    fn syncItem(self, start: usize) {
+        if self.pos == start && !self.at(K_END) {
+            self.advance()
+        }
+        // Brace depth at the error position, counted from the start of the failed item, so the
+        // rest of its body is skipped instead of being re-parsed as top-level code.
+        local depth: i32 = 0
+        for i in start..self.pos {
+            if self.toks[i].kind == K_LBRACE {
+                depth = depth + 1
+            } else if self.toks[i].kind == K_RBRACE && depth > 0 {
+                depth = depth - 1
+            }
+        }
+        while !self.at(K_END) {
+            if depth == 0 && self.cur().newlineBefore != 0 && self.startsItem(self.cur().kind) {
+                return
+            }
+            if self.at(K_LBRACE) {
+                depth = depth + 1
+            } else if self.at(K_RBRACE) && depth > 0 {
+                depth = depth - 1
+            }
+            self.advance()
+        }
+    }
+
+    /// Skips the rest of a failed statement: past its unclosed braces, to a line break or the
+    /// closing brace of the enclosing block.
+    fn syncStatement(self, start: usize) {
+        if self.pos == start && !self.at(K_END) && !self.at(K_RBRACE) {
+            self.advance()
+        }
+        // Braces the failed statement opened and did not close (a `switch` body, a struct
+        // literal, a closure), counted from its start like `syncItem`, so the rest of them is
+        // skipped instead of being parsed as statements of the enclosing block.
+        local depth: i32 = 0
+        for i in start..self.pos {
+            if self.toks[i].kind == K_LBRACE {
+                depth = depth + 1
+            } else if self.toks[i].kind == K_RBRACE && depth > 0 {
+                depth = depth - 1
+            }
+        }
+        while !self.at(K_END) {
+            if depth == 0 && (self.cur().newlineBefore != 0 || self.at(K_RBRACE)) {
+                return
+            }
+            if self.at(K_LBRACE) {
+                depth = depth + 1
+            } else if self.at(K_RBRACE) && depth > 0 {
+                depth = depth - 1
+            }
+            self.advance()
+        }
+    }
+
+    fn rejectDirective(self) {
+        local k = self.cur().kind
+        if k >= K_DIR_IF && k <= K_DIR_ERROR {
+            local msg = format("`{}` is not supported yet", describeToken(self.cur()))
+            self.failAt(self.cur(), msg, String("conditional-compilation directive"),
+                String("The lexer recognizes `#if`/`#elif`/`#else`/`#endif`/`#ifdef`/`#ifndef`/`#error`, but the preprocessor that evaluates them is not implemented yet."),
+                String("remove the directive for now"))
+        }
+    }
+
+    /// Parses the whole token array into the builder's arenas: the `@file(...)` attributes, then
+    /// the items, then the function literals lifted out of expressions.
+    fn run(self) {
+        // `@file(...)` attributes at the very top.
+        local attrsFirst: u32 = self.b.attrs.length() as u32
+        while self.at(K_AT) && self.peekKind(1) == K_IDENT && eq(self.textOf(self.peek(1)), "file") {
+            try {
+                self.parseAttribute()
+            } catch e {
+                self.restore(ParseState())
+                self.syncItem(self.pos)
+            }
+        }
+        local attrsCount: u32 = (self.b.attrs.length() as u32) - attrsFirst
+
+        while !self.at(K_END) {
+            local start: usize = self.pos
+            try {
+                self.parseItem()
+            } catch e {
+                eprint("[xlparser] item panic: ")
+                eprint(e)
+                self.restore(ParseState())
+                self.syncItem(start)
+            }
+        }
+        for i in 0..self.lambdas.length() {
+            local item: XItem
+            item.decl = *self.lambdas.get(i as usize)
+            self.b.items.push(item)
+        }
+
+        local p: XProgram
+        p.file = self.b.file
+        p.fileAttrsFirst = attrsFirst
+        p.fileAttrsCount = attrsCount
+        p.itemsFirst = 0
+        p.itemsCount = self.b.items.length() as u32
+        self.b.program = p
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // attributes.cpp: `@name(...)` attributes
+
+    /// @grammar `@name`, `@name(a, key = v, ...)`, `@file(name(...))` at the top of a file
+    fn parseAttribute(self) -> i32 {
+        local start = self.spanOfCur()
+        self.expect(K_AT, "`@`")
+        local name = self.expectIdent("an attribute name")
+        local argsFirst: u32 = self.b.attrArgs.length() as u32
+        if self.at(K_LPAREN) && self.continues() && self.adjacent(self.prev(), self.cur()) {
+            self.advance()
+            self.nlDepth = self.nlDepth + 1
+            while !self.at(K_RPAREN) {
+                local argSpan = self.spanOfCur()
+                local key: str = ""
+                if self.at(K_IDENT) && self.peekKind(1) == K_ASSIGN {
+                    key = self.textOf(self.advance())
+                    self.advance() // '='
+                    argSpan = self.spanOfCur()
+                }
+                local arg: XAttrArg
+                self.parseAttributeValue(&arg)
+                arg.key = self.b.text(key)
+                arg.span = self.spanFrom(argSpan)
+                self.b.attrArgs.push(arg)
+                if !self.match(K_COMMA) {
+                    break
+                }
+            }
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)` closing the attribute")
+        }
+        local a: XAttr
+        a.name = self.b.text(name)
+        a.argsFirst = argsFirst
+        a.argsCount = (self.b.attrArgs.length() as u32) - argsFirst
+        a.span = self.spanFrom(start)
+        self.b.attrs.push(a)
+        return (self.b.attrs.length() - 1) as i32
+    }
+
+    /// @grammar the value of an attribute argument: an identifier, an integer literal or a string
+    fn parseAttributeValue(self, arg: *XAttrArg) {
+        local k = self.cur().kind
+        if k == K_IDENT || k == K_PRIM_TYPE || k == K_TRUE || k == K_FALSE {
+            arg.kind = XAA_IDENT
+            arg.text = self.b.text(self.textOf(self.advance()))
+            return
+        }
+        if k == K_INT {
+            arg.kind = XAA_INT
+            arg.number = self.advance().intValue as i64
+            return
+        }
+        if k == K_MINUS {
+            self.advance()
+            arg.kind = XAA_INT
+            arg.number = -(self.expect(K_INT, "an integer").intValue as i64)
+            return
+        }
+        if k == K_STRING {
+            arg.kind = XAA_STRING
+            arg.text = self.b.text(self.textOf(self.advance()))
+            return
+        }
+        self.expected("an attribute argument (identifier, integer or string)")
+    }
+
+    /// @grammar one or more `@attribute` lines before an item, a statement or a parameter
+    fn parseAttributes(self) -> (u32, u32) {
+        local first: u32 = self.b.attrs.length() as u32
+        while self.at(K_AT) {
+            self.parseAttribute()
+        }
+        return (first, (self.b.attrs.length() as u32) - first)
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // types.cpp: types, generic parameters/arguments and their lookahead
+
+    /// @grammar `<T, U>` after a `fn`, `struct`, `class` or `interface` name, `<>` empty
+    fn parseGenericParams(self) -> (u32, u32) {
+        local first: u32 = self.b.strs.length() as u32
+        self.expect(K_LT, "`<` starting the type parameters")
+        while !self.at(K_GT) && !self.at(K_END) {
+            self.b.strs.push(self.b.text(self.expectIdent("a type parameter name")))
+            if !self.match(K_COMMA) {
+                break
+            }
+        }
+        self.closeAngle()
+        return (first, (self.b.strs.length() as u32) - first)
+    }
+
+    /// Type parameters on a declaration that cannot have them (E0724); they are consumed.
+    fn rejectTypeParams(self) {
+        if self.at(K_LT) {
+            self.b.error(self.spanOfCur(),
+                "type parameters are only allowed on `fn`, `struct` and `class`",
+                "remove the `<...>`", "", "")
+            self.parseGenericParams()
+        }
+    }
+
+    /// @grammar `<A, B>` after a type name or an identifier in an expression, `>>` closing two levels
+    /// @invariant inside `<...>` a nested `<` always opens type arguments, also in the type of a
+    /// @invariant cast, so `castType` is cleared here and restored on exit
+    fn parseTypeArgs(self) -> (u32, u32) {
+        // The direct type arguments are collected first and pushed contiguously before the
+        // caller records the range: a nested generic type parses inside the loop and its own
+        // references must not land inside this range.
+        local list = Vec<i32>()
+        self.expect(K_LT, "`<` starting the type arguments")
+        // Inside `<...>` a nested `<` always opens type arguments, also in the type of a cast.
+        local savedCast = self.castType
+        self.castType = false
+        while !self.at(K_GT) && !self.at(K_SHR) && !self.at(K_END) {
+            list.push(self.parseType())
+            if !self.match(K_COMMA) {
+                break
+            }
+        }
+        self.castType = savedCast
+        self.closeAngle()
+        local first: u32 = self.b.typeRefs.length() as u32
+        for i in 0..list.length() {
+            self.b.typeRefs.push(*list.get(i))
+        }
+        return (first, list.length() as u32)
+    }
+
+    /// Consumes one `>`. A `>>` (or `>=`, `>>=`) token gives up its first character, so nested
+    /// type arguments `Vec<Vec<i32>>` close one level at a time.
+    fn closeAngle(self) {
+        local kind = self.toks[self.pos].kind
+        if kind == K_GT {
+            self.advance()
+            return
+        }
+        // The rewritten token's text points into the parser's own stable bytes (reserved once,
+        // eight writes total, so the buffer never moves). The token itself is written back into
+        // the array, since a token is a value and a local copy would be lost.
+        local buf: *u8 = self.splitBuf.data
+        if kind == K_SHR {
+            self.toks[self.pos].kind = K_GT
+            buf[0] = 62
+            self.toks[self.pos].text = buf
+            self.toks[self.pos].textLen = 1
+            return
+        }
+        if kind == K_GE {
+            self.toks[self.pos].kind = K_ASSIGN
+            buf[0] = 61
+            self.toks[self.pos].text = buf
+            self.toks[self.pos].textLen = 1
+            return
+        }
+        if kind == K_SHR_ASSIGN {
+            self.toks[self.pos].kind = K_GE
+            buf[0] = 62
+            buf[1] = 61
+            self.toks[self.pos].text = buf
+            self.toks[self.pos].textLen = 2
+            return
+        }
+        self.expected("`>` closing the type arguments")
+    }
+
+    /// Index of the `>` that closes the angle brackets opened by the `<` at the cursor, when
+    /// everything in between is made of type tokens: names, primitives, `*`, `.`, `,`, array and
+    /// slice brackets with an integer length, tuple parentheses and `fn(...) -> R`. The bool is
+    /// false when another token comes first, or when a `)`/`]`/`>` has no opener inside.
+    fn typeArgsClose(self) -> (bool, usize) {
+        local angles: i32 = 0
+        local groups: i32 = 0 // `(` and `[` inside the arguments
+        for i in self.pos..self.count {
+            local k = self.toks[i].kind
+            if k == K_LT {
+                angles = angles + 1
+            } else if k == K_GT {
+                angles = angles - 1
+            } else if k == K_SHR {
+                angles = angles - 2
+            } else if k == K_LPAREN || k == K_LBRACKET {
+                groups = groups + 1
+            } else if k == K_RPAREN || k == K_RBRACKET {
+                groups = groups - 1
+                if groups < 0 {
+                    return (false, 0)
+                }
+            } else if !(k == K_IDENT || k == K_PRIM_TYPE || k == K_STAR || k == K_COMMA ||
+                        k == K_DOT || k == K_INT || k == K_SEMICOLON || k == K_FN ||
+                        k == K_ARROW) {
+                return (false, 0)
+            }
+            if angles < 0 {
+                return (false, 0)
+            }
+            if angles == 0 {
+                // A `>` inside `(` or `[` cannot close the arguments: types never hold one there
+                // except as a nested argument list, which is already counted.
+                return (groups == 0, i)
+            }
+        }
+        return (false, 0)
+    }
+
+    /// Whether the `<` at the cursor opens type arguments of an identifier in an expression: they
+    /// hold only type tokens (`typeArgsClose`) and the `>` is followed by what no comparison's right
+    /// operand starts with: `(`, `{`, `)`, `]`, `,`, `;` or the end of the line. Otherwise the `<`
+    /// is a comparison.
+    fn genericArgsAhead(self) -> bool {
+        local close = self.typeArgsClose()
+        if !close.0 {
+            return false
+        }
+        local i: usize = close.1
+        if i + 1 >= self.count || self.toks[i + 1].newlineBefore != 0 {
+            return true
+        }
+        local nk = self.toks[i + 1].kind
+        return nk == K_LPAREN || nk == K_LBRACE || nk == K_RPAREN || nk == K_RBRACKET ||
+            nk == K_COMMA || nk == K_SEMICOLON
+    }
+
+    /// Whether the `<` after the type name of `x as T` opens type arguments (`x as Box<i32>`) rather
+    /// than comparing the cast value (`x as Idx < n`): they hold only type tokens (`typeArgsClose`)
+    /// and the `>` is not followed, on its line, by a token that starts an operand (a name, a
+    /// literal, `(`, `[`, `self`, `!`, `~`, a closure), which only a comparison `a < b > c` has.
+    fn castTypeArgsAhead(self) -> bool {
+        local close = self.typeArgsClose()
+        if !close.0 {
+            return false
+        }
+        local i: usize = close.1
+        if i + 1 >= self.count || self.toks[i + 1].newlineBefore != 0 {
+            return true
+        }
+        local nk = self.toks[i + 1].kind
+        return !(nk == K_IDENT || nk == K_PRIM_TYPE || nk == K_INT || nk == K_FLOAT ||
+            nk == K_STRING || nk == K_BYTE_LIT || nk == K_TRUE || nk == K_FALSE ||
+            nk == K_SELF_KW || nk == K_LPAREN || nk == K_LBRACKET || nk == K_BANG ||
+            nk == K_TILDE || nk == K_PIPE || nk == K_OR_OR || nk == K_NEW || nk == K_FN)
+    }
+
+    /// @grammar the type after `->`, which may be `never` (the one place it may be written)
+    fn parseReturnType(self) -> i32 {
+        if self.at(K_PRIM_TYPE) && eq(self.curText(), "never") {
+            local t = self.advance()
+            local n = self.b.typeNode(XT_NEVER)
+            self.b.types.get(n as usize).span = self.b.spanOf(t)
+            return n
+        }
+        return self.parseType()
+    }
+
+    /// @grammar `*T`, `[]T`, `[]mut T`, `[T; N]`, `(T,)`, `(A, B)`, `()`
+    /// @grammar `fn(A) -> R`, `fn(A)`, `Name`, `a.b.Name`, `Name<T, U>`
+    /// @grammar `*T` is written with a star, never a postfix form: the type grammar is prefix only
+    /// @grammar `(T)` without the trailing comma is `T` in parentheses, not a one-element tuple
+    /// @grammar `[T; N]` keeps N as an expression, parsed with `noStruct` cleared
+    /// @grammar `never` is accepted here and rejected later with E0765 unless it is a return type
+    /// @invariant `nlDepth` is raised around every bracket the rule consumes and lowered on every
+    /// @invariant exit path, so a newline inside a type does not end the enclosing statement
+    fn parseType(self) -> i32 {
+        local start = self.spanOfCur()
+        local k = self.cur().kind
+        if k == K_STAR {
+            self.advance()
+            local elem = self.parseType()
+            local t = self.b.typeNode(XT_POINTER)
+            local p = self.b.types.get(t as usize)
+            p.elem = elem
+            p.span = self.spanFrom(start)
+            return t
+        }
+        if k == K_PRIM_TYPE {
+            local t = self.advance()
+            local idx = self.primitiveType(self.textOf(t))
+            local p = self.b.types.get(idx as usize)
+            if p.kind == XT_NEVER {
+                self.b.error(self.b.spanOf(t), "`never` is only a return type",
+                    "write it after `->` of a function that does not return", "", "")
+            }
+            p.span = self.spanFrom(start)
+            return idx
+        }
+        if k == K_FN {
+            self.advance()
+            self.expect(K_LPAREN, "`(` after `fn` in a function pointer type")
+            self.nlDepth = self.nlDepth + 1
+            // Two-phase: the parameter types are pushed contiguously right before the node, so
+            // the return type parsed in between does not land inside the parameter range.
+            local params = Vec<i32>()
+            while !self.at(K_RPAREN) {
+                params.push(self.parseType())
+                if !self.match(K_COMMA) {
+                    break
+                }
+            }
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)` closing the parameter types")
+            local ret: i32 = -1
+            if self.match(K_ARROW) {
+                ret = self.parseReturnType()
+            }
+            local paramsFirst: u32 = self.b.typeRefs.length() as u32
+            for i in 0..params.length() {
+                self.b.typeRefs.push(*params.get(i))
+            }
+            local t = self.b.typeNode(XT_FN_PTR)
+            local p = self.b.types.get(t as usize)
+            p.paramsFirst = paramsFirst
+            p.paramsCount = params.length() as u32
+            p.ret = ret
+            p.span = self.spanFrom(start)
+            return t
+        }
+        if k == K_LBRACKET {
+            self.advance()
+            self.nlDepth = self.nlDepth + 1
+            // `[]T` / `[]mut T` is a slice type; `[T; N]` needs the semicolon and length below.
+            // `mut` is not a keyword: it is an identifier, so it is matched by its text.
+            if self.match(K_RBRACKET) {
+                self.nlDepth = self.nlDepth - 1
+                local isMut = self.at(K_IDENT) && eq(self.curText(), "mut")
+                if isMut {
+                    self.advance()
+                }
+                local elem = self.parseType()
+                local t = self.b.typeNode(XT_SLICE)
+                local p = self.b.types.get(t as usize)
+                p.elem = elem
+                p.isMutable = isMut ? 1 : 0
+                p.span = self.spanFrom(start)
+                return t
+            }
+            local elem = self.parseType()
+            self.expect(K_SEMICOLON, "`;` between the element type and the length")
+            local savedNoStruct = self.noStruct
+            self.noStruct = false
+            local length = self.parseExpr()
+            self.noStruct = savedNoStruct
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RBRACKET, "`]` closing the array type")
+            local t = self.b.typeNode(XT_ARRAY)
+            local p = self.b.types.get(t as usize)
+            p.elem = elem
+            p.length = length
+            p.span = self.spanFrom(start)
+            return t
+        }
+        if k == K_LPAREN {
+            // Tuple type: `()` is the empty tuple, `(A,)` a one-element tuple, `(A, B)` a product.
+            self.advance()
+            self.nlDepth = self.nlDepth + 1
+            // Two-phase: pushed contiguously before the node, so nested generics stay out.
+            local list = Vec<i32>()
+            local trailingComma = false
+            while !self.at(K_RPAREN) {
+                list.push(self.parseType())
+                if !self.match(K_COMMA) {
+                    break
+                }
+                trailingComma = self.at(K_RPAREN)
+            }
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)` closing the tuple type")
+            if list.length() == 1 && !trailingComma {
+                // `(T)` is not a tuple: it is the type `T` in parentheses.
+                local inner = *list.get(0)
+                self.b.types.get(inner as usize).span = self.spanFrom(start)
+                return inner
+            }
+            local argsFirst: u32 = self.b.typeRefs.length() as u32
+            for i in 0..list.length() {
+                self.b.typeRefs.push(*list.get(i))
+            }
+            local t = self.b.typeNode(XT_TUPLE)
+            local p = self.b.types.get(t as usize)
+            p.argsFirst = argsFirst
+            p.argsCount = list.length() as u32
+            p.span = self.spanFrom(start)
+            return t
+        }
+        if k == K_IDENT {
+            local pathFirst: u32 = self.b.strs.length() as u32
+            self.b.strs.push(self.b.text(self.textOf(self.advance())))
+            while self.at(K_DOT) && self.peekKind(1) == K_IDENT {
+                self.advance()
+                self.b.strs.push(self.b.text(self.textOf(self.advance())))
+            }
+            local t = self.b.typeNode(XT_NAMED)
+            local p = self.b.types.get(t as usize)
+            p.pathFirst = pathFirst
+            p.pathCount = (self.b.strs.length() as u32) - pathFirst
+            if self.at(K_LT) && (!self.castType || self.castTypeArgsAhead()) {
+                local args = self.parseTypeArgs()
+                // The arguments are type nodes: the types arena may have moved, so refetch.
+                p = self.b.types.get(t as usize)
+                p.argsFirst = args.0
+                p.argsCount = args.1
+            }
+            p.span = self.spanFrom(start)
+            return t
+        }
+        self.expected("a type")
+        return -1
+    }
+
+    /// The flat type node of a primitive name (`i32`, `usize`, `f64`, `bool`, `void`, `never`, `str`).
+    fn primitiveType(self, name: str) -> i32 {
+        local kind: i32 = XT_VOID
+        local bits: u32 = 0
+        local signed: u32 = 0
+        if eq(name, "void") {
+            kind = XT_VOID
+        } else if eq(name, "never") {
+            kind = XT_NEVER
+        } else if eq(name, "bool") {
+            kind = XT_BOOL
+        } else if eq(name, "str") {
+            kind = XT_STR
+        } else if eq(name, "f32") {
+            kind = XT_FLOAT
+            bits = 32
+        } else if eq(name, "f64") {
+            kind = XT_FLOAT
+            bits = 64
+        } else if eq(name, "isize") {
+            kind = XT_INT
+            signed = 1
+        } else if eq(name, "usize") {
+            kind = XT_INT
+        } else {
+            // i8..i64 and u8..u64: the letter and the digit count fix kind, bits and signedness.
+            kind = XT_INT
+            bits = (name[1] - 48) as u32
+            if name.len > 2 {
+                bits = bits * 10 + (name[2] - 48) as u32
+            }
+            signed = name[0] == 105 ? 1 : 0 // 'i'
+        }
+        local t = self.b.typeNode(kind)
+        local p = self.b.types.get(t as usize)
+        p.bits = bits
+        p.isSigned = signed
+        return t
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // expr/binary.cpp: ternary, binary operators (Go precedence), `as` and prefix operators
+
+    /// The entry of expression parsing: `parseTernary` with no extra context.
+    fn parseExpr(self) -> i32 {
+        return self.parseTernary()
+    }
+
+    /// @grammar `cond ? a : b` is right associative and the lowest precedence level
+    /// @invariant `openTernaries` holds the token index of every `?` whose `:` is still owed, so
+    /// @invariant `ternaryColonAhead` can tell a ternary `?` from a propagating one
+    fn parseTernary(self) -> i32 {
+        local cond = self.parseOr()
+        if self.at(K_QUESTION) && self.continues() {
+            self.openTernaries.push(self.pos)
+            self.advance()
+            local thenValue = self.parseTernary()
+            self.openTernaries.pop()
+            self.expect(K_COLON, "`:` between the two branches of `?`")
+            local elseValue = self.parseTernary()
+            local argsFirst: u32 = self.b.exprRefs.length() as u32
+            self.b.exprRefs.push(elseValue)
+            local e = self.b.expr(XE_TERNARY,
+                self.b.merge(self.b.exprs.get(cond as usize).span, self.b.exprs.get(elseValue as usize).span))
+            local p = self.b.exprs.get(e as usize)
+            p.lhs = cond
+            p.rhs = thenValue
+            p.argsFirst = argsFirst
+            p.argsCount = 1
+            return e
+        }
+        return cond
+    }
+
+    fn makeBinary(self, op: i32, lhs: i32, rhs: i32) -> i32 {
+        local e = self.b.expr(XE_BINARY,
+            self.b.merge(self.b.exprs.get(lhs as usize).span, self.b.exprs.get(rhs as usize).span))
+        local p = self.b.exprs.get(e as usize)
+        p.binaryOp = op
+        p.lhs = lhs
+        p.rhs = rhs
+        return e
+    }
+
+    /// @grammar `a || b`
+    fn parseOr(self) -> i32 {
+        local lhs = self.parseAnd()
+        while self.at(K_OR_OR) && self.continues() {
+            self.advance()
+            lhs = self.makeBinary(XB_OR, lhs, self.parseAnd())
+        }
+        return lhs
+    }
+
+    /// @grammar `a && b`
+    fn parseAnd(self) -> i32 {
+        local lhs = self.parseEquality()
+        while self.at(K_AND_AND) && self.continues() {
+            self.advance()
+            lhs = self.makeBinary(XB_AND, lhs, self.parseEquality())
+        }
+        return lhs
+    }
+
+    /// @grammar `a == b`, `a != b`
+    fn parseEquality(self) -> i32 {
+        local lhs = self.parseComparison()
+        while (self.at(K_EQ_EQ) || self.at(K_NOT_EQ)) && self.continues() {
+            local op: i32 = self.advance().kind == K_EQ_EQ ? XB_EQ : XB_NE
+            lhs = self.makeBinary(op, lhs, self.parseComparison())
+        }
+        return lhs
+    }
+
+    /// @grammar `a < b`, `a <= b`, `a > b`, `a >= b`
+    fn parseComparison(self) -> i32 {
+        local lhs = self.parseAdditive()
+        while (self.at(K_LT) || self.at(K_LE) || self.at(K_GT) || self.at(K_GE)) && self.continues() {
+            local op: i32 = XB_GE
+            local k = self.advance().kind
+            if k == K_LT { op = XB_LT }
+            if k == K_LE { op = XB_LE }
+            if k == K_GT { op = XB_GT }
+            lhs = self.makeBinary(op, lhs, self.parseAdditive())
+        }
+        return lhs
+    }
+
+    /// @grammar `a + b`, `a - b`, `a | b`, `a ^ b`
+    fn parseAdditive(self) -> i32 {
+        local lhs = self.parseMultiplicative()
+        // Go-style levels: `+ - | ^` here, `* / % << >> &` in parseMultiplicative.
+        while (self.at(K_PLUS) || self.at(K_MINUS) || self.at(K_PIPE) || self.at(K_CARET)) && self.continues() {
+            local op: i32 = XB_BITXOR
+            local k = self.advance().kind
+            if k == K_PLUS { op = XB_ADD }
+            if k == K_MINUS { op = XB_SUB }
+            if k == K_PIPE { op = XB_BITOR }
+            lhs = self.makeBinary(op, lhs, self.parseMultiplicative())
+        }
+        return lhs
+    }
+
+    /// @grammar `a * b`, `a / b`, `a % b`, `a & b`, `a << b`, `a >> b`
+    fn parseMultiplicative(self) -> i32 {
+        local lhs = self.parseCast()
+        while (self.at(K_STAR) || self.at(K_SLASH) || self.at(K_PERCENT) || self.at(K_SHL) ||
+               self.at(K_SHR) || self.at(K_AMP)) && self.continues() {
+            local op: i32 = XB_MOD
+            local k = self.advance().kind
+            if k == K_STAR { op = XB_MUL }
+            if k == K_SLASH { op = XB_DIV }
+            if k == K_SHL { op = XB_SHL }
+            if k == K_SHR { op = XB_SHR }
+            if k == K_AMP { op = XB_BITAND }
+            lhs = self.makeBinary(op, lhs, self.parseCast())
+        }
+        return lhs
+    }
+
+    /// @grammar `e as T` binds tighter than every binary operator, so `a + b as i64` casts `b`
+    /// @grammar `castType` tells `parseType` that a `<` after a name may be a comparison
+    /// @grammar (`x as Idx < n`) rather than type arguments; `castTypeArgsAhead` decides
+    /// @invariant `castType` stays true for the whole target type and is cleared right after
+    fn parseCast(self) -> i32 {
+        local value = self.parseUnary()
+        while self.at(K_AS) && self.continues() {
+            self.advance()
+            local savedCast = self.castType
+            self.castType = true
+            local target = self.parseType() // a raised panic here is undone by the recovery's restore
+            self.castType = savedCast
+            local e = self.b.expr(XE_CAST,
+                self.b.merge(self.b.exprs.get(value as usize).span, self.b.spanOf(self.prev())))
+            local p = self.b.exprs.get(e as usize)
+            p.lhs = value
+            p.typeIdx = target
+            value = e
+        }
+        return value
+    }
+
+    /// @grammar `-e`, `!e`, `~e`, `*e`, `&e`, `&mut e`, repeated (`--x`, `*&p`)
+    /// @invariant `prefixOperand` and `prefixNlBase` are raised around the operand, so a
+    /// @invariant newline in front of a binary `&`/`*` ends the operand, not the next argument
+    fn parseUnary(self) -> i32 {
+        local start = self.spanOfCur()
+        local op: i32 = -1
+        local k = self.cur().kind
+        if k == K_MINUS { op = XU_NEG }
+        if k == K_BANG { op = XU_NOT }
+        if k == K_TILDE { op = XU_BITNOT }
+        if k == K_STAR { op = XU_DEREF }
+        if k == K_AMP { op = XU_ADDROF }
+        if k == K_AND_AND {
+            // `&&x` in prefix position is two address-of operators.
+            self.advance()
+            local inner = self.parseUnary()
+            local mid = self.b.expr(XE_UNARY, self.b.merge(start, self.b.exprs.get(inner as usize).span))
+            local mp = self.b.exprs.get(mid as usize)
+            mp.unaryOp = XU_ADDROF
+            mp.lhs = inner
+            local outer = self.b.expr(XE_UNARY, self.b.exprs.get(mid as usize).span)
+            local op2 = self.b.exprs.get(outer as usize)
+            op2.unaryOp = XU_ADDROF
+            op2.lhs = mid
+            return outer
+        }
+        if op >= 0 {
+            self.advance()
+            // `*` and `&` are binary as well, so the operand of a prefix `*`/`&` stops at the end
+            // of its line: in `T {\n &A()\n &B() }` the second `&` starts the next argument, not
+            // the right side of a `&` term.
+            local savedOperand = self.prefixOperand
+            local savedBase = self.prefixNlBase
+            self.prefixOperand = true
+            self.prefixNlBase = self.nlDepth
+            local operand = self.parseUnary()
+            self.prefixOperand = savedOperand
+            self.prefixNlBase = savedBase
+            local e = self.b.expr(XE_UNARY, self.b.merge(start, self.b.exprs.get(operand as usize).span))
+            local p = self.b.exprs.get(e as usize)
+            p.unaryOp = op
+            p.lhs = operand
+            return e
+        }
+        return self.parsePostfix(self.parsePrimary())
+    }
+
+    /// Dotted name of a `Name`/`Field` chain, empty when `e` is anything else.
+    fn pathOf(self, e: i32) -> String {
+        local p = self.b.exprs.get(e as usize)
+        if p.kind == XE_NAME {
+            return String(self.b.strOf(p.text))
+        }
+        if p.kind == XE_FIELD && p.lhs >= 0 {
+            local base = self.pathOf(p.lhs)
+            if base.len == 0 {
+                return base
+            }
+            local out = base
+            out.append(".")
+            out.append(self.b.strOf(p.text))
+            return out
+        }
+        return String("")
+    }
+
+    /// Splits a dotted path into its parts (the C++ `splitPath`).
+    fn splitPath(self, path: str) -> (u32, u32) {
+        local first: u32 = self.b.strs.length() as u32
+        local start: usize = 0
+        while true {
+            local dot: usize = path.len
+            for i in start..path.len {
+                if path[i] == 46 {
+                    dot = i
+                    break
+                }
+            }
+            local end: usize = dot
+            if dot == path.len {
+                end = path.len
+            }
+            local part = view(path, start, end - start)
+            self.b.strs.push(self.b.text(part))
+            if dot == path.len {
+                break
+            }
+            start = dot + 1
+        }
+        return (first, (self.b.strs.length() as u32) - first)
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // expr/postfix.cpp: paths, field initializers, macro and call arguments, postfix operators
+
+    /// At `{`: does what follow look like a struct literal body (`}` or `name :`)?
+    fn looksLikeStructLiteral(self) -> bool {
+        if self.peekKind(1) == K_RBRACE {
+            return true
+        }
+        return self.peekKind(1) == K_IDENT && self.peekKind(2) == K_COLON
+    }
+
+    /// @grammar `Type { field: value, other }`, `Type { }`
+    fn parseFieldInits(self) -> (u32, u32) {
+        self.expect(K_LBRACE, "`{`")
+        local savedDepth = self.nlDepth
+        local savedNoStruct = self.noStruct
+        self.nlDepth = 0
+        self.noStruct = false
+        // Two-phase: a nested struct literal in a value pushes its own field inits into the same
+        // arena, so the outer ones are collected first and pushed contiguously at the end.
+        local inits = Vec<XFieldInit>()
+        while !self.at(K_RBRACE) {
+            local span = self.spanOfCur()
+            local name = self.expectIdent("a field name")
+            self.expect(K_COLON, "`:` after the field name")
+            local value = self.parseExpr()
+            local f: XFieldInit
+            f.name = self.b.text(name)
+            f.value = value
+            f.span = self.spanFrom(span)
+            inits.push(f)
+            if self.match(K_COMMA) {
+                continue
+            }
+            if !self.at(K_RBRACE) && self.cur().newlineBefore == 0 {
+                self.expected("`,`, a line break or `}`")
+            }
+        }
+        self.nlDepth = savedDepth
+        self.noStruct = savedNoStruct
+        self.expect(K_RBRACE, "`}`")
+        local first: u32 = self.b.fieldInits.length() as u32
+        for i in 0..inits.length() {
+            self.b.fieldInits.push(*inits.get(i))
+        }
+        return (first, inits.length() as u32)
+    }
+
+    /// Appends one raw token to the token arena (macro bodies and macro arguments).
+    fn pushTok(self, t: CToken) {
+        local x: XTok
+        x.kind = t.kind
+        x.text = self.b.text(self.textOf(t))
+        x.intValue = t.intValue
+        x.floatValue = t.floatValue
+        x.line = t.line
+        x.column = t.column
+        x.endLine = t.endLine
+        x.endColumn = t.endColumn
+        x.newlineBefore = t.newlineBefore
+        self.b.toks.push(x)
+    }
+
+    /// Raw token lists of a macro argument list; consumes the `(` ... `)`.
+    /// @grammar `name!(raw tokens...)`, the arguments are not parsed
+    fn parseMacroArgs(self) -> (u32, u32) {
+        self.expect(K_LPAREN, "`(`")
+        local listsFirst: u32 = self.b.tokLists.length() as u32
+        local tokFirst: u32 = self.b.toks.length() as u32
+        local tokCount: u32 = 0
+        local any = false
+        local depth: i32 = 0
+        while true {
+            if self.at(K_END) {
+                self.expected("`)` closing the macro call")
+            }
+            local kind = self.cur().kind
+            if depth == 0 && kind == K_RPAREN {
+                break
+            }
+            if depth == 0 && kind == K_COMMA {
+                local l: XTokList
+                l.first = tokFirst
+                l.count = tokCount
+                self.b.tokLists.push(l)
+                tokFirst = self.b.toks.length() as u32
+                tokCount = 0
+                self.advance()
+                continue
+            }
+            if kind == K_LPAREN || kind == K_LBRACKET || kind == K_LBRACE {
+                depth = depth + 1
+            } else if kind == K_RPAREN || kind == K_RBRACKET || kind == K_RBRACE {
+                depth = depth - 1
+            }
+            any = true
+            self.pushTok(self.advance())
+            tokCount = tokCount + 1
+        }
+        if any || ((self.b.tokLists.length() as u32) > listsFirst) {
+            local l: XTokList
+            l.first = tokFirst
+            l.count = tokCount
+            self.b.tokLists.push(l)
+        }
+        self.advance() // ')'
+        return (listsFirst, (self.b.tokLists.length() as u32) - listsFirst)
+    }
+
+    /// A call argument. Inline-asm operands are written `in(reg) x`, `out("rax") y`,
+    /// `inout(reg) z`: a register spec in parentheses followed by the operand expression.
+    fn parseCallArg(self) -> i32 {
+        if self.at(K_DOT_DOT) { // `..args`: spreads a parameter pack into the call
+            local span = self.spanOfCur()
+            self.advance()
+            local pack = self.expectIdent("a parameter pack name after `..`")
+            local e = self.b.expr(XE_SPREAD, self.spanFrom(span))
+            self.b.exprs.get(e as usize).text = self.b.text(pack)
+            return e
+        }
+        local arg = self.parseExpr()
+        local p = self.b.exprs.get(arg as usize)
+        local operandHead = false
+        if p.kind == XE_CALL && p.lhs >= 0 {
+            local callee = self.b.exprs.get(p.lhs as usize)
+            local t = self.b.strOf(callee.text)
+            operandHead = callee.kind == XE_NAME && (eq(t, "in") || eq(t, "out") || eq(t, "inout")) &&
+                p.argsCount == 1
+        }
+        if !operandHead || self.at(K_COMMA) || self.at(K_RPAREN) {
+            return arg
+        }
+        local operand = self.b.expr(XE_ASM_OPERAND, p.span)
+        local q = self.b.exprs.get(operand as usize)
+        q.lhs = *self.b.exprRefs.get(p.argsFirst as usize)
+        // The operand expression may grow the exprs arena: parse first, refetch, then write.
+        local operandExpr = self.parseExpr()
+        q = self.b.exprs.get(operand as usize)
+        q.rhs = operandExpr
+        // The operand expression may have moved the exprs arena: refetch the callee name.
+        q.text = self.b.exprs.get(p.lhs as usize).text
+        self.b.exprs.get(operand as usize).span = self.spanFrom(p.span)
+        return operand
+    }
+
+    /// A `?` that propagates (`f()?`) rather than starts a ternary. It must touch the operand
+    /// before it. Then it propagates when what follows cannot be the first token of a ternary's
+    /// value: the end of the line or of the file, a closing or separating token (`;`, `)`, `]`,
+    /// `}`, `,`, `.`, `{`, `:`, another `?`), or an operator that only works between two operands
+    /// (`f()? + 1`, `a? == b?`, `as`). Otherwise (`-`, `*`, `&`, a name, a literal follow) it is a
+    /// ternary only when its `:` follows (`ternaryColonAhead`): `c? -1 : 1` is a ternary,
+    /// `f()? - 1` and `f()? * 2` propagate.
+    fn tryOperatorAhead(self) -> bool {
+        if !self.at(K_QUESTION) || !self.continues() || !self.adjacent(self.prev(), self.cur()) {
+            return false
+        }
+        local next = self.peek(1)
+        if next.newlineBefore != 0 {
+            return true
+        }
+        local nk = next.kind
+        if nk == K_SEMICOLON || nk == K_RPAREN || nk == K_RBRACKET || nk == K_RBRACE ||
+           nk == K_LBRACE || nk == K_COMMA || nk == K_COLON || nk == K_DOT || nk == K_QUESTION ||
+           nk == K_END || nk == K_PLUS || nk == K_SLASH || nk == K_PERCENT || nk == K_PIPE ||
+           nk == K_CARET || nk == K_SHL || nk == K_SHR || nk == K_EQ_EQ || nk == K_NOT_EQ ||
+           nk == K_LT || nk == K_LE || nk == K_GT || nk == K_GE || nk == K_AND_AND ||
+           nk == K_OR_OR || nk == K_AS || nk == K_ASSIGN || nk == K_DOT_DOT || nk == K_DOT_DOT_EQ {
+            return true
+        }
+        return !self.ternaryColonAhead()
+    }
+
+    /// Net count of brackets (`(`, `[`, `{`) opened and not closed by the tokens `from` .. `to - 1`.
+    fn openBrackets(self, lo: usize, hi: usize) -> i32 {
+        local depth: i32 = 0
+        for i in lo..hi {
+            local k = self.toks[i].kind
+            if k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE {
+                depth = depth + 1
+            } else if k == K_RPAREN || k == K_RBRACKET || k == K_RBRACE {
+                depth = depth - 1
+            }
+        }
+        return depth
+    }
+
+    /// Whether the `?` at the cursor has a ternary `:` of its own after it. The scan stays at the
+    /// `?`'s bracket level and stops where the expression ends there: a line break outside
+    /// brackets, a `,` or `;`, a closing bracket of an outer level, a block `{` in a condition, or
+    /// the end of the file. Each `?` met on the way takes the next `:`. The `:` left over belong
+    /// to the ternaries whose then-branch encloses the cursor at this same level
+    /// (`openTernaries`); one more than those is this `?`'s own.
+    fn ternaryColonAhead(self) -> bool {
+        local owed: i32 = 0
+        for i in 0..self.openTernaries.length() {
+            if self.openBrackets(*self.openTernaries.get(i as usize) + 1, self.pos) == 0 {
+                owed = owed + 1
+            }
+        }
+        local depth: i32 = 0
+        local pending: i32 = 0 // `?` met in the scan that still wait for their `:`
+        local colons: i32 = 0  // `:` left over for this `?` and the enclosing ternaries
+        for i in self.pos + 1..self.count {
+            local t = self.toks[i]
+            if depth == 0 && t.newlineBefore != 0 && self.nlDepth == 0 {
+                break
+            }
+            if t.kind == K_END || (depth == 0 && (t.kind == K_COMMA || t.kind == K_SEMICOLON)) ||
+               (depth == 0 && t.kind == K_LBRACE && self.noStruct) {
+                break
+            }
+            if t.kind == K_LPAREN || t.kind == K_LBRACKET || t.kind == K_LBRACE {
+                depth = depth + 1
+            } else if t.kind == K_RPAREN || t.kind == K_RBRACKET || t.kind == K_RBRACE {
+                if depth == 0 {
+                    break
+                }
+                depth = depth - 1
+            } else if depth == 0 && t.kind == K_QUESTION {
+                pending = pending + 1
+            } else if depth == 0 && t.kind == K_COLON {
+                if pending > 0 {
+                    pending = pending - 1
+                } else {
+                    colons = colons + 1
+                }
+            }
+        }
+        return colons > owed
+    }
+
+    /// Wraps `base` in a slice node after `..` was consumed; reads the optional upper bound and
+    /// closes the bracket.
+    fn finishSlice(self, base: i32, lo: i32, savedNoStruct: bool, savedDepth: i32) -> i32 {
+        local hi: i32 = -1
+        if !self.at(K_RBRACKET) {
+            hi = self.parseExpr() // `hi`; absent when the bracket closes here
+        }
+        self.noStruct = savedNoStruct
+        self.nlDepth = savedDepth
+        self.expect(K_RBRACKET, "`]` closing the slice")
+        local slice = self.b.expr(XE_SLICE,
+            self.b.merge(self.b.exprs.get(base as usize).span, self.b.spanOf(self.prev())))
+        local p = self.b.exprs.get(slice as usize)
+        p.lhs = base
+        local argsFirst: u32 = self.b.exprRefs.length() as u32
+        if lo >= 0 {
+            self.b.exprRefs.push(lo)
+        }
+        p.argsFirst = argsFirst
+        p.argsCount = (self.b.exprRefs.length() as u32) - argsFirst
+        p.rhs = hi
+        return slice
+    }
+
+    /// @grammar `f(a, b)`, `a[i]`, `a[lo..hi]`, `a[lo..]`, `e.field`, `e<T>(...)`, `e!`, `e?`
+    /// @grammar `name!(args...)`, `in(reg) x` / `out("rax") y` / `inout(reg) z` as a call argument
+    /// @grammar `..pack` as a call argument, chained (`a.b(c)[d]?.e`)
+    /// @grammar the loop keeps applying suffixes while `continues()` holds, so a newline ends the
+    /// @grammar chain unless a `(`/`[`/`{` is still open
+    /// @invariant `noStruct` is cleared inside `(` and `[` and restored on exit, so `{` in an
+    /// @invariant argument list is a struct literal even inside an `if` condition
+    fn parsePostfix(self, expr: i32) -> i32 {
+        while true {
+            if self.at(K_LPAREN) && self.continues() {
+                self.advance()
+                self.nlDepth = self.nlDepth + 1
+                local savedNoStruct = self.noStruct
+                self.noStruct = false
+                // Two-phase: the arguments are pushed contiguously right before the call node,
+                // so a nested call inside an argument does not land inside this argument range.
+                local args = Vec<i32>()
+                while !self.at(K_RPAREN) {
+                    args.push(self.parseCallArg())
+                    if !self.match(K_COMMA) {
+                        break
+                    }
+                }
+                self.noStruct = savedNoStruct
+                self.nlDepth = self.nlDepth - 1
+                self.expect(K_RPAREN, "`)` closing the argument list")
+                local argsFirst: u32 = self.b.exprRefs.length() as u32
+                for i in 0..args.length() {
+                    self.b.exprRefs.push(*args.get(i))
+                }
+                local call = self.b.expr(XE_CALL,
+                    self.b.merge(self.b.exprs.get(expr as usize).span, self.b.spanOf(self.prev())))
+                local p = self.b.exprs.get(call as usize)
+                p.lhs = expr
+                p.argsFirst = argsFirst
+                p.argsCount = args.length() as u32
+                expr = call
+            } else if self.tryOperatorAhead() {
+                // `e?`: written against the operand and followed by something that ends it, which
+                // no ternary (`c ? a : b`, an operand always follows its `?`) can be.
+                self.advance()
+                local propagate = self.b.expr(XE_TRY, self.b.exprs.get(expr as usize).span)
+                local p = self.b.exprs.get(propagate as usize)
+                p.span = self.spanFrom(p.span)
+                p.lhs = expr
+                expr = propagate
+            } else if self.at(K_LBRACKET) && self.continues() {
+                self.advance()
+                self.nlDepth = self.nlDepth + 1
+                local savedNoStruct = self.noStruct
+                self.noStruct = false
+                // `base[lo..hi]` and `base[lo..]` are slices; `..=` is not a slice, because a view
+                // has no defined inclusive end (`base[lo..=hi]` would be off by one).
+                if self.at(K_DOT_DOT) {
+                    self.advance()
+                    expr = self.finishSlice(expr, -1, savedNoStruct, self.nlDepth - 1)
+                } else {
+                    local first = self.parseExpr()
+                    if self.at(K_DOT_DOT) {
+                        self.advance()
+                        expr = self.finishSlice(expr, first, savedNoStruct, self.nlDepth - 1)
+                    } else {
+                        local index = self.b.expr(XE_INDEX, self.b.exprs.get(expr as usize).span)
+                        local p = self.b.exprs.get(index as usize)
+                        p.rhs = first
+                        self.noStruct = savedNoStruct
+                        self.nlDepth = self.nlDepth - 1
+                        self.expect(K_RBRACKET, "`]` closing the index")
+                        self.b.exprs.get(index as usize).span =
+                            self.b.merge(self.b.exprs.get(expr as usize).span, self.b.spanOf(self.prev()))
+                        p.lhs = expr
+                        expr = index
+                    }
+                }
+            } else if self.at(K_DOT) && self.continues() {
+                self.advance()
+                if self.at(K_INT) {
+                    // `.0`, `.1`, ... in a tuple: the element at that position. The index travels
+                    // in `intValue`; `text` stays empty, so nothing mistakes it for a field name.
+                    local elem = self.b.expr(XE_FIELD, self.b.exprs.get(expr as usize).span)
+                    local p = self.b.exprs.get(elem as usize)
+                    p.intValue = self.advance().intValue
+                    self.b.exprs.get(elem as usize).span =
+                        self.b.merge(self.b.exprs.get(expr as usize).span, self.b.spanOf(self.prev()))
+                    p.lhs = expr
+                    expr = elem
+                    continue
+                }
+                if !self.atMemberName() {
+                    self.expected("a member name after `.`")
+                }
+                local field = self.b.expr(XE_FIELD, self.b.exprs.get(expr as usize).span)
+                local p = self.b.exprs.get(field as usize)
+                p.text = self.b.text(self.textOf(self.advance()))
+                if self.at(K_LT) && self.genericArgsAhead() {
+                    local args = self.parseTypeArgs() // `obj.m<T>(...)`
+                    p.genericArgsFirst = args.0
+                    p.genericArgsCount = args.1
+                }
+                self.b.exprs.get(field as usize).span =
+                    self.b.merge(self.b.exprs.get(expr as usize).span, self.b.spanOf(self.prev()))
+                p.lhs = expr
+                expr = field
+            } else if self.at(K_BANG) && self.peekKind(1) == K_LPAREN &&
+                      self.adjacent(self.prev(), self.cur()) && self.adjacent(self.cur(), self.peek(1)) &&
+                      self.pathOf(expr).len > 0 {
+                self.advance() // '!'
+                local call = self.b.expr(XE_MACRO_CALL, self.b.exprs.get(expr as usize).span)
+                local p = self.b.exprs.get(call as usize)
+                p.text = self.b.text(self.pathOf(expr).asStr())
+                local args = self.parseMacroArgs()
+                p.macroArgsFirst = args.0
+                p.macroArgsCount = args.1
+                self.b.exprs.get(call as usize).span =
+                    self.b.merge(self.b.exprs.get(expr as usize).span, self.b.spanOf(self.prev()))
+                expr = call
+            } else if self.at(K_LBRACE) && !self.noStruct && self.continues() &&
+                      self.pathOf(expr).len > 0 && self.looksLikeStructLiteral() {
+                local lit = self.b.expr(XE_STRUCT_LITERAL, self.b.exprs.get(expr as usize).span)
+                local p = self.b.exprs.get(lit as usize)
+                local path = self.splitPath(self.pathOf(expr).asStr())
+                local t = self.b.typeNode(XT_NAMED)
+                local tp = self.b.types.get(t as usize)
+                tp.pathFirst = path.0
+                tp.pathCount = path.1
+                local src = self.b.exprs.get(expr as usize)
+                tp.argsFirst = src.genericArgsFirst
+                tp.argsCount = src.genericArgsCount
+                tp.span = src.span
+                p.typeIdx = t
+                local fields = self.parseFieldInits()
+                // The field initializers are expressions: the exprs arena may have moved.
+                p = self.b.exprs.get(lit as usize)
+                p.fieldsFirst = fields.0
+                p.fieldsCount = fields.1
+                p.span = self.b.merge(self.b.exprs.get(expr as usize).span, self.b.spanOf(self.prev()))
+                expr = lit
+            } else {
+                break
+            }
+        }
+        return expr
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // expr/primary.cpp: primary expressions, fn literals, closures, array literals, `new`
+
+    /// `fn(params) -> R { body }` as an expression: the body becomes a module-level function with a
+    /// generated name, and the expression is a reference to it. A literal captures nothing; an
+    /// outer local used inside it is an unknown name.
+    /// @grammar `fn(params) -> R { body }` as an expression
+    fn parseFnLiteral(self) -> i32 {
+        local start = self.spanOfCur()
+        self.expect(K_FN, "`fn`")
+        local name = format("__lambda{}", self.lambdaCount)
+        self.lambdaCount = self.lambdaCount + 1
+        local d = self.b.decl(XD_FN)
+        self.parseFnTail(d, name.asStr(), false, true)
+        local p = self.b.decls.get(d as usize)
+        p.name = self.b.text(name.asStr())
+        p.nameSpan = start
+        p.span = self.spanFrom(start)
+        self.lambdas.push(d)
+        local e = self.b.expr(XE_NAME, start)
+        self.b.exprs.get(e as usize).text = self.b.text(name.asStr())
+        return e
+    }
+
+    /// `[move] |a: T, b| [-> R] { body }` or `[move] |x| expr`; `||` is the empty parameter list.
+    /// Types may be left out where the context names a `fn(...)` type (checked by the lowering).
+    /// `move` is a keyword only in front of `|`.
+    /// @grammar `||`, `|a, b|`, `|a: T, b| -> R { body }`, `|x| expr`, `move |x| expr`
+    /// @grammar `move` is a keyword only directly in front of `|`, so `a | b` and `a || b` stay
+    /// @grammar operators
+    /// @invariant a parameter type may be omitted only where the context names a `fn(...)` type; the
+    /// @invariant parser accepts the omission and lowering rejects an unknown one with E0770
+    fn parseClosure(self) -> i32 {
+        local start = self.spanOfCur()
+        local isMove = false
+        if self.at(K_IDENT) && eq(self.curText(), "move") {
+            self.advance()
+            isMove = true
+        }
+        local paramsFirst: u32 = self.b.params.length() as u32
+        if self.match(K_OR_OR) {
+            // no parameters
+        } else {
+            self.expect(K_PIPE, "`|` starting the closure parameters")
+            while !self.at(K_PIPE) {
+                local paramSpan = self.spanOfCur()
+                local paramName = self.expectIdent("a closure parameter name")
+                local hasType = false
+                local paramType: i32 = -1
+                if self.match(K_COLON) {
+                    hasType = true
+                    paramType = self.parseType()
+                }
+                local param: XParam
+                param.name = self.b.text(paramName)
+                param.typeIdx = paramType
+                param.hasType = hasType ? 1 : 0
+                param.span = self.spanFrom(paramSpan)
+                self.b.params.push(param)
+                if !self.match(K_COMMA) {
+                    break
+                }
+            }
+            self.expect(K_PIPE, "`|` closing the closure parameters")
+        }
+        local hasRet = false
+        local ret: i32 = -1
+        if self.match(K_ARROW) {
+            hasRet = true
+            ret = self.parseReturnType()
+            if !self.at(K_LBRACE) {
+                self.expected("`{` with the closure body (a closure with `->` has a block body)")
+            }
+        }
+        local body: i32 = -1
+        local exprBody = false
+        if self.at(K_LBRACE) {
+            body = self.parseBlock()
+        } else {
+            // `|x| x * 2`: the value is the whole expression after the bars.
+            local valueSpan = self.spanOfCur()
+            local savedNoStruct = self.noStruct
+            self.noStruct = false
+            local value = self.parseExpr()
+            self.noStruct = savedNoStruct
+            local span = self.spanFrom(valueSpan)
+            local stmt = self.b.stmt(XS_EXPR)
+            local sp = self.b.stmts.get(stmt as usize)
+            sp.expr = value
+            sp.span = span
+            local stmtsFirst: u32 = self.b.stmtRefs.length() as u32
+            self.b.stmtRefs.push(stmt)
+            body = self.b.block(span)
+            local bp = self.b.blocks.get(body as usize)
+            bp.stmtsFirst = stmtsFirst
+            bp.stmtsCount = 1
+            exprBody = true
+        }
+        local c: XClosure
+        c.paramsFirst = paramsFirst
+        c.paramsCount = (self.b.params.length() as u32) - paramsFirst
+        c.hasRet = hasRet ? 1 : 0
+        c.ret = ret
+        c.isMove = isMove ? 1 : 0
+        c.exprBody = exprBody ? 1 : 0
+        c.body = body
+        self.b.closures.push(c)
+        local closureIdx = (self.b.closures.length() - 1) as i32
+        local e = self.b.expr(XE_CLOSURE, self.spanFrom(start))
+        self.b.exprs.get(e as usize).closure = closureIdx
+        return e
+    }
+
+    /// @grammar `123`, `1.5`, `"text"`, `b'x'`, `true`, `false`, `self`, `name`, `name::name`
+    /// @grammar `name<T, U>`, `(a)`, `(a, b)`, `[a, b]`, `[v; n]`, `new T`, `new(p) T`
+    /// @grammar `__builtin_asm(...)`
+    /// @grammar a name is a primary; the suffixes (`call`, `index`, `field`, `?`) are applied by
+    /// @grammar `parsePostfix`, so `a.b(c)` is not a single primary form
+    fn parsePrimary(self) -> i32 {
+        local tok = self.cur()
+        local start = self.spanOfCur()
+        local k = tok.kind
+        if k == K_PIPE || k == K_OR_OR {
+            return self.parseClosure()
+        }
+        if k == K_INT {
+            local e = self.b.expr(XE_INT_LITERAL, start)
+            self.b.exprs.get(e as usize).intValue = tok.intValue
+            self.advance()
+            return e
+        }
+        if k == K_FLOAT {
+            local e = self.b.expr(XE_FLOAT_LITERAL, start)
+            self.b.exprs.get(e as usize).floatValue = tok.floatValue
+            self.advance()
+            return e
+        }
+        if k == K_STRING {
+            local e = self.b.expr(XE_STRING_LITERAL, start)
+            self.b.exprs.get(e as usize).text = self.b.text(self.textOf(tok))
+            self.advance()
+            return e
+        }
+        if k == K_BYTE_LIT {
+            local e = self.b.expr(XE_BYTE_LITERAL, start)
+            self.b.exprs.get(e as usize).intValue = tok.intValue
+            self.advance()
+            return e
+        }
+        if k == K_TRUE || k == K_FALSE {
+            local e = self.b.expr(XE_BOOL_LITERAL, start)
+            self.b.exprs.get(e as usize).boolValue = k == K_TRUE ? 1 : 0
+            self.advance()
+            return e
+        }
+        if k == K_IDENT {
+            if eq(self.curText(), "move") &&
+               (self.peekKind(1) == K_PIPE || self.peekKind(1) == K_OR_OR) {
+                return self.parseClosure()
+            }
+            local e = self.b.expr(XE_NAME, start)
+            local p = self.b.exprs.get(e as usize)
+            p.text = self.b.text(self.textOf(tok))
+            self.advance()
+            if self.at(K_LT) && self.genericArgsAhead() {
+                local args = self.parseTypeArgs()
+                self.b.exprs.get(e as usize).genericArgsFirst = args.0
+                self.b.exprs.get(e as usize).genericArgsCount = args.1
+            }
+            return e
+        }
+        if k == K_SELF_KW {
+            local e = self.b.expr(XE_NAME, start)
+            self.b.exprs.get(e as usize).text = self.b.text("self")
+            self.advance()
+            return e
+        }
+        if k == K_PRIM_TYPE {
+            // A type used as an argument, e.g. `sizeOf(i32)`.
+            local e = self.b.expr(XE_NAME, start)
+            self.b.exprs.get(e as usize).text = self.b.text(self.textOf(tok))
+            self.advance()
+            return e
+        }
+        if k == K_LPAREN {
+            // A tuple value: `()` (empty), `(x,)` (one element) or `(a, b, ...)`, with an
+            // optional trailing comma. `(x)` stays a parenthesized expression.
+            self.advance()
+            self.nlDepth = self.nlDepth + 1
+            local savedNoStruct = self.noStruct
+            self.noStruct = false
+            // Two-phase: pushed contiguously before the node, so nested calls stay out.
+            local list = Vec<i32>()
+            local trailingComma = false
+            while !self.at(K_RPAREN) {
+                list.push(self.parseExpr())
+                if !self.match(K_COMMA) {
+                    break
+                }
+                trailingComma = self.at(K_RPAREN)
+            }
+            self.noStruct = savedNoStruct
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)`")
+            if list.length() == 1 && !trailingComma {
+                local inner = *list.get(0)
+                self.b.exprs.get(inner as usize).span = self.spanFrom(start)
+                return inner
+            }
+            local argsFirst: u32 = self.b.exprRefs.length() as u32
+            for i in 0..list.length() {
+                self.b.exprRefs.push(*list.get(i))
+            }
+            local tuple = self.b.expr(XE_TUPLE_LITERAL, self.spanFrom(start))
+            local p = self.b.exprs.get(tuple as usize)
+            p.argsFirst = argsFirst
+            p.argsCount = list.length() as u32
+            return tuple
+        }
+        if k == K_FN {
+            return self.parseFnLiteral()
+        }
+        if k == K_LBRACKET {
+            return self.parseArrayLiteral()
+        }
+        if k == K_NEW {
+            return self.parseNew()
+        }
+        self.expected("an expression")
+        return -1
+    }
+
+    /// `[]T` and `[]mut T` as the element type of a slice, versus `[]` the empty array
+    /// literal: only a type token directly after `]` on the same line means a slice type
+    /// (no expression continues with a type name after `]`, which is what makes this peek
+    /// unambiguous).
+    fn atSliceType(self) -> bool {
+        if self.peekKind(1) != K_RBRACKET || self.peek(2).newlineBefore != 0 {
+            return false
+        }
+        local k = self.peekKind(2)
+        return k == K_PRIM_TYPE || k == K_IDENT || k == K_STAR || k == K_LBRACKET || k == K_FN
+    }
+
+    /// @grammar `[a, b]`, `[v; n]`, `[a, b,]`, `[]`
+    /// @invariant `noStruct` is cleared inside the brackets and restored on exit, so an element may
+    /// @invariant be a struct literal
+    fn parseArrayLiteral(self) -> i32 {
+        local start = self.spanOfCur()
+        if self.atSliceType() {
+            local operand = self.b.expr(XE_TYPE_OPERAND, start)
+            local t = self.parseType()
+            self.b.exprs.get(operand as usize).typeIdx = t
+            self.b.exprs.get(operand as usize).span = self.spanFrom(start)
+            return operand
+        }
+        self.advance() // '['
+        self.nlDepth = self.nlDepth + 1
+        local savedNoStruct = self.noStruct
+        self.noStruct = false
+        local result: i32 = -1
+        if self.at(K_RBRACKET) {
+            result = self.b.expr(XE_ARRAY_LIST, start)
+        } else {
+            local first = self.parseExpr()
+            if self.match(K_SEMICOLON) {
+                result = self.b.expr(XE_ARRAY_REPEAT, start)
+                local p = self.b.exprs.get(result as usize)
+                p.lhs = first
+                // The count expression grows the exprs arena: parse first, refetch, then write.
+                local count = self.parseExpr()
+                p = self.b.exprs.get(result as usize)
+                p.rhs = count
+            } else {
+                // Two-phase: pushed contiguously before the node, so nested lists stay out.
+                local list = Vec<i32>()
+                list.push(first)
+                while self.match(K_COMMA) {
+                    if self.at(K_RBRACKET) {
+                        break
+                    }
+                    list.push(self.parseExpr())
+                }
+                result = self.b.expr(XE_ARRAY_LIST, start)
+                local argsFirst: u32 = self.b.exprRefs.length() as u32
+                for i in 0..list.length() {
+                    self.b.exprRefs.push(*list.get(i))
+                }
+                local p = self.b.exprs.get(result as usize)
+                p.argsFirst = argsFirst
+                p.argsCount = list.length() as u32
+            }
+        }
+        self.noStruct = savedNoStruct
+        self.nlDepth = self.nlDepth - 1
+        self.expect(K_RBRACKET, "`]` closing the array literal")
+        self.b.exprs.get(result as usize).span = self.spanFrom(start)
+        return result
+    }
+
+    /// @grammar `new T { fields }`, `new T(args)`, `new(p) T { fields }`, `new(p) T(args)`
+    fn parseNew(self) -> i32 {
+        local start = self.spanOfCur()
+        self.advance() // 'new'
+        local e = self.b.expr(XE_NEW, start)
+        local p = self.b.exprs.get(e as usize)
+        if self.at(K_LPAREN) {
+            self.advance()
+            self.nlDepth = self.nlDepth + 1
+            local savedNoStruct = self.noStruct
+            self.noStruct = false
+            local placed = self.parseExpr()
+            p = self.b.exprs.get(e as usize)
+            p.lhs = placed
+            self.noStruct = savedNoStruct
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)` closing the memory argument")
+        }
+        p.typeIdx = self.parseType()
+        if self.at(K_LPAREN) {
+            // `new T(args)`: the class constructor (its `init`) runs on the new object.
+            self.advance()
+            self.nlDepth = self.nlDepth + 1
+            local savedNoStruct = self.noStruct
+            self.noStruct = false
+            // Two-phase: pushed contiguously before the range is recorded.
+            local args = Vec<i32>()
+            while !self.at(K_RPAREN) {
+                args.push(self.parseCallArg())
+                if !self.match(K_COMMA) {
+                    break
+                }
+            }
+            self.noStruct = savedNoStruct
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)` closing the constructor arguments")
+            local argsFirst: u32 = self.b.exprRefs.length() as u32
+            for i in 0..args.length() {
+                self.b.exprRefs.push(*args.get(i))
+            }
+            // The arguments are expressions: the exprs arena may have moved, so refetch.
+            p = self.b.exprs.get(e as usize)
+            p.argsFirst = argsFirst
+            p.argsCount = args.length() as u32
+            p.hasCallArgs = 1
+        } else if self.at(K_LBRACE) {
+            local fields = self.parseFieldInits()
+            // The values of the field initializers may have moved the exprs arena: refetch.
+            p = self.b.exprs.get(e as usize)
+            p.fieldsFirst = fields.0
+            p.fieldsCount = fields.1
+        } else {
+            self.expected("`(` with the constructor arguments or `{` with the field initializers after the type of `new`")
+        }
+        self.b.exprs.get(e as usize).span = self.spanFrom(start)
+        return e
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // stmt/block.cpp: blocks, statements, locals and simple statements
+
+    /// @grammar `{ stmt; stmt }`
+    fn parseBlock(self) -> i32 {
+        local span = self.spanOfCur()
+        self.expect(K_LBRACE, "`{`")
+        // A block starts a fresh statement context: line breaks end statements again, `{` may
+        // start a struct literal, and a closure body inside a `for` header is not the header.
+        local saved = self.state()
+        self.nlDepth = 0
+        self.noStruct = false
+        self.forHeader = false
+        self.prefixOperand = false
+        self.castType = false
+        local inside = self.state()
+        // The direct statements are collected first and pushed to the reference arena right
+        // before the block record: a nested block parses inside the loop, and its own references
+        // must not land inside this block's range (every range stays contiguous).
+        local list = Vec<i32>()
+        while !self.at(K_RBRACE) {
+            if self.at(K_END) {
+                self.restore(saved)
+                self.failAt(self.cur(), String("unexpected end of file in a block"),
+                    String("the block opened here is never closed"), String(""),
+                    String("add a closing `}`"))
+            }
+            local start: usize = self.pos
+            try {
+                list.push(self.parseStatement())
+            } catch e {
+                self.restore(inside)
+                self.syncStatement(start)
+            }
+        }
+        self.restore(saved)
+        self.advance() // '}'
+        local stmtsFirst: u32 = self.b.stmtRefs.length() as u32
+        for i in 0..list.length() {
+            self.b.stmtRefs.push(*list.get(i))
+        }
+        local b = self.b.block(self.spanFrom(span))
+        local p = self.b.blocks.get(b as usize)
+        p.stmtsFirst = stmtsFirst
+        p.stmtsCount = (list.length() as u32)
+        return b
+    }
+
+    /// After a statement that did not end in a block: a line break or `}` must follow.
+    fn endOfStatement(self) {
+        if self.at(K_END) || self.at(K_RBRACE) || self.cur().newlineBefore != 0 {
+            return
+        }
+        if self.forHeader && (self.at(K_SEMICOLON) || self.at(K_LBRACE)) {
+            return // `for init; cond; step {`
+        }
+        local msg = format("unexpected {} after the end of a statement", describeToken(self.cur()))
+        self.failAt(self.cur(), msg, String("a statement ends at a line break"),
+            String("Statements are separated by line breaks; there is no `;` terminator."),
+            String("put this on a new line"))
+    }
+
+    /// @grammar `@attribute` applied to a statement, before any statement form
+    fn parseStatement(self) -> i32 {
+        self.rejectDirective()
+        local attrs = self.parseAttributes()
+        local start: XSpan = self.spanOfCur()
+        if attrs.1 > 0 {
+            start = self.b.attrs.get(attrs.0 as usize).span
+        }
+        local stmt = self.parseStatementBody()
+        local sp = self.b.stmts.get(stmt as usize)
+        sp.attrsFirst = attrs.0
+        sp.attrsCount = attrs.1
+        self.b.stmts.get(stmt as usize).span = self.spanFrom(start)
+        // `@allow` scopes are registered by the C++ bridge, which owns the diagnostic engine.
+        return stmt
+    }
+
+    /// @grammar `label: while ...`, `label: do ... while ...`, `label: for ...`
+    /// @grammar `switch ...`, `if ...`, `while ...`, `do ... while ...`, `for ...`
+    /// @grammar `return e`, `return`, `break [label]`, `continue [label]`, `defer stmt`
+    /// @grammar `try { } catch e { }`, `unsafe { }`, `{ ... }`, `local ...`
+    /// @grammar the simple statement: assignment, compound assignment, `++`, `--`, expression
+    fn parseStatementBody(self) -> i32 {
+        // `label: while|do|for ...`
+        if self.at(K_IDENT) && self.peekKind(1) == K_COLON &&
+           (self.peekKind(2) == K_WHILE || self.peekKind(2) == K_DO || self.peekKind(2) == K_FOR) {
+            local label = self.textOf(self.advance())
+            self.advance() // ':'
+            local loop = self.parseStatementBody()
+            self.b.stmts.get(loop as usize).label = self.b.text(label)
+            return loop
+        }
+        local k = self.cur().kind
+        if k == K_LOCAL {
+            local stmt = self.b.stmt(XS_LOCAL)
+            self.advance()
+            self.parseLocalTail(stmt)
+            self.endOfStatement()
+            return stmt
+        }
+        if k == K_DELETE {
+            local stmt = self.b.stmt(XS_DELETE)
+            self.advance()
+            self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+            self.endOfStatement()
+            return stmt
+        }
+        if k == K_CONST {
+            local stmt = self.b.stmt(XS_CONST)
+            self.advance()
+            local p = self.b.stmts.get(stmt as usize)
+            p.name = self.b.text(self.expectIdent("a constant name"))
+            if self.match(K_COLON) {
+                p.hasType = 1
+                p.typeIdx = self.parseType()
+            }
+            self.expect(K_ASSIGN, "`=` and the value of the `const`")
+            self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+            self.endOfStatement()
+            return stmt
+        }
+        if k == K_RETURN {
+            local stmt = self.b.stmt(XS_RETURN)
+            self.advance()
+            if !self.at(K_END) && !self.at(K_RBRACE) && self.cur().newlineBefore == 0 {
+                self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+            }
+            self.endOfStatement()
+            return stmt
+        }
+        if k == K_IF {
+            return self.parseIf()
+        }
+        if k == K_WHILE {
+            local stmt = self.b.stmt(XS_WHILE)
+            self.advance()
+            self.b.stmts.get(stmt as usize).expr = self.parseCondition()
+            self.b.stmts.get(stmt as usize).body = self.parseBlock()
+            return stmt
+        }
+        if k == K_DO {
+            local stmt = self.b.stmt(XS_DO_WHILE)
+            self.advance()
+            self.b.stmts.get(stmt as usize).body = self.parseBlock()
+            if !self.at(K_WHILE) {
+                self.expected("`while` and the condition after the `do` block")
+            }
+            self.advance()
+            self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+            self.endOfStatement()
+            return stmt
+        }
+        if k == K_FOR {
+            return self.parseFor()
+        }
+        if k == K_SWITCH {
+            return self.parseSwitch()
+        }
+        if k == K_DEFER {
+            local stmt = self.b.stmt(XS_DEFER)
+            self.advance()
+            self.b.stmts.get(stmt as usize).step = self.parseStatement()
+            return stmt
+        }
+        if k == K_TRY {
+            local stmt = self.b.stmt(XS_TRY)
+            self.advance()
+            self.b.stmts.get(stmt as usize).body = self.parseBlock()
+            self.expect(K_CATCH, "`catch` after the `try` block")
+            if self.at(K_IDENT) {
+                self.b.stmts.get(stmt as usize).name = self.b.text(self.textOf(self.advance()))
+            }
+            self.b.stmts.get(stmt as usize).elseBody = self.parseBlock()
+            return stmt
+        }
+        if k == K_CONTINUE || k == K_BREAK {
+            local kind: i32 = self.advance().kind == K_BREAK ? XS_BREAK : XS_CONTINUE
+            local stmt = self.b.stmt(kind)
+            if self.at(K_IDENT) && self.cur().newlineBefore == 0 {
+                self.b.stmts.get(stmt as usize).name = self.b.text(self.textOf(self.advance()))
+            }
+            self.endOfStatement()
+            return stmt
+        }
+        if k == K_UNSAFE {
+            local stmt = self.b.stmt(XS_UNSAFE)
+            self.advance()
+            self.b.stmts.get(stmt as usize).body = self.parseBlock()
+            return stmt
+        }
+        if k == K_LBRACE {
+            local stmt = self.b.stmt(XS_BLOCK)
+            self.b.stmts.get(stmt as usize).body = self.parseBlock()
+            return stmt
+        }
+        return self.parseSimpleStatement()
+    }
+
+    /// The part of a `local` statement after the keyword: `name [: T | := expr] [= expr]`. Shared
+    /// by statement position and the `for` initializer so both spellings of the declaration behave
+    /// alike. Fills the already pushed `Local` record; on return the cursor is after the
+    /// initializer (or after the type), never at `;`.
+    /// @grammar `local name`, `local name: T`, `local name := expr`
+    /// @grammar `local name = expr`, `local name: T = expr`
+    fn parseLocalTail(self, stmt: i32) {
+        if self.at(K_LPAREN) {
+            // Tuple target: `local (a, b) = expr` takes the tuple apart element by element.
+            self.advance()
+            self.nlDepth = self.nlDepth + 1
+            local namesFirst: u32 = self.b.strs.length() as u32
+            while !self.at(K_RPAREN) {
+                self.b.strs.push(self.b.text(self.expectIdent("a variable name inside the tuple target")))
+                if !self.match(K_COMMA) {
+                    break
+                }
+            }
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)` closing the tuple target")
+            local p = self.b.stmts.get(stmt as usize)
+            p.namesFirst = namesFirst
+            p.namesCount = (self.b.strs.length() as u32) - namesFirst
+            if p.namesCount == 0 {
+                self.expected("at least one name inside `( )`")
+            }
+            if self.at(K_COLON) || self.at(K_COLON_ASSIGN) {
+                self.failAt(self.cur(), String("a tuple target cannot take a type or `:=`"),
+                    String("each element takes its type from the tuple"),
+                    String("The tuple's element types already fix the variables' types."),
+                    String("Write `local (a, b) = expr`."))
+            }
+            if !self.match(K_ASSIGN) {
+                self.expected("`=` and the tuple value to take apart")
+            }
+            self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+            return
+        }
+        local p = self.b.stmts.get(stmt as usize)
+        p.name = self.b.text(self.expectIdent("a variable name"))
+        if self.match(K_COLON) {
+            p.hasType = 1
+            p.typeIdx = self.parseType()
+            if self.at(K_COLON_ASSIGN) {
+                self.failAt(self.cur(), String("a type and `:=` cannot be combined in one `local`"),
+                    String("`:=` already infers the type from the initializer"),
+                    String("`local x: T := v` writes the type twice."),
+                    String("Write `local x: T = v` or `local x := v`."))
+            }
+        } else if self.match(K_COLON_ASSIGN) {
+            p.hasType = 0
+            if self.at(K_SEMICOLON) || self.at(K_RBRACE) || self.at(K_END) ||
+               self.cur().newlineBefore != 0 {
+                self.failAt(self.cur(), String("expected an initializer after `:=`"),
+                    String("`:=` needs a value to infer the type from"),
+                    String("Without a value the type cannot be inferred."),
+                    String("Write `local x := expr`, or `local x: T` to declare without a value."))
+            }
+            self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+            return
+        }
+        if self.match(K_ASSIGN) {
+            self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+        } else if p.hasType == 0 {
+            self.expected("`:` with a type, `:=` with an inferred type, or `=` with an initializer")
+        }
+    }
+
+    /// @grammar `target = v`, `target += v` (and the other compound assignments)
+    /// @grammar `target++`, `target--`, `expr`
+    fn parseSimpleStatement(self) -> i32 {
+        local stmt = self.b.stmt(XS_EXPR)
+        self.b.stmts.get(stmt as usize).span = self.spanOfCur()
+        local lhs = self.parseExpr()
+        local compound: i32 = -1
+        local incdec = false
+        if self.continues() {
+            local k = self.cur().kind
+            if k == K_PLUS_ASSIGN { compound = XB_ADD }
+            if k == K_MINUS_ASSIGN { compound = XB_SUB }
+            if k == K_STAR_ASSIGN { compound = XB_MUL }
+            if k == K_SLASH_ASSIGN { compound = XB_DIV }
+            if k == K_PERCENT_ASSIGN { compound = XB_MOD }
+            if k == K_AMP_ASSIGN { compound = XB_BITAND }
+            if k == K_PIPE_ASSIGN { compound = XB_BITOR }
+            if k == K_CARET_ASSIGN { compound = XB_BITXOR }
+            if k == K_SHL_ASSIGN { compound = XB_SHL }
+            if k == K_SHR_ASSIGN { compound = XB_SHR }
+            if k == K_PLUS_PLUS {
+                compound = XB_ADD
+                incdec = true
+            }
+            if k == K_MINUS_MINUS {
+                compound = XB_SUB
+                incdec = true
+            }
+        }
+        if (self.at(K_ASSIGN) && self.continues()) || compound >= 0 {
+            local lp = self.b.exprs.get(lhs as usize)
+            local ok = lp.kind == XE_NAME || lp.kind == XE_FIELD || lp.kind == XE_INDEX
+            if !ok && lp.kind == XE_UNARY && lp.unaryOp == XU_DEREF {
+                ok = true
+            }
+            if !ok {
+                self.failAt(self.cur(), String("invalid assignment target"),
+                    String("cannot assign to this expression"),
+                    String("Only a variable, a field, an index or a dereference can be assigned to."),
+                    String(""))
+            }
+            self.advance()
+            local p = self.b.stmts.get(stmt as usize)
+            p.kind = XS_ASSIGN
+            p.target = lhs
+            if incdec {
+                p.isIncDec = 1
+                p.hasCompoundOp = 1
+                p.compoundOp = compound
+                local one = self.b.expr(XE_INT_LITERAL, self.b.spanOf(self.prev()))
+                self.b.exprs.get(one as usize).intValue = 1
+                p.expr = one
+            } else {
+                p.hasCompoundOp = compound >= 0 ? 1 : 0
+                p.compoundOp = compound >= 0 ? compound : XB_ADD
+                p.expr = self.parseExpr()
+            }
+            self.endOfStatement()
+            return stmt
+        }
+        if self.at(K_COLON_ASSIGN) {
+            self.failAt(self.cur(),
+                String("`:=` declares a new variable and cannot assign to an existing one"),
+                String("`:=` is only used in a `local` declaration"),
+                String("An assignment to an existing variable is written with `=`."),
+                String("Write `local name := expr` to declare, or `name = expr` to assign."))
+        }
+        local p = self.b.stmts.get(stmt as usize)
+        p.kind = XS_EXPR
+        p.expr = lhs
+        self.endOfStatement()
+        return stmt
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // stmt/control.cpp: `for`, `switch` and `if`
+
+    /// @grammar `for init; cond; step { body }` (every part optional)
+    /// @grammar `for x in e { body }`, `for x, i in e { body }`
+    /// @grammar `for i in lo..hi { body }`, `for i in lo..=hi { body }`
+    /// @grammar `for` header vs `for x in` is decided by `Ident` followed by `in` or `,` on the next
+    /// @grammar token, so `for i in 0..n` and `for x, i in s` never reach the C-style form
+    /// @invariant `noStruct` and `forHeader` are put back on every return path, including the
+    /// @invariant two early returns of the range forms; the `for` header is not a struct context
+    fn parseFor(self) -> i32 {
+        local stmt = self.b.stmt(XS_FOR)
+        self.advance() // 'for'
+        local savedNoStruct = self.noStruct
+        local savedHeader = self.forHeader
+        self.noStruct = true
+        if self.at(K_IDENT) &&
+           (self.peekKind(1) == K_IDENT || self.peekKind(1) == K_COMMA) &&
+           (eq(self.textOf(self.peek(1)), "in") || self.peekKind(1) == K_COMMA) {
+            // `for x in expr { }`, `for x, i in expr { }` or `for i in lo..hi { }`.
+            local p = self.b.stmts.get(stmt as usize)
+            p.name = self.b.text(self.textOf(self.advance()))
+            local hasIndex = self.match(K_COMMA)
+            if hasIndex {
+                if !self.at(K_IDENT) {
+                    self.expected("the index name after `,`")
+                }
+                local namesFirst: u32 = self.b.strs.length() as u32
+                self.b.strs.push(self.b.text(self.textOf(self.advance())))
+                p.namesFirst = namesFirst
+                p.namesCount = (self.b.strs.length() as u32) - namesFirst
+            }
+            if !(self.at(K_IDENT) && eq(self.curText(), "in")) {
+                self.expected("`in` after the loop variable")
+            }
+            self.advance() // `in`
+            p.expr = self.parseExpr()
+            if self.at(K_LBRACE) { // iterates a collection or a parameter pack
+                p.kind = XS_FOR_EACH
+                self.noStruct = savedNoStruct
+                self.b.stmts.get(stmt as usize).body = self.parseBlock()
+                return stmt
+            }
+            if hasIndex {
+                self.expected("`{` after the iterable; `for x, i in ...` needs a collection, not a range")
+            }
+            p.kind = XS_FOR_RANGE
+            if !self.match(K_DOT_DOT) {
+                self.expect(K_DOT_DOT_EQ, "`..` or `..=` between the bounds of the range")
+                p.rangeInclusive = 1
+            }
+            p.expr2 = self.parseExpr()
+            self.noStruct = savedNoStruct
+            self.b.stmts.get(stmt as usize).body = self.parseBlock()
+            return stmt
+        }
+        self.forHeader = true
+        if !self.at(K_SEMICOLON) {
+            // Every clause can grow the statement arena (a `local` initializer is a statement),
+            // so the statement pointer is refetched before each write.
+            self.b.stmts.get(stmt as usize).init = self.parseForClause()
+        }
+        self.expect(K_SEMICOLON, "`;` after the `for` initializer")
+        if !self.at(K_SEMICOLON) {
+            self.b.stmts.get(stmt as usize).expr = self.parseExpr()
+        }
+        self.expect(K_SEMICOLON, "`;` after the `for` condition")
+        if !self.at(K_LBRACE) {
+            self.b.stmts.get(stmt as usize).step = self.parseSimpleStatement()
+        }
+        self.forHeader = savedHeader
+        self.noStruct = savedNoStruct
+        self.b.stmts.get(stmt as usize).body = self.parseBlock()
+        return stmt
+    }
+
+    /// @grammar `for init; cond; step { body }` and the range/foreach forms share one rule so a
+    /// @grammar `local` in the initializer behaves exactly as in statement position
+    fn parseForClause(self) -> i32 {
+        if !self.at(K_LOCAL) {
+            return self.parseSimpleStatement()
+        }
+        local stmt = self.b.stmt(XS_LOCAL)
+        self.b.stmts.get(stmt as usize).span = self.spanOfCur()
+        self.advance()
+        self.parseLocalTail(stmt)
+        return stmt
+    }
+
+    /// @grammar `switch v { case a, b { ... } default { ... } }`, `switch { case cond { } ... }`
+    /// @grammar `case a, b` takes a list; `default` takes none, at most one arm
+    /// @invariant `nlDepth` is reset to 0 inside the body and restored on every exit, including
+    /// @invariant the end-of-file error, so a raised depth never leaks past it
+    fn parseSwitch(self) -> i32 {
+        local stmt = self.b.stmt(XS_SWITCH)
+        self.advance() // 'switch'
+        // `switch { case a < b { } ... }` has no subject: each `case` lists conditions instead.
+        if !self.at(K_LBRACE) {
+            self.b.stmts.get(stmt as usize).expr = self.parseCondition()
+        }
+        self.expect(K_LBRACE, "`{` opening the `switch` body")
+        local savedDepth = self.nlDepth
+        local savedNoStruct = self.noStruct
+        self.nlDepth = 0
+        // Two-phase: a nested `switch` inside an arm body pushes its own arms into the same
+        // arena, so the arms of this switch are collected first and pushed at the end.
+        local arms = Vec<XSwitchCase>()
+        while !self.at(K_RBRACE) {
+            if self.at(K_END) {
+                self.nlDepth = savedDepth
+                self.noStruct = savedNoStruct
+                self.failAt(self.cur(), String("unexpected end of file in a `switch`"),
+                    String("the `switch` opened here is never closed"), String(""), String(""))
+            }
+            local armSpan = self.spanOfCur()
+            local isDefault = false
+            // Two-phase: the case values are pushed contiguously right before the arm record.
+            local values = Vec<i32>()
+            if self.match(K_DEFAULT) {
+                isDefault = true
+            } else if self.match(K_CASE) {
+                self.noStruct = true
+                while true {
+                    values.push(self.parseExpr())
+                    if !self.match(K_COMMA) {
+                        break
+                    }
+                }
+                self.noStruct = false
+            } else {
+                self.nlDepth = savedDepth
+                self.noStruct = savedNoStruct
+                self.expected("`case` or `default` inside a `switch`")
+            }
+            local body = self.parseBlock()
+            local valuesFirst: u32 = self.b.exprRefs.length() as u32
+            for i in 0..values.length() {
+                self.b.exprRefs.push(*values.get(i))
+            }
+            local arm: XSwitchCase
+            arm.span = self.spanFrom(armSpan)
+            arm.isDefault = isDefault ? 1 : 0
+            arm.valuesFirst = valuesFirst
+            arm.valuesCount = values.length() as u32
+            arm.body = body
+            arms.push(arm)
+        }
+        self.nlDepth = savedDepth
+        self.noStruct = savedNoStruct
+        self.advance() // '}'
+        local casesFirst: u32 = self.b.cases.length() as u32
+        for i in 0..arms.length() {
+            self.b.cases.push(*arms.get(i))
+        }
+        local p = self.b.stmts.get(stmt as usize)
+        p.casesFirst = casesFirst
+        p.casesCount = arms.length() as u32
+        return stmt
+    }
+
+    // (the `p` above is fetched after every parse that can grow the statement arena)
+
+    /// `if`/`while` condition: struct literals are not allowed (the `{` starts the block).
+    fn parseCondition(self) -> i32 {
+        local saved = self.noStruct
+        self.noStruct = true
+        local cond = self.parseExpr()
+        self.noStruct = saved
+        return cond
+    }
+
+    fn parseIf(self) -> i32 {
+        local stmt = self.b.stmt(XS_IF)
+        local start = self.spanOfCur()
+        self.advance() // 'if'
+        local p = self.b.stmts.get(stmt as usize)
+        p.expr = self.parseCondition()
+        self.b.stmts.get(stmt as usize).body = self.parseBlock()
+        if self.at(K_ELSE) {
+            self.advance()
+            if self.at(K_IF) {
+                local nested = self.parseIf()
+                local stmtsFirst: u32 = self.b.stmtRefs.length() as u32
+                self.b.stmtRefs.push(nested)
+                local wrapper = self.b.block(self.b.stmts.get(nested as usize).span)
+                local wp = self.b.blocks.get(wrapper as usize)
+                wp.stmtsFirst = stmtsFirst
+                wp.stmtsCount = 1
+                self.b.stmts.get(stmt as usize).elseBody = wrapper
+                self.b.stmts.get(stmt as usize).elseIsIf = 1
+            } else {
+                self.b.stmts.get(stmt as usize).elseBody = self.parseBlock()
+            }
+        }
+        self.b.stmts.get(stmt as usize).span = self.spanFrom(start)
+        return stmt
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // item/item.cpp: item dispatch and modifiers
+
+    /// The name of a declaration kind for diagnostics (the C++ `declKindName`).
+    fn declKindName(self, d: i32) -> str {
+        local kind = self.b.decls.get(d as usize).kind
+        if kind == XD_FN { return "function" }
+        if kind == XD_GLOBAL {
+            return self.b.decls.get(d as usize).isConst != 0 ? "const" : "global"
+        }
+        if kind == XD_STRUCT { return "struct" }
+        if kind == XD_CLASS { return "class" }
+        if kind == XD_INTERFACE { return "interface" }
+        if kind == XD_IMPL { return "impl" }
+        if kind == XD_ENUM { return "enum" }
+        if kind == XD_TYPE_ALIAS { return "type alias" }
+        if kind == XD_DEFINE_CONST { return "define" }
+        if kind == XD_DEFINE_MACRO { return "macro" }
+        if kind == XD_IMPORT { return "import" }
+        if kind == XD_EXPORT_FROM { return "re-export" }
+        if kind == XD_MACRO_CALL { return "macro call" }
+        if kind == XD_TOP_LEVEL_CALL { return "call" }
+        return "function alias"
+    }
+
+    /// Items that end without a closing brace must be followed by a line break.
+    fn endOfItemLine(self) {
+        if self.at(K_END) || self.at(K_RBRACE) || self.cur().newlineBefore != 0 {
+            return
+        }
+        local msg = format("unexpected {} after the end of a declaration", describeToken(self.cur()))
+        self.failAt(self.cur(), msg, String("a declaration ends at a line break"), String(""),
+            String("put this on a new line"))
+    }
+
+    /// @grammar `fn name<T>(params) -> R { body }`, `fn +(...)` and the other operator names
+    /// @grammar `fn name: sig`, `global name: T = c`, `const name: T = c`
+    /// @grammar `struct`, `class`, `interface`, `enum`, `impl`, `type Name = T`, `define`
+    /// @grammar `import`, `export name from "m"`, `export *`, a module-level `name!(...)` call
+    /// @grammar `@attribute` before any of them, `export` / `export(c)` / `@library` modifiers
+    fn parseItem(self) {
+        self.rejectDirective()
+        local s = DeclStart()
+        s.start = self.spanOfCur()
+        local attrs = self.parseAttributes()
+        s.attrsFirst = attrs.0
+        s.attrsCount = attrs.1
+        if attrs.1 > 0 {
+            s.start = self.b.attrs.get(attrs.0 as usize).span
+        }
+        self.rejectDirective()
+
+        // Re-exports: `export * ...` / `export { ... } from ...`.
+        if self.at(K_EXPORT) && (self.peekKind(1) == K_STAR || self.peekKind(1) == K_LBRACE) {
+            self.parseExportFrom(&s)
+            return
+        }
+
+        self.parseModifiers(&s.mods)
+
+        local kw = self.cur().kind
+        if kw == K_FN {
+            if self.peek(1).kind == K_IDENT && self.peek(2).kind == K_ASSIGN {
+                self.addItem(self.parseFnAlias(&s), &s)
+            } else {
+                self.addItem(self.parseFn(&s, false), &s)
+            }
+            return
+        }
+        if kw == K_GLOBAL {
+            self.addItem(self.parseGlobal(&s), &s)
+            return
+        }
+        if kw == K_CONST {
+            self.addItem(self.parseConstItem(&s), &s)
+            return
+        }
+        if kw == K_STRUCT {
+            self.addItem(self.parseStruct(&s), &s)
+            return
+        }
+        if kw == K_CLASS {
+            self.addItem(self.parseClass(&s), &s)
+            return
+        }
+        if kw == K_INTERFACE {
+            self.addItem(self.parseInterface(&s), &s)
+            return
+        }
+        if kw == K_IMPL {
+            local implDecl = self.parseImpl(&s)
+            if implDecl >= 0 {
+                self.addItem(implDecl, &s)
+            }
+            return
+        }
+        if kw == K_ENUM {
+            self.addEnum(self.parseEnum(&s), &s)
+            return
+        }
+        if kw == K_TYPE {
+            self.addItem(self.parseTypeAlias(&s), &s)
+            return
+        }
+        if kw == K_DEFINE {
+            self.addItem(self.parseDefine(&s), &s)
+            return
+        }
+        if kw == K_IMPORT || kw == K_FROM {
+            self.addItem(self.parseImport(&s), &s)
+            return
+        }
+        if kw == K_IDENT {
+            self.addItem(self.parseTopLevelCall(&s), &s)
+            return
+        }
+        local msg = format("expected a declaration, found {}", describeToken(self.cur()))
+        self.failAt(self.cur(), msg, String("expected a declaration here"), String(""),
+            String("declarations start with fn, global, struct, class, interface, impl, enum, type, define, import, from or export"))
+    }
+
+    /// Pushes one item with the start's modifiers and checks the modifier applicability.
+    fn addItem(self, d: i32, s: *DeclStart) {
+        local item: XItem
+        item.exported = s.mods.exported ? 1 : 0
+        item.exportC = s.mods.exportC ? 1 : 0
+        item.declared = s.mods.declared ? 1 : 0
+        item.registered = s.mods.registered ? 1 : 0
+        item.registerRole = self.b.text(s.mods.registerRole.asStr())
+        item.decl = d
+        self.checkModifiers(d, s)
+        self.b.items.push(item)
+    }
+
+    /// @grammar `export`, `export(c)`, `@library` and the other item modifiers before the keyword
+    fn parseModifiers(self, mods: *Modifiers) {
+        while true {
+            if self.at(K_EXPORT) {
+                if mods.exported {
+                    self.failAt(self.cur(), String("duplicate `export`"), String("already exported"),
+                        String(""), String(""))
+                }
+                self.advance()
+                mods.exported = true
+                if self.at(K_LPAREN) && self.peekKind(1) == K_IDENT && self.peekKind(2) == K_RPAREN {
+                    self.advance()
+                    local abi = self.advance()
+                    self.advance()
+                    if !eq(self.textOf(abi), "c") {
+                        local msg = format("unknown export ABI `{}`", String(self.textOf(abi)))
+                        self.failAt(abi, msg, String("only `export(c)` exists"), String(""), String(""))
+                    }
+                    mods.exportC = true
+                }
+            } else if self.at(K_DECLARE) {
+                if mods.declared {
+                    self.failAt(self.cur(), String("duplicate `declare`"), String("already declared"),
+                        String(""), String(""))
+                }
+                self.advance()
+                mods.declared = true
+            } else if self.at(K_REGISTER) {
+                if mods.registered {
+                    self.failAt(self.cur(), String("duplicate `register`"), String("already registered"),
+                        String(""), String(""))
+                }
+                self.advance()
+                mods.registered = true
+                if self.at(K_LPAREN) && self.peekKind(1) == K_IDENT && self.peekKind(2) == K_RPAREN {
+                    self.advance()
+                    mods.registerRole = String(self.textOf(self.advance()))
+                    self.advance()
+                }
+            } else {
+                return
+            }
+        }
+    }
+
+    /// Prefix applicability (soft errors: parsing continues).
+    fn checkModifiers(self, d: i32, s: *DeclStart) {
+        local p = self.b.decls.get(d as usize)
+        local kind = self.declKindName(d)
+        local name = String(self.b.strOf(p.name))
+        local isImport = p.kind == XD_IMPORT
+        local isCall = p.kind == XD_TOP_LEVEL_CALL || p.kind == XD_MACRO_CALL
+        local isImpl = p.kind == XD_IMPL
+        local isDefine = p.kind == XD_DEFINE_CONST || p.kind == XD_DEFINE_MACRO
+        local isEnum = p.kind == XD_ENUM
+        if s.mods.exported && (isImport || isCall || isImpl) {
+            local msg = format("`{}` cannot be applied to {} `{}`", String("export"), String(kind), name)
+            local label = format("`{}` is not valid on {}", String("export"), String(kind))
+            self.softError(p.span, msg, label)
+        }
+        if s.mods.declared && (isImport || isCall || isImpl || isDefine) {
+            local msg = format("`{}` cannot be applied to {} `{}`", String("declare"), String(kind), name)
+            local label = format("`{}` is not valid on {}", String("declare"), String(kind))
+            self.softError(p.span, msg, label)
+        }
+        if s.mods.declared && isEnum {
+            local msg = format("`{}` cannot be applied to {} `{}`", String("declare"), String(kind), name)
+            local label = format("`{}` is not valid on {}", String("declare"), String(kind))
+            self.softError(p.span, msg, label)
+        }
+        if s.mods.registered && (isImport || isCall || isImpl || isDefine) {
+            local msg = format("`{}` cannot be applied to {} `{}`", String("register"), String(kind), name)
+            local label = format("`{}` is not valid on {}", String("register"), String(kind))
+            self.softError(p.span, msg, label)
+        }
+        if s.mods.exportC && !(p.kind == XD_FN || p.kind == XD_GLOBAL) {
+            local msg = format("`{}` cannot be applied to {} `{}`", String("export(c)"), String(kind), name)
+            local label = format("`{}` is not valid on {}", String("export(c)"), String(kind))
+            self.softError(p.span, msg, label)
+        }
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // item/fn.cpp: `fn` declarations, operator function names, fn aliases, globals and constants
+
+    /// The parameter list, the optional return type and the body of a function (after its name):
+    /// shared by named functions and function literals. `needsBody` makes a missing body an error.
+    /// Fills the already pushed `Fn` record `d`.
+    /// @grammar the parameters and the body of a function: `(a: T, b: U) -> R { body }`
+    /// @grammar `(self)`, `(self: *T)`, a trailing `,` before `)` allowed
+    fn parseFnTail(self, d: i32, name: str, member: bool, needsBody: bool) {
+        self.expect(K_LPAREN, "`(` starting the parameter list")
+        self.nlDepth = self.nlDepth + 1
+        local paramsFirst: u32 = self.b.params.length() as u32
+        while !self.at(K_RPAREN) {
+            local paramSpan = self.spanOfCur()
+            local param: XParam
+            if self.at(K_SELF_KW) {
+                self.advance()
+                param.name = self.b.text("self")
+                param.isSelf = 1
+                if self.match(K_COLON) { // `self: T` (inherent `impl` only, see parseMethod)
+                    param.typeIdx = self.parseType()
+                    param.typedSelf = 1
+                }
+            } else if self.at(K_DOT_DOT) { // `..args`: the untyped trailing pack
+                self.advance()
+                param.name = self.b.text(self.expectIdent("a parameter pack name after `..`"))
+                param.isPack = 1
+                param.typeIdx = -1
+            } else {
+                param.name = self.b.text(self.expectIdent("a parameter name"))
+                self.expect(K_COLON, "`:` and the parameter type")
+                param.typeIdx = self.parseType()
+                param.hasType = 1
+            }
+            param.span = self.spanFrom(paramSpan)
+            self.b.params.push(param)
+            if !self.match(K_COMMA) {
+                break
+            }
+        }
+        self.nlDepth = self.nlDepth - 1
+        self.expect(K_RPAREN, "`)` closing the parameter list")
+        // The count is fixed here: a closure in the body pushes its own parameters onto the
+        // same arena, and those belong to the closure, not to this function.
+        local paramsCount: u32 = (self.b.params.length() as u32) - paramsFirst
+
+        local hasRet = false
+        local ret: i32 = -1
+        if self.match(K_ARROW) {
+            hasRet = true
+            ret = self.parseReturnType()
+        }
+
+        local hasBody = false
+        local body: i32 = -1
+        if self.at(K_LBRACE) {
+            hasBody = true
+            body = self.parseBlock()
+        } else if needsBody {
+            // A function that needs a body has none here.
+            local msg = format("expected `{{` starting the body of `{}`, found {}", String(name),
+                describeToken(self.cur()))
+            self.failAt(self.cur(), msg, String("function body expected here"), String(""),
+                String("write a body, or `declare fn` for a function defined elsewhere"))
+        } else {
+            self.endOfItemLine()
+        }
+        local p = self.b.decls.get(d as usize)
+        p.paramsFirst = paramsFirst
+        p.paramsCount = paramsCount
+        p.hasRet = hasRet ? 1 : 0
+        p.ret = ret
+        p.hasBody = hasBody ? 1 : 0
+        p.body = body
+    }
+
+    /// The operator a function name spells after `fn` (`fn +(...)`, `fn []=(...)`, `fn ()(...)`):
+    /// the token(s) are consumed and the function is named `operator<symbol>`. The bool is false
+    /// (nothing consumed) when the next token is no operator.
+    /// @grammar `+ - * / % & | ^ << >> == != < <= > >= ! ~ ++ -- [ ] [ ]= ( )`, as a function name
+    fn parseOperatorName(self) -> (bool, str) {
+        local k = self.cur().kind
+        if k == K_PLUS {
+            self.advance()
+            return (true, "operator+")
+        }
+        if k == K_MINUS {
+            self.advance()
+            return (true, "operator-")
+        }
+        if k == K_STAR {
+            self.advance()
+            return (true, "operator*")
+        }
+        if k == K_SLASH {
+            self.advance()
+            return (true, "operator/")
+        }
+        if k == K_PERCENT {
+            self.advance()
+            return (true, "operator%")
+        }
+        if k == K_AMP {
+            self.advance()
+            return (true, "operator&")
+        }
+        if k == K_PIPE {
+            self.advance()
+            return (true, "operator|")
+        }
+        if k == K_CARET {
+            self.advance()
+            return (true, "operator^")
+        }
+        if k == K_SHL {
+            self.advance()
+            return (true, "operator<<")
+        }
+        if k == K_SHR {
+            self.advance()
+            return (true, "operator>>")
+        }
+        if k == K_EQ_EQ {
+            self.advance()
+            return (true, "operator==")
+        }
+        if k == K_NOT_EQ {
+            self.advance()
+            return (true, "operator!=")
+        }
+        if k == K_LT {
+            self.advance()
+            return (true, "operator<")
+        }
+        if k == K_LE {
+            self.advance()
+            return (true, "operator<=")
+        }
+        if k == K_GT {
+            self.advance()
+            return (true, "operator>")
+        }
+        if k == K_GE {
+            self.advance()
+            return (true, "operator>=")
+        }
+        if k == K_BANG {
+            self.advance()
+            return (true, "operator!")
+        }
+        if k == K_TILDE {
+            self.advance()
+            return (true, "operator~")
+        }
+        if k == K_PLUS_ASSIGN {
+            self.advance()
+            return (true, "operator+=")
+        }
+        if k == K_MINUS_ASSIGN {
+            self.advance()
+            return (true, "operator-=")
+        }
+        if k == K_STAR_ASSIGN {
+            self.advance()
+            return (true, "operator*=")
+        }
+        if k == K_SLASH_ASSIGN {
+            self.advance()
+            return (true, "operator/=")
+        }
+        if k == K_PERCENT_ASSIGN {
+            self.advance()
+            return (true, "operator%=")
+        }
+        if k == K_AMP_ASSIGN {
+            self.advance()
+            return (true, "operator&=")
+        }
+        if k == K_PIPE_ASSIGN {
+            self.advance()
+            return (true, "operator|=")
+        }
+        if k == K_CARET_ASSIGN {
+            self.advance()
+            return (true, "operator^=")
+        }
+        if k == K_SHL_ASSIGN {
+            self.advance()
+            return (true, "operator<<=")
+        }
+        if k == K_SHR_ASSIGN {
+            self.advance()
+            return (true, "operator>>=")
+        }
+        if k == K_PLUS_PLUS {
+            self.advance()
+            return (true, "operator++")
+        }
+        if k == K_MINUS_MINUS {
+            self.advance()
+            return (true, "operator--")
+        }
+        if k == K_LBRACKET {
+            if self.peekKind(1) != K_RBRACKET {
+                return (false, "")
+            }
+            self.advance()
+            self.advance()
+            if self.match(K_ASSIGN) {
+                return (true, "operator[]=")
+            }
+            return (true, "operator[]")
+        }
+        if k == K_LPAREN {
+            if self.peekKind(1) != K_RPAREN || self.peekKind(2) != K_LPAREN {
+                return (false, "")
+            }
+            self.advance()
+            self.advance()
+            return (true, "operator()")
+        }
+        return (false, "")
+    }
+
+    /// @grammar `fn name(params) -> R { body }`, `fn name(params)`, `fn self.name(...)` in a member
+    fn parseFn(self, s: *DeclStart, member: bool) -> i32 {
+        local fnStart = self.spanOfCur()
+        self.expect(K_FN, "`fn`")
+        local nameTok = self.cur()
+        local nameSpan = self.b.spanOf(nameTok)
+        local name: String = String("")
+        local op = self.parseOperatorName()
+        if op.0 {
+            name = String(op.1)
+        } else if member ? self.atMemberName() : self.at(K_IDENT) {
+            name = String(self.textOf(self.advance()))
+        } else {
+            self.expected("a function name")
+        }
+        local d = self.b.decl(XD_FN)
+        local genericFirst: u32 = 0
+        local genericCount: u32 = 0
+        if self.at(K_LT) {
+            local g = self.parseGenericParams()
+            genericFirst = g.0
+            genericCount = g.1
+        }
+        self.parseFnTail(d, name.asStr(), member, !member && !s.mods.declared)
+        local p = self.b.decls.get(d as usize)
+        p.name = self.b.text(name.asStr())
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = nameSpan
+        p.span = member ? self.spanFrom(fnStart) : self.spanFrom(s.start)
+        p.genericFirst = genericFirst
+        p.genericCount = genericCount
+        return d
+    }
+
+    /// `fn name = target` or `fn name = module.target` at module level.
+    /// @grammar `fn name = fnType`
+    fn parseFnAlias(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_FN_ALIAS)
+        self.advance() // 'fn'
+        local nameTok = self.cur()
+        local name = self.expectIdent("a function alias name")
+        self.expect(K_ASSIGN, "`=` and the function the alias names")
+        local p = self.b.decls.get(d as usize)
+        local targetSpan = self.spanOfCur()
+        local pathFirst: u32 = self.b.strs.length() as u32
+        self.b.strs.push(self.b.text(self.expectIdent("a function name")))
+        while self.match(K_DOT) {
+            self.b.strs.push(self.b.text(self.expectIdent("a function name")))
+        }
+        self.b.decls.get(d as usize).targetSpan = self.spanFrom(targetSpan)
+        self.endOfItemLine()
+        p.targetPathFirst = pathFirst
+        p.targetPathCount = (self.b.strs.length() as u32) - pathFirst
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        return d
+    }
+
+    /// @grammar `global name: T = expr`
+    fn parseGlobal(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_GLOBAL)
+        self.advance() // 'global'
+        local nameTok = self.cur()
+        local name = self.expectIdent("a global name")
+        self.rejectTypeParams()
+        self.expect(K_COLON, "`:` and the type of the global")
+        local p = self.b.decls.get(d as usize)
+        p.typeIdx = self.parseType()
+        p.hasType = 1
+        if self.match(K_ASSIGN) {
+            p.init = self.parseExpr()
+        }
+        self.endOfItemLine()
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        return d
+    }
+
+    /// `const NAME [: T] = expr` at module level. The type is optional.
+    /// @grammar `const name: T = expr`
+    fn parseConstItem(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_GLOBAL)
+        self.b.decls.get(d as usize).isConst = 1
+        self.advance() // 'const'
+        local nameTok = self.cur()
+        local name = self.expectIdent("a constant name")
+        self.rejectTypeParams()
+        local p = self.b.decls.get(d as usize)
+        if self.match(K_COLON) {
+            p.hasType = 1
+            p.typeIdx = self.parseType()
+        }
+        self.expect(K_ASSIGN, "`=` and the value of the `const`")
+        p.init = self.parseExpr()
+        self.endOfItemLine()
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        return d
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // item/aggregate.cpp: `struct`, `class`, `interface` and `impl`
+
+    /// @grammar `field: T`, `@attribute field: T`, member separated by `,` or a line break
+    fn parseField(self, attrsFirst: u32, attrsCount: u32) -> i32 {
+        local span: XSpan = self.spanOfCur()
+        if attrsCount > 0 {
+            span = self.b.attrs.get(attrsFirst as usize).span
+        }
+        local f: XField
+        f.attrsFirst = attrsFirst
+        f.attrsCount = attrsCount
+        f.name = self.b.text(self.expectIdent("a field name"))
+        self.expect(K_COLON, "`:` and the field type")
+        f.typeIdx = self.parseType()
+        f.span = self.spanFrom(span)
+        self.b.fields.push(f)
+        return (self.b.fields.length() - 1) as i32
+    }
+
+    /// Separator between members: `,`, or a line break, or the closing `}`.
+    fn memberSeparator(self) {
+        if self.match(K_COMMA) {
+            return
+        }
+        if !self.at(K_RBRACE) && self.cur().newlineBefore == 0 {
+            self.expected("`,`, a line break or `}`")
+        }
+    }
+
+    /// @grammar `struct Name { fields }`, `struct Name<T, U> { fields }`, `@repr(c) struct ...`
+    fn parseStruct(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_STRUCT)
+        self.advance() // 'struct'
+        local nameTok = self.cur()
+        local name = self.expectIdent("a struct name")
+        local genericFirst: u32 = 0
+        local genericCount: u32 = 0
+        if self.at(K_LT) {
+            local g = self.parseGenericParams()
+            genericFirst = g.0
+            genericCount = g.1
+        }
+        local fieldsFirst: u32 = self.b.fields.length() as u32
+        local opaque = false
+        if self.at(K_LBRACE) {
+            self.advance()
+            local savedDepth = self.nlDepth
+            self.nlDepth = 0
+            while !self.at(K_RBRACE) {
+                self.rejectDirective()
+                local attrs = self.parseAttributes()
+                if self.at(K_FN) || self.at(K_VIRTUAL) || self.at(K_OVERRIDE) {
+                    self.failAt(self.cur(), String("structs cannot have methods"),
+                        String("method declared inside a struct"),
+                        String("`struct` only carries data."),
+                        String("use `class` for methods and inheritance, or an `impl` block for interfaces"))
+                }
+                self.parseField(attrs.0, attrs.1)
+                self.memberSeparator()
+            }
+            self.nlDepth = savedDepth
+            self.advance() // '}'
+        } else if s.mods.declared {
+            opaque = true
+            self.endOfItemLine()
+        } else {
+            self.expected("`{` with the fields of the struct")
+        }
+        local p = self.b.decls.get(d as usize)
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        p.genericFirst = genericFirst
+        p.genericCount = genericCount
+        p.fieldsFirst = fieldsFirst
+        p.fieldsCount = (self.b.fields.length() as u32) - fieldsFirst
+        p.opaque = opaque ? 1 : 0
+        return d
+    }
+
+    /// @grammar `class Name [: Base] { members }`, `class Name<T> [: Base] { members }`
+    fn parseClass(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_CLASS)
+        self.advance() // 'class'
+        local nameTok = self.cur()
+        local name = self.expectIdent("a class name")
+        local genericFirst: u32 = 0
+        local genericCount: u32 = 0
+        if self.at(K_LT) {
+            local g = self.parseGenericParams()
+            genericFirst = g.0
+            genericCount = g.1
+        }
+        local baseHas = false
+        local baseFirst: u32 = 0
+        local baseCount: u32 = 0
+        if self.match(K_COLON) {
+            baseHas = true
+            baseFirst = self.b.strs.length() as u32
+            self.b.strs.push(self.b.text(self.expectIdent("a base class name")))
+            while self.at(K_DOT) && self.peekKind(1) == K_IDENT {
+                self.advance()
+                self.b.strs.push(self.b.text(self.textOf(self.advance())))
+            }
+            baseCount = (self.b.strs.length() as u32) - baseFirst
+        }
+        local fieldsFirst: u32 = self.b.fields.length() as u32
+        local methodsFirst: u32 = self.b.decls.length() as u32
+        local opaque = false
+        if self.at(K_LBRACE) {
+            self.advance()
+            local savedDepth = self.nlDepth
+            self.nlDepth = 0
+            while !self.at(K_RBRACE) {
+                self.rejectDirective()
+                local attrs = self.parseAttributes()
+                if self.at(K_FN) || self.at(K_VIRTUAL) || self.at(K_OVERRIDE) {
+                    self.parseMethod(attrs.0, attrs.1, false)
+                } else {
+                    self.parseField(attrs.0, attrs.1)
+                    self.memberSeparator()
+                }
+            }
+            self.nlDepth = savedDepth
+            self.advance() // '}'
+        } else if s.mods.declared {
+            opaque = true
+            self.endOfItemLine()
+        } else {
+            self.expected("`{` with the members of the class")
+        }
+        local p = self.b.decls.get(d as usize)
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        p.genericFirst = genericFirst
+        p.genericCount = genericCount
+        p.fieldsFirst = fieldsFirst
+        p.fieldsCount = (self.b.fields.length() as u32) - fieldsFirst
+        p.methodsFirst = methodsFirst
+        p.methodsCount = (self.b.decls.length() as u32) - methodsFirst
+        p.baseHas = baseHas ? 1 : 0
+        p.baseFirst = baseFirst
+        p.baseCount = baseCount
+        p.opaque = opaque ? 1 : 0
+        return d
+    }
+
+    /// `[virtual|override] fn ...` inside class/interface/impl bodies; the method record is
+    /// appended to the declaration arena (the caller ranges over it).
+    /// @grammar `[virtual|override] fn name(params) -> R { body }`, `fn +(...)`, `fn [](...)`
+    fn parseMethod(self, attrsFirst: u32, attrsCount: u32, inherent: bool) -> i32 {
+        local ms = DeclStart()
+        ms.attrsFirst = attrsFirst
+        ms.attrsCount = attrsCount
+        ms.start = attrsCount > 0 ? self.b.attrs.get(attrsFirst as usize).span : self.spanOfCur()
+        local isVirtual = false
+        local isOverride = false
+        if self.match(K_VIRTUAL) {
+            isVirtual = true
+        } else if self.match(K_OVERRIDE) {
+            isOverride = true
+        }
+        local d = self.parseFn(&ms, true)
+        local p = self.b.decls.get(d as usize)
+        p.isVirtual = isVirtual ? 1 : 0
+        p.isOverride = isOverride ? 1 : 0
+        p.span = self.spanFrom(ms.start)
+        if !inherent {
+            local q = self.b.decls.get(d as usize)
+            for i in 0..q.paramsCount {
+                local param = self.b.params.get(q.paramsFirst as usize + i as usize)
+                if param.typedSelf != 0 {
+                    local msg = String("`self: T` is only written in an inherent `impl` (`impl T { ... }`)")
+                    local label = String("a class, interface or `impl ... for` method has an implicit `self`")
+                    self.softError(param.span, msg, label)
+                }
+            }
+        }
+        return d
+    }
+
+    /// @grammar `interface Name { fn name(params) -> R }`, `interface Name : Base { ... }`
+    fn parseInterface(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_INTERFACE)
+        self.advance() // 'interface'
+        local nameTok = self.cur()
+        local name = self.expectIdent("an interface name")
+        local genericFirst: u32 = 0
+        local genericCount: u32 = 0
+        if self.at(K_LT) {
+            local g = self.parseGenericParams()
+            genericFirst = g.0
+            genericCount = g.1
+        }
+        local methodsFirst: u32 = self.b.decls.length() as u32
+        local opaque = false
+        if self.at(K_LBRACE) {
+            self.advance()
+            local savedDepth = self.nlDepth
+            self.nlDepth = 0
+            while !self.at(K_RBRACE) {
+                self.rejectDirective()
+                local attrs = self.parseAttributes()
+                if !self.at(K_FN) {
+                    self.expected("`fn` (an interface only holds method signatures)")
+                }
+                self.parseMethod(attrs.0, attrs.1, false)
+            }
+            self.nlDepth = savedDepth
+            self.advance() // '}'
+        } else if s.mods.declared {
+            opaque = true
+            self.endOfItemLine()
+        } else {
+            self.expected("`{` with the method signatures of the interface")
+        }
+        local p = self.b.decls.get(d as usize)
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        p.genericFirst = genericFirst
+        p.genericCount = genericCount
+        p.methodsFirst = methodsFirst
+        p.methodsCount = (self.b.decls.length() as u32) - methodsFirst
+        p.opaque = opaque ? 1 : 0
+        return d
+    }
+
+    /// `impl Iface for T { ... }` becomes an `ImplDecl` record. The inherent form
+    /// `impl T { fn +(self: T, o: T) -> T { } fn len(self: *T) -> usize { } }` holds operators and
+    /// methods of a struct; each becomes a module-level function named `operator<symbol>` or
+    /// `T.name`, added to the items directly, and the result is -1 (no impl record).
+    /// @grammar `impl T { fn +(...) ... }`, `impl<T> Box<T> { ... }`, `impl Iface for T { ... }`
+    fn parseImpl(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_IMPL)
+        self.advance() // 'impl'
+        local genericFirst: u32 = 0
+        local genericCount: u32 = 0
+        if self.at(K_LT) {
+            local g = self.parseGenericParams()
+            genericFirst = g.0
+            genericCount = g.1
+        }
+        local nameTok = self.cur()
+        local pathFirst: u32 = self.b.strs.length() as u32
+        self.b.strs.push(self.b.text(self.expectIdent("an interface or type name")))
+        while self.at(K_DOT) && self.peekKind(1) == K_IDENT {
+            self.advance()
+            self.b.strs.push(self.b.text(self.textOf(self.advance())))
+        }
+        local pathCount: u32 = (self.b.strs.length() as u32) - pathFirst
+        local argsFirst: u32 = 0
+        local argsCount: u32 = 0
+        if self.at(K_LT) {
+            local args = self.parseTypeArgs()
+            argsFirst = args.0
+            argsCount = args.1
+        }
+        local inherent = self.at(K_LBRACE)
+        local target: i32 = -1
+        if inherent {
+            target = self.b.typeNode(XT_NAMED)
+            local tp = self.b.types.get(target as usize)
+            tp.pathFirst = pathFirst
+            tp.pathCount = pathCount
+            tp.argsFirst = argsFirst
+            tp.argsCount = argsCount
+            tp.span = self.b.spanOf(nameTok)
+        } else {
+            self.expect(K_FOR, "`for` and the implementing type")
+            target = self.parseType()
+        }
+        self.expect(K_LBRACE, "`{` with the methods of the impl")
+        local savedDepth = self.nlDepth
+        self.nlDepth = 0
+        local methodsFirst: u32 = self.b.decls.length() as u32
+        while !self.at(K_RBRACE) {
+            self.rejectDirective()
+            local attrs = self.parseAttributes()
+            if !self.at(K_FN) {
+                self.expected("`fn`")
+            }
+            self.parseMethod(attrs.0, attrs.1, inherent)
+        }
+        self.nlDepth = savedDepth
+        self.advance() // '}'
+        if !inherent {
+            local lastName = self.b.strs.get((pathFirst + pathCount - 1) as usize)
+            local p = self.b.decls.get(d as usize)
+            p.name = *lastName
+            p.attrsFirst = s.attrsFirst
+            p.attrsCount = s.attrsCount
+            p.nameSpan = self.b.spanOf(nameTok)
+            p.span = self.spanFrom(s.start)
+            p.genericFirst = genericFirst
+            p.genericCount = genericCount
+            p.ifacePathFirst = pathFirst
+            p.ifacePathCount = pathCount
+            p.ifaceArgsFirst = argsFirst
+            p.ifaceArgsCount = argsCount
+            p.implTarget = target
+            p.methodsFirst = methodsFirst
+            p.methodsCount = (self.b.decls.length() as u32) - methodsFirst
+            return d
+        }
+        // The inherent form: every method becomes a module-level function.
+        for i in methodsFirst..(self.b.decls.length() as u32) {
+            local m = self.b.decls.get(i as usize)
+            local mname = String(self.b.strOf(m.name))
+            if !startsWith(mname.asStr(), "operator") {
+                // A method of a struct: the function `T.name`, found by `value.name(...)` and by
+                // `for x in value` (`iter`, `next`).
+                local targetPath = self.b.types.get(target as usize).pathFirst
+                local targetName = self.b.strs.get(targetPath as usize +
+                    (self.b.types.get(target as usize).pathCount - 1) as usize)
+                local out = String(self.b.strOf(*targetName))
+                out.append(".")
+                out.append(mname)
+                m.name = self.b.text(out.asStr())
+            }
+            for k in 0..m.paramsCount {
+                local param = self.b.params.get(m.paramsFirst as usize + k as usize)
+                if param.isSelf != 0 { // `self` alone is the target by value; `self: T` names its type
+                    param.isSelf = 0
+                    if param.typedSelf == 0 {
+                        param.typeIdx = target
+                    }
+                }
+            }
+            // The impl's type parameters come before the method's own; the two runs are not
+            // adjacent in the string arena, so the concatenation is written out fresh.
+            local genFirst: u32 = self.b.strs.length() as u32
+            for k in 0..genericCount {
+                self.b.strs.push(*self.b.strs.get(genericFirst as usize + k as usize))
+            }
+            for k in 0..m.genericCount {
+                self.b.strs.push(*self.b.strs.get(m.genericFirst as usize + k as usize))
+            }
+            m.genericFirst = genFirst
+            m.genericCount = genericCount + m.genericCount
+            self.addItem(i as i32, s)
+        }
+        return -1
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // item/enum.cpp: `enum` and `type` aliases
+
+    /// @grammar `enum E: T { A, B = 3, C }`, `enum E { A, B }` (i32 implied)
+    fn parseEnum(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_ENUM)
+        self.advance() // 'enum'
+        local nameTok = self.cur()
+        local name = self.expectIdent("an enum name")
+        local genericFirst: u32 = 0
+        local genericCount: u32 = 0
+        if self.at(K_LT) {
+            local g = self.parseGenericParams()
+            genericFirst = g.0
+            genericCount = g.1
+        }
+        local hasUnderlying = false
+        local underlying: i32 = -1
+        if self.match(K_COLON) {
+            hasUnderlying = true
+            underlying = self.parseType()
+        } else {
+            // A value enum without `: T` is `i32` by default.
+            underlying = self.primitiveType("i32")
+        }
+        self.expect(K_LBRACE, "`{` with the members of the enum")
+        local savedDepth = self.nlDepth
+        self.nlDepth = 0
+        local membersFirst: u32 = self.b.enumMembers.length() as u32
+        while !self.at(K_RBRACE) {
+            self.rejectDirective()
+            local attrs = self.parseAttributes()
+            local span = self.spanOfCur()
+            if attrs.1 > 0 {
+                span = self.b.attrs.get(attrs.0 as usize).span
+            }
+            local mem: XEnumMember
+            mem.value = -1
+            mem.attrsFirst = attrs.0
+            mem.attrsCount = attrs.1
+            mem.name = self.b.text(self.expectIdent("an enum member name"))
+            mem.span = self.spanFrom(span)
+            if self.match(K_LPAREN) {
+                // `Add(A, B)`: a payload variant; the payload types are pushed contiguously
+                // right before the member record.
+                mem.hasPayload = 1
+                self.nlDepth = self.nlDepth + 1
+                local payload = Vec<i32>()
+                while !self.at(K_RPAREN) {
+                    payload.push(self.parseType())
+                    if !self.match(K_COMMA) {
+                        break
+                    }
+                }
+                self.nlDepth = self.nlDepth - 1
+                self.expect(K_RPAREN, "`)` closing the payload types")
+                mem.payloadFirst = self.b.typeRefs.length() as u32
+                for i in 0..payload.length() {
+                    self.b.typeRefs.push(*payload.get(i))
+                }
+                mem.payloadCount = payload.length() as u32
+            } else if self.match(K_ASSIGN) {
+                mem.value = self.parseExpr()
+            }
+            self.b.enumMembers.push(mem)
+            self.memberSeparator()
+        }
+        self.nlDepth = savedDepth
+        self.advance() // '}'
+        local p = self.b.decls.get(d as usize)
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        p.genericFirst = genericFirst
+        p.genericCount = genericCount
+        p.hasUnderlying = hasUnderlying ? 1 : 0
+        p.underlying = underlying
+        p.membersFirst = membersFirst
+        p.membersCount = (self.b.enumMembers.length() as u32) - membersFirst
+        return d
+    }
+
+    /// `enum` records are pushed to the item arena directly (not through `addItem`), because the
+    /// C++ path only appends to `items` when the enum has members; `s` still carries the prefix.
+    /// A value enum is one item. A payload enum (`Add(A, B)` members) becomes four kinds of
+    /// ordinary items: `Name$Tag` (the tag enum), `Name$Vi` (one struct per variant with data),
+    /// `Name$Data` (their union) and `Name` (`{ tag, data }` plus the variant list).
+    fn addEnum(self, d: i32, s: *DeclStart) {
+        local p = self.b.decls.get(d as usize)
+        local hasPayload = false
+        local i: u32 = 0
+        while i < p.membersCount {
+            local m = self.b.enumMembers.get((p.membersFirst + i) as usize)
+            if m.hasPayload != 0 {
+                hasPayload = true
+            }
+            i = i + 1
+        }
+        if !hasPayload {
+            self.addEnumItem(d, s)
+            return
+        }
+        // A payload enum has no `: T` and no `= value`; the tag is numbered by position.
+        local anyValue = false
+        i = 0
+        while i < p.membersCount {
+            local m = self.b.enumMembers.get((p.membersFirst + i) as usize)
+            if m.value >= 0 {
+                anyValue = true
+            }
+            i = i + 1
+        }
+        if p.hasUnderlying != 0 || anyValue {
+            local msg = String(self.b.strOf(p.name))
+            msg.append(" mixes payload variants with constant values")
+            self.b.error(p.nameSpan, msg.asStr(),
+                "a payload enum has no `: T` and no `= value`; the tag is numbered by position",
+                "", "")
+        }
+        local enumNameX: XStr = p.name
+        local enumName = String(self.b.strOf(p.name))
+        local declSpan = p.span
+        local nameSpan = p.nameSpan
+        local genericFirst = p.genericFirst
+        local genericCount = p.genericCount
+        local attrsFirst = p.attrsFirst
+        local attrsCount = p.attrsCount
+        local membersFirst = p.membersFirst
+        local membersCount = p.membersCount
+
+        // The tag enum is `i32` by position whatever the enum's parameters are, so it stays an
+        // ordinary enum with no parameters and no attributes of its own.
+        local tag = self.b.decl(XD_ENUM)
+        local tagPath = String(enumName.asStr())
+        tagPath.append("$Tag")
+        local tagName = self.b.text(tagPath.asStr())
+        local tagUnder = self.b.typeNode(XT_INT)
+        local tu = self.b.types.get(tagUnder as usize)
+        tu.bits = 32
+        tu.isSigned = 1
+        tu.span = nameSpan
+        local tagMembersFirst: u32 = self.b.enumMembers.length() as u32
+        i = 0
+        while i < membersCount {
+            local m = self.b.enumMembers.get((membersFirst + i) as usize)
+            local mem: XEnumMember
+            mem.value = -1
+            mem.name = m.name
+            mem.span = m.span
+            self.b.enumMembers.push(mem)
+            i = i + 1
+        }
+        local tp = self.b.decls.get(tag as usize)
+        tp.name = tagName
+        tp.span = declSpan
+        tp.nameSpan = nameSpan
+        tp.hasUnderlying = 1
+        tp.underlying = tagUnder
+        tp.membersFirst = tagMembersFirst
+        tp.membersCount = membersCount
+        self.addEnumItem(tag, s)
+
+        // One payload struct per variant with data; it carries no type parameters of its own
+        // (its fields keep the enum's own type text and are substituted by the enum's instance).
+        i = 0
+        while i < membersCount {
+            local m = self.b.enumMembers.get((membersFirst + i) as usize)
+            if m.payloadCount > 0 {
+                local payload = self.b.decl(XD_STRUCT)
+                local payloadPath = String(enumName.asStr())
+                payloadPath.append("$")
+                payloadPath.append(self.b.strOf(m.name))
+                local payloadName = self.b.text(payloadPath.asStr())
+                local fieldsFirst: u32 = self.b.fields.length() as u32
+                local j: u32 = 0
+                while j < m.payloadCount {
+                    local f: XField
+                    f.name = self.b.text(format("_{}", j).asStr())
+                    f.typeIdx = *self.b.typeRefs.get((m.payloadFirst + j) as usize)
+                    f.span = m.span
+                    self.b.fields.push(f)
+                    j = j + 1
+                }
+                local pp = self.b.decls.get(payload as usize)
+                pp.name = payloadName
+                pp.span = declSpan
+                pp.nameSpan = nameSpan
+                pp.isPayload = 1
+                pp.fieldsFirst = fieldsFirst
+                pp.fieldsCount = m.payloadCount
+                self.addEnumItem(payload, s)
+            }
+            i = i + 1
+        }
+
+        // The data part is the union of the variant payloads; a generic enum's data part names
+        // the enum's arguments (`Result<T, E>` holds `data: Result$Data<T, E>`).
+        local data = self.b.decl(XD_STRUCT)
+        local dataPath = String(enumName.asStr())
+        dataPath.append("$Data")
+        local dataName = self.b.text(dataPath.asStr())
+        local dataFieldsFirst: u32 = self.b.fields.length() as u32
+        local dataFieldsCount: u32 = 0
+        i = 0
+        while i < membersCount {
+            local m = self.b.enumMembers.get((membersFirst + i) as usize)
+            if m.payloadCount > 0 {
+                local f: XField
+                f.name = m.name
+                local memberSuffix = String("$")
+                memberSuffix.append(self.b.strOf(m.name))
+                f.typeIdx = self.selfArgsType(enumName.asStr(), memberSuffix.asStr(), genericFirst,
+                    genericCount, m.span)
+                f.span = m.span
+                self.b.fields.push(f)
+                dataFieldsCount = dataFieldsCount + 1
+            }
+            i = i + 1
+        }
+        local dp = self.b.decls.get(data as usize)
+        dp.name = dataName
+        dp.span = declSpan
+        dp.nameSpan = nameSpan
+        dp.genericFirst = genericFirst
+        dp.genericCount = genericCount
+        dp.isUnion = 1
+        dp.fieldsFirst = dataFieldsFirst
+        dp.fieldsCount = dataFieldsCount
+        self.addEnumItem(data, s)
+
+        // The enum itself lowers to `{ tag: Name$Tag, data: Name$Data<T...> }` plus the variant
+        // list; it keeps the enum's attributes and type parameters.
+        local sum = self.b.decl(XD_STRUCT)
+        local sumFieldsFirst: u32 = self.b.fields.length() as u32
+        local tagField: XField
+        tagField.name = self.b.text("tag")
+        tagField.typeIdx = self.namedTypeRef(tagPath.asStr(), nameSpan)
+        tagField.span = nameSpan
+        self.b.fields.push(tagField)
+        local dataField: XField
+        dataField.name = self.b.text("data")
+        dataField.typeIdx = self.selfArgsType(enumName.asStr(), "$Data", genericFirst,
+            genericCount, nameSpan)
+        dataField.span = nameSpan
+        self.b.fields.push(dataField)
+        local variantsFirst: u32 = self.b.variants.length() as u32
+        i = 0
+        while i < membersCount {
+            local m = self.b.enumMembers.get((membersFirst + i) as usize)
+            local v: XSumVariant
+            v.name = m.name
+            v.payloadFirst = m.payloadFirst
+            v.payloadCount = m.payloadCount
+            self.b.variants.push(v)
+            i = i + 1
+        }
+        local sp = self.b.decls.get(sum as usize)
+        sp.name = enumNameX
+        sp.span = declSpan
+        sp.nameSpan = nameSpan
+        sp.attrsFirst = attrsFirst
+        sp.attrsCount = attrsCount
+        sp.genericFirst = genericFirst
+        sp.genericCount = genericCount
+        sp.fieldsFirst = sumFieldsFirst
+        sp.fieldsCount = 2
+        sp.variantsFirst = variantsFirst
+        sp.variantsCount = membersCount
+        self.addEnumItem(sum, s)
+    }
+
+    /// One generated item of a payload enum: the same modifiers as the enum, no `@allow` scopes.
+    fn addEnumItem(self, d: i32, s: *DeclStart) {
+        local item: XItem
+        item.exported = s.mods.exported ? 1 : 0
+        item.exportC = s.mods.exportC ? 1 : 0
+        item.declared = s.mods.declared ? 1 : 0
+        item.registered = s.mods.registered ? 1 : 0
+        item.registerRole = self.b.text(s.mods.registerRole.asStr())
+        item.decl = d
+        self.checkModifiers(d, s)
+        self.b.items.push(item)
+    }
+
+    /// The flat named type `enumName + suffix` with one argument per generic parameter of the
+    /// enum (`Result$Ok<T, E>`); `genericCount == 0` leaves the type without arguments.
+    fn selfArgsType(self, enumName: str, suffix: str, genericFirst: u32,
+            genericCount: u32, span: XSpan) -> i32 {
+        local path = String(enumName)
+        path.append(suffix)
+        local t = self.b.typeNode(XT_NAMED)
+        local p = self.b.types.get(t as usize)
+        // The path is a range in the string-list arena: one `XStr` record per segment.
+        local nameX = self.b.text(path.asStr())
+        p.pathFirst = self.b.strRef(nameX) as u32
+        p.pathCount = 1
+        if genericCount > 0 {
+            p.argsFirst = self.b.typeRefs.length() as u32
+            local j: u32 = 0
+            while j < genericCount {
+                local arg = self.b.typeNode(XT_NAMED)
+                local ap = self.b.types.get(arg as usize)
+                local param = self.b.strs.get((genericFirst + j) as usize)
+                ap.pathFirst = self.b.strRef(*param) as u32
+                ap.pathCount = 1
+                ap.span = span
+                self.b.typeRefs.push(arg)
+                j = j + 1
+            }
+            p.argsCount = genericCount
+        }
+        // The arguments are type nodes: the types arena may have moved, so refetch.
+        p = self.b.types.get(t as usize)
+        p.argsCount = genericCount
+        p.span = span
+        return t
+    }
+
+    /// The flat named type `path` with no arguments (a helper for the generated enum items).
+    fn namedTypeRef(self, path: str, span: XSpan) -> i32 {
+        local t = self.b.typeNode(XT_NAMED)
+        local p = self.b.types.get(t as usize)
+        // The path is a range in the string-list arena: one `XStr` record per segment.
+        local nameX = self.b.text(path)
+        p.pathFirst = self.b.strRef(nameX) as u32
+        p.pathCount = 1
+        p.span = span
+        return t
+    }
+
+    /// @grammar `type Name = T`, `type Name<T, U> = T`
+    fn parseTypeAlias(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_TYPE_ALIAS)
+        self.advance() // 'type'
+        local nameTok = self.cur()
+        local name = self.expectIdent("a type alias name")
+        local genericFirst: u32 = 0
+        local genericCount: u32 = 0
+        if self.at(K_LT) {
+            local g = self.parseGenericParams()
+            genericFirst = g.0
+            genericCount = g.1
+        }
+        self.expect(K_ASSIGN, "`=` and the aliased type")
+        local target = self.parseType()
+        self.endOfItemLine()
+        local p = self.b.decls.get(d as usize)
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        p.genericFirst = genericFirst
+        p.genericCount = genericCount
+        p.typeIdx = target
+        return d
+    }
+
+    /// @grammar `define name: T = value`, `define name = value` (the compiler's `-D` constants)
+    /// @grammar `define name(a: expr, b: stmt) { body }`, used as `name!(...)`
+    /// @grammar `define name = value`
+    fn parseDefine(self, s: *DeclStart) -> i32 {
+        self.advance() // 'define'
+        local nameTok = self.cur()
+        local name = self.expectIdent("a define name")
+        if self.at(K_LPAREN) {
+            // The macro form: typed parameters and a raw token body.
+            local d = self.b.decl(XD_DEFINE_MACRO)
+            self.advance() // '('
+            self.nlDepth = self.nlDepth + 1
+            local paramsFirst: u32 = self.b.macroParams.length() as u32
+            while !self.at(K_RPAREN) {
+                local m: XMacroParam
+                m.span = self.spanOfCur()
+                m.name = self.b.text(self.expectIdent("a macro parameter name"))
+                self.expect(K_COLON, "`:` and the parameter kind")
+                local kt = self.cur()
+                if self.at(K_TYPE) {
+                    m.kind = 1
+                    self.advance()
+                } else if self.at(K_IDENT) && eq(self.textOf(kt), "expr") {
+                    m.kind = 0
+                    self.advance()
+                } else if self.at(K_IDENT) && eq(self.textOf(kt), "ident") {
+                    m.kind = 2
+                    self.advance()
+                } else if self.at(K_IDENT) && eq(self.textOf(kt), "block") {
+                    m.kind = 3
+                    self.advance()
+                } else if self.at(K_IDENT) && eq(self.textOf(kt), "items") {
+                    m.kind = 4
+                    self.advance()
+                } else {
+                    self.expected("a macro parameter kind (expr, type, ident, block or items)")
+                }
+                m.span = self.spanFrom(m.span)
+                self.b.macroParams.push(m)
+                if !self.match(K_COMMA) {
+                    break
+                }
+            }
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RPAREN, "`)` closing the macro parameters")
+            self.expect(K_LBRACE, "`{` starting the macro body")
+            local bodyFirst: u32 = self.b.toks.length() as u32
+            local depth: i32 = 1
+            while true {
+                if self.at(K_END) {
+                    self.expected("`}` closing the macro body")
+                }
+                if self.at(K_LBRACE) {
+                    depth = depth + 1
+                } else if self.at(K_RBRACE) {
+                    depth = depth - 1
+                    if depth == 0 {
+                        break
+                    }
+                }
+                self.pushTok(self.advance())
+            }
+            self.advance() // closing '}'
+            local p = self.b.decls.get(d as usize)
+            p.name = self.b.text(name)
+            p.attrsFirst = s.attrsFirst
+            p.attrsCount = s.attrsCount
+            p.nameSpan = self.b.spanOf(nameTok)
+            p.span = self.spanFrom(s.start)
+            p.macroParamsFirst = paramsFirst
+            p.macroParamsCount = (self.b.macroParams.length() as u32) - paramsFirst
+            p.macroBodyFirst = bodyFirst
+            p.macroBodyCount = (self.b.toks.length() as u32) - bodyFirst
+            return d
+        }
+        local d = self.b.decl(XD_DEFINE_CONST)
+        self.expect(K_ASSIGN, "`=` and the constant value, or `(` for a macro")
+        local p = self.b.decls.get(d as usize)
+        p.init = self.parseExpr()
+        self.endOfItemLine()
+        p.name = self.b.text(name)
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        return d
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // item/module.cpp: `import`, `export ... from` and module-level calls
+
+    /// @grammar `name`, `name as alias`, separated by `,` while the line continues
+    fn parseNameList(self, namesFirst: u32) {
+        while true {
+            local n: XImportName
+            n.span = self.spanOfCur()
+            n.name = self.b.text(self.expectIdent("a name"))
+            if self.match(K_AS) {
+                n.alias = self.b.text(self.expectIdent("an alias"))
+            }
+            n.span = self.spanFrom(n.span)
+            self.b.importNames.push(n)
+            if !(self.at(K_COMMA) && self.continues()) {
+                break
+            }
+            self.advance()
+        }
+    }
+
+    /// The module path: a string literal, or a bare `ident/ident/...` written without whitespace.
+    /// Returns the path as an `XStr` in the builder's byte buffer plus its span.
+    fn parseModuleString(self) -> (XStr, XSpan) {
+        if self.at(K_STRING) {
+            local t = self.advance()
+            return (self.b.text(self.textOf(t)), self.b.spanOf(t))
+        }
+        if !self.at(K_IDENT) {
+            self.expected("a module path (`json`, `std/mem` or a string)")
+        }
+        local span = self.spanOfCur()
+        local path = String(self.textOf(self.advance()))
+        while self.at(K_SLASH) && self.peekKind(1) == K_IDENT &&
+              self.adjacent(self.prev(), self.cur()) && self.adjacent(self.cur(), self.peek(1)) {
+            self.advance()
+            path.append("/")
+            path.append(self.textOf(self.advance()))
+        }
+        return (self.b.text(path.asStr()), self.spanFrom(span))
+    }
+
+    /// @grammar `import "m"`, `import "m" as alias`, `import name from "m"`, `import * from "m"`
+    /// @grammar `import * as ns from "m"`, `from "m" import name, other as alias`
+    fn parseImport(self, s: *DeclStart) -> i32 {
+        local d = self.b.decl(XD_IMPORT)
+        local nameTok = self.cur()
+        local namesFirst: u32 = self.b.importNames.length() as u32
+        local form: u32 = XIMP_MODULE
+        local module_: XStr
+        local moduleSpan: XSpan
+        local alias = String("")
+        if self.match(K_FROM) {
+            form = XIMP_NAMES
+            local m = self.parseModuleString()
+            module_ = m.0
+            moduleSpan = m.1
+            self.expect(K_IMPORT, "`import` and the imported names")
+            self.parseNameList(namesFirst)
+        } else {
+            self.advance() // 'import'
+            if self.at(K_STRING) {
+                form = XIMP_MODULE
+                local m = self.parseModuleString()
+                module_ = m.0
+                moduleSpan = m.1
+                if self.match(K_AS) {
+                    alias = String(self.expectIdent("a module alias"))
+                }
+            } else if self.match(K_STAR) {
+                form = XIMP_STAR
+                if self.match(K_AS) {
+                    form = XIMP_STAR_AS
+                    alias = String(self.expectIdent("a namespace alias"))
+                }
+                self.expect(K_FROM, "`from` and the module path")
+                local m = self.parseModuleString()
+                module_ = m.0
+                moduleSpan = m.1
+            } else if self.at(K_IDENT) {
+                form = XIMP_NAMES
+                self.parseNameList(namesFirst)
+                self.expect(K_FROM, "`from` and the module path")
+                local m = self.parseModuleString()
+                module_ = m.0
+                moduleSpan = m.1
+            } else {
+                self.expected("a module path string, `*` or an imported name")
+            }
+        }
+        self.endOfItemLine()
+        local p = self.b.decls.get(d as usize)
+        p.form = form
+        p.module = module_
+        p.moduleSpan = moduleSpan
+        p.alias = self.b.text(alias.asStr())
+        p.namesFirst = namesFirst
+        p.namesCount = (self.b.importNames.length() as u32) - namesFirst
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.name = p.module
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        return d
+    }
+
+    /// @grammar `export * from "m"`, `export * as ns from "m"`, `export * from "m" except a, b`
+    /// @grammar `export { a, b as c } from "m"`
+    fn parseExportFrom(self, s: *DeclStart) {
+        local d = self.b.decl(XD_EXPORT_FROM)
+        local nameTok = self.cur()
+        self.advance() // 'export'
+        local namesFirst: u32 = self.b.importNames.length() as u32
+        local exceptFirst: u32 = self.b.importNames.length() as u32
+        local form: u32 = XEF_STAR
+        local module_: XStr
+        local moduleSpan: XSpan
+        local alias = String("")
+        if self.match(K_STAR) {
+            if self.match(K_AS) {
+                form = XEF_STAR_AS
+                alias = String(self.expectIdent("a namespace name"))
+            }
+            self.expect(K_FROM, "`from` and the module path")
+            local m = self.parseModuleString()
+            module_ = m.0
+            moduleSpan = m.1
+            if self.at(K_EXCEPT) && self.continues() {
+                if form == XEF_STAR_AS {
+                    self.failAt(self.cur(),
+                        String("`except` cannot be combined with `export * as`"),
+                        String("not valid here"), String(""),
+                        String("write `export * from \"m\" except a, b`"))
+                }
+                self.advance()
+                exceptFirst = self.b.importNames.length() as u32
+                self.parseNameList(exceptFirst)
+            }
+        } else {
+            self.expect(K_LBRACE, "`{`")
+            form = XEF_NAMES
+            self.nlDepth = self.nlDepth + 1
+            while !self.at(K_RBRACE) {
+                local n: XImportName
+                n.span = self.spanOfCur()
+                n.name = self.b.text(self.expectIdent("an exported name"))
+                if self.match(K_AS) {
+                    n.alias = self.b.text(self.expectIdent("an alias"))
+                }
+                n.span = self.spanFrom(n.span)
+                self.b.importNames.push(n)
+                if !self.match(K_COMMA) {
+                    break
+                }
+            }
+            self.nlDepth = self.nlDepth - 1
+            self.expect(K_RBRACE, "`}` closing the re-export list")
+            self.expect(K_FROM, "`from` and the module path")
+            local m = self.parseModuleString()
+            module_ = m.0
+            moduleSpan = m.1
+        }
+        self.endOfItemLine()
+        local p = self.b.decls.get(d as usize)
+        p.form = form
+        p.module = module_
+        p.moduleSpan = moduleSpan
+        p.alias = self.b.text(alias.asStr())
+        p.namesFirst = namesFirst
+        p.namesCount = (self.b.importNames.length() as u32) - namesFirst
+        p.exceptFirst = exceptFirst
+        p.exceptCount = (self.b.importNames.length() as u32) - exceptFirst
+        p.attrsFirst = s.attrsFirst
+        p.attrsCount = s.attrsCount
+        p.name = p.module
+        p.nameSpan = self.b.spanOf(nameTok)
+        p.span = self.spanFrom(s.start)
+        // Re-exports are always exported.
+        local item: XItem
+        item.exported = 1
+        item.decl = d
+        self.b.items.push(item)
+        return
+    }
+
+    /// @grammar a module-level `name!(...)` call, or a plain call, as an item
+    fn parseTopLevelCall(self, s: *DeclStart) -> i32 {
+        local first = self.cur()
+        local expr = self.parseExpr()
+        local ep = self.b.exprs.get(expr as usize)
+        if ep.kind == XE_MACRO_CALL {
+            local d = self.b.decl(XD_MACRO_CALL)
+            self.endOfItemLine()
+            local p = self.b.decls.get(d as usize)
+            p.macroArgsFirst = ep.macroArgsFirst
+            p.macroArgsCount = ep.macroArgsCount
+            p.attrsFirst = s.attrsFirst
+            p.attrsCount = s.attrsCount
+            p.name = ep.text
+            p.nameSpan = self.b.spanOf(first)
+            p.span = self.spanFrom(s.start)
+            return d
+        }
+        if ep.kind == XE_CALL {
+            local d = self.b.decl(XD_TOP_LEVEL_CALL)
+            self.endOfItemLine()
+            local p = self.b.decls.get(d as usize)
+            p.call = expr
+            p.attrsFirst = s.attrsFirst
+            p.attrsCount = s.attrsCount
+            p.name = ep.text
+            p.nameSpan = self.b.spanOf(first)
+            p.span = self.spanFrom(s.start)
+            return d
+        }
+        self.failAt(first,
+            format("expected a declaration, found {}", describeToken(first)),
+            String("expected a declaration here"), String(""),
+            String("module-level code is limited to declarations, macro invocations and calls such as `staticAssert(...)`"))
+        return -1
+    }
+}
+
+// ----------------------------------------------------------------------------------------
+// The C boundary: freeze the arenas into one block the C++ bridge reads and frees.
+
+/// The frozen result `xlcParse` hands to C++: the program header, one pointer and count per
+/// arena, and the owning block (`xlcParseFree` drops it). The pointers stay valid until the
+/// free, like the lexer's token array.
+@repr(c)
+export struct CParseResult {
+    // The program header, flattened (an embedded imported struct shifted the offsets once).
+    programFile: u32
+    fileAttrsFirst: u32 ///< XAttr arena
+    fileAttrsCount: u32
+    itemsFirst: u32 ///< XItem arena
+    itemsCount: u32
+    exprs: *XExpr
+    exprCount: u32
+    stmts: *XStmt
+    stmtCount: u32
+    blocks: *XBlock
+    blockCount: u32
+    types: *XType
+    typeCount: u32
+    typeRefs: *i32
+    typeRefCount: u32
+    exprRefs: *i32
+    exprRefCount: u32
+    stmtRefs: *i32
+    stmtRefCount: u32
+    decls: *XDecl
+    declCount: u32
+    items: *XItem
+    itemCount: u32
+    attrs: *XAttr
+    attrCount: u32
+    attrArgs: *XAttrArg
+    attrArgCount: u32
+    params: *XParam
+    paramCount: u32
+    closures: *XClosure
+    closureCount: u32
+    fieldInits: *XFieldInit
+    fieldInitCount: u32
+    fields: *XField
+    fieldCount: u32
+    variants: *XSumVariant
+    variantCount: u32
+    enumMembers: *XEnumMember
+    enumMemberCount: u32
+    macroParams: *XMacroParam
+    macroParamCount: u32
+    importNames: *XImportName
+    importNameCount: u32
+    tokLists: *XTokList
+    tokListCount: u32
+    toks: *XTok
+    tokCount: u32
+    cases: *XSwitchCase
+    caseCount: u32
+    strs: *XStr
+    strCount: u32
+    bytes: *u8
+    byteCount: u32
+    errs: *XErr
+    errCount: u32
+    errLabels: *XErrLabel
+    errLabelCount: u32
+    block: *ParseBlock
+}
+
+/// The heap block that owns the arenas `xlcParse` hands out; dropped by `xlcParseFree`.
+export class ParseBlock {
+    b: Ast
+
+    fn init(self, file: u32) {
+        self.b = Ast(file)
+    }
+}
+
+/// `xlcParse`: parse `count` tokens at `toks` (the frozen lexer output, ending with `End`) and
+/// hand the C++ side the flat AST of ../ast/ast.xl. Syntax errors are recorded in the `errs`
+/// arena, not thrown across the boundary; the C++ bridge reports them as `E0002`.
+export(c) fn xlcParse(toks: *CToken, count: u32, file: u32) -> CParseResult {
+    local block = new ParseBlock(file)
+    local p = new Parser(toks, count as usize, &(block.b))
+    p.run()
+    local b = &(block.b)
+    local r: CParseResult
+    r.programFile = b.program.file
+    r.fileAttrsFirst = b.program.fileAttrsFirst
+    r.fileAttrsCount = b.program.fileAttrsCount
+    r.itemsFirst = b.program.itemsFirst
+    r.itemsCount = b.program.itemsCount
+    r.exprs = b.exprs.data
+    r.exprCount = b.exprs.length() as u32
+    r.stmts = b.stmts.data
+    r.stmtCount = b.stmts.length() as u32
+    r.blocks = b.blocks.data
+    r.blockCount = b.blocks.length() as u32
+    r.types = b.types.data
+    r.typeCount = b.types.length() as u32
+    r.typeRefs = b.typeRefs.data
+    r.typeRefCount = b.typeRefs.length() as u32
+    r.exprRefs = b.exprRefs.data
+    r.exprRefCount = b.exprRefs.length() as u32
+    r.stmtRefs = b.stmtRefs.data
+    r.stmtRefCount = b.stmtRefs.length() as u32
+    r.decls = b.decls.data
+    r.declCount = b.decls.length() as u32
+    r.items = b.items.data
+    r.itemCount = b.items.length() as u32
+    r.attrs = b.attrs.data
+    r.attrCount = b.attrs.length() as u32
+    r.attrArgs = b.attrArgs.data
+    r.attrArgCount = b.attrArgs.length() as u32
+    r.params = b.params.data
+    r.paramCount = b.params.length() as u32
+    r.closures = b.closures.data
+    r.closureCount = b.closures.length() as u32
+    r.fieldInits = b.fieldInits.data
+    r.fieldInitCount = b.fieldInits.length() as u32
+    r.fields = b.fields.data
+    r.fieldCount = b.fields.length() as u32
+    r.variants = b.variants.data
+    r.variantCount = b.variants.length() as u32
+    r.enumMembers = b.enumMembers.data
+    r.enumMemberCount = b.enumMembers.length() as u32
+    r.macroParams = b.macroParams.data
+    r.macroParamCount = b.macroParams.length() as u32
+    r.importNames = b.importNames.data
+    r.importNameCount = b.importNames.length() as u32
+    r.tokLists = b.tokLists.data
+    r.tokListCount = b.tokLists.length() as u32
+    r.toks = b.toks.data
+    r.tokCount = b.toks.length() as u32
+    r.cases = b.cases.data
+    r.caseCount = b.cases.length() as u32
+    r.strs = b.strs.data
+    r.strCount = b.strs.length() as u32
+    r.bytes = b.bytes.data
+    r.byteCount = b.bytes.length() as u32
+    r.errs = b.errs.data
+    r.errCount = b.errs.length() as u32
+    r.errLabels = b.errLabels.data
+    r.errLabelCount = b.errLabels.length() as u32
+    r.block = block
+    return r
+}
+
+/// `xlcParseFree`: release the block `xlcParse` allocated.
+export(c) fn xlcParseFree(result: CParseResult) {
+    delete result.block
+}

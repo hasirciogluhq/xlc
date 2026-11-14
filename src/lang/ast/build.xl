@@ -1,0 +1,201 @@
+// The flat AST builder: the arenas the parser fills and the small makers every parser file uses.
+//
+// The parser (src/lang/parser/*.xl) pushes records into the arenas here and links them with
+// indices; the finished arenas freeze into one block for the C++ bridge (see freeze in parser.xl).
+// A child list is always a `(first, count)` range whose children were pushed immediately before
+// the parent, so every subtree is contiguous. Strings are copied into `bytes` once and named by
+// an `XStr` offset pair, so nothing dangles when an arena grows.
+
+from "std" import String, Vec
+from "std/str" import fromParts, eq
+from "../abi" import CToken
+from "ast" import XExpr, XStmt, XBlock, XType, XDecl, XItem, XAttr, XAttrArg, XParam, XClosure
+from "ast" import XFieldInit, XField, XSumVariant, XEnumMember, XMacroParam, XImportName
+from "ast" import XTokList, XTok, XSwitchCase, XStr, XErr, XErrLabel, XProgram, XSpan
+
+/// The arenas of one parsed file.
+export class Ast {
+    exprs: Vec<XExpr>
+    stmts: Vec<XStmt>
+    blocks: Vec<XBlock>
+    types: Vec<XType>
+    typeRefs: Vec<i32> ///< type index lists (FnPtr params, generic args, Tuple elements, payloads)
+    exprRefs: Vec<i32> ///< expression index lists (call args, ternary branches, case values)
+    stmtRefs: Vec<i32> ///< the top-level statement indices of each block, in order
+    decls: Vec<XDecl>
+    items: Vec<XItem>
+    attrs: Vec<XAttr>
+    attrArgs: Vec<XAttrArg>
+    params: Vec<XParam>
+    closures: Vec<XClosure>
+    fieldInits: Vec<XFieldInit>
+    fields: Vec<XField>
+    variants: Vec<XSumVariant>
+    enumMembers: Vec<XEnumMember>
+    macroParams: Vec<XMacroParam>
+    importNames: Vec<XImportName>
+    tokLists: Vec<XTokList>
+    toks: Vec<XTok>
+    cases: Vec<XSwitchCase>
+    strs: Vec<XStr> ///< string lists (name lists, paths), ranged over by `*First/Count` fields
+    bytes: Vec<u8> ///< the string bytes every `XStr` offsets into
+    errs: Vec<XErr>
+    errLabels: Vec<XErrLabel>
+    program: XProgram
+    file: u32
+
+    fn init(self, file: u32) {
+        self.exprs = Vec<XExpr>()
+        self.stmts = Vec<XStmt>()
+        self.blocks = Vec<XBlock>()
+        self.types = Vec<XType>()
+        self.typeRefs = Vec<i32>()
+        self.exprRefs = Vec<i32>()
+        self.stmtRefs = Vec<i32>()
+        self.decls = Vec<XDecl>()
+        self.items = Vec<XItem>()
+        self.attrs = Vec<XAttr>()
+        self.attrArgs = Vec<XAttrArg>()
+        self.params = Vec<XParam>()
+        self.closures = Vec<XClosure>()
+        self.fieldInits = Vec<XFieldInit>()
+        self.fields = Vec<XField>()
+        self.variants = Vec<XSumVariant>()
+        self.enumMembers = Vec<XEnumMember>()
+        self.macroParams = Vec<XMacroParam>()
+        self.importNames = Vec<XImportName>()
+        self.tokLists = Vec<XTokList>()
+        self.toks = Vec<XTok>()
+        self.cases = Vec<XSwitchCase>()
+        self.strs = Vec<XStr>()
+        self.bytes = Vec<u8>()
+        self.errs = Vec<XErr>()
+        self.errLabels = Vec<XErrLabel>()
+        self.file = file
+    }
+
+    /// Copies `s` into the byte buffer and returns its `XStr`.
+    fn text(self, s: str) -> XStr {
+        local off: u32 = self.bytes.length() as u32
+        for i in 0..s.len {
+            self.bytes.push(s[i])
+        }
+        return XStr { off: off, len: s.len as u32 }
+    }
+
+    /// The `str` view of an `XStr` (valid while the builder lives).
+    fn strOf(self, s: XStr) -> str {
+        return fromParts(self.bytes.get(s.off as usize) as *u8, s.len as usize)
+    }
+
+    /// Appends `s` to the string-list arena and returns its index.
+    fn strRef(self, s: XStr) -> i32 {
+        self.strs.push(s)
+        return (self.strs.length() - 1) as i32
+    }
+
+    /// The span of one token.
+    fn spanOf(self, t: CToken) -> XSpan {
+        local s: XSpan
+        s.file = self.file
+        s.line = t.line
+        s.column = t.column
+        s.endLine = t.endLine
+        s.endColumn = t.endColumn
+        return s
+    }
+
+    /// The range from the start of `a` to the end of `b` (the C++ `Span::merge`).
+    fn merge(self, a: XSpan, b: XSpan) -> XSpan {
+        local s: XSpan
+        s.file = a.file
+        s.line = a.line
+        s.column = a.column
+        s.endLine = b.endLine
+        s.endColumn = b.endColumn
+        return s
+    }
+
+    fn expr(self, kind: i32, span: XSpan) -> i32 {
+        local e: XExpr
+        e.kind = kind
+        e.span = span
+        // Unused index fields are -1 (none); zero is a valid index.
+        e.lhs = -1
+        e.rhs = -1
+        e.typeIdx = -1
+        e.closure = -1
+        self.exprs.push(e)
+        return (self.exprs.length() - 1) as i32
+    }
+
+    fn exprAt(self, idx: i32) -> *XExpr {
+        return self.exprs.get(idx as usize)
+    }
+
+    fn stmt(self, kind: i32) -> i32 {
+        local s: XStmt
+        s.kind = kind
+        // Unused index fields are -1 (none); zero is a valid index.
+        s.typeIdx = -1
+        s.target = -1
+        s.expr = -1
+        s.expr2 = -1
+        s.body = -1
+        s.elseBody = -1
+        s.init = -1
+        s.step = -1
+        self.stmts.push(s)
+        return (self.stmts.length() - 1) as i32
+    }
+
+    fn block(self, span: XSpan) -> i32 {
+        local b: XBlock
+        b.span = span
+        self.blocks.push(b)
+        return (self.blocks.length() - 1) as i32
+    }
+
+    fn typeNode(self, kind: i32) -> i32 {
+        local t: XType
+        t.kind = kind
+        // Unused index fields are -1 (none); zero is a valid index.
+        t.elem = -1
+        t.ret = -1
+        t.length = -1
+        self.types.push(t)
+        return (self.types.length() - 1) as i32
+    }
+
+    fn decl(self, kind: i32) -> i32 {
+        local d: XDecl
+        d.kind = kind
+        // Unused index fields are -1 (none); zero is a valid index.
+        d.ret = -1
+        d.body = -1
+        d.typeIdx = -1
+        d.init = -1
+        d.implTarget = -1
+        d.underlying = -1
+        d.call = -1
+        self.decls.push(d)
+        return (self.decls.length() - 1) as i32
+    }
+
+    /// Records one syntax error: the message, one primary label and the optional detail and fix
+    /// hints. The C++ bridge reports it as `E0002`.
+    fn error(self, span: XSpan, msg: str, label: str, detail: str, fix: str) {
+        local labelsFirst: u32 = self.errLabels.length() as u32
+        local l: XErrLabel
+        l.span = span
+        l.text = self.text(label)
+        self.errLabels.push(l)
+        local e: XErr
+        e.message = self.text(msg)
+        e.detail = self.text(detail)
+        e.fix = self.text(fix)
+        e.labelsFirst = labelsFirst
+        e.labelsCount = 1
+        self.errs.push(e)
+    }
+}

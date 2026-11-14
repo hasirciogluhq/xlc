@@ -1,0 +1,483 @@
+// The abstract syntax tree the parser produces, in the flat form that crosses the C boundary.
+//
+// The C++ parser (src/lang/parser/) builds the pointer tree of include/xlang/lang/ast.h; this
+// file is the xlang mirror of the same shapes as flat records linked by indices. Every struct is
+// `@repr(c)` and flat so the result freezes into one block by copying the arenas verbatim, and
+// the C++ bridge (src/lang/parser/parser.cpp) walks the arenas and rebuilds the tree. The kind
+// constants mirror the C++ enums number for number; do not reorder either side.
+//
+// A `str`-shaped field is an `XStr`: an offset and a length into the byte buffer the result
+// carries. An index field is `i32`, `-1` for none. A child list is a `(first, count)` range into
+// the arena named in the comment; children are pushed before the parent that ranges over them,
+// so every subtree is contiguous.
+
+/// `(offset, length)` into the result's string bytes.
+@repr(c)
+export struct XStr {
+    off: u32
+    len: u32
+}
+
+/// Field for field the C++ `Span` of util/source.h.
+@repr(c)
+export struct XSpan {
+    file: u32
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+}
+
+// ---------------------------------------------------------------------------------------------
+// Expression kinds, the order of `Expr::Kind` in ast.h
+
+export const XE_INT_LITERAL: i32 = 0
+export const XE_FLOAT_LITERAL: i32 = 1
+export const XE_BOOL_LITERAL: i32 = 2
+export const XE_STRING_LITERAL: i32 = 3
+export const XE_BYTE_LITERAL: i32 = 4
+export const XE_NAME: i32 = 5
+export const XE_UNARY: i32 = 6
+export const XE_BINARY: i32 = 7
+export const XE_CALL: i32 = 8
+export const XE_INDEX: i32 = 9
+export const XE_SLICE: i32 = 10
+export const XE_FIELD: i32 = 11
+export const XE_CAST: i32 = 12
+export const XE_ARRAY_LIST: i32 = 13
+export const XE_ARRAY_REPEAT: i32 = 14
+export const XE_TUPLE_LITERAL: i32 = 15
+export const XE_STRUCT_LITERAL: i32 = 16
+export const XE_NEW: i32 = 17
+export const XE_TERNARY: i32 = 18
+export const XE_TRY: i32 = 19
+export const XE_MACRO_CALL: i32 = 20
+export const XE_SPREAD: i32 = 21
+export const XE_ASM_OPERAND: i32 = 22
+export const XE_TYPE_OPERAND: i32 = 23
+export const XE_CLOSURE: i32 = 24
+
+// UnaryOp, the order of `UnaryOp` in ast.h
+export const XU_NEG: i32 = 0
+export const XU_NOT: i32 = 1
+export const XU_DEREF: i32 = 2
+export const XU_ADDROF: i32 = 3
+export const XU_BITNOT: i32 = 4
+
+// BinaryOp, the order of `BinaryOp` in ast.h
+export const XB_ADD: i32 = 0
+export const XB_SUB: i32 = 1
+export const XB_MUL: i32 = 2
+export const XB_DIV: i32 = 3
+export const XB_MOD: i32 = 4
+export const XB_EQ: i32 = 5
+export const XB_NE: i32 = 6
+export const XB_LT: i32 = 7
+export const XB_LE: i32 = 8
+export const XB_GT: i32 = 9
+export const XB_GE: i32 = 10
+export const XB_AND: i32 = 11
+export const XB_OR: i32 = 12
+export const XB_BITAND: i32 = 13
+export const XB_BITOR: i32 = 14
+export const XB_BITXOR: i32 = 15
+export const XB_SHL: i32 = 16
+export const XB_SHR: i32 = 17
+
+/// One field initializer of a struct literal or `new`.
+@repr(c)
+export struct XFieldInit {
+    name: XStr
+    value: i32 ///< expr index
+    span: XSpan
+}
+
+/// The parameters and body of a closure literal; the C++ `ClosureData`.
+@repr(c)
+export struct XClosure {
+    paramsFirst: u32 ///< XParam arena
+    paramsCount: u32
+    hasRet: u32
+    ret: i32 ///< type index
+    isMove: u32
+    exprBody: u32
+    body: i32 ///< block index
+}
+
+/// One expression node; the fields of the C++ `Expr`, unused ones left zero.
+@repr(c)
+export struct XExpr {
+    kind: i32
+    span: XSpan
+    intValue: u64
+    floatValue: f64
+    boolValue: u32
+    text: XStr
+    unaryOp: i32
+    binaryOp: i32
+    lhs: i32 ///< expr index
+    rhs: i32 ///< expr index
+    argsFirst: u32 ///< expr index arena (exprRefs)
+    argsCount: u32
+    fieldsFirst: u32 ///< XFieldInit arena
+    fieldsCount: u32
+    typeIdx: i32 ///< type index (Cast target, StructLiteral/New type)
+    hasCallArgs: u32
+    genericArgsFirst: u32 ///< type index arena
+    genericArgsCount: u32
+    macroArgsFirst: u32 ///< XTokList arena, one entry per argument
+    macroArgsCount: u32
+    closure: i32 ///< XClosure index
+}
+
+// ---------------------------------------------------------------------------------------------
+// Statement kinds, the order of `Stmt::Kind` in ast.h
+
+export const XS_LOCAL: i32 = 0
+export const XS_DELETE: i32 = 1
+export const XS_CONST: i32 = 2
+export const XS_ASSIGN: i32 = 3
+export const XS_RETURN: i32 = 4
+export const XS_EXPR: i32 = 5
+export const XS_IF: i32 = 6
+export const XS_WHILE: i32 = 7
+export const XS_DO_WHILE: i32 = 8
+export const XS_FOR: i32 = 9
+export const XS_FOR_RANGE: i32 = 10
+export const XS_FOR_PACK: i32 = 11
+export const XS_FOR_EACH: i32 = 12
+export const XS_SWITCH: i32 = 13
+export const XS_DEFER: i32 = 14
+export const XS_TRY: i32 = 15
+export const XS_CONTINUE: i32 = 16
+export const XS_BREAK: i32 = 17
+export const XS_UNSAFE: i32 = 18
+export const XS_BLOCK: i32 = 19
+
+/// One arm of a `switch`.
+@repr(c)
+export struct XSwitchCase {
+    span: XSpan
+    isDefault: u32
+    valuesFirst: u32 ///< expr index arena (exprRefs)
+    valuesCount: u32
+    body: i32 ///< block index
+}
+
+/// One statement node; the fields of the C++ `Stmt`, unused ones left zero.
+@repr(c)
+export struct XStmt {
+    kind: i32
+    span: XSpan
+    attrsFirst: u32 ///< XAttr arena
+    attrsCount: u32
+    name: XStr
+    namesFirst: u32 ///< string offsets of the names, in the XStr table
+    namesCount: u32
+    label: XStr
+    hasType: u32
+    typeIdx: i32 ///< type index
+    target: i32 ///< expr index (Assign)
+    expr: i32 ///< expr index
+    expr2: i32 ///< expr index (ForRange upper bound)
+    hasCompoundOp: u32
+    compoundOp: i32
+    isIncDec: u32
+    rangeInclusive: u32
+    body: i32 ///< block index
+    elseBody: i32 ///< block index
+    elseIsIf: u32
+    init: i32 ///< stmt index (For initializer, Defer statement)
+    step: i32 ///< stmt index (For step)
+    casesFirst: u32 ///< XSwitchCase arena
+    casesCount: u32
+}
+
+/// One block: a span and a run of top-level statement indices (into the `stmtRefs` arena).
+@repr(c)
+export struct XBlock {
+    span: XSpan
+    stmtsFirst: u32
+    stmtsCount: u32
+}
+
+// ---------------------------------------------------------------------------------------------
+// Type kinds, the order of `TypeKind` in types.h
+
+export const XT_VOID: i32 = 0
+export const XT_NEVER: i32 = 1
+export const XT_BOOL: i32 = 2
+export const XT_INT: i32 = 3
+export const XT_FLOAT: i32 = 4
+export const XT_POINTER: i32 = 5
+export const XT_FN_PTR: i32 = 6
+export const XT_ARRAY: i32 = 7
+export const XT_ENUM: i32 = 8
+export const XT_STRUCT: i32 = 9
+export const XT_CLASS: i32 = 10
+export const XT_INTERFACE: i32 = 11
+export const XT_STR: i32 = 12
+export const XT_SLICE: i32 = 13
+export const XT_TUPLE: i32 = 14
+export const XT_NAMED: i32 = 15
+
+/// One type node; the fields of the C++ `Type`. `path` parts and the child type lists are ranges;
+/// children are built before the node that ranges over them.
+@repr(c)
+export struct XType {
+    kind: i32
+    bits: u32
+    isSigned: u32
+    isMutable: u32
+    pathFirst: u32 ///< string table
+    pathCount: u32
+    elem: i32 ///< type index (Pointer/Array pointee, Enum underlying)
+    paramsFirst: u32 ///< type index arena (FnPtr)
+    paramsCount: u32
+    ret: i32 ///< type index (FnPtr)
+    argsFirst: u32 ///< type index arena (generic arguments, Tuple elements)
+    argsCount: u32
+    length: i32 ///< expr index (Array length)
+    span: XSpan
+}
+
+// ---------------------------------------------------------------------------------------------
+// Declarations, the order of the `Decl` variant in ast.h
+
+export const XD_FN: i32 = 0
+export const XD_GLOBAL: i32 = 1
+export const XD_STRUCT: i32 = 2
+export const XD_CLASS: i32 = 3
+export const XD_INTERFACE: i32 = 4
+export const XD_IMPL: i32 = 5
+export const XD_ENUM: i32 = 6
+export const XD_TYPE_ALIAS: i32 = 7
+export const XD_DEFINE_CONST: i32 = 8
+export const XD_DEFINE_MACRO: i32 = 9
+export const XD_IMPORT: i32 = 10
+export const XD_EXPORT_FROM: i32 = 11
+export const XD_MACRO_CALL: i32 = 12
+export const XD_TOP_LEVEL_CALL: i32 = 13
+export const XD_FN_ALIAS: i32 = 14
+
+/// Attribute argument kinds (C++ `AttributeArg::Kind`).
+export const XAA_IDENT: i32 = 0
+export const XAA_INT: i32 = 1
+export const XAA_STRING: i32 = 2
+
+@repr(c)
+export struct XAttrArg {
+    kind: i32
+    key: XStr
+    text: XStr
+    number: i64
+    span: XSpan
+}
+
+@repr(c)
+export struct XAttr {
+    name: XStr
+    argsFirst: u32 ///< XAttrArg arena
+    argsCount: u32
+    span: XSpan
+}
+
+@repr(c)
+export struct XParam {
+    name: XStr
+    typeIdx: i32 ///< type index
+    isSelf: u32
+    isPack: u32
+    typedSelf: u32
+    hasType: u32
+    span: XSpan
+}
+
+@repr(c)
+export struct XField {
+    name: XStr
+    typeIdx: i32 ///< type index
+    attrsFirst: u32 ///< XAttr arena
+    attrsCount: u32
+    span: XSpan
+}
+
+@repr(c)
+export struct XSumVariant {
+    name: XStr
+    payloadFirst: u32 ///< type index arena
+    payloadCount: u32
+}
+
+@repr(c)
+export struct XEnumMember {
+    name: XStr
+    value: i32 ///< expr index, -1 = auto-numbered
+    hasPayload: u32
+    payloadFirst: u32 ///< type index arena
+    payloadCount: u32
+    attrsFirst: u32 ///< XAttr arena
+    attrsCount: u32
+    span: XSpan
+}
+
+/// Macro parameter kinds (C++ `MacroParam::Kind`).
+export const XMP_EXPR: i32 = 0
+export const XMP_TYPE: i32 = 1
+export const XMP_IDENT: i32 = 2
+export const XMP_BLOCK: i32 = 3
+export const XMP_ITEMS: i32 = 4
+
+@repr(c)
+export struct XMacroParam {
+    kind: i32
+    name: XStr
+    span: XSpan
+}
+
+@repr(c)
+export struct XImportName {
+    name: XStr
+    alias: XStr
+    span: XSpan
+}
+
+/// Import/export forms (C++ `ImportDecl::Form` / `ExportFromDecl::Form`).
+export const XF_MODULE: i32 = 0
+export const XF_STAR: i32 = 1
+export const XF_STAR_AS: i32 = 2
+export const XF_NAMES: i32 = 3
+
+/// One raw token kept in the tree (macro bodies and macro call arguments); the C++ `Token`.
+@repr(c)
+export struct XTok {
+    kind: i32
+    text: XStr
+    intValue: u64
+    floatValue: f64
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+    newlineBefore: u32
+}
+
+/// One raw token list (a macro argument, or the whole body of a `define`).
+@repr(c)
+export struct XTokList {
+    first: u32 ///< XTok arena
+    count: u32
+}
+
+/// One declaration record: the union of the fields the fifteen C++ declaration structs carry,
+/// tagged by `kind`. Unused fields stay zero. Methods of a class/interface/impl are Fn records
+/// in the same declaration arena, ranged over by `methodsFirst/Count`.
+/// The forms of `import` (Module, Star, StarAs, Names) and `export ... from` (Star, StarAs, Names).
+export const XIMP_MODULE: u32 = 0
+export const XIMP_STAR: u32 = 1
+export const XIMP_STAR_AS: u32 = 2
+export const XIMP_NAMES: u32 = 3
+export const XEF_STAR: u32 = 0
+export const XEF_STAR_AS: u32 = 1
+export const XEF_NAMES: u32 = 2
+
+@repr(c)
+export struct XDecl {
+    form: u32 ///< XIMP_* (Import) or XEF_* (ExportFrom)
+    kind: i32
+    name: XStr
+    attrsFirst: u32 ///< XAttr arena
+    attrsCount: u32
+    span: XSpan
+    nameSpan: XSpan
+    genericFirst: u32 ///< string table
+    genericCount: u32
+    paramsFirst: u32 ///< XParam arena (Fn)
+    paramsCount: u32
+    hasRet: u32
+    ret: i32 ///< type index
+    hasBody: u32
+    body: i32 ///< block index
+    isVirtual: u32
+    isOverride: u32
+    typeIdx: i32 ///< type index (Global/Const, TypeAlias target)
+    hasType: u32
+    isConst: u32
+    init: i32 ///< expr index (Global init, DefineConst value)
+    fieldsFirst: u32 ///< XField arena (Struct/Class)
+    fieldsCount: u32
+    opaque: u32
+    isUnion: u32
+    isPayload: u32
+    variantsFirst: u32 ///< XSumVariant arena (Struct of a payload enum)
+    variantsCount: u32
+    methodsFirst: u32 ///< XDecl arena, kind Fn (Class/Interface/Impl)
+    methodsCount: u32
+    baseHas: u32
+    baseFirst: u32 ///< string table (Class base path)
+    baseCount: u32
+    ifacePathFirst: u32 ///< string table (Impl)
+    ifacePathCount: u32
+    ifaceArgsFirst: u32 ///< type index arena (Impl)
+    ifaceArgsCount: u32
+    implTarget: i32 ///< type index (Impl target type)
+    hasUnderlying: u32
+    underlying: i32 ///< type index (Enum)
+    membersFirst: u32 ///< XEnumMember arena (Enum)
+    membersCount: u32
+    macroParamsFirst: u32 ///< XMacroParam arena (DefineMacro)
+    macroParamsCount: u32
+    macroBodyFirst: u32 ///< XTok arena (DefineMacro)
+    macroBodyCount: u32
+    module: XStr
+    moduleSpan: XSpan
+    alias: XStr
+    namesFirst: u32 ///< XImportName arena (Import/ExportFrom)
+    namesCount: u32
+    exceptFirst: u32 ///< XImportName arena (ExportFrom)
+    exceptCount: u32
+    macroArgsFirst: u32 ///< XTokList arena (MacroCall item)
+    macroArgsCount: u32
+    call: i32 ///< expr index (TopLevelCall)
+    targetPathFirst: u32 ///< string table (FnAlias)
+    targetPathCount: u32
+    targetSpan: XSpan
+}
+
+/// The modifiers of one item (C++ `Modifiers`).
+@repr(c)
+export struct XItem {
+    exported: u32
+    exportC: u32
+    declared: u32
+    registered: u32
+    registerRole: XStr
+    decl: i32 ///< XDecl index
+}
+
+/// One label of an error: a span and its text.
+@repr(c)
+export struct XErrLabel {
+    span: XSpan
+    text: XStr
+}
+
+/// One syntax error: the message, the labels (first is primary) and the detail and fix hints.
+@repr(c)
+export struct XErr {
+    message: XStr
+    detail: XStr
+    fix: XStr
+    labelsFirst: u32 ///< XErrLabel arena
+    labelsCount: u32
+}
+
+/// The whole program: the file, its `@file(...)` attributes and the items.
+@repr(c)
+export struct XProgram {
+    file: u32
+    fileAttrsFirst: u32 ///< XAttr arena
+    fileAttrsCount: u32
+    itemsFirst: u32 ///< XItem arena
+    itemsCount: u32
+}

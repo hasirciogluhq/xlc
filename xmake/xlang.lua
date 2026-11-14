@@ -3,9 +3,9 @@
 --
 -- Each entry file is compiled by the installed `xl` into one object. `src/lang/compiler.xl`
 -- imports `src/lang/lexer/*.xl` and `src/lang/preprocess/*.xl`, so one object carries them all;
--- `src/lang/lexer/lexer.cpp`, `src/lang/preprocess/preprocess.cpp` and
+-- `src/lang/lexer/lexer.cpp`, `src/lang/preprocess/directives_bridge.cpp` and
 -- `src/lang/macro/macro.cpp` bridge the C ABI on the C++ side
--- (include/xlang/lang/lexer_c.h, preprocess_c.h, macro_c.h).
+-- (include/xlang/lang/lexer_c.h, directives_c.h, macro_c.h).
 --
 -- `XL_XL` selects the `xl` binary (default: `xl` on PATH). A missing or failing `xl` fails the
 -- build instead of linking a stale object.

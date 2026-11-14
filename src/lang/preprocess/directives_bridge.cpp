@@ -1,14 +1,15 @@
-// The seam between the C++ compiler and the preprocessor written in xlang
+// The seam between the C++ compiler and the directive walk written in xlang
 // (src/lang/preprocess/preprocess.xl).
 //
-// The directive walk itself lives on the xlang side; this file turns the token stream and the
-// resolved definitions into the flat arrays of include/xlang/lang/preprocess_c.h, calls
-// `xlcPreprocess`, and turns the frozen result back into `Token` values, reporting the
-// diagnostics the xlang side collected as E0003. Token kinds cross the boundary as the numbers of
-// `enum class TokenKind`; src/lang/lexer/tokens.xl must agree number for number.
-#include "xlang/lang/preprocess.h"
+// Nothing here decides a `#if`: the evaluation lives on the xlang side. This file is the only C++
+// code that touches the boundary, so it turns the token stream and the resolved definitions into
+// the flat arrays of include/xlang/lang/directives_c.h, calls `xlcPreprocess`, and turns the frozen
+// result back into `Token` values, reporting the diagnostics the xlang side collected as E0003.
+// Token kinds cross the boundary as the numbers of `enum class TokenKind`; src/lang/lexer/tokens.xl
+// must agree number for number.
+#include "xlang/lang/directives.h"
 
-#include "xlang/lang/preprocess_c.h"
+#include "xlang/lang/directives_c.h"
 
 #include <cstdint>
 #include <string>
@@ -21,10 +22,10 @@ namespace {
 /// The bytes of an empty token text: the boundary wants a valid pointer even for length zero.
 const char kEmptyText[1] = {'\0'};
 
-}  // namespace
+} // namespace
 
-std::vector<Token> preprocess(std::vector<Token> tokens, const BuildConfig& config,
-                              DiagnosticEngine& diagnostics) {
+std::vector<Token>
+preprocess(std::vector<Token> tokens, const BuildConfig& config, DiagnosticEngine& diagnostics) {
     // Every token of one call belongs to one file; the diagnostics and the result spans carry
     // that file id, which the boundary does not know.
     const FileId file = tokens.empty() ? FileId{} : tokens.front().span.file;
@@ -78,9 +79,10 @@ std::vector<Token> preprocess(std::vector<Token> tokens, const BuildConfig& conf
         raw_tokens.push_back(raw);
     }
 
-    const XlcPreprocessResult result =
-        xlcPreprocess(raw_tokens.data(), static_cast<std::uint32_t>(raw_tokens.size()),
-                      defines.data(), static_cast<std::uint32_t>(defines.size()));
+    const XlcPreprocessResult result = xlcPreprocess(raw_tokens.data(),
+                                                     static_cast<std::uint32_t>(raw_tokens.size()),
+                                                     defines.data(),
+                                                     static_cast<std::uint32_t>(defines.size()));
 
     std::vector<Token> out;
     out.reserve(result.token_count);
@@ -109,7 +111,9 @@ std::vector<Token> preprocess(std::vector<Token> tokens, const BuildConfig& conf
             span.end_line = raw.labels[0].end_line;
             span.end_column = raw.labels[0].end_column;
         }
-        diagnostics.error("E0003", span, std::string(raw.message, raw.message_len),
+        diagnostics.error("E0003",
+                          span,
+                          std::string(raw.message, raw.message_len),
                           raw.label_count > 0
                               ? std::string(raw.labels[0].text, raw.labels[0].text_len)
                               : std::string());
@@ -118,4 +122,4 @@ std::vector<Token> preprocess(std::vector<Token> tokens, const BuildConfig& conf
     return out;
 }
 
-}  // namespace xlang
+} // namespace xlang

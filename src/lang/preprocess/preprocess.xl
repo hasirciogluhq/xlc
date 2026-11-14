@@ -7,7 +7,7 @@
 // NAME (the CLI wins).
 //
 // The C++ side sees `xlcPreprocess` and `xlcPreprocessFree` only
-// (include/xlang/lang/preprocess_c.h); everything here is the implementation behind them.
+// (include/xlang/lang/directives_c.h); everything here is the implementation behind them.
 from "std" import String, Vec, format
 from "std/str" import fromParts
 from "../abi" import CToken, CDefine, CPreResult, CError, CLabel
@@ -355,7 +355,7 @@ class Preprocessor {
 
 /// The heap block `xlcPreprocess` returns: everything the result points into, plus the
 /// `String`s behind the error messages. `xlcPreprocessFree` drops exactly this.
-class PreBlock {
+class DirectiveBlock {
     pre: *Preprocessor
     result: CPreResult
 }
@@ -366,7 +366,7 @@ class PreBlock {
 export(c) fn xlcPreprocess(tokens: *CToken, tokenCount: u32, defines: *CDefine,
                            defineCount: u32) -> CPreResult {
     local pre = new Preprocessor(tokens, tokenCount, defines, defineCount)
-    local block = new PreBlock {
+    local block = new DirectiveBlock {
         pre: pre,
         result: CPreResult { tokens: nil, tokenCount: 0, errors: nil, errorCount: 0, block: nil },
     }
@@ -380,7 +380,7 @@ export(c) fn xlcPreprocess(tokens: *CToken, tokenCount: u32, defines: *CDefine,
 /// vectors.
 export(c) fn xlcPreprocessFree(result: CPreResult) {
     if result.block == nil { return }
-    local block = result.block as *PreBlock
+    local block = result.block as *DirectiveBlock
     block.pre.parser.dropArena()
     delete block
 }

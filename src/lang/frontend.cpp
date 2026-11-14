@@ -1,8 +1,8 @@
 #include "xlang/lang/frontend.h"
 
+#include "xlang/lang/directives.h"
 #include "xlang/lang/lexer.h"
 #include "xlang/lang/parser.h"
-#include "xlang/lang/preprocess.h"
 
 namespace xlang {
 

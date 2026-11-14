@@ -1,9 +1,11 @@
 #pragma once
 
-// The C boundary of the preprocessor, which is written in xlang (src/lang/preprocess/) and built
-// into the compiler as an object file. This header is the C++ side of that seam: `preprocess()` in
-// src/lang/preprocess/preprocess.cpp turns the token stream and the resolved definitions into the
-// flat arrays below, calls `xlcPreprocess`, and turns the frozen result back into `Token` values.
+// The C boundary of the directive walk (`#if/#elif/#else/#endif/#ifdef/#ifndef/#error`), which is
+// written in xlang (src/lang/preprocess/) and built into the compiler as an object file. This
+// header is the C++ side of that seam: `preprocess()` in
+// src/lang/preprocess/directives_bridge.cpp turns the token stream and the resolved definitions into
+// the flat arrays below, calls `xlcPreprocess`, and turns the frozen result back into `Token`
+// values.
 //
 // Ownership: everything the xlang side returns lives in one block that `xlcPreprocessFree`
 // releases through the `block` field of the result. The token texts of the result point into that
@@ -35,13 +37,12 @@ typedef struct XlcDefine {
     uint32_t string_len;
 } XlcDefine;
 
-/// One preprocessing error: the code is always E0003, as the C++ preprocessor reported it. Same
-/// shape as `XlcLexError`.
+/// One error of the directive walk: the code is always E0003. Same shape as `XlcLexError`.
 typedef XlcLexError XlcPreprocessError;
 
-/// The frozen outcome of one file: the tokens that survive preprocessing (always ending in kind 0,
-/// end of file) and the errors found on the way. `block` is the opaque handle `xlcPreprocessFree`
-/// releases.
+/// The frozen outcome of one file: the tokens that survive the directive walk (always ending in
+/// kind 0, end of file) and the errors found on the way. `block` is the opaque handle
+/// `xlcPreprocessFree` releases.
 typedef struct XlcPreprocessResult {
     const XlcLexToken* tokens;
     uint32_t token_count;
@@ -51,7 +52,7 @@ typedef struct XlcPreprocessResult {
 } XlcPreprocessResult;
 
 /// Resolves the directives of `token_count` tokens against `define_count` definitions (see
-/// preprocess.h for the semantics). The result is owned by the callee's allocator and must be
+/// directives.h for the semantics). The result is owned by the callee's allocator and must be
 /// passed to `xlcPreprocessFree` exactly once. The spans carry lines and columns only; the caller
 /// stamps its own file onto them.
 XlcPreprocessResult XLC_PREPROCESS_CALL xlcPreprocess(const XlcLexToken* tokens,

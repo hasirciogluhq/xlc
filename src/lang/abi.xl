@@ -2,7 +2,7 @@
 // expander).
 //
 // Every struct here is the layout of a struct in include/xlang/lang/lexer_c.h,
-// include/xlang/lang/preprocess_c.h or include/xlang/lang/macro_c.h, field for field. A part
+// include/xlang/lang/directives_c.h or include/xlang/lang/macro_c.h, field for field. A part
 // fills its result and hands it to C++; the C++ side copies what it keeps and releases the whole
 // block through the result's `block` handle, so nothing on this side is freed behind C++'s back.
 // The structs stay flat: a nested struct shifted the offsets once already (a u32 followed by an
@@ -113,7 +113,7 @@ export struct CValue {
 }
 
 /// One definition that crossed the boundary: a name and its value. The value fields are flat so
-/// the layout matches `XlcDefine` of preprocess_c.h field for field with no nested padding.
+/// the layout matches `XlcDefine` of directives_c.h field for field with no nested padding.
 @repr(c)
 export struct CDefine {
     name: *u8
@@ -124,7 +124,7 @@ export struct CDefine {
     strLen: u32
 }
 
-/// The `XlcPreprocessResult` of preprocess_c.h: the tokens that survive preprocessing, the
+/// The `XlcPreprocessResult` of directives_c.h: the tokens that survive the directive walk, the
 /// errors collected on the way, and the handle `xlcPreprocessFree` releases.
 @repr(c)
 export struct CPreResult {

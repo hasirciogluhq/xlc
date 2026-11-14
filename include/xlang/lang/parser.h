@@ -19,4 +19,9 @@ namespace xlang {
 [[nodiscard]] Program parseTokens(std::vector<Token> tokens, FileId file,
                                   DiagnosticEngine& diagnostics);
 
+/// Parses through the xlang parser (src/lang/parser/parser.xl) over the frozen C boundary. The
+/// reference `parseTokens` dispatches here when `XLC_PARSER` says so; see bridge.cpp.
+[[nodiscard]] Program parseTokensFlat(std::vector<Token> tokens, FileId file,
+                                      DiagnosticEngine& diagnostics);
+
 }  // namespace xlang
