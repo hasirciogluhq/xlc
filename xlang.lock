@@ -2,6 +2,6 @@
 
 [[package]]
 name = "github.com/hasirciogluhq/xl-std"
-version = "v1.6.1"
-commit = "d05a9120afdcfd4f63d7b2453c05fd737482191c"
+version = "v1.6.2"
+commit = "af7a5b36990e0a321341a800153978c4ca5b2867"
 source = "https://github.com/hasirciogluhq/xl-std.git"

@@ -366,7 +366,7 @@ export fn parseArgs(args: Vec<String>) -> Opts {
             // `--context` sets both counts; `--context-errors`/`--context-warnings` below win.
             local v = String(valueOf(&argv, &i, a, &o))
             local n: u64 = 0
-            if toU64(v.asStr(), &n) {
+            if toU64(&v, &n) {
                 o.contextErrors = n
                 o.contextWarnings = n
             } else {
@@ -375,7 +375,7 @@ export fn parseArgs(args: Vec<String>) -> Opts {
         } else if startsWith(a, "--context-errors=") || a == "--context-errors" {
             local v = String(valueOf(&argv, &i, a, &o))
             local n: u64 = 0
-            if toU64(v.asStr(), &n) {
+            if toU64(&v, &n) {
                 o.contextErrors = n
             } else {
                 o.bad = format("`--context-errors {}` must be a count", v.asStr())
@@ -383,7 +383,7 @@ export fn parseArgs(args: Vec<String>) -> Opts {
         } else if startsWith(a, "--context-warnings=") || a == "--context-warnings" {
             local v = String(valueOf(&argv, &i, a, &o))
             local n: u64 = 0
-            if toU64(v.asStr(), &n) {
+            if toU64(&v, &n) {
                 o.contextWarnings = n
             } else {
                 o.bad = format("`--context-warnings {}` must be a count", v.asStr())
