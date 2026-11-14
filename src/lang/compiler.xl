@@ -9,3 +9,7 @@ from "macro/expand" import xlcExpandMacros, xlcExpandMacrosFree
 from "../hir/dump" import xlcHirDump, xlcHirDumpFree
 from "../hir/prune" import xlcHirPrune, xlcHirPruneFree
 from "parser/parser" import xlcParse
+from "../util/source" import xlcUtilSourcesNew, xlcUtilAddFile, xlcUtilSourcesFree
+from "../util/diagnostics" import xlcDiagNew, xlcDiagConfigure, xlcDiagAddAllowScope,
+    xlcDiagReport, xlcDiagBeginQuiet, xlcDiagEndQuiet, xlcDiagFlush, xlcDiagExplain,
+    xlcDiagFreeEngine

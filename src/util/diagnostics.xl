@@ -1,0 +1,1304 @@
+// The diagnostic engine (port of src/util/diagnostics.cpp and include/xlang/util/diagnostics.h).
+//
+// One engine collects the diagnostics of a compilation, applies the registry severity and the
+// allow/deny rules, and `flush` renders the queue ordered by source position (the lexer runs ahead
+// of the parser, so reporting order alone would not be source order). Reported text lives in one
+// byte arena (`bytes`) addressed by `Txt` views, so `Diagnostic` and its labels stay plain data
+// that a `Vec` can own; the rendered output of `flush` is one `String` the caller reads until the
+// next flush. The C ABI entry points at the bottom are the util bridge (src/util/xl_bridge.hpp).
+
+from "std" import String, Vec, format
+from "std/io" import fsWrite, fsAppend
+from "std/str" import eq, find, findLast, fromParts, startsWith, view
+from "source" import Span, SourceManager, XbStr, NO_FILE, spanNone
+
+// -------------------------------------------------------------------------------------------
+// Severity, the diagnostic record and the registry
+
+export const SEV_WARNING: i32 = 0
+export const SEV_ERROR: i32 = 1
+
+export const FORMAT_TEXT: i32 = 0
+export const FORMAT_JSON: i32 = 1
+
+export const LOG_ALL: i32 = 0
+export const LOG_ERROR: i32 = 1
+
+/// One string of the engine's byte arena.
+@repr(c)
+export struct Txt {
+    off: u32
+    len: u32
+}
+
+/// One marked place of a diagnostic. The first label is the primary one; further labels show the
+/// other side of a conflict.
+export struct Label {
+    span: Span
+    text: Txt
+}
+
+/// A secondary message at a place, such as the request that caused an instantiation.
+export struct Note {
+    span: Span
+    hasSpan: u32
+    message: Txt
+}
+
+/// One diagnostic: the code, the message, the marked places and the detail/reason/fix blocks.
+export struct Diagnostic {
+    code: Txt
+    severity: i32
+    message: Txt
+    labelsFirst: i32 ///< range in the engine's label arena
+    labelsCount: u32
+    notesFirst: i32 ///< range in the engine's note arena
+    notesCount: u32
+    detail: Txt ///< what exactly is wrong
+    reason: Txt ///< why it matters
+    fix: Txt ///< how to fix it
+    suppressed: u32
+    // The flush order key, taken from the primary label at report time (the C++ side computes it
+    // in flush; a plain function comparator needs the key inside the record).
+    keyFile: u32
+    keyLine: u32
+    keyColumn: u32
+}
+
+/// Registry entry: every code the compiler can emit lives in one table.
+export struct DiagnosticInfo {
+    code: str
+    severity: i32
+    title: str
+    explanation: str
+}
+
+global REGISTRY: [DiagnosticInfo; 95] = [
+    DiagnosticInfo { code: "E0001", severity: 1, title: "lexical error", explanation: "The source contains a character, literal or escape the lexer cannot read (unknown character, unterminated string, malformed number, misplaced `#` directive). Fix the token at the marked position." },
+    DiagnosticInfo { code: "E0002", severity: 1, title: "syntax error", explanation: "The tokens do not form a valid construct at the marked position. The detail line names what the parser expected. Statements and items end at a line break; an expression may continue on the next line only inside parentheses/brackets or after a binary operator." },
+    DiagnosticInfo { code: "E0003", severity: 1, title: "preprocessor error", explanation: "A `#error` directive was reached, a conditional-compilation directive is malformed (missing condition, `#endif`, stray `#else`), or a condition uses an undefined name or mixes kinds. Use `defined(NAME)` to test for optional definitions." },
+    DiagnosticInfo { code: "E0004", severity: 1, title: "macro expansion error", explanation: "A macro call has the wrong number or kind of arguments, a macro is defined twice, or expansion is deeper than 64 levels. The labels show the expansion chain." },
+    DiagnosticInfo { code: "W0201", severity: 0, title: "layout of a declared type is unknown, C layout assumed", explanation: "A `declare`d struct/class/global has no layout record in the linked objects and no entry in `xl.layout`, so the C layout is assumed. Add `@repr(c)` if the other side is C/C++, build the other side with xl so a layout record is emitted, or silence it with `@allow(W0201)` / `--allow=W0201`." },
+    DiagnosticInfo { code: "W0202", severity: 0, title: "declared layout contradicts the recorded layout", explanation: "The layout written in the `declare` differs from the recorded layout of the same type." },
+    DiagnosticInfo { code: "W0203", severity: 0, title: "layout record uses a different layout scheme", explanation: "The layout record was produced by another default layout scheme version (for example v2 vs v3)." },
+    DiagnosticInfo { code: "W0301", severity: 0, title: "declared symbol not resolved in this compilation", explanation: "The symbol is `declare`d but not defined in this compilation; it will be looked up at link time." },
+    DiagnosticInfo { code: "E0302", severity: 1, title: "type not expressible in C used in `export(c)` or `declare`", explanation: "`export(c)` and `declare` signatures follow the target's C calling convention and accept only C-compatible types: integers, `f32/f64`, `bool`, `*T`, `@repr(c)` structs, function pointers and integer-based enums." },
+    DiagnosticInfo { code: "W0401", severity: 0, title: "same entity imported/exported through two paths", explanation: "Not an error (it is one entity), but two paths may silently conflict later if one of them defines its own symbol. Import through a single path or use `import * as ns`." },
+    DiagnosticInfo { code: "E0401", severity: 1, title: "different entities bound to the same name", explanation: "Two imports or exports bind the same name to different entities. Rename one with `as`, use `except`, or import into a namespace with `import * as ns`." },
+    DiagnosticInfo { code: "E0501", severity: 1, title: "no registered `alloc`, `free` or `unwind` function", explanation: "`new T { }` gets its memory from the function registered with `register(alloc)`, `delete p` releases it through the function registered with `register(free)`, and `try` / `catch` runs on the function registered with `register(unwind)`; the needed one was not found. Register it, or write `new(p) T { }` with memory you already have." },
+    DiagnosticInfo { code: "E0502", severity: 1, title: "duplicate `register`", explanation: "A role (or a global name) was registered twice. At most one registration per role is allowed per group (a module root is the library group, everything else the program group); remove the extra registration. A program registration replaces a library default of the same role." },
+    DiagnosticInfo { code: "E0503", severity: 1, title: "`register` role contract not met", explanation: "The registered symbol does not fit its role: `panic` is `fn(msg: *u8)`, `alloc` is `fn(size: usize, align: usize) -> *void`, `free` is `fn(p: *void)`, `unwind` is `fn(op: i32, snapshot: *usize, message: *u8)`." },
+    DiagnosticInfo { code: "E0504", severity: 1, title: "interface used without `impl`", explanation: "Interfaces are nominal: a type is usable as an interface only after `impl Interface for Type`, even when its method names match." },
+    DiagnosticInfo { code: "W0402", severity: 0, title: "local name shadows a registered global", explanation: "A local definition or import hides a `register`ed global name. The role binding is unaffected because it is bound by registration, not by name." },
+    DiagnosticInfo { code: "E0601", severity: 1, title: "implicit signedness-changing conversion", explanation: "An implicit conversion changes signedness (`u <-> i`, `u -> f`; floats count as signed), or a binary operation mixes signedness. Use `as`, or write the expression inside an `unsafe { }` block." },
+    DiagnosticInfo { code: "E0701", severity: 1, title: "constant array index out of bounds", explanation: "A constant index is outside `[0, N)`. Checked regardless of `--safety` and cannot be silenced." },
+    DiagnosticInfo { code: "E0702", severity: 1, title: "static assertion failed", explanation: "A `staticAssert` condition evaluated to false at compile time (or was not a bool constant)." },
+    DiagnosticInfo { code: "E0703", severity: 1, title: "type has no known size", explanation: "`sizeOf`/layout needs a sized type: `void`, opaque `declare` types, types from modules that are not loaded, and types that contain themselves by value have none." },
+    DiagnosticInfo { code: "E0704", severity: 1, title: "cyclic type alias", explanation: "A `type` alias refers to itself, directly or through other aliases." },
+    DiagnosticInfo { code: "E0705", severity: 1, title: "invalid enum or layout attribute", explanation: "An enum has a non-constant underlying type, a duplicate member, a missing value in a non-integer enum or a value of the wrong kind; or `@align`/`@layout` has a bad argument." },
+    DiagnosticInfo { code: "E0706", severity: 1, title: "unknown type or name", explanation: "The name is not declared in this module (or is not of the expected kind)." },
+    DiagnosticInfo { code: "E0707", severity: 1, title: "not a compile-time constant", explanation: "A constant expression (array length, enum value, `staticAssert`, `sizeOf` argument) uses something that cannot be evaluated at compile time." },
+    DiagnosticInfo { code: "E0708", severity: 1, title: "type mismatch", explanation: "A value does not have the type its context needs and no implicit conversion exists (`as` is required for narrowing, float to integer, pointer casts and so on)." },
+    DiagnosticInfo { code: "E0709", severity: 1, title: "invalid operation", explanation: "An operator, field access, index, call or assignment does not apply to the operand: unknown field or method, dereferencing a non-pointer, assigning to a non-place, `&` of a temporary, arithmetic on pointers, and similar." },
+    DiagnosticInfo { code: "E0710", severity: 1, title: "wrong number of arguments", explanation: "A call has a different number of arguments than the callee declares, or a `syscall` has more arguments than the target allows." },
+    DiagnosticInfo { code: "E0711", severity: 1, title: "module or imported name not found", explanation: "An `import`/`export ... from` names a module that cannot be located, a path that is both `x.xl` and `x/index.xl`, or a name the module does not export." },
+    DiagnosticInfo { code: "E0712", severity: 1, title: "invalid `virtual`/`override` use", explanation: "A method marked `override` replaces nothing, replaces a method with a different signature, re-declares an already virtual method without `override`, or hides a virtual base method with a plain method." },
+    DiagnosticInfo { code: "E0713", severity: 1, title: "`impl` does not match its interface", explanation: "An `impl Interface for Type` lacks a method of the interface, defines a method the interface does not have, or a method has a different signature." },
+    DiagnosticInfo { code: "E0714", severity: 1, title: "code generation failed", explanation: "The back end could not lower the program: an unresolved external reference, a syscall form the target does not support, a generated module that failed LLVM verification, or a module whose back end returned no object without a reason (an internal error that names the module)." },
+    DiagnosticInfo { code: "E0403", severity: 1, title: "ambiguous overloaded call or use", explanation: "Several overloads of a function match the arguments (or the expected function type) equally well, so no one is chosen. Give the arguments types that prefer one overload, or use a typed value instead of an untyped literal." },
+    DiagnosticInfo { code: "E0404", severity: 1, title: "no overload matches", explanation: "No overload of a function takes these arguments (or has the expected function type). The diagnostic lists the declared signatures. Change the arguments or the call." },
+    DiagnosticInfo { code: "E0405", severity: 1, title: "function cannot be overloaded", explanation: "A name with more than one declaration names a function that cannot be overloaded: `main`, a `register`ed function, `export(c)` (one C symbol per name) or `declare` (one external symbol). Keep a single declaration with that name." },
+    DiagnosticInfo { code: "E0715", severity: 1, title: "`const` initializer is not a compile-time constant", explanation: "The value of a `const` (module level or in a block) must be known at compile time: literals, arithmetic and casts on them, `define` constants, arrays and struct literals of such values, and `&global`. Calls and reads of other variables or `const`s are not allowed. A module-level `const` without a type must have a literal value; write `const NAME: T = ...` otherwise." },
+    DiagnosticInfo { code: "E0716", severity: 1, title: "write to a read-only place", explanation: "A value that cannot change is assigned to: an element or field of a `str` (`s[i] = x`, `s.len = n`), or the name of a `const`. Copy the bytes into a `[u8; N]` local or a `String` to get a writable buffer." },
+    DiagnosticInfo { code: "E0717", severity: 1, title: "string literal does not fit the array", explanation: "A string literal initializes a `[u8; N]` but has more than N bytes. Make the array longer, or use a `str` value instead." },
+    DiagnosticInfo { code: "E0726", severity: 1, title: "reserved entry symbol", explanation: "A symbol named `_start`, `mainCRTStartup` or `_xl_initAll` was requested through `export(c)`, `@mangle` or `declare`. The compiler generates these symbols to start the program. Rename the function or global." },
+    DiagnosticInfo { code: "E0727", severity: 1, title: "call or value use of an `@init`, `@fini` or `@entry` function", explanation: "Hook functions are started by the generated code and cannot be called from code or used as a function value. Move the shared code into a normal function and call or use that." },
+    DiagnosticInfo { code: "E0729", severity: 1, title: "invalid `@init` or `@fini` function", explanation: "`@init` and `@fini` mark a module-level function with no generics, no parameters, no return type and a body. They are not allowed on methods or on other kinds of declarations." },
+    DiagnosticInfo { code: "E0720", severity: 1, title: "move out of a field, element or pointer", explanation: "A value that needs drop was moved out of a class field, an array element or a dereferenced pointer. Only locals and parameters can give up ownership. Take its address or copy it through a `clone()` method." },
+    DiagnosticInfo { code: "E0721", severity: 1, title: "value that needs drop in a place that cannot own it", explanation: "A global, a struct field, a local or a parameter has a type that needs drop, or an array whose element type needs drop, or a payload enum holds such a value. Structs and globals are plain data, arrays do not drop their elements, and a payload enum needs every payload type to be droppable through its variant. Use a class field or a local of a class type." },
+    DiagnosticInfo { code: "E0722", severity: 1, title: "invalid `init` or `drop` method", explanation: "An `init` method takes no return type, and a `drop` method takes only `self`, returns nothing and cannot be virtual. A class whose `init` needs a base constructor requires that base to have an `init` without arguments." },
+    DiagnosticInfo { code: "E0723", severity: 1, title: "literal for a class or struct with an `init`", explanation: "A class with an `init` cannot be built with a field literal, because the literal would skip the constructor. Build it with `T(...)` or allocate it with `new T(...)`." },
+    DiagnosticInfo { code: "E0724", severity: 1, title: "wrong or missing type arguments", explanation: "A generic declaration (`fn`, `struct`, `class`, `interface`, `enum` or `type`) needs one type argument per type parameter. A non-generic declaration takes none, and a generic function value needs its type arguments written out." },
+    DiagnosticInfo { code: "E0725", severity: 1, title: "generic instantiation too deep", explanation: "The type arguments of a generic instance nest more than 64 levels. Use a simpler type argument." },
+    DiagnosticInfo { code: "E0730", severity: 1, title: "generic method cannot be virtual", explanation: "A method with its own type parameters cannot be `virtual` or `override`: a vtable slot has one fixed signature. Remove the `virtual`/`override` or the type parameters." },
+    DiagnosticInfo { code: "E0731", severity: 1, title: "conflicting impls", explanation: "Two `impl` blocks give the same interface for the same type, after generic arguments are filled in. Keep one of them." },
+    DiagnosticInfo { code: "E0732", severity: 1, title: "impl type parameter not in the target", explanation: "Every type parameter of a generic `impl` must be a direct type argument of its target, so that the target type fixes it. Write `impl<T> Iface for Target<T>`." },
+    DiagnosticInfo { code: "E0733", severity: 1, title: "generic method outside a class", explanation: "Generic methods are monomorphized per class, so only methods of a `class` (not of an `impl` or an `interface`) can have their own type parameters. Move the method into the class, or make it a generic free function." },
+    DiagnosticInfo { code: "E0734", severity: 1, title: "invalid parameter pack", explanation: "A `..name` parameter takes the arguments after the fixed parameters, so it must be the last parameter, and a function can have only one. Remove the extra pack or move it to the end of the parameter list." },
+    DiagnosticInfo { code: "E0735", severity: 1, title: "parameter pack used as a value", explanation: "A parameter pack is not a value. Read its count with `name.len`, iterate it with `for x in name { }`, or pass it on with `..name` in a call. Nothing else may use it." },
+    DiagnosticInfo { code: "E0736", severity: 1, title: "parameter pack not allowed here", explanation: "Only a free function with a body can take a parameter pack. It cannot be `declare`d, `export(c)`, `virtual` or `override`, have type parameters, or be a method of a class, impl or interface." },
+    DiagnosticInfo { code: "E0737", severity: 1, title: "spread outside a pack call", explanation: "`..name` is valid only as an argument of a call, and only when `name` is the parameter pack of the enclosing function. Pass the pack's elements to a function that takes them, or write the arguments out." },
+    DiagnosticInfo { code: "E0738", severity: 1, title: "parameter pack indexed", explanation: "A parameter pack has no index operator, because its elements have different types. Iterate it with `for x in name { }`, or pass it on with `..name`." },
+    DiagnosticInfo { code: "E0739", severity: 1, title: "executable without an entry point", explanation: "`--emit=exe` (and `xl run`) needs exactly one `@entry` function with a body: the compiler generates the program start code around it. A program without `@entry` cannot be linked as an executable. Mark `@entry fn main()`, or build the file with `--emit=obj`, `--emit=static` or `--emit=shared`." },
+    DiagnosticInfo { code: "E0740", severity: 1, title: "invalid xlang.toml or xlang.lock", explanation: "The project manifest or lock file cannot be read or does not follow the format: a TOML syntax error, an unknown key, a dependency that is not named by a repository path such as `github.com/user/repo`, or a `[[native]]` entry without `link`. Fix the reported line; delete xlang.lock and run `xl install` if the lock is damaged." },
+    DiagnosticInfo { code: "E0741", severity: 1, title: "package not installed", explanation: "A package that the build needs is not in `.xlang/cache`, or the cached copy does not match the commit in xlang.lock. Builds never use the network: run `xl install` once." },
+    DiagnosticInfo { code: "E0742", severity: 1, title: "invalid version tag", explanation: "A dependency version must be `latest` (projects only) or a release tag: `vMAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH`, for example `v1.2.0`. Pre-release (`-rc.1`) and `-test` tags are never chosen as `latest` but install when named explicitly (`repo@v1.2.0-test`). A package that other projects depend on must pin exact tags for its own dependencies." },
+    DiagnosticInfo { code: "E0743", severity: 1, title: "conflicting package versions", explanation: "Two packages need different versions of the same repository and the project does not choose. There is one copy of each package per build. Name the version you want in the `[dependencies]` table of your own xlang.toml; the project's choice wins." },
+    DiagnosticInfo { code: "E0744", severity: 1, title: "package download failed", explanation: "`git` could not list or download a repository, the repository has no release tag, or a tag moved to another commit than the one recorded in xlang.lock. Release tags must never move." },
+    DiagnosticInfo { code: "E0745", severity: 1, title: "import of an undeclared package", explanation: "The import path looks like a repository path (`github.com/user/repo/...`) but no file matches and no `[dependencies]` entry of xlang.toml is a prefix of it. Run `xl install <repository>` to add it." },
+    DiagnosticInfo { code: "E0746", severity: 1, title: "native file missing", explanation: "A `[[native]]` entry lists a file that does not exist in the package at the installed version. Fix the `link` list, or commit the file." },
+    DiagnosticInfo { code: "E0747", severity: 1, title: "payload enum mixed with constant values", explanation: "An enum with payload variants (`Add(*Expr, *Expr)`) is a sum type: its tag is numbered by position. It cannot have an underlying type (`: T`) or `= value` members. Use two enums: one with constants, one with payloads." },
+    DiagnosticInfo { code: "E0749", severity: 1, title: "invalid case of a payload enum switch", explanation: "A `case` of a `switch` on a payload enum must name variants of that enum: `case E.A(x, y) { }` binds the payload (one name per value, `_` to ignore, alone in the case), `case E.A, E.B { }` matches without binding." },
+    DiagnosticInfo { code: "E0750", severity: 1, title: "switch does not cover every variant", explanation: "A `switch` on a payload enum without `default` must have a `case` for every variant. Add the missing cases or a `default`." },
+    DiagnosticInfo { code: "E0751", severity: 1, title: "wrong number of payload values", explanation: "A payload variant is built like a call, `E.A(x, y)`, with exactly as many values as its payload has; a variant without data is written `E.B`." },
+    DiagnosticInfo { code: "E0752", severity: 1, title: "invalid `@entry` function", explanation: "`@entry` marks a module-level function with no generics and a body, and a signature of no parameters or exactly `argc: i32` and `argv: **u8` in that order, returning void or i32. Methods and other declarations cannot be the entry." },
+    DiagnosticInfo { code: "E0753", severity: 1, title: "more than one `@entry` function", explanation: "A program has exactly one `@entry` function. Remove the second `@entry` attribute, or move the code into an `@init` function or a normal function that the entry calls." },
+    DiagnosticInfo { code: "E0754", severity: 1, title: "`@entry` in a static library or object file", explanation: "Static libraries and object files have no entry point: the program that links them provides it. Remove `@entry`, use `@init` for startup work and `@fini` for teardown." },
+    DiagnosticInfo { code: "E0755", severity: 1, title: "`@entry` arguments the target cannot pass", explanation: "The `argc`/`argv` form of `@entry` is available for executables. Shared libraries take `@entry fn name()` with no parameters. A Windows program is started with a command-line string only, so the arguments come from the `register(args)` function (`fn(argc: *i32) -> **u8`); the standard library registers one, and a program built without it registers its own." },
+    DiagnosticInfo { code: "E0756", severity: 1, title: "cannot infer the type arguments of a generic payload enum", explanation: "`Result.Ok(v)` names a variant of every instance of the enum, so the compiler needs the instance to build. Write the target type where the value is created, as in `local r: Result<i32, E> = Result.Ok(v)`." },
+    DiagnosticInfo { code: "E0757", severity: 1, title: "`case` names a variant of another enum", explanation: "Every `case` of a `switch` on a payload enum must name a variant of that same enum. Check the enum in front of the variant name, and write the variants of the enum being switched on." },
+    DiagnosticInfo { code: "E0758", severity: 1, title: "payload enum needs drop in a place that cannot own it", explanation: "An enum with a droppable payload owns that value and drops it with the live variant, so it is a local or a class field. It cannot be a global or a struct field, because those hold plain data and drop nothing. Use a local, a class field or a `Vec<T>`." },
+    DiagnosticInfo { code: "E0759", severity: 1, title: "array of a payload enum that needs drop", explanation: "An array of an enum whose payload needs drop cannot own its elements, because arrays do not drop their elements. Use a `Vec<T>`, whose elements are dropped when it is dropped." },
+    DiagnosticInfo { code: "E0760", severity: 1, title: "stack object returned as an interface", explanation: "An interface value is a fat pointer that borrows its object and owns nothing. Returning one whose object is a local, a parameter or a temporary of the function leaves it pointing at a frame that is gone. This is always an error and cannot be allowed. Allocate the object with `new` and return the pointer: `local p := new CProvider()` then `return p`." },
+    DiagnosticInfo { code: "E0761", severity: 1, title: "`?` in a place that cannot return", explanation: "`e?` returns the failure from the enclosing function. A `defer` body runs while the block is being left, after the function's result is decided, so it has nothing to return to and `?` is refused there. Handle the failure in the `defer` with `switch` or `if`." },
+    DiagnosticInfo { code: "E0762", severity: 1, title: "`?` on a value that is not a success-or-failure enum", explanation: "`e?` needs an enum of two variants: a success carrying one value and a failure carrying at most one (`Ok(T)` / `Err(E)`), or `None` / `Some(T)`. `?` gives the success value, or returns the failure from the function." },
+    DiagnosticInfo { code: "E0763", severity: 1, title: "`?` cannot return its failure from this function", explanation: "`e?` returns the failure of `e` from the function, so the function must return an enum of the same shape whose failure carries the same type (there is no conversion between error types). Match the error type, or handle the failure with a `switch`." },
+    DiagnosticInfo { code: "E0764", severity: 1, title: "missing return", explanation: "Control can reach the end of a function that has a return type: some path has no `return` (a loop that ends with `break`, an `if` without `else`, ...). A `-> never` function must not reach its end at all. End every path with `return`, an endless loop or a call to a `-> never` function. A function without `->` returns `void` and needs no `return`." },
+    DiagnosticInfo { code: "E0765", severity: 1, title: "invalid use of `never`", explanation: "`never` is the return type of a function that does not return (it exits, traps or loops forever). It is only written after `->`; a `-> never` function has no `return`, and a call to it has no value." },
+    DiagnosticInfo { code: "E0766", severity: 1, title: "drop through a base pointer would skip a derived drop", explanation: "`delete p` and `__builtin_drop(p)` with `p: *Base` run the drop of `Base` only when `Base` has no virtual method, but a class derived from `Base` has its own `drop` or a field that needs drop, and that part would never run. Give `Base` a virtual method: a polymorphic class drops through its vtable, so the drop of the object's own class runs. Or drop through a pointer to the derived class." },
+    DiagnosticInfo { code: "E0770", severity: 1, title: "closure parameter type unknown", explanation: "A closure parameter without a type takes it from the `fn(...)` type the closure is used for: an argument, a typed `local`, a field or a `return`. Here nothing names one. Write the type (`|x: i32| x * 2`), or give the closure a `fn(...)` context (`local f: fn(i32) -> i32 = |x| x * 2`)." },
+    DiagnosticInfo { code: "E0771", severity: 1, title: "closure parameter count does not match", explanation: "The closure is used where a `fn(...)` type is expected, and the type has a different number of parameters than the closure. Write as many parameters as the type has." },
+    DiagnosticInfo { code: "E0773", severity: 1, title: "closure with captures where a function pointer is expected", explanation: "A closure that uses variables of the enclosing function is a struct of those variables, and a `fn(...)` pointer has no place to keep them. Take the closure as a generic parameter (`fn apply<F>(f: F, x: i32)`), or pass the variable as an argument." },
+    DiagnosticInfo { code: "E0774", severity: 1, title: "`move` closure captures a value that needs drop", explanation: "`move` copies the captured variables into the closure's struct, which is plain data and cannot own a value that needs drop. Borrow the variable (write the closure without `move`)." },
+    DiagnosticInfo { code: "E0775", severity: 1, title: "type cannot be iterated", explanation: "`for x in value` over a struct or class needs `fn next(self: *T) -> Option<U>` (the value is its own iterator) or `fn iter(self: *T) -> I` where `I` has `next`. The type has neither." },
+    DiagnosticInfo { code: "E0776", severity: 1, title: "`iter` does not return an iterator", explanation: "`iter` must return a struct or class that has `next`; a type that only has `iter` gives the loop nothing to call. Add `next` to the returned type." },
+    DiagnosticInfo { code: "E0777", severity: 1, title: "`next` cannot end a loop", explanation: "`next` returns an enum with two variants, one carrying the item and one without data (`Some(T)` / `None`); the variant without data ends the loop. A `Result` or any other type has no end." },
+    DiagnosticInfo { code: "E0778", severity: 1, title: "C-convention function that passes a struct used as a value", explanation: "A call through a `fn(...)` pointer passes a struct as the address of a copy (the xlang convention). An `export(c)` or `declare` function that takes or returns a struct by value follows the C convention, so it can only be called by name. Call it directly, or change it to take and return the struct through a pointer." },
+    DiagnosticInfo { code: "E0779", severity: 1, title: "comparison operator takes an operand by value", explanation: "`a == b`, `a != b`, `a < b`, `a <= b`, `a > b` and `a >= b` on a struct or class call the operator function with the operands' addresses, so comparing never moves or drops a value. Declare every operand parameter as a pointer: `fn ==(a: *T, b: *T) -> bool`, or `fn <(self, other: *T) -> bool` in a class." },
+    DiagnosticInfo { code: "E0780", severity: 1, title: "use of a moved value", explanation: "Passing, returning or assigning a value whose type needs drop moves it: the new owner drops it, and the old name no longer holds a value. Reading the old name afterwards (on every path or only on some, such as after a move inside an `if` or a loop) would read an object that may already be dropped. Borrow it instead (`f(&x)` with a pointer parameter), move a copy (`x.clone()`), or assign `x` a new value before the use." },
+    DiagnosticInfo { code: "W0770", severity: 0, title: "`next` takes `self` by value", explanation: "Each call of `next` works on a copy of the iterator, so its position never advances and the loop does not end. Write `fn next(self: *T)`." },
+    DiagnosticInfo { code: "W0771", severity: 0, title: "`for` uses `iter`, not `next`", explanation: "The type has both `iter` and `next`. `for` calls `iter` and starts from the beginning every time; the position `next` keeps on the value itself is not used." },
+    DiagnosticInfo { code: "W0601", severity: 0, title: "implicit signed integer to float conversion", explanation: "A signed integer is implicitly converted to `f32`/`f64` and precision may be lost. Write `as f64`, or silence with `@allow(W0601)` / `--allow=W0601`." },
+]
+
+/// The registry, in table order.
+export fn allDiagnosticInfos() -> *[DiagnosticInfo; 95] {
+    return &REGISTRY
+}
+
+export const DIAGNOSTIC_COUNT: i32 = 95
+
+/// The index of `code` in the registry, or -1.
+export fn findDiagnosticInfo(code: str) -> i32 {
+    for i in 0..DIAGNOSTIC_COUNT {
+        if eq(REGISTRY[i].code, code) {
+            return i
+        }
+    }
+    return -1
+}
+
+/// `--explain CODE`; empty when the code is unknown.
+export fn explain(code: str) -> String {
+    local i = findDiagnosticInfo(code)
+    if i < 0 {
+        return String()
+    }
+    local info = REGISTRY[i]
+    return format("{} ({}): {}\n\n{}\n", info.code, info.severity == SEV_ERROR ? "error" : "warning",
+        info.title, info.explanation)
+}
+
+// -------------------------------------------------------------------------------------------
+// Text helpers
+
+/// Escapes `text` for a JSON string literal.
+fn jsonEscape(text: str, out: *String) {
+    for i in 0..text.len {
+        local c = text[i]
+        if c == 34 { // '"'
+            out.append("\\\"")
+        } else if c == 92 { // '\\'
+            out.append("\\\\")
+        } else if c == 10 { // '\n'
+            out.append("\\n")
+        } else if c == 13 { // '\r'
+            out.append("\\r")
+        } else if c == 9 { // '\t'
+            out.append("\\t")
+        } else if c < 0x20 {
+            out.append(format("\\u{:04x}", c as i64))
+        } else {
+            out.append(view(text, i, 1))
+        }
+    }
+}
+
+/// The number of decimal digits of `value` (at least 1); the gutter width.
+fn digits(value: usize) -> usize {
+    local n: usize = 1
+    local v = value
+    while v >= 10 {
+        v = v / 10
+        n++
+    }
+    return n
+}
+
+/// `value` right-aligned in `width` spaces (std::format "{:>{}}").
+fn padLeft(value: usize, width: usize) -> String {
+    local s = format("{}", value as i64)
+    local out = String()
+    while out.length() + s.length() < width {
+        out.append(" ")
+    }
+    out.append(s.asStr())
+    return out
+}
+
+/// `count` spaces.
+fn spaces(count: usize) -> String {
+    local out = String()
+    for i in 0..count {
+        out.append(" ")
+    }
+    return out
+}
+
+/// Appends `tag` and `text`, indenting every line after the first by eight spaces.
+fn appendBlock(out: *String, tag: str, text: str) {
+    if text.len == 0 {
+        return
+    }
+    out.append(tag)
+    for i in 0..text.len {
+        local c = text[i]
+        out.append(view(text, i, 1))
+        if c == 10 { // '\n'
+            out.append("        ")
+        }
+    }
+    out.append("\n")
+}
+
+// -------------------------------------------------------------------------------------------
+// The engine
+
+/// `@allow(CODE...)`: warnings whose primary span lies inside `scope` are silenced.
+export struct AllowScope {
+    scope: Span
+    codesFirst: u32 ///< range in the engine's code arena
+    codesCount: u32
+}
+
+/// The options of `configure`, one field per CLI flag. A class because it owns the code lists.
+export class DiagnosticOptions {
+    allow: Vec<Txt> ///< --allow=CODE / -Wno-CODE
+    deny: Vec<Txt> ///< --deny=CODE
+    warnAll: u32 ///< --warn-all
+    allowAll: u32 ///< --allow-all
+    contextErrors: usize
+    contextWarnings: usize
+    logPath: Txt ///< --diag-log=<file>; empty = no log
+    format: i32 ///< FORMAT_TEXT or FORMAT_JSON
+    logLevel: i32 ///< LOG_ALL or LOG_ERROR
+    color: u32 ///< ANSI colors on the text output; never in the log or JSON
+
+    fn init(self) {
+        self.allow = Vec<Txt>()
+        self.deny = Vec<Txt>()
+        self.warnAll = 0
+        self.allowAll = 0
+        self.contextErrors = 10
+        self.contextWarnings = 2
+        self.logPath = Txt { off: 0, len: 0 }
+        self.format = FORMAT_TEXT
+        self.logLevel = LOG_ALL
+        self.color = 0
+    }
+}
+
+/// The queue of one compilation. Everything reported lives in the engine's own arenas, so the
+/// records stay plain data; `flush` renders into `output`, which the caller reads until the next
+/// flush.
+export class DiagnosticEngine {
+    sources: *SourceManager
+    bytes: Vec<u8> ///< the string arena every `Txt` views into
+    labels: Vec<Label>
+    notes: Vec<Note>
+    codes: Vec<Txt> ///< the allow, deny and scope code strings
+    scopes: Vec<AllowScope>
+    pending: Vec<Diagnostic>
+    options: *DiagnosticOptions
+    output: String ///< what `flush` printed (the C++ engine writes to a std::ostream)
+    logOpen: u32 ///< the log file was truncated at configure time
+    errors: usize
+    warnings: usize
+    quiet: usize
+
+    fn init(self, sources: *SourceManager) {
+        self.sources = sources
+        self.bytes = Vec<u8>()
+        self.labels = Vec<Label>()
+        self.notes = Vec<Note>()
+        self.codes = Vec<Txt>()
+        self.scopes = Vec<AllowScope>()
+        self.pending = Vec<Diagnostic>()
+        self.options = new DiagnosticOptions()
+        self.output = String()
+        self.logOpen = 0
+        self.errors = 0
+        self.warnings = 0
+        self.quiet = 0
+    }
+
+    /// Copies `s` into the byte arena and returns the view of it.
+    fn txt(self, s: str) -> Txt {
+        local off: u32 = self.bytes.length() as u32
+        for i in 0..s.len {
+            self.bytes.push(s[i])
+        }
+        return Txt { off: off, len: s.len as u32 }
+    }
+
+    /// The `str` view of a `Txt` (valid while the engine lives).
+    fn strOf(self, t: Txt) -> str {
+        if t.len == 0 {
+            return fromParts(nil, 0)
+        }
+        return fromParts(self.bytes.get(t.off as usize) as *u8, t.len as usize)
+    }
+
+    /// Applies the options. An unknown code, or an error code asked to be allowed, is a panic (the
+    /// C++ side throws XlangError, which the driver reports before any compilation starts).
+    fn configure(self, options: *DiagnosticOptions) {
+        self.options = options
+        for i in 0..options.allow.length() {
+            local code = self.strOf(*options.allow.get(i))
+            local info = findDiagnosticInfo(code)
+            if info < 0 {
+                panic("unknown diagnostic code")
+            }
+            if REGISTRY[info].severity == SEV_ERROR {
+                panic("the code is an error and cannot be allowed")
+            }
+        }
+        for i in 0..options.deny.length() {
+            if findDiagnosticInfo(self.strOf(*options.deny.get(i))) < 0 {
+                panic("unknown diagnostic code")
+            }
+        }
+        if self.strOf(options.logPath).len > 0 {
+            // Truncate now, append on every flush (the C++ side opens an ofstream with trunc).
+            if !fsWrite(self.logPathCstr(), "") {
+                panic("cannot open diagnostic log")
+            }
+            self.logOpen = 1
+        }
+    }
+
+    fn logPathCstr(self) -> *u8 {
+        // The path is NUL-terminated only in a String; build one on demand (configure and flush
+        // call this a handful of times).
+        local s = String(self.strOf(self.options.logPath))
+        return s.cstr()
+    }
+
+    /// `@allow(CODE...)`: warnings whose primary span lies inside `scope` are silenced.
+    fn addAllowScope(self, scope: Span, codes: *Vec<str>) {
+        local first: u32 = self.codes.length() as u32
+        for i in 0..codes.length() {
+            self.codes.push(self.txt(*codes.get(i)))
+        }
+        self.scopes.push(AllowScope { scope: scope, codesFirst: first,
+            codesCount: (self.codes.length() as u32) - first })
+    }
+
+    /// Warnings are silenced by --allow-all, --allow=CODE or a covering `@allow` scope; errors
+    /// never (unless --warn-all turned the warning into an error first, which deny does later).
+    fn isAllowed(self, d: *Diagnostic) -> bool {
+        if d.severity != SEV_WARNING || self.options.warnAll != 0 {
+            return false
+        }
+        if self.options.allowAll != 0 {
+            return true
+        }
+        for i in 0..self.options.allow.length() {
+            if eq(self.strOf(*self.options.allow.get(i)), self.strOf(d.code)) {
+                return true
+            }
+        }
+        if d.labelsCount == 0 {
+            return false
+        }
+        local primary = (*self.labels.get(d.labelsFirst as usize)).span
+        for s in 0..self.scopes.length() {
+            local scope = *self.scopes.get(s)
+            if !scope.scope.contains(primary) {
+                continue
+            }
+            for c in 0..scope.codesCount {
+                if eq(self.strOf(*self.codes.get(scope.codesFirst + c)), self.strOf(d.code)) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Applies registry severity and allow/deny, counts, and queues the diagnostic. Nothing is
+    /// printed until `flush`.
+    fn report(self, d: Diagnostic) {
+        if self.quiet > 0 {
+            return
+        }
+        local info = findDiagnosticInfo(self.strOf(d.code))
+        local diag = d
+        if info >= 0 {
+            diag.severity = REGISTRY[info].severity
+        }
+        diag.suppressed = self.isAllowed(&diag) ? 1 : 0
+        if diag.suppressed == 0 && diag.severity == SEV_WARNING {
+            for i in 0..self.options.deny.length() {
+                if eq(self.strOf(*self.options.deny.get(i)), self.strOf(diag.code)) {
+                    diag.severity = SEV_ERROR
+                }
+            }
+        }
+        if diag.suppressed == 0 {
+            if diag.severity == SEV_ERROR {
+                self.errors++
+            } else {
+                self.warnings++
+            }
+        }
+        // The order key of the primary label, computed here so the flush sort stays a plain
+        // function over the record.
+        diag.keyFile = NO_FILE
+        diag.keyLine = 0
+        diag.keyColumn = 0
+        if diag.labelsCount > 0 {
+            local span = (*self.labels.get(diag.labelsFirst as usize)).span
+            if span.valid() {
+                diag.keyFile = span.file
+                diag.keyLine = span.line
+                diag.keyColumn = span.column
+            }
+        }
+        self.pending.push(diag)
+    }
+
+    /// Trial lowering (overload resolution): while quiet, reports are dropped and do not count.
+    /// Calls nest; each `beginQuiet` needs one `endQuiet`.
+    fn beginQuiet(self) {
+        self.quiet++
+    }
+
+    fn endQuiet(self) {
+        self.quiet--
+    }
+
+    fn errorCount(self) -> usize {
+        return self.errors
+    }
+
+    fn warningCount(self) -> usize {
+        return self.warnings
+    }
+
+    fn hasErrors(self) -> bool {
+        return self.errors != 0
+    }
+
+    /// Builder for the common error shape.
+    fn error(self, code: str, span: Span, message: str, label: str) {
+        local d: Diagnostic
+        d.code = self.txt(code)
+        d.severity = SEV_ERROR
+        d.message = self.txt(message)
+        if span.valid() {
+            d.labelsFirst = self.labels.length() as i32
+            self.labels.push(Label { span: span, text: self.txt(label) })
+            d.labelsCount = (self.labels.length() as u32) - (d.labelsFirst as u32)
+        }
+        self.report(d)
+    }
+
+    /// Builder for the common warning shape.
+    fn warning(self, code: str, span: Span, message: str, label: str) {
+        local d: Diagnostic
+        d.code = self.txt(code)
+        d.severity = SEV_WARNING
+        d.message = self.txt(message)
+        if span.valid() {
+            d.labelsFirst = self.labels.length() as i32
+            self.labels.push(Label { span: span, text: self.txt(label) })
+            d.labelsCount = (self.labels.length() as u32) - (d.labelsFirst as u32)
+        }
+        self.report(d)
+    }
+
+    /// Emits the queue ordered by source position into `output` (and the log file). The queue and
+    /// its labels and notes are dropped.
+    fn flush(self) {
+        self.pending.sortBy(cmpDiagnostic)
+
+        local logLine = String()
+        for i in 0..self.pending.length() {
+            local d: *Diagnostic = self.pending.get(i)
+            local text: String
+            if self.options.format == FORMAT_JSON {
+                text = renderJson(self, d)
+            } else {
+                text = renderText(self, d)
+            }
+            if d.suppressed == 0 {
+                if self.options.color != 0 && self.options.format == FORMAT_TEXT {
+                    local colored = colorize(text.asStr(), d.severity)
+                    self.output.append(colored.asStr())
+                } else {
+                    self.output.append(text.asStr())
+                }
+                self.output.append("\n")
+            }
+            if self.strOf(self.options.logPath).len == 0 {
+                continue
+            }
+            // `--diag-log-level`: all keeps warnings (suppressed included) and errors; error only
+            // keeps errors.
+            if self.options.logLevel == LOG_ERROR && d.severity != SEV_ERROR {
+                continue
+            }
+            logLine.append(text.asStr())
+            logLine.append("\n")
+        }
+        if logLine.length() > 0 {
+            fsAppend(self.logPathCstr(), logLine.asStr())
+        }
+        // The queue is rendered; its strings are no longer needed.
+        self.pending.clear()
+        self.labels.clear()
+        self.notes.clear()
+        self.bytes.clear()
+    }
+}
+
+/// The flush order: file, then line, then column of the primary label; diagnostics without one
+/// keep their report order (the sort is stable).
+fn cmpDiagnostic(a: *Diagnostic, b: *Diagnostic) -> i32 {
+    if a.keyFile != b.keyFile {
+        return a.keyFile < b.keyFile ? -1 : 1
+    }
+    if a.keyLine != b.keyLine {
+        return a.keyLine < b.keyLine ? -1 : 1
+    }
+    if a.keyColumn != b.keyColumn {
+        return a.keyColumn < b.keyColumn ? -1 : 1
+    }
+    return 0
+}
+
+fn cmpUsize(a: *usize, b: *usize) -> i32 {
+    if *a != *b {
+        return *a < *b ? -1 : 1
+    }
+    return 0
+}
+
+// -------------------------------------------------------------------------------------------
+// The text rendering: source lines, display columns, marks
+
+/// One display column per cell: a code point, or one space of an expanded tab. Fills the caller's
+/// reusable buffers (the C++ side caches one `DisplayLine` per line; here every use re-expands,
+/// which keeps the buffers plain locals of `renderText`).
+fn expandLine(line: str, cells: *Vec<String>, byteToCell: *Vec<usize>) {
+    cells.clear()
+    byteToCell.clear()
+    for i in 0..line.len + 1 {
+        byteToCell.push(0)
+    }
+    local i: usize = 0
+    while i < line.len {
+        local lead = line[i]
+        local len: usize = 1
+        // UTF-8: the lead byte fixes the length of one code point.
+        if lead >= 0xF0 {
+            len = 4
+        } else if lead >= 0xE0 {
+            len = 3
+        } else if lead >= 0xC0 {
+            len = 2
+        }
+        if len > line.len - i {
+            len = line.len - i
+        }
+        for k in 0..len {
+            byteToCell.set(i + k, cells.length())
+        }
+        if line[i] == 9 { // '\t'
+            for k in 0..4 {
+                cells.push(String(" "))
+            }
+        } else {
+            cells.push(String(view(line, i, len)))
+        }
+        i += len
+    }
+    byteToCell.set(line.len, cells.length())
+}
+
+/// The display column of byte `byteIndex` (clamped to the line end).
+fn cellOf(byteToCell: *Vec<usize>, byteIndex: usize) -> usize {
+    local last = byteToCell.length() - 1
+    return *byteToCell.get(byteIndex <= last ? byteIndex : last)
+}
+
+/// The visible window of a line: at most 110 cells around `anchor`, with 40 cells of lead; a cut
+/// start or end shows an ellipsis. `shift` turns a display column of the full line into one of
+/// `text`; `width` is the visible width.
+export class Shown {
+    text: String
+    shift: i64
+    width: usize
+
+    fn init(self) {
+        self.text = String()
+        self.shift = 0
+        self.width = 0
+    }
+}
+
+const TAB_WIDTH: usize = 4
+const MAX_LINE_WIDTH: usize = 110
+const LEAD_WIDTH: usize = 40
+
+fn show(cells: *Vec<String>, byteToCell: *Vec<usize>, anchor: usize) -> *Shown {
+    local out = new Shown()
+    local begin: usize = 0
+    local end: usize = cells.length()
+    local leadCut = false
+    local tailCut = false
+    if cells.length() > MAX_LINE_WIDTH {
+        if anchor > LEAD_WIDTH {
+            begin = anchor - LEAD_WIDTH
+            if begin > cells.length() - MAX_LINE_WIDTH {
+                begin = cells.length() - MAX_LINE_WIDTH
+            }
+        }
+        end = begin + MAX_LINE_WIDTH
+        leadCut = begin > 0
+        tailCut = end < cells.length()
+    }
+    if leadCut {
+        out.text.append("\xe2\x80\xa6") // U+2026
+    }
+    for i in begin..end {
+        out.text.append(cells.get(i).asStr())
+    }
+    if tailCut {
+        out.text.append("\xe2\x80\xa6")
+    }
+    out.shift = (leadCut ? 1 : 0) as i64 - begin as i64
+    out.width = (end - begin) + (leadCut ? 1 : 0) + (tailCut ? 1 : 0)
+    return out
+}
+
+/// The text form of a diagnostic: the header, the source lines with `<=======` markers and
+/// caret lines, the notes and the detail/reason/fix blocks.
+fn renderText(e: *DiagnosticEngine, d: *Diagnostic) -> String {
+    local out = String()
+    out.append(format("{}[{}]{}: {}\n", d.severity == SEV_ERROR ? "error" : "warning",
+        e.strOf(d.code), d.suppressed != 0 ? " (suppressed)" : "", e.strOf(d.message)))
+
+    local context = d.severity == SEV_ERROR ? e.options.contextErrors : e.options.contextWarnings
+
+    // Group labels by file, primary file first.
+    local fileOrder = Vec<u32>()
+    for i in 0..d.labelsCount {
+        local label = *e.labels.get(d.labelsFirst as usize + i)
+        if !label.span.valid() {
+            continue
+        }
+        local seen = false
+        for f in 0..fileOrder.length() {
+            if *fileOrder.get(f) == label.span.file {
+                seen = true
+            }
+        }
+        if !seen {
+            fileOrder.push(label.span.file)
+        }
+    }
+
+    // Gutter width: largest line number that can be displayed.
+    local maxLine: usize = 1
+    for f in 0..fileOrder.length() {
+        local count = e.sources.file(*fileOrder.get(f)).lineCount()
+        for i in 0..d.labelsCount {
+            local label = *e.labels.get(d.labelsFirst as usize + i)
+            if !label.span.valid() || label.span.file != *fileOrder.get(f) {
+                continue
+            }
+            local m = label.span.endLine as usize + context
+            if m > count {
+                m = count
+            }
+            if m > maxLine {
+                maxLine = m
+            }
+        }
+    }
+    local width = digits(maxLine)
+    local blankGutter = spaces(width)
+
+    // Reusable line buffers (see expandLine).
+    local cells = Vec<String>()
+    local byteToCell = Vec<usize>()
+
+    // The marks of one file group, flat: parallel arrays grouped by nothing, scanned per line.
+    local markLine = Vec<usize>()
+    local markLabel = Vec<usize>() ///< index into e.labels
+    local markFirst = Vec<usize>()
+    local markLast = Vec<usize>()
+
+    local firstGroup = true
+    for f in 0..fileOrder.length() {
+        local source = e.sources.file(*fileOrder.get(f))
+        local head: Span = spanNone()
+        for i in 0..d.labelsCount {
+            local label = *e.labels.get(d.labelsFirst as usize + i)
+            if label.span.valid() && label.span.file == *fileOrder.get(f) {
+                head = label.span
+                break
+            }
+        }
+        out.append(blankGutter.asStr())
+        out.append(firstGroup ? "-->" : ":::")
+        out.append(format(" {}:{}:{}\n", source.path.asStr(), head.line as i64,
+            head.column as i64))
+        firstGroup = false
+        out.append(blankGutter.asStr())
+        out.append(" |\n")
+
+        markLine.clear()
+        markLabel.clear()
+        markFirst.clear()
+        markLast.clear()
+        for i in 0..d.labelsCount {
+            local li = d.labelsFirst as usize + i
+            local label = *e.labels.get(li)
+            if !label.span.valid() || label.span.file != *fileOrder.get(f) {
+                continue
+            }
+            local s = label.span
+            // The start mark; a multi-line span also marks its end line.
+            expandLine(source.line(s.line as usize), &cells, &byteToCell)
+            local firstCell = cellOf(&byteToCell, s.column as usize - 1)
+            local lastCell: usize = firstCell + 1
+            if s.endLine == s.line {
+                local c2 = cellOf(&byteToCell, s.endColumn as usize - 1)
+                if c2 > lastCell {
+                    lastCell = c2
+                }
+            } else {
+                if cells.length() > lastCell {
+                    lastCell = cells.length()
+                }
+            }
+            markLine.push(s.line as usize)
+            markLabel.push(li)
+            markFirst.push(firstCell)
+            markLast.push(lastCell)
+            if s.endLine != s.line {
+                expandLine(source.line(s.endLine as usize), &cells, &byteToCell)
+                local endFirst = cellOf(&byteToCell, s.endColumn > 1 ? s.endColumn as usize - 2 : 0)
+                markLine.push(s.endLine as usize)
+                markLabel.push(li)
+                markFirst.push(endFirst)
+                markLast.push(endFirst + 1)
+            }
+        }
+
+        // Context ranges around the marked lines, merged when they touch or overlap.
+        local lines = Vec<usize>()
+        for m in 0..markLine.length() {
+            local seen = false
+            for x in 0..lines.length() {
+                if *lines.get(x) == *markLine.get(m) {
+                    seen = true
+                }
+            }
+            if !seen {
+                lines.push(*markLine.get(m))
+            }
+        }
+        lines.sortBy(cmpUsize)
+        local rangeLo = Vec<usize>()
+        local rangeHi = Vec<usize>()
+        for x in 0..lines.length() {
+            local line = *lines.get(x)
+            local lo = line > context ? (line - context) : 1
+            local hi = source.lineCount()
+            if line + context < hi {
+                hi = line + context
+            }
+            if rangeLo.length() > 0 && lo <= *rangeHi.get(rangeHi.length() - 1) + 1 {
+                if hi > *rangeHi.get(rangeHi.length() - 1) {
+                    rangeHi.set(rangeHi.length() - 1, hi)
+                }
+            } else {
+                rangeLo.push(lo)
+                rangeHi.push(hi)
+            }
+        }
+
+        // Render every marked line first to align the `<=======` column across the block.
+        local markerColumn: usize = 0
+        for r in 0..rangeLo.length() {
+            for line in *rangeLo.get(r)..*rangeHi.get(r) + 1 {
+                local mf = firstMark(line, &markLine)
+                if mf < 0 {
+                    continue
+                }
+                expandLine(source.line(line), &cells, &byteToCell)
+                local shown = show(&cells, &byteToCell, *markFirst.get(mf as usize))
+                if shown.width > markerColumn {
+                    markerColumn = shown.width
+                }
+                delete shown
+            }
+        }
+
+        local firstBlock = true
+        for r in 0..rangeLo.length() {
+            if !firstBlock {
+                out.append(blankGutter.asStr())
+                out.append("...\n")
+            }
+            firstBlock = false
+            for line in *rangeLo.get(r)..*rangeHi.get(r) + 1 {
+                local mf = firstMark(line, &markLine)
+                expandLine(source.line(line), &cells, &byteToCell)
+                local anchor: usize = 0
+                if mf >= 0 {
+                    anchor = *markFirst.get(mf as usize)
+                }
+                local shown = show(&cells, &byteToCell, anchor)
+                local lineOut = padLeft(line, width)
+                lineOut.append(" | ")
+                lineOut.append(shown.text.asStr())
+                if mf >= 0 {
+                    lineOut.append(spaces(markerColumn - shown.width + 4).asStr())
+                    lineOut.append("<=======")
+                    local text = e.strOf((*e.labels.get(*markLabel.get(mf as usize))).text)
+                    if text.len > 0 {
+                        lineOut.append(" ")
+                        lineOut.append(text)
+                    }
+                }
+                out.append(lineOut.asStr())
+                out.append("\n")
+                // More than one mark on the line: one caret line per mark.
+                local count: usize = 0
+                for m in 0..markLine.length() {
+                    if *markLine.get(m) == line {
+                        count++
+                    }
+                }
+                if count > 1 {
+                    for m in 0..markLine.length() {
+                        if *markLine.get(m) != line {
+                            continue
+                        }
+                        local start = *markFirst.get(m) as i64 + shown.shift
+                        local carets = String(blankGutter.asStr())
+                        carets.append(" | ")
+                        carets.append(spaces(start < 0 ? 0 : start as usize).asStr())
+                        local cw = *markLast.get(m) - *markFirst.get(m)
+                        if cw < 1 {
+                            cw = 1
+                        }
+                        for c in 0..cw {
+                            carets.append("^")
+                        }
+                        local text = e.strOf((*e.labels.get(*markLabel.get(m))).text)
+                        if text.len > 0 {
+                            carets.append(" ")
+                            carets.append(text)
+                        }
+                        out.append(carets.asStr())
+                        out.append("\n")
+                    }
+                }
+                delete shown
+            }
+        }
+        out.append(blankGutter.asStr())
+        out.append(" |\n")
+    }
+
+    for i in 0..d.notesCount {
+        local note = *e.notes.get(d.notesFirst as usize + i)
+        out.append("note: ")
+        out.append(e.strOf(note.message))
+        out.append("\n")
+        if note.hasSpan != 0 {
+            local source = e.sources.file(note.span.file)
+            out.append(format("  --> {}:{}:{}\n", source.path.asStr(), note.span.line as i64,
+                note.span.column as i64))
+        }
+    }
+    appendBlock(&out, "detail: ", e.strOf(d.detail))
+    appendBlock(&out, "reason: ", e.strOf(d.reason))
+    appendBlock(&out, "fix:    ", e.strOf(d.fix))
+    if out.length() > 0 && out.at(out.length() - 1) == b'\n' {
+        return out.slice(0, out.length() - 1)
+    }
+    return out
+}
+
+    /// The JSON form of a diagnostic (one object, no trailing newline).
+fn renderJson(e: *DiagnosticEngine, d: *Diagnostic) -> String {
+    local out = String()
+    out.append("{")
+    local code = String()
+    jsonEscape(e.strOf(d.code), &code)
+    local message = String()
+    jsonEscape(e.strOf(d.message), &message)
+    out.append(format("\"code\":\"{}\",\"severity\":\"{}\",\"suppressed\":{},\"message\":\"{}\"",
+        code.asStr(), d.severity == SEV_ERROR ? "error" : "warning",
+        d.suppressed != 0 ? "true" : "false", message.asStr()))
+    out.append(",\"labels\":[")
+    local first = true
+    for i in 0..d.labelsCount {
+        local label = *e.labels.get(d.labelsFirst as usize + i)
+        if !label.span.valid() {
+            continue
+        }
+        if !first {
+            out.append(",")
+        }
+        first = false
+        local text = String()
+        jsonEscape(e.strOf(label.text), &text)
+        local path = String()
+        jsonEscape(e.sources.file(label.span.file).path.asStr(), &path)
+        out.append(format(
+            "{{\"file\":\"{}\",\"line\":{},\"column\":{},\"endLine\":{},\"endColumn\":{},\"text\":\"{}\"}}",
+            path.asStr(), label.span.line, label.span.column, label.span.endLine,
+            label.span.endColumn, text.asStr()))
+    }
+    out.append("]")
+    out.append(",\"notes\":[")
+    for i in 0..d.notesCount {
+        local note = *e.notes.get(d.notesFirst as usize + i)
+        if i != 0 {
+            out.append(",")
+        }
+        local message = String()
+        jsonEscape(e.strOf(note.message), &message)
+        local path = String()
+        jsonEscape(note.hasSpan != 0 ? e.sources.file(note.span.file).path.asStr() : "",
+            &path)
+        out.append(format("{{\"file\":\"{}\",\"line\":{},\"column\":{},\"message\":\"{}\"}}",
+            path.asStr(), note.span.line, note.span.column, message.asStr()))
+    }
+    out.append("]")
+    local detail = String()
+    jsonEscape(e.strOf(d.detail), &detail)
+    local reason = String()
+    jsonEscape(e.strOf(d.reason), &reason)
+    local fix = String()
+    jsonEscape(e.strOf(d.fix), &fix)
+    out.append(format(",\"detail\":\"{}\",\"reason\":\"{}\",\"fix\":\"{}\"}}", detail.asStr(),
+        reason.asStr(), fix.asStr()))
+    return out
+}
+
+/// The index of the first mark of `line`, or -1.
+fn firstMark(line: usize, markLine: *Vec<usize>) -> i32 {
+    for m in 0..markLine.length() {
+        if *markLine.get(m) == line {
+            return m as i32
+        }
+    }
+    return -1
+}
+
+/// ANSI-colors the plain text `renderText` produces, line by line: the header, the `-->` locations,
+/// the gutter, the `<=======` marker and carets (error red, warning yellow), and the `note:`,
+/// `detail:`, `reason:`, `fix:` tags. The plain text stays the source of truth.
+fn colorize(text: str, severity: i32) -> String {
+    local RESET = "\x1b[0m"
+    local BLUE = "\x1b[1;34m"
+    local CYAN = "\x1b[1;36m"
+    local GREEN = "\x1b[1;32m"
+    local BOLD = "\x1b[1m"
+    local ACCENT = severity == SEV_ERROR ? "\x1b[1;31m" : "\x1b[1;33m"
+
+    local out = String()
+    local start: usize = 0
+    local first = true
+    while start <= text.len {
+        local nl = find(view(text, start, text.len - start), "\n")
+        local end: usize = text.len
+        if nl >= 0 {
+            end = start + nl as usize
+        }
+        local line = view(text, start, end - start)
+        start = end + 1
+        if !first {
+            out.append("\n")
+        }
+
+        // The indent of the line and its body after it.
+        local indent: usize = 0
+        while indent < line.len && line[indent] == 32 {
+            indent++
+        }
+        local body = indent < line.len ? view(line, indent, line.len - indent) : view("", 0, 0)
+
+        if first {
+            first = false
+            local close = find(line, "]")
+            if close >= 0 {
+                out.append(ACCENT)
+                out.append(view(line, 0, close as usize + 1))
+                out.append(RESET)
+                out.append(BOLD)
+                out.append(view(line, close as usize + 1, line.len - close as usize - 1))
+                out.append(RESET)
+                continue
+            }
+        }
+        local tagged = false
+        for t in 0..7 {
+            local tag = t == 0 ? "-->" : t == 1 ? ":::" : t == 2 ? "note:" : t == 3 ? "detail:"
+                : t == 4 ? "reason:" : t == 5 ? "fix:" : "..."
+            local color = t == 5 ? GREEN : t == 2 || t == 3 || t == 4 ? CYAN : BLUE
+            if startsWith(body, tag) {
+                out.append(view(line, 0, indent))
+                out.append(color)
+                out.append(tag)
+                out.append(RESET)
+                out.append(view(body, tag.len, body.len - tag.len))
+                tagged = true
+            }
+        }
+        if tagged {
+            continue
+        }
+
+        // Gutter: optional spaces, optional line number, spaces, then `|`.
+        local i: usize = 0
+        while i < line.len && line[i] == 32 {
+            i++
+        }
+        while i < line.len && line[i] >= 48 && line[i] <= 57 {
+            i++
+        }
+        while i < line.len && line[i] == 32 {
+            i++
+        }
+        if i < line.len && line[i] == 124 { // '|'
+            out.append(BLUE)
+            out.append(view(line, 0, i + 1))
+            out.append(RESET)
+            local rest = view(line, i + 1, line.len - i - 1)
+            local marker = findLast(rest, "<=======")
+            local caret: usize = 0
+            while caret < rest.len && rest[caret] == 32 {
+                caret++
+            }
+            if marker >= 0 {
+                out.append(view(rest, 0, marker as usize))
+                out.append(ACCENT)
+                out.append(view(rest, marker as usize, rest.len - marker as usize))
+                out.append(RESET)
+            } else if caret < rest.len && rest[caret] == 94 { // '^'
+                out.append(view(rest, 0, caret))
+                out.append(ACCENT)
+                out.append(view(rest, caret, rest.len - caret))
+                out.append(RESET)
+            } else {
+                out.append(rest)
+            }
+            continue
+        }
+        out.append(line)
+    }
+    return out
+}
+
+// -------------------------------------------------------------------------------------------
+// The C ABI of the util bridge (src/util/xl_bridge.hpp)
+
+/// One label handed over the bridge.
+@repr(c)
+export struct XbLabel {
+    file: u32
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+    text: *u8
+    textLen: u32
+}
+
+/// One note handed over the bridge.
+@repr(c)
+export struct XbNote {
+    file: u32
+    line: u32
+    column: u32
+    hasSpan: u32
+    message: *u8
+    msgLen: u32
+}
+
+/// One diagnostic handed over the bridge.
+@repr(c)
+export struct XbDiagnostic {
+    code: XbStr
+    severity: u32
+    message: XbStr
+    labels: *XbLabel
+    labelCount: u32
+    notes: *XbNote
+    noteCount: u32
+    detail: XbStr
+    reason: XbStr
+    fix: XbStr
+}
+
+/// The options of `xlcDiagConfigure`.
+@repr(c)
+export struct XbOptions {
+    allow: *XbStr
+    allowCount: u32
+    deny: *XbStr
+    denyCount: u32
+    warnAll: u32
+    allowAll: u32
+    contextErrors: u32
+    contextWarnings: u32
+    logPath: XbStr
+    format: u32
+    logLevel: u32
+    color: u32
+}
+
+/// What `xlcDiagFlush` returns: the rendered text (valid until the next flush) and the counts.
+@repr(c)
+export struct XbFlush {
+    text: *u8
+    textLen: u32
+    errors: u32
+    warnings: u32
+}
+
+/// A fresh engine over `m`.
+export(c) fn xlcDiagNew(m: *SourceManager) -> *DiagnosticEngine {
+    return new DiagnosticEngine(m)
+}
+
+export(c) fn xlcDiagConfigure(e: *DiagnosticEngine, o: *XbOptions) {
+    local options = new DiagnosticOptions()
+    options.warnAll = o.warnAll
+    options.allowAll = o.allowAll
+    options.contextErrors = o.contextErrors as usize
+    options.contextWarnings = o.contextWarnings as usize
+    options.format = o.format as i32
+    options.logLevel = o.logLevel as i32
+    options.color = o.color
+    for i in 0..o.allowCount {
+        local s = o.allow[i]
+        options.allow.push(e.txt(fromParts(s.ptr, s.len as usize)))
+    }
+    for i in 0..o.denyCount {
+        local s = o.deny[i]
+        options.deny.push(e.txt(fromParts(s.ptr, s.len as usize)))
+    }
+    if o.logPath.len > 0 {
+        options.logPath = e.txt(fromParts(o.logPath.ptr, o.logPath.len as usize))
+    }
+    e.configure(options)
+}
+
+export(c) fn xlcDiagAddAllowScope(e: *DiagnosticEngine, scope: *Span, codes: *XbStr, count: u32) {
+    local list = Vec<str>()
+    for i in 0..count {
+        local s = codes[i]
+        list.push(fromParts(s.ptr, s.len as usize))
+    }
+    e.addAllowScope(*scope, &list)
+}
+
+/// Reports one diagnostic; the bridge copies every string into the engine's arena.
+export(c) fn xlcDiagReport(e: *DiagnosticEngine, d: *XbDiagnostic) {
+    local diag: Diagnostic
+    diag.code = e.txt(fromParts(d.code.ptr, d.code.len as usize))
+    diag.severity = d.severity as i32
+    diag.message = e.txt(fromParts(d.message.ptr, d.message.len as usize))
+    diag.labelsFirst = -1
+    diag.notesFirst = -1
+    diag.detail = e.txt(fromParts(d.detail.ptr, d.detail.len as usize))
+    diag.reason = e.txt(fromParts(d.reason.ptr, d.reason.len as usize))
+    diag.fix = e.txt(fromParts(d.fix.ptr, d.fix.len as usize))
+    if d.labelCount > 0 {
+        diag.labelsFirst = e.labels.length() as i32
+        for i in 0..d.labelCount {
+            local l = d.labels[i]
+            local span = spanNone()
+            span.file = l.file
+            span.line = l.line
+            span.column = l.column
+            span.endLine = l.endLine
+            span.endColumn = l.endColumn
+            e.labels.push(Label { span: span, text: e.txt(fromParts(l.text, l.textLen as usize)) })
+        }
+        diag.labelsCount = (e.labels.length() as u32) - (diag.labelsFirst as u32)
+    }
+    if d.noteCount > 0 {
+        diag.notesFirst = e.notes.length() as i32
+        for i in 0..d.noteCount {
+            local n = d.notes[i]
+            local note: Note
+            note.hasSpan = n.hasSpan
+            if n.hasSpan != 0 {
+                note.span = spanNone()
+                note.span.file = n.file
+                note.span.line = n.line
+                note.span.column = n.column
+            }
+            note.message = e.txt(fromParts(n.message, n.msgLen as usize))
+            e.notes.push(note)
+        }
+        diag.notesCount = (e.notes.length() as u32) - (diag.notesFirst as u32)
+    }
+    e.report(diag)
+}
+
+export(c) fn xlcDiagBeginQuiet(e: *DiagnosticEngine) {
+    e.beginQuiet()
+}
+
+export(c) fn xlcDiagEndQuiet(e: *DiagnosticEngine) {
+    e.endQuiet()
+}
+
+/// Renders and drops the queue; the text stays valid until the next flush.
+export(c) fn xlcDiagFlush(e: *DiagnosticEngine) -> XbFlush {
+    e.flush()
+    local r: XbFlush
+    r.text = e.output.ptr
+    r.textLen = e.output.len as u32
+    r.errors = e.errors as u32
+    r.warnings = e.warnings as u32
+    return r
+}
+
+/// `--explain CODE` into `out` (capacity `cap`); returns the byte count without a NUL, or `cap`
+/// when the text does not fit.
+export(c) fn xlcDiagExplain(code: *XbStr, out: *u8, cap: u32) -> u32 {
+    local text = explain(fromParts(code.ptr, code.len as usize))
+    local n = text.len < cap as usize ? text.len : cap as usize
+    for i in 0..n {
+        out[i] = text.at(i)
+    }
+    return n as u32
+}
+
+export(c) fn xlcDiagFreeEngine(e: *DiagnosticEngine) {
+    delete e
+}
