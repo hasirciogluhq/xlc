@@ -26,11 +26,13 @@ add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build"})
 add_defines("XLANG_VERSION=\"" .. xlc_version .. "\"")
 
--- Finds llvm-config: `$LLVM_CONFIG`, then Homebrew, then the versioned llvm.org installs on
--- Linux (`/usr/lib/llvm-23/bin/llvm-config`), then `llvm-config` on PATH. Probed by file
--- existence only: this function runs with the xmakefile's restricted environment, which has no
--- `os.which`, no `assert` and no way to run a program. When nothing matches it returns the bare
--- name, so the caller's `llvm-config` invocation fails with the linker's own clear message.
+-- Finds llvm-config: `$LLVM_CONFIG`, then Homebrew, then the pinned LLVM 23 install of
+-- apt.llvm.org (`/usr/lib/llvm-23`), then `llvm-config` on PATH. Probed by file existence only:
+-- this function runs with the xmakefile's restricted environment, which has no `os.which`, no
+-- `assert` and no way to run a program. The version is pinned, not discovered: the code needs
+-- the LLVM 20+ APIs, and the runners carry an older llvm-dev that must never win. When nothing
+-- matches it returns the bare name, so the caller's `llvm-config` invocation fails with the
+-- linker's own clear message.
 local function find_llvm_config()
     if os.getenv("LLVM_CONFIG") then
         return os.getenv("LLVM_CONFIG")
@@ -41,19 +43,7 @@ local function find_llvm_config()
             table.insert(candidates, path.join(prefix, "opt/llvm/bin/llvm-config"))
         end
     end
-    -- The versioned llvm.org installs: newest first, so a distribution's older llvm-dev
-    -- (`/usr/lib/llvm-17`) never wins over the installed one (`/usr/lib/llvm-23`).
-    local versioned = {}
-    for _, dir in ipairs(os.dirs("/usr/lib/llvm-*/bin") or {}) do
-        local ver = tonumber(dir:match("llvm%-(%d+)"))
-        if ver and os.isfile(path.join(dir, "llvm-config")) then
-            table.insert(versioned, {ver, path.join(dir, "llvm-config")})
-        end
-    end
-    table.sort(versioned, function (a, b) return a[1] > b[1] end)
-    for _, c in ipairs(versioned) do
-        table.insert(candidates, c[2])
-    end
+    table.insert(candidates, "/usr/lib/llvm-23/bin/llvm-config")
     table.insert(candidates, "/usr/bin/llvm-config")
     for _, c in ipairs(candidates) do
         if os.isfile(c) then
