@@ -81,6 +81,7 @@ void Lowerer::lowerStmtBody(const Stmt& s, std::vector<hir::Stmt>& out) {
     case Stmt::Kind::Const:
         lowerLocalConst(s);
         return;
+/// @ownership `delete` drops the object through its class drop glue first, then calls the registered `free`; with no `free` role it is E0501, never a silent leak.
     case Stmt::Kind::Delete: {
         // Drop the object (when its class needs drop), then free it through the allocator.
         EP p = expr(*s.expr, nullptr);

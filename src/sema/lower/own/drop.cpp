@@ -55,6 +55,7 @@ void Lowerer::rejectDroppablePlace(const Type& t, const Span& at, const char* wh
     rejectDroppableArray(t, at, where);
 }
 
+/// @invariant `needsDrop` is memoized with a `false` written before the recursion, so a type that owns itself through a pointer terminates instead of recursing forever.
 bool Lowerer::needsDrop(const Type& t) {
     if (t.kind == TypeKind::Tuple) {
         // A tuple owns its elements, like a struct owns its fields.
@@ -118,6 +119,7 @@ bool Lowerer::dropsThroughPointer(const Type& t) {
     return needsDrop(t) || dropsVirtually(t) || !derivedDropLostThrough(t).empty();
 }
 
+/// @invariant a class dropped through a pointer to its base loses the derived destructor unless the base has a virtual drop slot; this returns the name of the lost one and is empty when nothing is lost.
 std::string Lowerer::derivedDropLostThrough(const Type& t) {
     if (t.kind != TypeKind::Class || t.path.empty() || dropsVirtually(t)) {
         return {};

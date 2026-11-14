@@ -4,6 +4,7 @@
 
 namespace xlang::parse {
 
+/// @grammar `{ stmt; stmt }`
 Block Parser::parseBlock() {
     Block block;
     block.span = cur().span;
@@ -55,6 +56,7 @@ void Parser::endOfStatement() {
            "put this on a new line");
 }
 
+/// @grammar `@attribute` applied to a statement, before any statement form
 Stmt Parser::parseStatement() {
     rejectDirective();
     std::vector<Attribute> attrs = parseAttributes();
@@ -66,6 +68,11 @@ Stmt Parser::parseStatement() {
     return stmt;
 }
 
+/// @grammar `label: while ...`, `label: do ... while ...`, `label: for ...`
+/// @grammar `switch ...`, `if ...`, `while ...`, `do ... while ...`, `for ...`
+/// @grammar `return e`, `return`, `break [label]`, `continue [label]`, `defer stmt`
+/// @grammar `try { } catch e { }`, `unsafe { }`, `{ ... }`, `local ...`
+/// @grammar the simple statement: assignment, compound assignment, `++`, `--`, expression
 Stmt Parser::parseStatementBody() {
     Stmt stmt;
     // `label: while|do|for ...`
@@ -189,6 +196,8 @@ Stmt Parser::parseStatementBody() {
 /// by statement position and the `for` initializer so both spellings of the declaration behave
 /// alike. On return the cursor is after the initializer (or after the type), never at `;`.
 /// `local x: T := expr` is refused because `:=` already means "infer the type".
+/// @grammar `local name`, `local name: T`, `local name := expr`
+/// @grammar `local name = expr`, `local name: T = expr`
 void Parser::parseLocalTail(Stmt& stmt) {
     stmt.kind = Stmt::Kind::Local;
     if (at(TokenKind::LParen)) {
@@ -250,6 +259,8 @@ void Parser::parseLocalTail(Stmt& stmt) {
     }
 }
 
+/// @grammar `target = v`, `target += v` (and the other compound assignments)
+/// @grammar `target++`, `target--`, `expr`
 Stmt Parser::parseSimpleStatement() {
     Stmt stmt;
     stmt.span = cur().span;

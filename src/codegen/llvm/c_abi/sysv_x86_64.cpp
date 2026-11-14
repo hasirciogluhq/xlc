@@ -81,6 +81,9 @@ struct Eightbytes {
 
 } // namespace
 
+/// @abi System V AMD64 3.2.3: INTEGER and SSE eightbytes go in registers, MEMORY on the stack
+/// @abi (6 integer and 8 SSE register slots); an aggregate over 16 bytes is always MEMORY.
+/// @spec https://gitlab.com/x86-psABIs/x86-64-ABI
 Signature classifySysV(llvm::LLVMContext& ctx, const Value& ret, const std::vector<Value>& params) {
     Signature s;
     unsigned free_ints = 6;

@@ -45,6 +45,7 @@ std::optional<std::uint64_t> Sema::primitiveSize(const Type& t, std::uint64_t& a
     }
 }
 
+/// @layout `interface` is a fat pointer: 2 * pointer width, aligned to the pointer width.
 std::optional<TypeLayout> Sema::layoutOf(const Type& type, const Span& at) {
     auto resolved = resolve(type);
     if (!resolved) {

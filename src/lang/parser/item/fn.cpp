@@ -6,6 +6,8 @@ namespace xlang::parse {
 
 /// The parameter list, the optional return type and the body of a function (after its name):
 /// shared by named functions and function literals. `needs_body` makes a missing body an error.
+/// @grammar the parameters and the body of a function: `(a: T, b: U) -> R { body }`
+/// @grammar `(self)`, `(self: *T)`, a trailing `,` before `)` allowed
 void Parser::parseFnTail(FnDecl& fn, const std::string& name, bool member, bool needs_body) {
     expect(TokenKind::LParen, "`(` starting the parameter list");
     ++nl_depth_;
@@ -66,6 +68,7 @@ void Parser::parseFnTail(FnDecl& fn, const std::string& name, bool member, bool 
 /// The operator a function name spells after `fn` (`fn +(...)`, `fn []=(...)`, `fn ()(...)`):
 /// the token(s) are consumed and the function is named `operator<symbol>`. nullopt (nothing
 /// consumed) when the next token is no operator. The table is `operatorFunctionName`.
+/// @grammar `+ - * / % & | ^ << >> == != < <= > >= ! ~ ++ -- [ ] [ ]= ( )`, as a function name
 std::optional<std::string> Parser::parseOperatorName() {
     const auto simple = [&](std::string_view symbol) {
         advance();
@@ -121,6 +124,7 @@ std::optional<std::string> Parser::parseOperatorName() {
     }
 }
 
+/// @grammar `fn name(params) -> R { body }`, `fn name(params)`, `fn self.name(...)` in a member
 FnDecl Parser::parseFn(const DeclStart& s, bool member) {
     FnDecl fn;
     Span fn_start = cur().span;
@@ -147,6 +151,7 @@ FnDecl Parser::parseFn(const DeclStart& s, bool member) {
 }
 
 /// `fn name = target` or `fn name = module.target` at module level.
+/// @grammar `fn name = fnType`
 FnAliasDecl Parser::parseFnAlias(const DeclStart& s) {
     FnAliasDecl a;
     advance(); // 'fn'
@@ -164,6 +169,7 @@ FnAliasDecl Parser::parseFnAlias(const DeclStart& s) {
     return a;
 }
 
+/// @grammar `global name: T = expr`
 GlobalDecl Parser::parseGlobal(const DeclStart& s) {
     GlobalDecl g;
     advance(); // 'global'
@@ -181,6 +187,7 @@ GlobalDecl Parser::parseGlobal(const DeclStart& s) {
 }
 
 /// `const NAME [: T] = expr` at module level. The type is optional.
+/// @grammar `const name: T = expr`
 GlobalDecl Parser::parseConstItem(const DeclStart& s) {
     GlobalDecl g;
     g.is_const = true;

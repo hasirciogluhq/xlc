@@ -44,6 +44,8 @@ std::string Parser::parseModuleString(Span& span) {
     return path;
 }
 
+/// @grammar `import "m"`, `import "m" as alias`, `import name from "m"`, `import * from "m"`
+/// @grammar `from "m" import name, other as alias`
 ImportDecl Parser::parseImport(const DeclStart& s) {
     ImportDecl decl;
     const Token& name_tok = cur();
@@ -82,6 +84,7 @@ ImportDecl Parser::parseImport(const DeclStart& s) {
     return decl;
 }
 
+/// @grammar `export * from "m"`, `export { a, b as c } from "m"`
 void Parser::parseExportFrom(Program& program, DeclStart& s) {
     ExportFromDecl decl;
     const Token& name_tok = cur();
@@ -136,6 +139,7 @@ void Parser::parseExportFrom(Program& program, DeclStart& s) {
     program.items.push_back(std::move(item));
 }
 
+/// @grammar a module-level `name!(...)` call, or a plain call, as an item
 Decl Parser::parseTopLevelCall(const DeclStart& s) {
     const Token& first = cur();
     ExprPtr expr = parseExpr();

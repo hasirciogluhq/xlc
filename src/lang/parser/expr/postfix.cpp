@@ -30,7 +30,10 @@ std::vector<std::string> Parser::splitPath(const std::string& path) {
     return out;
 }
 
-/// At `{`: does what follows look like a struct literal body (`}` or `name :`)?
+/// @grammar the brace that may open the body of a struct literal: `{` is a literal only when it
+/// @grammar is followed by `}` or by `name :`
+/// @invariant this is the only place that answers the struct-literal-or-block question; every
+/// @invariant caller must consult it rather than re-implementing the two-token peek
 bool Parser::looksLikeStructLiteral() const {
     if (peekKind(1) == TokenKind::RBrace) {
         return true;
@@ -38,6 +41,7 @@ bool Parser::looksLikeStructLiteral() const {
     return peekKind(1) == TokenKind::Ident && peekKind(2) == TokenKind::Colon;
 }
 
+/// @grammar `Type { field: value, other }`, `Type { }`
 std::vector<FieldInit> Parser::parseFieldInits() {
     expect(TokenKind::LBrace, "`{`");
     const int saved_depth = nl_depth_;
@@ -67,6 +71,7 @@ std::vector<FieldInit> Parser::parseFieldInits() {
 }
 
 /// Raw token lists of a macro argument list; consumes the `(` ... `)`.
+/// @grammar `name!(raw tokens...)`, the arguments are not parsed
 std::vector<std::vector<Token>> Parser::parseMacroArgs() {
     expect(TokenKind::LParen, "`(`");
     std::vector<std::vector<Token>> args;
@@ -206,6 +211,13 @@ bool Parser::ternaryColonAhead() const {
     return colons > owed;
 }
 
+/// @grammar `f(a, b)`, `a[i]`, `a[lo..hi]`, `a[lo..]`, `e.field`, `e<T>(...)`, `e!`, `e?`
+/// @grammar `name!(args...)`, `in(reg) x` / `out("rax") y` / `inout(reg) z` as a call argument
+/// @grammar `..pack` as a call argument, chained (`a.b(c)[d]?.e`)
+/// @grammar the loop keeps applying suffixes while `continues()` holds, so a newline ends the
+/// @grammar chain unless a `(`/`[`/`{` is still open
+/// @invariant `no_struct_` is cleared inside `(` and `[` and restored on exit, so `{` in an
+/// @invariant argument list is a struct literal even inside an `if` condition
 ExprPtr Parser::parsePostfix(ExprPtr expr) {
     while (true) {
         if (at(TokenKind::LParen) && continues()) {

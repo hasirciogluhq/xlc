@@ -31,6 +31,8 @@ template <std::ranges::input_range R> llvm::Function* Gen::emitHookAll(std::stri
     return all;
 }
 
+/// @abi the entry symbol is `_start` on ELF and `mainCRTStartup` on PE; a user symbol with either
+/// @abi name is E0726, so this lookup is the only way `@entry` becomes the program entry.
 const hir::Function* Gen::entryDecl() const {
     const auto it = std::ranges::find_if(hm_.functions, &hir::Function::is_entry);
     return it == hm_.functions.end() ? nullptr : &*it;

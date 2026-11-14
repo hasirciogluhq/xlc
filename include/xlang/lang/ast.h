@@ -18,8 +18,11 @@ namespace xlang {
 // AST nodes are tagged structs (Kind) with static factory helpers; declarations are a variant
 // of structs deriving from `DeclBase`. Types live in `types.h` (`Type` tree).
 
+/// @grammar the five prefix operators: `-e`, `!e`, `*e`, `&e`, `~e`
 enum class UnaryOp { Neg, Not, Deref, AddrOf, BitNot };
 
+/// @grammar the infix operators: `a + b`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`,
+/// @grammar `&&`, `||`, `&`, `|`, `^`, `<<`, `>>` (Go precedence, `&&`/`||` lowest above `?`)
 enum class BinaryOp {
     Add, Sub, Mul, Div, Mod, Eq, Ne, Lt, Le, Gt, Ge, And, Or,
     BitAnd, BitOr, BitXor, Shl, Shr

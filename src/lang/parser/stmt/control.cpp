@@ -4,7 +4,13 @@
 
 namespace xlang::parse {
 
-/// `for init; cond; step { body }` (every part optional) or `for i in lo..hi { body }`.
+/// @grammar `for init; cond; step { body }` (every part optional)
+/// @grammar `for x in e { body }`, `for x, i in e { body }`
+/// @grammar `for i in lo..hi { body }`, `for i in lo..=hi { body }`
+/// @grammar `for` header vs `for x in` is decided by `Ident` followed by `in` or `,` on the next
+/// @grammar token, so `for i in 0..n` and `for x, i in s` never reach the C-style form
+/// @invariant `no_struct_` and `for_header_` are put back on every return path, including the
+/// @invariant two early returns of the range forms; the `for` header is not a struct context
 Stmt Parser::parseFor() {
     Stmt stmt;
     advance(); // 'for'
@@ -67,6 +73,8 @@ Stmt Parser::parseFor() {
     return stmt;
 }
 
+/// @grammar `for init; cond; step { body }` and the range/foreach forms share one rule so a
+/// @grammar `local` in the initializer behaves exactly as in statement position
 Stmt Parser::parseForClause() {
     if (!at(TokenKind::Local)) {
         return parseSimpleStatement();
@@ -78,7 +86,10 @@ Stmt Parser::parseForClause() {
     return stmt;
 }
 
-/// `switch v { case a, b { ... } default { ... } }`
+/// @grammar `switch v { case a, b { ... } default { ... } }`, `switch { case cond { } ... }`
+/// @grammar `case a, b` takes a list; `default` takes none, at most one arm
+/// @invariant `nl_depth_` is reset to 0 inside the body and restored through `restore` on every
+/// @invariant exit, including the end-of-file error, so a raised depth never leaks past it
 Stmt Parser::parseSwitch() {
     Stmt stmt;
     stmt.kind = Stmt::Kind::Switch;

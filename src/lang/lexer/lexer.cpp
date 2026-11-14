@@ -173,6 +173,8 @@ private:
         emit(std::move(t));
     }
 
+    /// @grammar the lexical forms are dispatched by first character: `b'x'` byte literal,
+    /// @grammar identifier or keyword, number, string, `#directive`, then punctuation
     void scanToken() {
         const char c = peek();
 
@@ -340,6 +342,7 @@ private:
         return std::format("\\x{:02x}", static_cast<unsigned>(u));
     }
 
+    /// @grammar `[A-Za-z_][A-Za-z0-9_]*`, a keyword or a primitive type name
     void scanWord() {
         Token t = begin(TokenKind::Ident);
         const std::size_t start = pos_;
@@ -355,6 +358,8 @@ private:
         emit(std::move(t));
     }
 
+    /// @grammar `#if`, `#elif`, `#else`, `#endif`, `#ifdef`, `#ifndef`, `#error`, first token of
+    /// @grammar its line only; `#` anywhere else is an error
     void scanDirective() {
         Token t = begin(TokenKind::DirIf);
         const bool line_start = at_line_start_ || tokens_.empty() || newline_pending_;
@@ -384,6 +389,7 @@ private:
     /// `b'x'`: exactly one byte, written as a printable character, a `\` escape, a `\xHH` pair or a
     /// `\u{...}` code point below 128. The byte lands in `int_value` (0..255), so the parser makes a
     /// `u8` literal from it without touching `text`.
+    /// @grammar `b'x'`, `b'\n'`, `b'\xHH'`, `b'\u{...}'`: exactly one byte, value 0..255
     void scanByte() {
         Token t = begin(TokenKind::ByteLit);
         advance();  // 'b'
@@ -444,6 +450,8 @@ private:
         emit(std::move(t));
     }
 
+    /// @grammar `"text"` with the escapes `\n \t \r \0 \\ \" \xHH \u{...}`; may not span a
+    /// @grammar line break
     void scanString() {
         Token t = begin(TokenKind::String);
         advance();  // opening quote
@@ -503,6 +511,8 @@ private:
         emit(std::move(t));
     }
 
+    /// @grammar `123`, `0x1f`, `0b1010`, `0o17`, `1_000`, `1.5`, `1e9`, `1.5e-3`; after a `.` it is
+    /// @grammar a tuple position, so it takes no fraction and no exponent there
     void scanNumber() {
         Token t = begin(TokenKind::Int);
         const std::size_t start = pos_;
@@ -635,6 +645,7 @@ private:
 
 }  // namespace
 
+/// @grammar the whole token stream of one file, always ending with `TokenKind::End`
 std::vector<Token> lex(const SourceManager& sources, FileId file, DiagnosticEngine& diagnostics) {
     Scanner scanner(sources.file(file), file, diagnostics);
     return scanner.run();

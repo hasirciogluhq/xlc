@@ -188,6 +188,8 @@ Lowerer::EP Lowerer::newExpr(const Expr& e) {
             "not allocatable");
         return nullptr;
     }
+    /// @ownership `new T` calls the registered `alloc`; `new(p) T` places into `p` and calls no
+    /// @ownership allocator, so the memory of only the first form is owned by the pointer.
     EP out = mk(hir::ExprKind::New, Type::makePointer(t), e.span);
     out->target = t;
     if (t.kind == TypeKind::Class && (e.has_call_args || hasInit(t.path.front()))) {

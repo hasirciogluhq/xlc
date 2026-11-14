@@ -4,6 +4,7 @@
 
 namespace xlang::parse {
 
+/// @grammar `field: T`, `@attribute field: T`, member separated by `,` or a line break
 FieldDecl Parser::parseField(std::vector<Attribute> attrs) {
     FieldDecl field;
     field.span = attrs.empty() ? cur().span : attrs.front().span;
@@ -25,6 +26,7 @@ void Parser::memberSeparator() {
     }
 }
 
+/// @grammar `struct Name { fields }`, `struct Name<T, U> { fields }`, `@repr(c) struct ...`
 StructDecl Parser::parseStruct(const DeclStart& s) {
     StructDecl decl;
     advance(); // 'struct'
@@ -63,6 +65,7 @@ StructDecl Parser::parseStruct(const DeclStart& s) {
     return decl;
 }
 
+/// @grammar `class Name [: Base] { members }`, `class Name<T> [: Base] { members }`
 ClassDecl Parser::parseClass(const DeclStart& s) {
     ClassDecl decl;
     advance(); // 'class'
@@ -106,6 +109,7 @@ ClassDecl Parser::parseClass(const DeclStart& s) {
 }
 
 /// `[virtual|override] fn ...` inside class/interface/impl bodies.
+/// @grammar `[virtual|override] fn name(params) -> R { body }`, `fn +(...)`, `fn [](...)`
 FnDecl Parser::parseMethod(std::vector<Attribute> attrs, bool inherent) {
     DeclStart ms;
     ms.start = attrs.empty() ? cur().span : attrs.front().span;
@@ -135,6 +139,7 @@ FnDecl Parser::parseMethod(std::vector<Attribute> attrs, bool inherent) {
     return fn;
 }
 
+/// @grammar `interface Name { fn name(params) -> R }`, `interface Name : Base { ... }`
 InterfaceDecl Parser::parseInterface(const DeclStart& s) {
     InterfaceDecl decl;
     advance(); // 'interface'
@@ -173,6 +178,7 @@ InterfaceDecl Parser::parseInterface(const DeclStart& s) {
 /// parameter, `self` alone meaning `self: T`), so it overloads like any function and nothing
 /// after the parser knows about the block. Those functions are added to `program` and the
 /// result is empty.
+/// @grammar `impl T { fn +(...) ... }`, `impl<T> Box<T> { ... }`, `impl Iface for T { ... }`
 std::optional<ImplDecl> Parser::parseImpl(Program& program, DeclStart& s) {
     ImplDecl decl;
     advance(); // 'impl'

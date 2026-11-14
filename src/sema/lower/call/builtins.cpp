@@ -4,6 +4,7 @@
 
 namespace xlang::lower {
 
+/// @grammar `syscall(nr, args...)`, returning `i64`: a negative result is `-errno`, so the caller checks the sign rather than a separate error out.
 Lowerer::EP Lowerer::syscallExpr(const Expr& e) {
     if (e.args.empty()) {
         err("E0710", e.span, "`syscall` needs the syscall number", "wrong number of arguments");
@@ -64,6 +65,11 @@ std::optional<std::uint32_t> Lowerer::memoryOrder(const Expr& arg) {
     return static_cast<std::uint32_t>(v->int_value);
 }
 
+/// @grammar `__builtin_atomicLoad(p, order)`, `__builtin_atomicStore(p, v, order)`, `__builtin_atomicXchg(p, v, order)`, `__builtin_atomicCas(p, expected, new, order)`, `__builtin_atomicAdd(p, v, order)`.
+/// @grammar `__builtin_read(p)`, `__builtin_write(p, v)`, `__builtin_drop(p)`, `__builtin_needsDrop<T>()`, `__builtin_fence(order)`, `__builtin_unwindPads()`, `__builtin_unwindPadCount()`, `__builtin_asm(...)`.
+/// @invariant the `__builtin_` set is closed: a name not listed here is not a builtin, and the compiler never learns a new one from the standard library.
+/// @invariant `__builtin_read` copies the value out of the pointer and drops nothing, so two reads of one pointer yield two owners of the same bytes and only the caller's discipline keeps that sound.
+/// @invariant `__builtin_write` is a statement, never a value, and moves the value through the pointer without running a destructor on the old bytes.
 Lowerer::EP Lowerer::builtinCall(const Expr& e, const std::string& name) {
     const bool is_load = name == "__builtin_atomicLoad";
     const bool is_store = name == "__builtin_atomicStore";
@@ -281,6 +287,7 @@ Lowerer::EP Lowerer::builtinCall(const Expr& e, const std::string& name) {
     return out;
 }
 
+/// @grammar `__builtin_asm("template", in(reg) x, out("rax") y, inout(reg) z, clobber("memory"), options(nomem|noreturn))`, with `{k}` placeholders numbered by operand order.
 Lowerer::EP Lowerer::asmCall(const Expr& e) {
     if (e.args.empty() || e.args[0]->kind != Expr::Kind::StringLiteral) {
         err("E0709",

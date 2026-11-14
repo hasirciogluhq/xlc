@@ -1,0 +1,65 @@
+#!/bin/sh
+# Pre-commit hook: check the compiler comment tags, collect them, and stage the collected view.
+#
+# Installed by `scripts/install-hooks.sh`, which points core.hooksPath at .githooks so the hook
+# is versioned with the code instead of living in .git/hooks.
+#
+# What it does, in this order:
+#   1. scripts/tags.sh check, when a staged file under src/ or include/ carries tags. A rule
+#      violation refuses the commit.
+#   2. scripts/tags.sh sync, which rewrites the collected block inside COMPILER-TAGS.md from the
+#      source. When the file changed, it is staged so the view travels in the same commit as the
+#      tag it came from.
+#
+# The compiler is not built here: a build in a pre-commit hook is slow enough that people
+# disable hooks, and the tag rules only need a text scan.
+#
+# Set XLANG_SKIP_HOOKS=1 to commit anyway (a hotfix or a rebase); CI runs the same check.
+
+set -eu
+
+if [ "${XLANG_SKIP_HOOKS:-0}" = "1" ]; then
+    echo "pre-commit: skipped (XLANG_SKIP_HOOKS=1)"
+    exit 0
+fi
+
+root=$(git rev-parse --show-toplevel)
+# The xlc repository may be a submodule: the scripts live next to .githooks in this repository.
+if [ -d "$root/.githooks" ]; then
+    work=$root
+else
+    work=$(git rev-parse --show-prefix)
+    work="$root/$work"
+fi
+cd "$work"
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+if ! echo "$staged" | grep -qE '^(src|include)/.*\.(cpp|h|hpp)$' &&
+    ! echo "$staged" | grep -q '^COMPILER-TAGS.md$'; then
+    # Nothing that carries tags: no scan, no rewrite, no cost.
+    exit 0
+fi
+
+if [ ! -x scripts/tags.sh ]; then
+    echo "pre-commit: scripts/tags.sh is missing or not executable" >&2
+    echo "pre-commit: run 'chmod +x scripts/tags.sh' in the xlc repository" >&2
+    exit 1
+fi
+
+# 1. The rules: a broken tag is refused, never silently rewritten.
+if ! out=$(./scripts/tags.sh check); then
+    echo "$out" >&2
+    echo "" >&2
+    echo "pre-commit: the commit was refused; see COMPILER-TAGS.md." >&2
+    echo "pre-commit: XLANG_SKIP_HOOKS=1 git commit ... commits anyway." >&2
+    exit 1
+fi
+
+# 2. The collected view, staged so it lands in this commit rather than a second one.
+./scripts/tags.sh sync
+if [ -n "$(git status --porcelain -- COMPILER-TAGS.md)" ]; then
+    git add COMPILER-TAGS.md
+    echo "pre-commit: staged COMPILER-TAGS.md (collected tag view)"
+fi
+
+exit 0

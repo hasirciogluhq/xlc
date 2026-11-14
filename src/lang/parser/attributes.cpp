@@ -4,6 +4,7 @@
 
 namespace xlang::parse {
 
+/// @grammar `@name`, `@name(a, key = v, ...)`, `@file(name(...))` at the top of a file
 Attribute Parser::parseAttribute() {
     Attribute attr;
     const Token& at_token = expect(TokenKind::At, "`@`");
@@ -33,6 +34,7 @@ Attribute Parser::parseAttribute() {
     return attr;
 }
 
+/// @grammar the value of an attribute argument: an identifier, an integer literal or a string
 void Parser::parseAttributeValue(AttributeArg& arg) {
     switch (cur().kind) {
     case TokenKind::Ident:
@@ -60,6 +62,7 @@ void Parser::parseAttributeValue(AttributeArg& arg) {
     }
 }
 
+/// @grammar one or more `@attribute` lines before an item, a statement or a parameter
 std::vector<Attribute> Parser::parseAttributes() {
     std::vector<Attribute> attrs;
     while (at(TokenKind::At)) {

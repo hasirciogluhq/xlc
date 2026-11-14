@@ -6,6 +6,7 @@
 
 namespace xlang::lower {
 
+/// @invariant the overload key is the qualified name plus the parameter types, so two overloads of one name never share a symbol.
 std::string Lowerer::overloadKey(const std::string& qname, const std::vector<Type>& params) {
     std::string key = qname;
     for (const Type& p : params) {

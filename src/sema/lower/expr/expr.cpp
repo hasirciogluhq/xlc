@@ -85,6 +85,7 @@ Lowerer::stringLiteral(const std::string& text, const Type* expected, const Span
 
 Lowerer::EP Lowerer::expr(const Expr& e, const Type* expected) {
     switch (e.kind) {
+/// @invariant an unsuffixed integer literal is `i32` unless the context asks for another type, and it widens to `i64` only when the value does not fit in 32 bits.
     case Expr::Kind::IntLiteral: {
         Type want = expected != nullptr ? resolved(*expected) : lower::unknownType();
         if (want.kind == TypeKind::Float) {
@@ -97,6 +98,7 @@ Lowerer::EP Lowerer::expr(const Expr& e, const Type* expected) {
                                                : Type::makeInt(32, true);
         return intConst(e.int_value, std::move(t), e.span);
     }
+/// @invariant an unsuffixed float literal is `f64` unless the context asks for `f32`, so `local x: f32 = 1.5` narrows at the literal, not at a cast.
     case Expr::Kind::FloatLiteral: {
         Type want = expected != nullptr ? resolved(*expected) : lower::unknownType();
         EP f = mk(hir::ExprKind::FloatConst,
@@ -110,8 +112,10 @@ Lowerer::EP Lowerer::expr(const Expr& e, const Type* expected) {
         b->bool_value = e.bool_value;
         return b;
     }
+/// @grammar a string literal is a `str`, or byte by byte into a `[u8; N]` when the context names one; a literal longer than N is E0717.
     case Expr::Kind::StringLiteral:
         return stringLiteral(e.text, expected, e.span);
+/// @invariant `b'x'` is always `u8`, never widened by the context, because the byte is the whole value.
     case Expr::Kind::ByteLiteral:
         return intConst(e.int_value, Type::makeInt(8, false), e.span);
     case Expr::Kind::Name:

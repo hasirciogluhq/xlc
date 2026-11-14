@@ -4,7 +4,7 @@
 
 namespace xlang::parse {
 
-/// `<T, U>` after a `fn`, `struct` or `class` name.
+/// @grammar `<T, U>` after a `fn`, `struct`, `class` or `interface` name, `<>` empty
 std::vector<std::string> Parser::parseGenericParams() {
     std::vector<std::string> names;
     expect(TokenKind::Lt, "`<` starting the type parameters");
@@ -29,7 +29,9 @@ void Parser::rejectTypeParams() {
     }
 }
 
-/// `<A, B>` after a type name or an identifier in an expression.
+/// @grammar `<A, B>` after a type name or an identifier in an expression, `>>` closing two levels
+/// @invariant inside `<...>` a nested `<` always opens type arguments, also in the type of a
+/// @invariant cast, so `cast_type_` is cleared here and restored on exit
 std::vector<Type> Parser::parseTypeArgs() {
     std::vector<Type> args;
     expect(TokenKind::Lt, "`<` starting the type arguments");
@@ -162,7 +164,7 @@ bool Parser::castTypeArgsAhead() const {
                                   tokens_[i + 1].kind);
 }
 
-/// The type after `->`: any type, or `never` (the one place it may be written).
+/// @grammar the type after `->`, which may be `never` (the one place it may be written)
 Type Parser::parseReturnType() {
     if (at(TokenKind::PrimType) && cur().text == "never") {
         advance();
@@ -171,6 +173,14 @@ Type Parser::parseReturnType() {
     return parseType();
 }
 
+/// @grammar `*T`, `[]T`, `[]mut T`, `[T; N]`, `(T,)`, `(A, B)`, `()`
+/// @grammar `fn(A) -> R`, `fn(A)`, `Name`, `a.b.Name`, `Name<T, U>`
+/// @grammar `*T` is written with a star, never a postfix form: the type grammar is prefix only
+/// @grammar `(T)` without the trailing comma is `T` in parentheses, not a one-element tuple
+/// @grammar `[T; N]` keeps N as an expression, parsed with `no_struct_` cleared
+/// @grammar `never` is accepted here and rejected later with E0765 unless it is a return type
+/// @invariant `nl_depth_` is raised around every bracket the rule consumes and lowered on every
+/// @invariant exit path, so a newline inside a type does not end the enclosing statement
 Type Parser::parseType() {
     const Span start = cur().span;
     Type type;

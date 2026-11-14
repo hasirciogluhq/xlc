@@ -9,6 +9,8 @@
 
 namespace xlang {
 
+/// @grammar every lexical token the parser can see; the spellings are fixed by `lexer.cpp` and
+/// @grammar the language grammar in the parser's `@grammar` comments uses these tokens
 enum class TokenKind {
     End,
 

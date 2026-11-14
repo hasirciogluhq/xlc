@@ -542,6 +542,8 @@ private:
 
 }  // namespace
 
+/// @grammar `#if`, `#elif`, `#else`, `#endif`, `#ifdef`, `#ifndef`, `#error`, resolved against the
+/// @grammar build definitions (`-DNAME=VALUE`, `-UNAME`) before the parser sees the tokens
 std::vector<Token> preprocess(std::vector<Token> tokens, const BuildConfig& config,
                               DiagnosticEngine& diagnostics) {
     Preprocessor pp(config, diagnostics);

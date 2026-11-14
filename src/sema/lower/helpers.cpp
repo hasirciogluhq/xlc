@@ -18,6 +18,7 @@ Lowerer::EP Lowerer::mk(hir::ExprKind kind, Type type, const Span& span) const {
     return e;
 }
 
+/// @invariant a negative literal of a type narrower than 64 bits keeps only its low bits of that width, which is why `-1 as u8` is 255 and not a sign-extended 64-bit value.
 Lowerer::EP Lowerer::intConst(std::uint64_t v, Type type, const Span& span) const {
     EP e = mk(hir::ExprKind::IntConst, std::move(type), span);
     e->int_value = v;

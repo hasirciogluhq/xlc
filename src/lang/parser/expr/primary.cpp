@@ -7,6 +7,9 @@ namespace xlang::parse {
 /// `fn(params) -> R { body }` as an expression: the body becomes a module-level function with a
 /// generated name, and the expression is a reference to it. A literal captures nothing; an
 /// outer local used inside it is an unknown name.
+/// @grammar `fn(params) -> R { body }` as an expression
+/// @ownership the produced `FnDecl` is moved into `lambdas_` and spliced onto `program.items` by
+/// @ownership `run()`; the expression only keeps the generated name
 ExprPtr Parser::parseFnLiteral() {
     const Span start = cur().span;
     expect(TokenKind::Fn, "`fn`");
@@ -27,6 +30,11 @@ ExprPtr Parser::parseFnLiteral() {
 /// `[move] |a: T, b| [-> R] { body }` or `[move] |x| expr`; `||` is the empty parameter list.
 /// Types may be left out where the context names a `fn(...)` type (checked by the lowering).
 /// `move` is a keyword only in front of `|`.
+/// @grammar `||`, `|a, b|`, `|a: T, b| -> R { body }`, `|x| expr`, `move |x| expr`
+/// @grammar `move` is a keyword only directly in front of `|`, so `a | b` and `a || b` stay
+/// @grammar operators
+/// @invariant a parameter type may be omitted only where the context names a `fn(...)` type; the
+/// @invariant parser accepts the omission and lowering rejects an unknown one with E0770
 ExprPtr Parser::parseClosure() {
     const Span start = cur().span;
     ExprPtr e = makeExpr(Expr::Kind::Closure, start);
@@ -84,6 +92,11 @@ ExprPtr Parser::parseClosure() {
     return e;
 }
 
+/// @grammar `123`, `1.5`, `"text"`, `b'x'`, `true`, `false`, `self`, `name`, `name::name`
+/// @grammar `name<T, U>`, `(a)`, `(a, b)`, `[a, b]`, `[v; n]`, `new T`, `new(p) T`
+/// @grammar `__builtin_asm(...)`
+/// @grammar a name is a primary; the suffixes (`call`, `index`, `field`, `?`) are applied by
+/// @grammar `parsePostfix`, so `a.b(c)` is not a single primary form
 ExprPtr Parser::parsePrimary() {
     const Token& tok = cur();
     const Span start = tok.span;
@@ -188,9 +201,10 @@ ExprPtr Parser::parsePrimary() {
     }
 }
 
-/// `[]` directly followed, on the same line, by something that starts an element type
-/// (`[]i32`, `[]mut u8`, `[]Point`, `[][]u8`, `[]*T`, `[]fn(i32)`) is the slice type, never the
-/// empty array literal: no expression continues with a type name after `]`.
+/// @grammar `[]T` and `[]mut T` as the element type of a slice, versus `[]` the empty array
+/// @grammar literal: only a type token directly after `]` on the same line means a slice type
+/// @invariant no expression continues with a type name after `]`, which is what makes this peek
+/// @invariant unambiguous
 bool Parser::atSliceType() const {
     if (peekKind(1) != TokenKind::RBracket || peek(2).newline_before) {
         return false;
@@ -207,6 +221,9 @@ bool Parser::atSliceType() const {
     }
 }
 
+/// @grammar `[a, b]`, `[v; n]`, `[a, b,]`, `[]`
+/// @invariant `no_struct_` is cleared inside the brackets and restored on exit, so an element may
+/// @invariant be a struct literal
 ExprPtr Parser::parseArrayLiteral() {
     const Span start = cur().span;
     if (atSliceType()) {
@@ -246,6 +263,7 @@ ExprPtr Parser::parseArrayLiteral() {
     return result;
 }
 
+/// @grammar `new T { fields }`, `new T(args)`, `new(p) T { fields }`, `new(p) T(args)`
 ExprPtr Parser::parseNew() {
     const Span start = cur().span;
     advance(); // 'new'

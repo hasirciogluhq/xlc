@@ -14,6 +14,8 @@ namespace {
 
 } // namespace
 
+/// @grammar `register(panic)`, `register(alloc)`, `register(free)`, `register(unwind)`, `register(args)`: one symbol per role per group, checked structurally against the shape the role needs.
+/// @invariant group 1 is the stdlib default and a group 2 (user) registration replaces it per role, so user code can override the allocator without changing the stdlib.
 void Lowerer::checkRegistrations() {
     for (const Item& item : s_.program_.items) {
         if (!item.modifiers.registered || item.modifiers.register_role.empty()) {
@@ -124,6 +126,8 @@ void Lowerer::checkRegistrations() {
     }
 }
 
+/// @grammar `@init fn`, `@fini fn`, `@entry fn`: module-level hooks that are not called by any code and are kept by reachability for that reason.
+/// @invariant `@init` runs for the stdlib group before user code and for an import before its importer; `_xl_initAll` is the only caller and it is compiler-owned.
 void Lowerer::checkHookFunctions() {
     // Attribute name, and the code reported when it is put on something that cannot be that hook.
     struct Hook {

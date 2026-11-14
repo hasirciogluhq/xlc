@@ -372,6 +372,8 @@ private:
 
 }  // namespace
 
+/// @grammar `name!(args...)`: each argument is matched against the parameter kinds `expr`,
+/// @grammar `type`, `ident`, `block`, `items`, and the body is substituted hygienically
 std::vector<Token> expandMacros(std::vector<Token> tokens, MacroTable& table,
                                 DiagnosticEngine& diagnostics) {
     Expander expander(table, diagnostics);

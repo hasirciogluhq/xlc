@@ -322,6 +322,7 @@ std::optional<ConstValue> Sema::evalCast(const Expr& expr) {
     return std::nullopt;
 }
 
+/// @grammar `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)` are the only calls that are compile-time constants; every other call in a constant position is E0707.
 std::optional<ConstValue> Sema::evalCall(const Expr& expr) {
     if (expr.lhs->kind != Expr::Kind::Name) {
         notConstant(expr.span, "only `sizeOf`, `alignOf` and `offsetOf` calls are constants");

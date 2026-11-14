@@ -4,6 +4,7 @@
 
 namespace xlang::lower {
 
+/// @invariant a bounds check exists only under `--safety=checked`; an unchecked build emits the access with no branch.
 Lowerer::EP Lowerer::indexExpr(const Expr& e) {
     const std::size_t mark = preludeMark();
     EP base = expr(*e.lhs, nullptr);

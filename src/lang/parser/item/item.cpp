@@ -23,6 +23,11 @@ void Parser::endOfItemLine() {
            "put this on a new line");
 }
 
+/// @grammar `fn name<T>(params) -> R { body }`, `fn +(...)` and the other operator names
+/// @grammar `fn name: sig`, `global name: T = c`, `const name: T = c`
+/// @grammar `struct`, `class`, `interface`, `enum`, `impl`, `type Name = T`, `define`
+/// @grammar `import`, `export name from "m"`, `export *`, a module-level `name!(...)` call
+/// @grammar `@attribute` before any of them, `export` / `export(c)` / `@library` modifiers
 void Parser::parseItem(Program& program) {
     rejectDirective();
     DeclStart s;
@@ -107,6 +112,7 @@ void Parser::addItem(Program& program, DeclStart& s, Decl decl) {
     program.items.push_back(std::move(item));
 }
 
+/// @grammar `export`, `export(c)`, `@library` and the other item modifiers before the keyword
 void Parser::parseModifiers(Modifiers& mods) {
     while (true) {
         if (at(TokenKind::Export)) {

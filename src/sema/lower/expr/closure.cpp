@@ -107,6 +107,7 @@ namespace {
 
 } // namespace
 
+/// @ownership a closure without `move` borrows: the field holds a pointer to the variable, so the closure sees later writes and a write inside changes the variable.
 std::vector<Lowerer::Capture>
 Lowerer::takeCaptures(ClosureData& closure, bool by_value, const std::string& env) {
     // Names the closure declares itself shadow the enclosing function's: parameters, locals, loop
@@ -171,6 +172,7 @@ Lowerer::takeCaptures(ClosureData& closure, bool by_value, const std::string& en
     return captures;
 }
 
+/// @invariant a closure that captures nothing is a plain `fn(A) -> R` pointer and captures anything only as a struct, so a `fn(...)` position holding a capturing closure is E0773.
 Lowerer::EP Lowerer::closureExpr(const Expr& e, const Type* expected) {
     const ClosureData& c = *e.closure;
     const Type want = expected != nullptr ? resolved(*expected) : unknownType();

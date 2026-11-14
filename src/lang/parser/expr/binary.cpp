@@ -4,7 +4,9 @@
 
 namespace xlang::parse {
 
-/// `cond ? a : b` (right associative, lowest precedence).
+/// @grammar `cond ? a : b` is right associative and the lowest precedence level
+/// @invariant `open_ternaries_` holds the token index of every `?` whose `:` is still owed, so
+/// @invariant `ternaryColonAhead` can tell a ternary `?` from a propagating one
 ExprPtr Parser::parseTernary() {
     ExprPtr cond = parseOr();
     if (at(TokenKind::Question) && continues()) {
@@ -32,6 +34,7 @@ ExprPtr Parser::makeBinary(BinaryOp op, ExprPtr lhs, ExprPtr rhs) {
     return e;
 }
 
+/// @grammar `a || b`
 ExprPtr Parser::parseOr() {
     ExprPtr lhs = parseAnd();
     while (at(TokenKind::OrOr) && continues()) {
@@ -41,6 +44,7 @@ ExprPtr Parser::parseOr() {
     return lhs;
 }
 
+/// @grammar `a && b`
 ExprPtr Parser::parseAnd() {
     ExprPtr lhs = parseEquality();
     while (at(TokenKind::AndAnd) && continues()) {
@@ -50,6 +54,7 @@ ExprPtr Parser::parseAnd() {
     return lhs;
 }
 
+/// @grammar `a == b`, `a != b`
 ExprPtr Parser::parseEquality() {
     ExprPtr lhs = parseComparison();
     while ((at(TokenKind::EqEq) || at(TokenKind::NotEq)) && continues()) {
@@ -59,6 +64,7 @@ ExprPtr Parser::parseEquality() {
     return lhs;
 }
 
+/// @grammar `a < b`, `a <= b`, `a > b`, `a >= b`
 ExprPtr Parser::parseComparison() {
     ExprPtr lhs = parseAdditive();
     while ((at(TokenKind::Lt) || at(TokenKind::Le) || at(TokenKind::Gt) || at(TokenKind::Ge)) &&
@@ -83,6 +89,7 @@ ExprPtr Parser::parseComparison() {
     return lhs;
 }
 
+/// @grammar `a + b`, `a - b`, `a | b`, `a ^ b`
 ExprPtr Parser::parseAdditive() {
     ExprPtr lhs = parseMultiplicative();
     // Go-style levels: `+ - | ^` here, `* / % << >> &` in parseMultiplicative.
@@ -109,6 +116,7 @@ ExprPtr Parser::parseAdditive() {
     return lhs;
 }
 
+/// @grammar `a * b`, `a / b`, `a % b`, `a & b`, `a << b`, `a >> b`
 ExprPtr Parser::parseMultiplicative() {
     ExprPtr lhs = parseCast();
     while ((at(TokenKind::Star) || at(TokenKind::Slash) || at(TokenKind::Percent) ||
@@ -140,6 +148,10 @@ ExprPtr Parser::parseMultiplicative() {
     return lhs;
 }
 
+/// @grammar `e as T` binds tighter than every binary operator, so `a + b as i64` casts `b`
+/// @grammar `[cast_type_]` tells `parseType` that a `<` after a name may be a comparison
+/// @grammar (`x as Idx < n`) rather than type arguments; `castTypeArgsAhead` decides
+/// @invariant `cast_type_` stays true for the whole target type and is cleared right after
 ExprPtr Parser::parseCast() {
     ExprPtr value = parseUnary();
     while (at(TokenKind::As) && continues()) {
@@ -155,6 +167,9 @@ ExprPtr Parser::parseCast() {
     return value;
 }
 
+/// @grammar `-e`, `!e`, `~e`, `*e`, `&e`, `&mut e`, repeated (`--x`, `*&p`)
+/// @invariant `prefix_operand_` and `prefix_nl_base_` are raised around the operand, so a
+/// @invariant newline in front of a binary `&`/`*` ends the operand, not the next argument
 ExprPtr Parser::parseUnary() {
     const Span start = cur().span;
     std::optional<UnaryOp> op;

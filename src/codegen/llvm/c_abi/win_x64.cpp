@@ -29,6 +29,9 @@ namespace {
 
 } // namespace
 
+/// @abi Microsoft x64: an aggregate of 1, 2, 4 or 8 bytes is passed as an integer of that size,
+/// @abi every other aggregate goes by hidden reference; four register slots, then the stack.
+/// @spec https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
 Signature
 classifyWin64(llvm::LLVMContext& ctx, const Value& ret, const std::vector<Value>& params) {
     Signature s;

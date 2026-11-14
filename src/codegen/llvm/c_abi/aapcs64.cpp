@@ -61,6 +61,9 @@ namespace {
 
 } // namespace
 
+/// @abi AAPCS64 6.8: HFA/HVA aggregates take up to four SIMD registers, other aggregates up to
+/// @abi 16 bytes go in x0-x7, the rest on the stack.
+/// @spec https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
 Signature
 classifyAapcs64(llvm::LLVMContext& ctx, const Value& ret, const std::vector<Value>& params) {
     Signature s;

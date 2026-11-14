@@ -21,6 +21,7 @@ Lowerer::EP Lowerer::boolConst(bool value, const Span& span) {
     return b;
 }
 
+/// @ownership the drop glue takes the address of the place and leaves the place unmodified; the flag that decides whether to run it is cleared by the caller, never here.
 Lowerer::EP Lowerer::dropCallOn(EP addr, const Type& t, const Span& span) {
     EP call = mk(hir::ExprKind::Call, Type::makeVoid(), span);
     call->text = t.kind == TypeKind::Tuple ? tupleDropGlue(t, span) : dropGlueName(t.path.front());

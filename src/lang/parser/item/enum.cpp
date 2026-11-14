@@ -4,6 +4,7 @@
 
 namespace xlang::parse {
 
+/// @grammar `enum Name: T { A, B }`, `enum Name<T> { A(T), B, C(A, B) }`
 EnumDecl Parser::parseEnum(const DeclStart& s) {
     EnumDecl decl;
     advance(); // 'enum'
@@ -146,6 +147,7 @@ void Parser::addEnum(Program& program, DeclStart& s, EnumDecl decl) {
     addItem(program, s, std::move(sum));
 }
 
+/// @grammar `type Name = T`, `type Name<T> = T`
 TypeAliasDecl Parser::parseTypeAlias(const DeclStart& s) {
     TypeAliasDecl decl;
     advance(); // 'type'
@@ -161,6 +163,7 @@ TypeAliasDecl Parser::parseTypeAlias(const DeclStart& s) {
     return decl;
 }
 
+/// @grammar `define name(a: expr, b: stmt) { body }`, used as `name!(...)`
 Decl Parser::parseDefine(const DeclStart& s) {
     advance(); // 'define'
     const Token& name_tok = cur();

@@ -125,8 +125,10 @@ namespace lower {
     return false;
 }
 
-/// Maximum number of syscall arguments (after the number) for the target; nullopt = no fixed
-/// limit in the target table (Windows NT: the compiler spills to the stack, plan 5.3).
+/// @abi the syscall number goes in one register and the arguments in the next ones: x0-x7 on
+/// @abi arm64 and rdi/rsi/rdx/r10/r8/r9 on x86-64 Linux and macOS, which is why the limit is six.
+/// @abi Windows NT has no `syscall` instruction: the compiler spills to the stack, so there is no
+/// @abi argument limit there and the number is resolved by the stdlib instead.
 [[nodiscard]] inline std::optional<unsigned> syscallMaxArgs(const TargetInfo& t) {
     if (t.os == "windows") {
         return std::nullopt;

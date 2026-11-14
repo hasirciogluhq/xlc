@@ -7,6 +7,7 @@
 
 namespace xlang::lower {
 
+/// @invariant `try` requires the `unwind` role: with no registered unwinder the program cannot catch and the form is E0501.
 void Lowerer::lowerTry(const Stmt& s, std::vector<hir::Stmt>& out) {
     if (mod_.unwind_function.empty()) {
         err("E0501",

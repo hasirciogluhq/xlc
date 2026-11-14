@@ -63,6 +63,14 @@ jobs:
           build-cache: true
           build-cache-key: ci-${{ runner.os }}-${{ runner.arch }}
           project-path: .
+      - name: Compiler comment tags
+        if: runner.os != 'Windows'
+        # COMPILER-TAGS.md: every tag line must stay collectable with one grep, and the collected
+        # view must match the source. The hook stages the view; this fails if it was not run.
+        run: |
+          ./scripts/tags.sh check
+          ./scripts/tags.sh sync
+          git diff --exit-code -- COMPILER-TAGS.md
       - name: Build and test
         if: runner.os != 'Windows'
         run: |
@@ -76,6 +84,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash -el {0}
         run: |
+          ./scripts/tags.sh check
+          ./scripts/tags.sh sync
+          git diff --exit-code -- COMPILER-TAGS.md
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
           xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
           xmake -P . -y
