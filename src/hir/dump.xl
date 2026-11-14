@@ -1,0 +1,526 @@
+// The HIR dump (`--dump-hir`), the xlang source of the logic in the old src/hir/hir.cpp: the text
+// form of a flat module (abi.xl) that reads like source, one statement per line, expressions in
+// prefix form `(kind ...):type`.
+//
+// This file walks the arenas of abi.xl and formats. The entry points are `xlcHirDump` and
+// `xlcHirDumpFree`; everything here is the implementation behind them.
+from "std" import String, format, toString
+from "abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, XlcHirStr, XlcHirText,
+    XlcHirAsmOperand, view, E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, E_NIL, E_LOCAL_REF, E_GLOBAL_REF,
+    E_FUNC_REF, E_EXTERNAL, E_UNARY, E_BINARY, E_SELECT, E_CAST, E_CALL, E_CALL_INDIRECT,
+    E_CALL_VIRTUAL, E_CALL_ITABLE, E_CALL_EXTERNAL, E_SYSCALL, E_FIELD, E_INDEX, E_SLICE, E_DEREF,
+    E_ADDR_OF, E_ARRAY_LIST, E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_NEW, E_TO_INTERFACE,
+    E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG, E_ATOMIC_CAS, E_ATOMIC_ADD, E_FENCE, E_ASM,
+    E_CONSTRUCT, E_MOVE, E_MATERIALIZE, E_RAW_READ, E_UNWIND_PADS, E_UNWIND_PAD_COUNT,
+    S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE, S_CONTINUE, S_BREAK, S_BLOCK, S_TRY
+
+/// Appends one boundary string.
+fn put(out: *String, s: XlcHirStr) {
+    out.append(view(s))
+}
+
+/// The name of local `i` of `f`; `?` when there is no function (a global initializer) or the index
+/// is out of range (an ill-formed tree the C++ side would have crashed on).
+fn localName(f: *XlcHirFunction, i: u32) -> str {
+    if f != nil && i < f.localCount {
+        return view(f.locals[i].name)
+    }
+    return "?"
+}
+
+/// The two's complement value of an `IntConst`: the boundary carries the bits as `u64`.
+fn signedOf(bits: u64) -> i64 {
+    return *(&bits as *i64)
+}
+
+/// One operand of `__builtin_asm`: ` in(reg) value` / ` out("rax") value` / ` inout(reg) value`.
+fn dumpOperand(out: *String, f: *XlcHirFunction, m: *XlcHirModule, o: *XlcHirAsmOperand) {
+    out.append(o.kind == 0 ? " in(" : o.kind == 1 ? " out(" : " inout(")
+    put(out, o.reg)
+    out.append(") ")
+    if o.value >= 0 {
+        dumpExpr(out, f, m, &m.exprs[o.value as usize])
+    }
+}
+
+/// One expression in prefix form; the closing `):type` and the children are the common tail.
+fn dumpExpr(out: *String, f: *XlcHirFunction, m: *XlcHirModule, e: *XlcHirExpr) {
+    switch {
+        case e.kind == E_INT_CONST {
+            out.append(format("{}:{}", signedOf(e.intValue), view(e.typeName)))
+            return
+        }
+        case e.kind == E_FLOAT_CONST {
+            // The C++ dump wrote `std::format("{}", v)`, whose whole plain values carry no `.0`
+            // marker; the stdlib's shortest form keeps it, so strip it back off.
+            local t = toString(e.floatValue)
+            if t.findLast("e") < 0 && t.length() >= 2 && t.at(t.length() - 2) == b'.' && t.at(t.length() - 1) == b'0' {
+                local cut = t.slice(0, t.length() - 2)
+                out.append(format("{}:{}", &cut, view(e.typeName)))
+            } else {
+                out.append(format("{}:{}", t, view(e.typeName)))
+            }
+            return
+        }
+        case e.kind == E_BOOL_CONST {
+            out.append(e.boolValue != 0 ? "true" : "false")
+            return
+        }
+        case e.kind == E_STR_CONST {
+            out.append("\"")
+            put(out, e.text)
+            out.append("\"")
+            return
+        }
+        case e.kind == E_NIL {
+            out.append("nil:")
+            put(out, e.typeName)
+            return
+        }
+        case e.kind == E_LOCAL_REF {
+            out.append(localName(f, e.localId))
+            out.append(format("#{}", e.localId))
+            return
+        }
+        case e.kind == E_GLOBAL_REF {
+            out.append("@")
+            put(out, e.text)
+            return
+        }
+        case e.kind == E_FUNC_REF {
+            out.append("&fn ")
+            put(out, e.text)
+            return
+        }
+        case e.kind == E_EXTERNAL {
+            out.append("external(")
+            put(out, e.text)
+            out.append(".")
+            put(out, e.member)
+            out.append(")")
+            return
+        }
+        case e.kind == E_CONSTRUCT {
+            out.append("construct ")
+            put(out, e.typeName)
+            out.append(" ")
+            put(out, e.text)
+        }
+        case e.kind == E_MOVE {
+            out.append(format("move#{}", e.localId))
+        }
+        case e.kind == E_MATERIALIZE {
+            out.append(format("materialize#{} live#{}", e.localId, e.index))
+        }
+        case e.kind == E_UNARY {
+            out.append("(")
+            put(out, e.unaryOp)
+        }
+        case e.kind == E_BINARY {
+            out.append("(")
+            put(out, e.binaryOp)
+        }
+        case e.kind == E_CAST {
+            out.append(e.implicit != 0 ? "(cast.implicit" : "(cast")
+        }
+        case e.kind == E_CALL {
+            out.append("(call ")
+            put(out, e.text)
+        }
+        case e.kind == E_CALL_INDIRECT {
+            out.append("(call.indirect")
+        }
+        case e.kind == E_CALL_VIRTUAL {
+            out.append(format("(call.virtual {}[{}]", view(e.text), e.index))
+        }
+        case e.kind == E_CALL_ITABLE {
+            out.append(format("(call.itable {}[{}]", view(e.text), e.index))
+        }
+        case e.kind == E_CALL_EXTERNAL {
+            out.append("(call.external ")
+            put(out, e.text)
+            out.append(".")
+            put(out, e.member)
+        }
+        case e.kind == E_SYSCALL {
+            out.append("(syscall")
+        }
+        case e.kind == E_FIELD {
+            out.append(e.throughPointer != 0 ? "(field.ptr " : "(field ")
+            put(out, e.text)
+        }
+        case e.kind == E_SELECT {
+            out.append("(select")
+        }
+        case e.kind == E_INDEX {
+            out.append(e.checked != 0 ? "(index.checked" : "(index")
+        }
+        case e.kind == E_SLICE {
+            out.append(e.checked != 0 ? "(slice.checked" : "(slice")
+        }
+        case e.kind == E_DEREF {
+            out.append("(deref")
+        }
+        case e.kind == E_RAW_READ {
+            out.append("(rawRead")
+        }
+        case e.kind == E_ADDR_OF {
+            out.append("(addr")
+        }
+        case e.kind == E_ARRAY_LIST {
+            out.append("(array")
+        }
+        case e.kind == E_TUPLE_LIT {
+            out.append("(tuple")
+        }
+        case e.kind == E_ARRAY_REPEAT {
+            out.append(format("(array.repeat {}", e.intValue))
+        }
+        case e.kind == E_STRUCT_LIT {
+            out.append("(struct ")
+            put(out, e.typeName)
+        }
+        case e.kind == E_NEW {
+            out.append("(new ")
+            put(out, e.typeName)
+            if e.registered != 0 {
+                out.append(" registered")
+            }
+        }
+        case e.kind == E_TO_INTERFACE {
+            out.append("(to.interface ")
+            put(out, e.text)
+        }
+        case e.kind == E_ATOMIC_LOAD {
+            out.append(format("(atomic.load order={}", e.index))
+        }
+        case e.kind == E_ATOMIC_STORE {
+            out.append(format("(atomic.store order={}", e.index))
+        }
+        case e.kind == E_ATOMIC_XCHG {
+            out.append(format("(atomic.xchg order={}", e.index))
+        }
+        case e.kind == E_ATOMIC_CAS {
+            out.append(format("(atomic.cas order={}", e.index))
+        }
+        case e.kind == E_ATOMIC_ADD {
+            out.append(format("(atomic.add order={}", e.index))
+        }
+        case e.kind == E_FENCE {
+            out.append(format("(fence order={}", e.index))
+        }
+        case e.kind == E_UNWIND_PADS {
+            out.append("(unwind.pads")
+        }
+        case e.kind == E_UNWIND_PAD_COUNT {
+            out.append("(unwind.pad.count")
+        }
+        case e.kind == E_ASM {
+            out.append("(asm \"")
+            put(out, e.text)
+            out.append("\"")
+            if e.nomem != 0 {
+                out.append(" nomem")
+            }
+            if e.noreturn != 0 {
+                out.append(" noreturn")
+            }
+            for i in 0..e.operandCount as usize {
+                dumpOperand(out, f, m, &m.operands[e.operandFirst as usize + i])
+            }
+            for i in 0..e.clobberCount as usize {
+                out.append(" clobber(")
+                put(out, m.strings[e.clobberFirst as usize + i])
+                out.append(")")
+            }
+        }
+    }
+    // The children, then the closing `):type`. `asm` carries its children above.
+    if e.lhs >= 0 {
+        out.append(" ")
+        dumpExpr(out, f, m, &m.exprs[e.lhs as usize])
+    }
+    if e.rhs >= 0 {
+        out.append(" ")
+        dumpExpr(out, f, m, &m.exprs[e.rhs as usize])
+    }
+    for i in 0..e.argCount as usize {
+        out.append(" ")
+        dumpExpr(out, f, m, &m.exprs[m.refs[e.argFirst as usize + i] as usize])
+    }
+    for i in 0..e.fieldCount as usize {
+        local fi = &m.fields[e.fieldFirst as usize + i]
+        out.append(" ")
+        put(out, fi.name)
+        out.append("=")
+        if fi.value >= 0 {
+            dumpExpr(out, f, m, &m.exprs[fi.value as usize])
+        }
+    }
+    out.append("):")
+    put(out, e.typeName)
+}
+
+/// Two spaces per indent level, the padding of one statement line.
+fn pad(out: *String, indent: i32) {
+    for i in 0..indent as usize {
+        out.append("  ")
+    }
+}
+
+/// One statement line; nested statements carry `indent + 1`.
+fn dumpStmt(out: *String, f: *XlcHirFunction, m: *XlcHirModule, s: *XlcHirStmt, indent: i32) {
+    pad(out, indent)
+    switch {
+        case s.kind == S_LOCAL {
+            out.append(format("local {}#{}: ", localName(f, s.localId), s.localId))
+            put(out, f.locals[s.localId as usize].typeName)
+            if s.value >= 0 {
+                out.append(" = ")
+                dumpExpr(out, f, m, &m.exprs[s.value as usize])
+            }
+            out.append("\n")
+        }
+        case s.kind == S_ASSIGN {
+            out.append("assign ")
+            dumpExpr(out, f, m, &m.exprs[s.target as usize])
+            out.append(" = ")
+            dumpExpr(out, f, m, &m.exprs[s.value as usize])
+            out.append("\n")
+        }
+        case s.kind == S_RETURN {
+            out.append("return")
+            if s.value >= 0 {
+                out.append(" ")
+                dumpExpr(out, f, m, &m.exprs[s.value as usize])
+            }
+            out.append("\n")
+        }
+        case s.kind == S_EXPR {
+            dumpExpr(out, f, m, &m.exprs[s.value as usize])
+            out.append("\n")
+        }
+        case s.kind == S_IF {
+            out.append("if ")
+            dumpExpr(out, f, m, &m.exprs[s.value as usize])
+            out.append("\n")
+            dumpStmts(out, f, m, s.bodyFirst, s.bodyCount, indent + 1)
+            if s.elseCount > 0 {
+                pad(out, indent)
+                out.append("else\n")
+                dumpStmts(out, f, m, s.elseFirst, s.elseCount, indent + 1)
+            }
+        }
+        case s.kind == S_WHILE {
+            out.append(s.postTest != 0 ? "do-while " : "while ")
+            dumpExpr(out, f, m, &m.exprs[s.value as usize])
+            out.append("\n")
+            dumpStmts(out, f, m, s.bodyFirst, s.bodyCount, indent + 1)
+            if s.stepCount > 0 {
+                pad(out, indent)
+                out.append("step\n")
+                dumpStmts(out, f, m, s.stepFirst, s.stepCount, indent + 1)
+            }
+        }
+        case s.kind == S_CONTINUE {
+            out.append("continue")
+            if s.depth != 0 {
+                out.append(format(" depth={}", s.depth))
+            }
+            out.append("\n")
+        }
+        case s.kind == S_BREAK {
+            out.append("break")
+            if s.depth != 0 {
+                out.append(format(" depth={}", s.depth))
+            }
+            out.append("\n")
+        }
+        case s.kind == S_BLOCK {
+            out.append("block\n")
+            dumpStmts(out, f, m, s.bodyFirst, s.bodyCount, indent + 1)
+        }
+        case s.kind == S_TRY {
+            out.append(format("try snapshot={}#{} message={}", localName(f, s.localId), s.localId, s.msgLocal))
+            out.append("\n")
+            dumpStmts(out, f, m, s.bodyFirst, s.bodyCount, indent + 1)
+            pad(out, indent)
+            out.append("catch\n")
+            dumpStmts(out, f, m, s.elseFirst, s.elseCount, indent + 1)
+        }
+    }
+}
+
+/// A run of statements: `(first, count)` in the module's statement arena.
+fn dumpStmts(out: *String, f: *XlcHirFunction, m: *XlcHirModule, first: u32, count: u32, indent: i32) {
+    for i in 0..count as usize {
+        dumpStmt(out, f, m, &m.stmts[first as usize + i], indent)
+    }
+}
+
+/// The text form of the whole module: the register hooks, the init and fini lists, then the enums,
+/// aggregates, interfaces, impls, globals and functions.
+fn dumpModule(out: *String, m: *XlcHirModule) {
+    if m.panicFunction.len > 0 {
+        out.append("register(panic) ")
+        put(out, m.panicFunction)
+        out.append("\n")
+    }
+    if m.allocFunction.len > 0 {
+        out.append("register(alloc) ")
+        put(out, m.allocFunction)
+        out.append("\n")
+    }
+    if m.freeFunction.len > 0 {
+        out.append("register(free) ")
+        put(out, m.freeFunction)
+        out.append("\n")
+    }
+    if m.unwindFunction.len > 0 {
+        out.append("register(unwind) ")
+        put(out, m.unwindFunction)
+        out.append("\n")
+    }
+    if m.argsFunction.len > 0 {
+        out.append("register(args) ")
+        put(out, m.argsFunction)
+        out.append("\n")
+    }
+    for i in 0..m.initCount as usize {
+        out.append("init ")
+        put(out, m.strings[m.initFirst as usize + i])
+        out.append("\n")
+    }
+    for i in 0..m.finiCount as usize {
+        out.append("fini ")
+        put(out, m.strings[m.finiFirst as usize + i])
+        out.append("\n")
+    }
+    for i in 0..m.enumCount as usize {
+        local e = &m.enums[i]
+        out.append("enum ")
+        put(out, e.name)
+        out.append(": ")
+        put(out, e.underlying)
+        out.append("\n")
+        for k in 0..e.memberCount as usize {
+            local v = &e.members[k]
+            out.append("  ")
+            put(out, v.name)
+            out.append(" = ")
+            if v.text.len > 0 {
+                put(out, v.text)
+            } else {
+                out.append(toString(v.value))
+            }
+            out.append("\n")
+        }
+    }
+    for i in 0..m.aggregateCount as usize {
+        local a = &m.aggregates[i]
+        out.append(a.isClass != 0 ? "class " : a.isUnion != 0 ? "union " : "struct ")
+        put(out, a.name)
+        if a.base.len > 0 {
+            out.append(" : ")
+            put(out, a.base)
+        }
+        out.append(a.opaque != 0 ? " (opaque)\n" : "\n")
+        for k in 0..a.fieldCount as usize {
+            out.append("  ")
+            put(out, a.fields[k].name)
+            out.append(": ")
+            put(out, a.fields[k].typeName)
+            out.append("\n")
+        }
+    }
+    for i in 0..m.interfaceCount as usize {
+        local it = &m.interfaces[i]
+        out.append("interface ")
+        put(out, it.name)
+        out.append("\n")
+        for k in 0..it.methodCount as usize {
+            local im = &it.methods[k]
+            out.append("  fn ")
+            put(out, im.name)
+            out.append("(")
+            for p in 0..im.paramCount as usize {
+                if p != 0 {
+                    out.append(", ")
+                }
+                put(out, m.strings[im.paramFirst as usize + p])
+            }
+            out.append(") -> ")
+            put(out, im.ret)
+            out.append("\n")
+        }
+    }
+    for i in 0..m.implCount as usize {
+        local im = &m.impls[i]
+        out.append("impl ")
+        put(out, im.interfaceName)
+        out.append(" for ")
+        put(out, im.typeName)
+        out.append("\n")
+    }
+    for i in 0..m.globalCount as usize {
+        local g = &m.globals[i]
+        out.append(g.constant != 0 ? "const " : "global ")
+        put(out, g.name)
+        out.append(": ")
+        put(out, g.typeName)
+        if g.init >= 0 {
+            out.append(" = ")
+            dumpExpr(out, nil, m, &m.exprs[g.init as usize])
+        }
+        out.append("\n")
+    }
+    for i in 0..m.functionCount as usize {
+        local f = &m.functions[i]
+        out.append("fn ")
+        put(out, f.name)
+        out.append("(")
+        for k in 0..f.paramCount as usize {
+            if k != 0 {
+                out.append(", ")
+            }
+            put(out, f.locals[k].name)
+            out.append(": ")
+            put(out, f.locals[k].typeName)
+        }
+        out.append(") -> ")
+        put(out, f.ret)
+        out.append(f.hasBody != 0 ? "\n" : " (no body)\n")
+        dumpStmts(out, f, m, f.bodyFirst, f.bodyCount, 1)
+        if f.unwindCount > 0 {
+            out.append("  unwind\n")
+            dumpStmts(out, f, m, f.unwindFirst, f.unwindCount, 2)
+        }
+    }
+}
+
+/// The heap block `xlcHirDump` returns: the text and the frozen `XlcHirText`. `result.block` hands
+/// the block back to `xlcHirDumpFree`, which drops exactly this, so the bytes stay valid until then.
+class DumpBlock {
+    text: String
+    result: XlcHirText
+}
+
+/// `xlcHirDump`: the text form of the flattened module. The result points into a `DumpBlock` that
+/// `xlcHirDumpFree` releases.
+export(c) fn xlcHirDump(m: *XlcHirModule) -> XlcHirText {
+    local block = new DumpBlock { text: String(), result: XlcHirText { bytes: nil, len: 0, block: nil } }
+    dumpModule(&block.text, m)
+    local v = block.text.asStr()
+    block.result.bytes = v.ptr
+    block.result.len = v.len as u32
+    block.result.block = block as *u8
+    return block.result
+}
+
+/// `xlcHirDumpFree`: release what `xlcHirDump` allocated. The block is dropped with its text.
+export(c) fn xlcHirDumpFree(t: XlcHirText) {
+    if t.block == nil {
+        return
+    }
+    delete (t.block as *DumpBlock)
+}

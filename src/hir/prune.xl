@@ -1,0 +1,288 @@
+// The reachability prune (plan 24), the xlang source of the logic in the old src/hir/prune.cpp:
+// marks the functions and globals the roots reach, then reports the survivors; the caller erases
+// the rest from its own module representation.
+//
+// Roots are the functions and globals the program needs whether or not its own code calls them:
+// the entry, the init and fini functions, the `register(role)` functions, the hooks codegen looks
+// up by name, every vtable slot and impl method, the C-named functions LLVM may call without any
+// call in the program, and the exports the output kind keeps. Reachability then follows direct
+// calls, function values, constructors and globals through the bodies and cleanup bodies.
+//
+// The C++ side sees `xlcHirPrune` and `xlcHirPruneFree` only; everything here is the
+// implementation behind them.
+from "std" import Vec
+from "std/str" import eq, compare
+from "abi" import XlcHirModule, XlcHirExpr, XlcHirStmt, XlcHirKeep, view,
+    E_CALL, E_CALL_VIRTUAL, E_FUNC_REF, E_CONSTRUCT, E_NEW, E_GLOBAL_REF
+
+/// C-named functions LLVM may call without any call in the program: it lowers aggregate copies and
+/// zeroing to `memcpy`/`memmove`/`memset`/`bzero` (Darwin), and comparisons of aggregates to
+/// `memcmp`/`bcmp`. Codegen emits no such call itself, so these stay roots by symbol name (they
+/// are `export(c)` in std/mem).
+fn isImplicitLibcall(symbol: str) -> bool {
+    return eq(symbol, "memcpy") || eq(symbol, "memmove") || eq(symbol, "memset") ||
+        eq(symbol, "memcmp") || eq(symbol, "bcmp") || eq(symbol, "bzero")
+}
+
+/// Marks the functions and globals reachable from the roots, then reports the survivors. The
+/// marking is a worklist over function indices: a function is pushed once, when it is first
+/// marked, and its body is walked when it is popped.
+///
+/// Name lookups go through a sorted `Vec<NameEntry>` and binary search rather than a `HashMap`
+/// keyed by `String`: the entries borrow the boundary bytes (which stay alive for the call), so
+/// the table holds no owned key objects and nothing dangles or double-frees when it grows.
+struct NameEntry {
+    name: str
+    idx: u32
+}
+
+/// Lexicographic order on the borrowed names.
+fn entryCmp(a: *NameEntry, b: *NameEntry) -> i32 {
+    return compare(a.name, b.name)
+}
+
+/// Binary search for `name`; -1 when absent. TEMP: linear scan to isolate the lookup.
+fn lookupName(entries: *Vec<NameEntry>, name: str) -> i32 {
+    for i in 0..entries.length() {
+        if eq(entries.get(i).name, name) {
+            return entries.get(i).idx as i32
+        }
+    }
+    return -1
+}
+
+class Reachability {
+    m: *XlcHirModule
+    fnLive: Vec<u8>
+    gLive: Vec<u8>
+    fnIndex: Vec<NameEntry>
+    gIndex: Vec<NameEntry>
+    work: Vec<u32>
+
+    fn init(self, m: *XlcHirModule) {
+        self.m = m
+        self.fnLive = Vec<u8>()
+        self.gLive = Vec<u8>()
+        self.fnIndex = Vec<NameEntry>()
+        self.gIndex = Vec<NameEntry>()
+        self.work = Vec<u32>()
+        for i in 0..m.functionCount as usize {
+            self.fnLive.push(0)
+            self.fnIndex.push(NameEntry { name: view(m.functions[i].name), idx: i as u32 })
+        }
+        for i in 0..m.globalCount as usize {
+            self.gLive.push(0)
+            self.gIndex.push(NameEntry { name: view(m.globals[i].name), idx: i as u32 })
+        }
+        self.fnIndex.sortBy(entryCmp)
+        self.gIndex.sortBy(entryCmp)
+    }
+
+    /// Marks one function by name; unknown names are ignored (an external or a module that is not
+    /// loaded).
+    fn markFunction(self, name: str) {
+        local i = lookupName(&self.fnIndex, name)
+        if i < 0 {
+            return
+        }
+        if *self.fnLive.get(i as usize) != 0 {
+            return
+        }
+        self.fnLive.set(i as usize, 1)
+        self.work.push(i as u32)
+    }
+
+    /// Marks one global by name. A global's initializer is a constant expression, but it may name
+    /// a function (`FuncRef`), so it is walked too.
+    fn markGlobal(self, name: str) {
+        local i = lookupName(&self.gIndex, name)
+        if i < 0 {
+            return
+        }
+        if *self.gLive.get(i as usize) != 0 {
+            return
+        }
+        self.gLive.set(i as usize, 1)
+        local g = &self.m.globals[i as usize]
+        if g.init >= 0 {
+            self.expr(&self.m.exprs[g.init as usize])
+        }
+    }
+
+    /// Drains the worklist: every function marked so far has its body and cleanup body walked.
+    fn run(self) {
+        while self.work.length() > 0 {
+            local i = self.work.pop()
+            local f = &self.m.functions[i as usize]
+            for j in 0..f.bodyCount as usize {
+                self.stmt(&self.m.stmts[f.bodyFirst as usize + j])
+            }
+            for j in 0..f.unwindCount as usize {
+                self.stmt(&self.m.stmts[f.unwindFirst as usize + j])
+            }
+        }
+    }
+
+    /// Appends the indices of the surviving functions, in module order.
+    fn liveFunctions(self, out: *Vec<u32>) {
+        for i in 0..self.m.functionCount as usize {
+            if *self.fnLive.get(i) != 0 {
+                out.push(i as u32)
+            }
+        }
+    }
+
+    /// Appends the indices of the surviving globals, in module order.
+    fn liveGlobals(self, out: *Vec<u32>) {
+        for i in 0..self.m.globalCount as usize {
+            if *self.gLive.get(i) != 0 {
+                out.push(i as u32)
+            }
+        }
+    }
+
+    fn expr(self, e: *XlcHirExpr) {
+        switch {
+            case e.kind == E_CALL || e.kind == E_CALL_VIRTUAL || e.kind == E_FUNC_REF || e.kind == E_CONSTRUCT || e.kind == E_NEW {
+                // `new C(args)` names the `init` it runs in `text`.
+                self.markFunction(view(e.text))
+            }
+            case e.kind == E_GLOBAL_REF {
+                self.markGlobal(view(e.text))
+            }
+        }
+        if e.lhs >= 0 {
+            self.expr(&self.m.exprs[e.lhs as usize])
+        }
+        if e.rhs >= 0 {
+            self.expr(&self.m.exprs[e.rhs as usize])
+        }
+        for i in 0..e.argCount as usize {
+            self.expr(&self.m.exprs[self.m.refs[e.argFirst as usize + i] as usize])
+        }
+        for i in 0..e.fieldCount as usize {
+            local v = self.m.fields[e.fieldFirst as usize + i].value
+            if v >= 0 {
+                self.expr(&self.m.exprs[v as usize])
+            }
+        }
+        for i in 0..e.operandCount as usize {
+            local v = self.m.operands[e.operandFirst as usize + i].value
+            if v >= 0 {
+                self.expr(&self.m.exprs[v as usize])
+            }
+        }
+    }
+
+    fn stmt(self, s: *XlcHirStmt) {
+        if s.target >= 0 {
+            self.expr(&self.m.exprs[s.target as usize])
+        }
+        if s.value >= 0 {
+            self.expr(&self.m.exprs[s.value as usize])
+        }
+        for i in 0..s.bodyCount as usize {
+            self.stmt(&self.m.stmts[s.bodyFirst as usize + i])
+        }
+        for i in 0..s.elseCount as usize {
+            self.stmt(&self.m.stmts[s.elseFirst as usize + i])
+        }
+        for i in 0..s.stepCount as usize {
+            self.stmt(&self.m.stmts[s.stepFirst as usize + i])
+        }
+    }
+}
+
+/// `exportC != 0` keeps the export for every output kind; a plain `export` only when the output
+/// keeps everything (a library or an object, not an executable without prebuilt inputs).
+fn kept(exported: i32, exportC: i32, keep: i32) -> bool {
+    return exportC != 0 ? keep != 0 : exported != 0 && keep == 2
+}
+
+/// Marks the roots listed in the module header: hooks named by codegen, init and fini lists.
+fn markNamedHooks(r: *Reachability, m: *XlcHirModule) {
+    if m.panicFunction.len > 0 { r.markFunction(view(m.panicFunction)) }
+    if m.allocFunction.len > 0 { r.markFunction(view(m.allocFunction)) }
+    if m.freeFunction.len > 0 { r.markFunction(view(m.freeFunction)) }
+    if m.unwindFunction.len > 0 { r.markFunction(view(m.unwindFunction)) }
+    if m.argsFunction.len > 0 { r.markFunction(view(m.argsFunction)) }
+    for i in 0..m.initCount as usize {
+        r.markFunction(view(m.strings[m.initFirst as usize + i]))
+    }
+    for i in 0..m.finiCount as usize {
+        r.markFunction(view(m.strings[m.finiFirst as usize + i]))
+    }
+}
+
+/// The heap block `xlcHirPrune` returns: the two index lists and the frozen `XlcHirKeep`.
+/// `result.block` hands the block back to `xlcHirPruneFree`, which drops exactly this.
+class KeepBlock {
+    functions: Vec<u32>
+    globals: Vec<u32>
+    result: XlcHirKeep
+}
+
+/// `xlcHirPrune`: marks the roots, follows reachability and reports the surviving functions and
+/// globals, in module order. `keep` is a `KeepExports` number: 0 = nothing, 1 = `export(c)` only,
+/// 2 = every export.
+export(c) fn xlcHirPrune(m: *XlcHirModule, keep: i32) -> XlcHirKeep {
+    local r = Reachability(m)
+
+    // Functions the program owns at run time, whether or not code calls them.
+    for i in 0..m.functionCount as usize {
+        local f = &m.functions[i]
+        if f.isEntry != 0 || f.isInit != 0 || f.isFini != 0 || f.registered != 0 ||
+            isImplicitLibcall(view(f.symbol)) || kept(f.exported, f.exportC, keep) {
+            r.markFunction(view(f.name))
+        }
+    }
+    for i in 0..m.globalCount as usize {
+        local g = &m.globals[i]
+        if g.registered != 0 || kept(g.exported, g.exportC, keep) {
+            r.markGlobal(view(g.name))
+        }
+    }
+    markNamedHooks(&r, m)
+
+    // Tables codegen writes for every class and impl name their functions, so those must exist.
+    for i in 0..m.aggregateCount as usize {
+        local a = &m.aggregates[i]
+        for k in 0..a.vtableCount as usize {
+            r.markFunction(view(a.vtable[k].function))
+        }
+    }
+    for i in 0..m.implCount as usize {
+        local im = &m.impls[i]
+        for k in 0..im.methodCount as usize {
+            r.markFunction(view(m.strings[im.methodFirst as usize + k]))
+        }
+    }
+
+    r.run()
+
+    local block = new KeepBlock {
+        functions: Vec<u32>(),
+        globals: Vec<u32>(),
+        result: XlcHirKeep { functions: nil, functionCount: 0, globals: nil, globalCount: 0, block: nil }
+    }
+    r.liveFunctions(&block.functions)
+    r.liveGlobals(&block.globals)
+    if block.functions.length() > 0 {
+        block.result.functions = block.functions.data
+    }
+    block.result.functionCount = block.functions.length() as u32
+    if block.globals.length() > 0 {
+        block.result.globals = block.globals.data
+    }
+    block.result.globalCount = block.globals.length() as u32
+    block.result.block = block as *u8
+    return block.result
+}
+
+/// `xlcHirPruneFree`: release what `xlcHirPrune` allocated. The block is dropped with its lists.
+export(c) fn xlcHirPruneFree(k: XlcHirKeep) {
+    if k.block == nil {
+        return
+    }
+    delete (k.block as *KeepBlock)
+}

@@ -1,0 +1,314 @@
+// The flat form of a HIR module: the arena structs the dump (dump.xl) and the prune (prune.xl)
+// walk, and the kind constants they switch on.
+//
+// Nothing here owns memory: children are node indices (`-1` = none), lists are `(first, count)`
+// ranges into the module's shared arenas, and every type arrives as its source spelling. The kind
+// constants agree number for number with `ExprKind` / `StmtKind` of include/xlang/hir/hir.h
+// (declaration order); a new kind is one line in each file. Fields the C++ side names `type`,
+// `local` or `interface` carry the xlang spellings `typeName`, `localId` and `interfaceName` here,
+// because all three are keywords of the language.
+from "std" import String
+from "std/str" import fromParts
+
+/// One string across the boundary: the bytes are not NUL-terminated. Empty = `len` 0.
+@repr(c)
+export struct XlcHirStr {
+    bytes: *u8
+    len: u32
+}
+
+/// One local of a function: a name and the spelling of its type.
+@repr(c)
+export struct XlcHirLocal {
+    name: XlcHirStr
+    typeName: XlcHirStr
+}
+
+/// One `name = value` of a struct literal; `value` is an expression node, -1 = none.
+@repr(c)
+export struct XlcHirFieldInit {
+    name: XlcHirStr
+    value: i32
+}
+
+/// One `in(reg) x` / `out("rax") y` / `inout(reg) z` of `__builtin_asm`; `kind` is 0, 1, 2 in that
+/// order, `value` is an expression node (-1 = none).
+@repr(c)
+export struct XlcHirAsmOperand {
+    kind: i32
+    reg: XlcHirStr
+    value: i32
+}
+
+// The order is the order of `enum class ExprKind` in include/xlang/hir/hir.h. Do not reorder: the
+// numbers cross the C boundary.
+export const E_INT_CONST: i32 = 0          ///< intValue, type Int/Enum
+export const E_FLOAT_CONST: i32 = 1        ///< floatValue
+export const E_BOOL_CONST: i32 = 2         ///< boolValue
+export const E_STR_CONST: i32 = 3          ///< text; type `*u8` or `str`
+export const E_NIL: i32 = 4                ///< `nil`, typed as the pointer it was converted to
+export const E_LOCAL_REF: i32 = 5          ///< local
+export const E_GLOBAL_REF: i32 = 6         ///< text = global name
+export const E_FUNC_REF: i32 = 7           ///< text = function name
+export const E_EXTERNAL: i32 = 8           ///< text = module, member = name
+export const E_UNARY: i32 = 9              ///< unaryOp; lhs
+export const E_BINARY: i32 = 10            ///< binaryOp; lhs, rhs
+export const E_SELECT: i32 = 11            ///< lhs ? rhs : args[0]
+export const E_CAST: i32 = 12              ///< lhs -> type; `implicit` when the compiler inserted it
+export const E_CALL: i32 = 13              ///< direct call: text = function name, args
+export const E_CALL_INDIRECT: i32 = 14     ///< lhs = function pointer value, args
+export const E_CALL_VIRTUAL: i32 = 15      ///< vtable call: index = slot, text = function
+export const E_CALL_ITABLE: i32 = 16       ///< lhs = interface value, text = method, index = slot
+export const E_CALL_EXTERNAL: i32 = 17     ///< text = module, member = name, args
+export const E_SYSCALL: i32 = 18           ///< args[0] = number, rest = arguments
+export const E_FIELD: i32 = 19             ///< lhs.text; `throughPointer`, index = field index
+export const E_INDEX: i32 = 20             ///< lhs[rhs]
+export const E_SLICE: i32 = 21             ///< lhs[lo..hi]
+export const E_DEREF: i32 = 22             ///< *lhs
+export const E_ADDR_OF: i32 = 23           ///< &lhs
+export const E_ARRAY_LIST: i32 = 24        ///< [args...]
+export const E_ARRAY_REPEAT: i32 = 25      ///< [lhs; intValue]
+export const E_TUPLE_LIT: i32 = 26         ///< (args...)
+export const E_STRUCT_LIT: i32 = 27        ///< type { fields }
+export const E_NEW: i32 = 28               ///< init `target` in the memory `lhs` points at
+export const E_TO_INTERFACE: i32 = 29      ///< lhs (a pointer) -> interface `type`; text = impl
+export const E_ATOMIC_LOAD: i32 = 30       ///< lhs = pointer, index = MemoryOrder
+export const E_ATOMIC_STORE: i32 = 31      ///< lhs = pointer, rhs = value, index = MemoryOrder
+export const E_ATOMIC_XCHG: i32 = 32       ///< lhs = pointer, rhs = value; returns the old value
+export const E_ATOMIC_CAS: i32 = 33        ///< lhs = pointer, rhs = expected, args[0] = desired
+export const E_ATOMIC_ADD: i32 = 34        ///< lhs = pointer, rhs = value; returns the old value
+export const E_FENCE: i32 = 35             ///< index = MemoryOrder; void
+export const E_ASM: i32 = 36               ///< text = template, operands, clobbers
+export const E_CONSTRUCT: i32 = 37         ///< `T(args)` of a class; text = its `init` function
+export const E_MOVE: i32 = 38              ///< lhs read by value; clears the drop flag `local`
+export const E_MATERIALIZE: i32 = 39       ///< lhs stored in local `local`, drop flag `index` set
+export const E_RAW_READ: i32 = 40          ///< `__builtin_read`: lhs = pointer
+export const E_UNWIND_PADS: i32 = 41       ///< `__builtin_unwindPads()`
+export const E_UNWIND_PAD_COUNT: i32 = 42  ///< `__builtin_unwindPadCount()`
+
+/// One HIR expression, flattened.
+@repr(c)
+export struct XlcHirExpr {
+    kind: i32
+    typeName: XlcHirStr
+    text: XlcHirStr
+    member: XlcHirStr
+    unaryOp: XlcHirStr   ///< the spelling of the operator, empty = not a `Unary`
+    binaryOp: XlcHirStr  ///< the spelling of the operator, empty = not a `Binary`
+    intValue: u64
+    floatValue: f64
+    boolValue: i32
+    localId: u32
+    index: u32
+    lhs: i32
+    rhs: i32
+    argFirst: u32
+    argCount: u32
+    fieldFirst: u32
+    fieldCount: u32
+    operandFirst: u32
+    operandCount: u32
+    clobberFirst: u32
+    clobberCount: u32
+    implicit: i32
+    checked: i32
+    throughPointer: i32
+    registered: i32
+    nomem: i32
+    noreturn: i32
+}
+
+// The order is the order of `enum class StmtKind` in include/xlang/hir/hir.h. Do not reorder.
+export const S_LOCAL: i32 = 0
+export const S_ASSIGN: i32 = 1
+export const S_RETURN: i32 = 2
+export const S_EXPR: i32 = 3
+export const S_IF: i32 = 4
+export const S_WHILE: i32 = 5
+export const S_CONTINUE: i32 = 6
+export const S_BREAK: i32 = 7
+export const S_BLOCK: i32 = 8
+export const S_TRY: i32 = 9
+
+/// One HIR statement, flattened.
+@repr(c)
+export struct XlcHirStmt {
+    kind: i32
+    localId: u32
+    msgLocal: u32
+    target: i32
+    value: i32
+    bodyFirst: u32
+    bodyCount: u32
+    elseFirst: u32
+    elseCount: u32
+    stepFirst: u32
+    stepCount: u32
+    postTest: i32
+    depth: u32
+}
+
+@repr(c)
+export struct XlcHirFunction {
+    name: XlcHirStr
+    symbol: XlcHirStr
+    ret: XlcHirStr
+    locals: *XlcHirLocal
+    localCount: u32
+    paramCount: u32
+    bodyFirst: u32
+    bodyCount: u32
+    unwindFirst: u32
+    unwindCount: u32
+    hasBody: i32
+    exported: i32
+    exportC: i32
+    registered: i32
+    isEntry: i32
+    isInit: i32
+    isFini: i32
+}
+
+@repr(c)
+export struct XlcHirGlobal {
+    name: XlcHirStr
+    typeName: XlcHirStr
+    init: i32
+    constant: i32
+    exported: i32
+    exportC: i32
+    registered: i32
+}
+
+@repr(c)
+export struct XlcHirEnumMember {
+    name: XlcHirStr
+    value: i64
+    text: XlcHirStr
+}
+
+@repr(c)
+export struct XlcHirEnum {
+    name: XlcHirStr
+    underlying: XlcHirStr
+    members: *XlcHirEnumMember
+    memberCount: u32
+}
+
+@repr(c)
+export struct XlcHirVtableSlot {
+    method: XlcHirStr
+    function: XlcHirStr
+}
+
+@repr(c)
+export struct XlcHirField {
+    name: XlcHirStr
+    typeName: XlcHirStr
+}
+
+@repr(c)
+export struct XlcHirAggregate {
+    name: XlcHirStr
+    base: XlcHirStr
+    fields: *XlcHirField
+    fieldCount: u32
+    vtable: *XlcHirVtableSlot
+    vtableCount: u32
+    isClass: i32
+    isUnion: i32
+    opaque: i32
+}
+
+/// One method of an interface; the parameter types are a range in `strings`.
+@repr(c)
+export struct XlcHirIfaceMethod {
+    name: XlcHirStr
+    ret: XlcHirStr
+    paramFirst: u32
+    paramCount: u32
+}
+
+@repr(c)
+export struct XlcHirInterface {
+    name: XlcHirStr
+    methods: *XlcHirIfaceMethod
+    methodCount: u32
+}
+
+/// One `impl ... for ...`; the method names are a range in `strings`.
+@repr(c)
+export struct XlcHirImpl {
+    interfaceName: XlcHirStr
+    typeName: XlcHirStr
+    methodFirst: u32
+    methodCount: u32
+}
+
+/// The whole module, flattened. Every pointer points into C++ memory that stays alive for the one
+/// call that uses it; the node and range arenas are shared by all functions and globals.
+@repr(c)
+export struct XlcHirModule {
+    functions: *XlcHirFunction
+    functionCount: u32
+    globals: *XlcHirGlobal
+    globalCount: u32
+    enums: *XlcHirEnum
+    enumCount: u32
+    aggregates: *XlcHirAggregate
+    aggregateCount: u32
+    interfaces: *XlcHirInterface
+    interfaceCount: u32
+    impls: *XlcHirImpl
+    implCount: u32
+    exprs: *XlcHirExpr
+    exprCount: u32
+    stmts: *XlcHirStmt
+    stmtCount: u32
+    fields: *XlcHirFieldInit
+    fieldCount: u32
+    operands: *XlcHirAsmOperand
+    operandCount: u32
+    strings: *XlcHirStr
+    stringCount: u32
+    refs: *u32
+    refCount: u32
+    panicFunction: XlcHirStr
+    allocFunction: XlcHirStr
+    freeFunction: XlcHirStr
+    unwindFunction: XlcHirStr
+    argsFunction: XlcHirStr
+    initFirst: u32
+    initCount: u32
+    finiFirst: u32
+    finiCount: u32
+}
+
+/// The text `xlcHirDump` produced: `len` bytes at `bytes`, owned by `block`.
+@repr(c)
+export struct XlcHirText {
+    bytes: *u8
+    len: u32
+    block: *u8
+}
+
+/// What `xlcHirPrune` keeps: the indices of the surviving functions and globals, in order.
+@repr(c)
+export struct XlcHirKeep {
+    functions: *u32
+    functionCount: u32
+    globals: *u32
+    globalCount: u32
+    block: *u8
+}
+
+/// A boundary string as a `str` view. The bytes stay alive for the one call.
+export fn view(s: XlcHirStr) -> str {
+    return fromParts(s.bytes, s.len as usize)
+}
+
+/// A boundary string as an owned `String` copy.
+export fn owned(s: XlcHirStr) -> String {
+    return String(fromParts(s.bytes, s.len as usize))
+}
+
