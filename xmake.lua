@@ -334,6 +334,11 @@ target("xlc")
 
 -- Frontend/sema/HIR unit tests: `xmake build xlc-tests && xmake run xlc-tests`.
 target("xlc-tests")
+    -- The tests reach the lexer, which is xlang code: without the xlang object (see the
+    -- `xlang.object` rule) `xlcLex` and the other C entry points are unresolved on Windows.
+    if is_plat("windows") then
+        set_enabled(false)
+    end
     set_kind("binary")
     set_default(false)
     add_files("test/unit/*.cpp")

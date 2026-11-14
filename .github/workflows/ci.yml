@@ -104,9 +104,8 @@ jobs:
           git diff --exit-code -- COMPILER-TAGS.md
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
           xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
-          # The xlc-bootstrap and xlc targets are disabled on Windows: the released xlc has no
-          # lowering for `try` (E0714), so no bootstrap object can be built there and there is no
-          # compiler binary or e2e until a release with Windows unwinding.
-          xmake -P . -y
-          xmake build -P . -y xlc-tests
-          xmake run -P . xlc-tests
+          # The released xlc has no lowering for `try` on Windows (E0714), so no xlang object
+          # (lexer, preprocessor, macro expander, CLI) can be built there: xlc-bootstrap, xlc and
+          # xlc-tests are disabled, and this job only compiles the C++ module archives, until a
+          # release with Windows unwinding.
+          xmake build -P . -y -a

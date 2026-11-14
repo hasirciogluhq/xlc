@@ -7,6 +7,11 @@
 // ships in no release.
 from "std/os/args" import fromArgv
 from "cli" import run
+// The xlang part of the compiler joins this object, so the program carries one copy of the
+// stdlib: a second object with its own copy (libxlc-lang's compiler.xl.o) would define every
+// shared stdlib symbol twice, which the ELF linkers reject. With the `xlc*` entry points
+// defined here, the linker never pulls compiler.xl.o out of the archive.
+import "lang/compiler"
 
 export(c) fn main(argc: i32, argv: **u8) -> i32 {
     return run(fromArgv(argc, argv))

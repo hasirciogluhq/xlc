@@ -3,6 +3,9 @@
 // xlang-docs/compiler/linking.md). Everything else lives in the `cli` module's `run`.
 from "std/os/args" import fromArgv
 from "cli" import run
+// The xlang part of the compiler joins this program, as in src/bootstrap.xl: one copy of the
+// stdlib, and the linker never pulls libxlc-lang's compiler.xl.o.
+import "lang/compiler"
 
 @entry fn main(argc: i32, argv: **u8) -> i32 {
     return run(fromArgv(argc, argv))
