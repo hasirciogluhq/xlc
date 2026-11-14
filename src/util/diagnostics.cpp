@@ -364,6 +364,12 @@ constexpr std::size_t kLeadWidth = 40;
          "(on every path or only on some, such as after a move inside an `if` or a loop) would "
          "read an object that may already be dropped. Borrow it instead (`f(&x)` with a pointer "
          "parameter), move a copy (`x.clone()`), or assign `x` a new value before the use."},
+        {"E0781", Severity::Error, "a by-value `self` is called through a pointer",
+         "An inherent `impl` method whose `self` is bare takes the target by value: "
+         "`impl A { fn g(self) }` declares `fn A.g(self: A)`. Called through a pointer, the call "
+         "would have to move the class out of the pointer, which the move rules forbid. Write "
+         "`self: *A` in the impl (the form struct methods normally spell), or call the method on "
+         "an owned value."},
         {"W0770", Severity::Warning, "`next` takes `self` by value",
          "Each call of `next` works on a copy of the iterator, so its position never advances and "
          "the loop does not end. Write `fn next(self: *T)`."},

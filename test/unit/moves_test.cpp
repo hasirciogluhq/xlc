@@ -59,6 +59,24 @@ void testCopiesAreNotMoves() {
                .diag->hasErrors());
 }
 
+// An inherent `impl` method with bare `self` takes the target by value; called through a pointer
+// the call would move the class out of the pointer, which is E0781 with the fix in the message.
+// The pointer form `self: *T` works.
+void testImplSelfByValueThroughPointer() {
+    const std::string kA = "class A {\n    id: i32\n    fn drop(self) { }\n}\n";
+    CHECK(Lowered(kA + "impl A {\n    fn g(self) { }\n}\n"
+                        "fn f(a: *A) {\n    a.g()\n}\n")
+               .failedWith("E0781"));
+    CHECK(!Lowered(kA + "impl A {\n    fn g(self: *A) { }\n}\n"
+                        "fn f(a: *A) {\n    a.g()\n}\n")
+               .diag->hasErrors());
+    // On an owned value the by-value form is fine: the receiver is moved, not copied out of a
+    // pointer.
+    CHECK(!Lowered(kA + "impl A {\n    fn g(self) { }\n}\n"
+                        "fn f() {\n    local a = A { id: 1 }\n    a.g()\n}\n")
+               .diag->hasErrors());
+}
+
 } // namespace
 
 void runMoveTests() {
@@ -66,4 +84,5 @@ void runMoveTests() {
     RUN(testMoveOnSomePaths);
     RUN(testNoFindingWhenOwnedAgain);
     RUN(testCopiesAreNotMoves);
+    RUN(testImplSelfByValueThroughPointer);
 }

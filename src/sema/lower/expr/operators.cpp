@@ -203,6 +203,20 @@ Lowerer::EP Lowerer::operatorCall(const std::string& name,
     for (ExprPtr& a : rest) {
         args.push_back(std::move(a));
     }
+    // A by-value first operand that the call would move out of a pointer (`methodCall` spells a
+    // pointer receiver as `*p`): the generic E0720 at the argument would not say that the fix is
+    // in the impl's `self`, so say it here.
+    if (!by_pointer && !types.empty() && needsDrop(types.front()) && !args.empty() &&
+        args.front()->kind == Expr::Kind::Unary && args.front()->unary_op == UnaryOp::Deref) {
+        err("E0781",
+            span,
+            std::format("`{}` takes `{}` by value and the receiver is behind a pointer",
+                        name,
+                        typeToString(types.front())),
+            std::format("write `self: *{}` in the `impl`, or call it on an owned value",
+                        typeToString(types.front())));
+        return nullptr;
+    }
     const ExprPtr call = makeCall(astName(name, span), std::move(args), span);
     return callEntry(*call, *pick, name);
 }

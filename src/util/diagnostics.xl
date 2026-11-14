@@ -73,7 +73,7 @@ export struct DiagnosticInfo {
     explanation: str
 }
 
-global REGISTRY: [DiagnosticInfo; 95] = [
+global REGISTRY: [DiagnosticInfo; 96] = [
     DiagnosticInfo { code: "E0001", severity: 1, title: "lexical error", explanation: "The source contains a character, literal or escape the lexer cannot read (unknown character, unterminated string, malformed number, misplaced `#` directive). Fix the token at the marked position." },
     DiagnosticInfo { code: "E0002", severity: 1, title: "syntax error", explanation: "The tokens do not form a valid construct at the marked position. The detail line names what the parser expected. Statements and items end at a line break; an expression may continue on the next line only inside parentheses/brackets or after a binary operator." },
     DiagnosticInfo { code: "E0003", severity: 1, title: "preprocessor error", explanation: "A `#error` directive was reached, a conditional-compilation directive is malformed (missing condition, `#endif`, stray `#else`), or a condition uses an undefined name or mixes kinds. Use `defined(NAME)` to test for optional definitions." },
@@ -166,17 +166,18 @@ global REGISTRY: [DiagnosticInfo; 95] = [
     DiagnosticInfo { code: "E0778", severity: 1, title: "C-convention function that passes a struct used as a value", explanation: "A call through a `fn(...)` pointer passes a struct as the address of a copy (the xlang convention). An `export(c)` or `declare` function that takes or returns a struct by value follows the C convention, so it can only be called by name. Call it directly, or change it to take and return the struct through a pointer." },
     DiagnosticInfo { code: "E0779", severity: 1, title: "comparison operator takes an operand by value", explanation: "`a == b`, `a != b`, `a < b`, `a <= b`, `a > b` and `a >= b` on a struct or class call the operator function with the operands' addresses, so comparing never moves or drops a value. Declare every operand parameter as a pointer: `fn ==(a: *T, b: *T) -> bool`, or `fn <(self, other: *T) -> bool` in a class." },
     DiagnosticInfo { code: "E0780", severity: 1, title: "use of a moved value", explanation: "Passing, returning or assigning a value whose type needs drop moves it: the new owner drops it, and the old name no longer holds a value. Reading the old name afterwards (on every path or only on some, such as after a move inside an `if` or a loop) would read an object that may already be dropped. Borrow it instead (`f(&x)` with a pointer parameter), move a copy (`x.clone()`), or assign `x` a new value before the use." },
+    DiagnosticInfo { code: "E0781", severity: 1, title: "a by-value `self` is called through a pointer", explanation: "An inherent `impl` method whose `self` is bare takes the target by value: `impl A { fn g(self) }` declares `fn A.g(self: A)`. Called through a pointer, the call would have to move the class out of the pointer, which the move rules forbid. Write `self: *A` in the impl (the form struct methods normally spell), or call the method on an owned value." },
     DiagnosticInfo { code: "W0770", severity: 0, title: "`next` takes `self` by value", explanation: "Each call of `next` works on a copy of the iterator, so its position never advances and the loop does not end. Write `fn next(self: *T)`." },
     DiagnosticInfo { code: "W0771", severity: 0, title: "`for` uses `iter`, not `next`", explanation: "The type has both `iter` and `next`. `for` calls `iter` and starts from the beginning every time; the position `next` keeps on the value itself is not used." },
     DiagnosticInfo { code: "W0601", severity: 0, title: "implicit signed integer to float conversion", explanation: "A signed integer is implicitly converted to `f32`/`f64` and precision may be lost. Write `as f64`, or silence with `@allow(W0601)` / `--allow=W0601`." },
 ]
 
 /// The registry, in table order.
-export fn allDiagnosticInfos() -> *[DiagnosticInfo; 95] {
+export fn allDiagnosticInfos() -> *[DiagnosticInfo; 96] {
     return &REGISTRY
 }
 
-export const DIAGNOSTIC_COUNT: i32 = 95
+export const DIAGNOSTIC_COUNT: i32 = 96
 
 /// The index of `code` in the registry, or -1.
 export fn findDiagnosticInfo(code: str) -> i32 {
