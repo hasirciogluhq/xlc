@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <iostream>
 #include <memory>
 #include <string>
