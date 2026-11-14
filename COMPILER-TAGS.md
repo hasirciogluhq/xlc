@@ -138,7 +138,7 @@ which keeps the view in the same commit as the tag it came from.
 <!-- written by scripts/tags.sh sync; every line below is a tag found in src/ and
      include/, grouped by tag and then by file. Do not edit inside the markers. -->
 
-### @grammar (119)
+### @grammar (109)
 
 ```
 include/xlang/lang/ast.h:21:/// @grammar the five prefix operators: `-e`, `!e`, `*e`, `&e`, `~e`
@@ -146,17 +146,7 @@ include/xlang/lang/ast.h:24:/// @grammar the infix operators: `a + b`, `-`, `*`,
 include/xlang/lang/ast.h:25:/// @grammar `&&`, `||`, `&`, `|`, `^`, `<<`, `>>` (Go precedence, `&&`/`||` lowest above `?`)
 include/xlang/lang/lexer.h:12:/// @grammar every lexical token the parser can see; the spellings are fixed by `lexer.cpp` and
 include/xlang/lang/lexer.h:13:/// @grammar the language grammar in the parser's `@grammar` comments uses these tokens
-src/lang/lexer/lexer.cpp:176:    /// @grammar the lexical forms are dispatched by first character: `b'x'` byte literal,
-src/lang/lexer/lexer.cpp:177:    /// @grammar identifier or keyword, number, string, `#directive`, then punctuation
-src/lang/lexer/lexer.cpp:345:    /// @grammar `[A-Za-z_][A-Za-z0-9_]*`, a keyword or a primitive type name
-src/lang/lexer/lexer.cpp:361:    /// @grammar `#if`, `#elif`, `#else`, `#endif`, `#ifdef`, `#ifndef`, `#error`, first token of
-src/lang/lexer/lexer.cpp:362:    /// @grammar its line only; `#` anywhere else is an error
-src/lang/lexer/lexer.cpp:392:    /// @grammar `b'x'`, `b'\n'`, `b'\xHH'`, `b'\u{...}'`: exactly one byte, value 0..255
-src/lang/lexer/lexer.cpp:453:    /// @grammar `"text"` with the escapes `\n \t \r \0 \\ \" \xHH \u{...}`; may not span a
-src/lang/lexer/lexer.cpp:454:    /// @grammar line break
-src/lang/lexer/lexer.cpp:514:    /// @grammar `123`, `0x1f`, `0b1010`, `0o17`, `1_000`, `1.5`, `1e9`, `1.5e-3`; after a `.` it is
-src/lang/lexer/lexer.cpp:515:    /// @grammar a tuple position, so it takes no fraction and no exponent there
-src/lang/lexer/lexer.cpp:648:/// @grammar the whole token stream of one file, always ending with `TokenKind::End`
+src/lang/lexer/lexer.cpp:18:/// @grammar the whole token stream of one file, always ending with `TokenKind::End`
 src/lang/macro/macro.cpp:375:/// @grammar `name!(args...)`: each argument is matched against the parameter kinds `expr`,
 src/lang/macro/macro.cpp:376:/// @grammar `type`, `ident`, `block`, `items`, and the body is substituted hygienically
 src/lang/parser/attributes.cpp:7:/// @grammar `@name`, `@name(a, key = v, ...)`, `@file(name(...))` at the top of a file
@@ -366,5 +356,5 @@ include/xlang/mir/mir.h:29:// @todo MIR does not yet carry what only code genera
 src/mir/dataflow/forward.hpp:25:/// @cost each block is processed once per change of its entry fact: at most (lattice height) times.
 ```
 
-Total: 188 tag lines.
+Total: 178 tag lines.
 <!-- END COLLECTED TAGS -->

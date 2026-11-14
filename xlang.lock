@@ -1,0 +1,7 @@
+# xlang.lock: written by `xl pkg`; do not edit.
+
+[[package]]
+name = "github.com/hasirciogluhq/xl-std"
+version = "v1.6.1"
+commit = "d05a9120afdcfd4f63d7b2453c05fd737482191c"
+source = "https://github.com/hasirciogluhq/xl-std.git"

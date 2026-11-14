@@ -1,0 +1,136 @@
+// The lexical forms that need more than one byte of lookahead: identifiers and keywords, byte
+// literals and preprocessor directives.
+//
+// Each function takes the open `Scanner`, moves its cursor over exactly one token and emits it.
+// They are free functions rather than methods so the scanner keeps only cursor plumbing and this
+// file keeps only the spelling rules; the dispatcher in lexer.xl calls one of them per first byte.
+from "std" import String
+from "../lexer/tokens" import K_IDENT, K_PRIM_TYPE, K_BYTE_LIT, K_DIR_IF
+from "../lexer/chars" import isIdentPart, isAlpha, digitValue
+from "../lexer/printable" import printable
+from "../lexer/keywords" import keywordKind, isPrimitiveTypeName, directiveKind
+from "../lexer/scanner" import Scanner
+
+/// `[A-Za-z_][A-Za-z0-9_]*`, a keyword or a primitive type name.
+export fn scanWord(s: *Scanner) {
+    s.begin(K_IDENT)
+    local start = s.pos
+    while isIdentPart(s.peek(0)) {
+        s.advance()
+    }
+    local word = s.text[start..s.pos]
+    s.tokText.append(word)
+    local kw = keywordKind(word)
+    if kw >= 0 {
+        s.kind = kw
+    } else if isPrimitiveTypeName(word) {
+        s.kind = K_PRIM_TYPE
+    }
+    s.finish()
+    s.emit()
+}
+
+/// `#if`, `#elif`, `#else`, `#endif`, `#ifdef`, `#ifndef`, `#error`, first token of its line only;
+/// `#` anywhere else is an error.
+export fn scanDirective(s: *Scanner) {
+    s.begin(K_DIR_IF)
+    local lineStart = s.atLineStart || s.tokens.isEmpty() || s.newlinePending
+    s.advance() // '#'
+    local start = s.pos
+    while isAlpha(s.peek(0)) {
+        s.advance()
+    }
+    local word = s.text[start..s.pos]
+    s.tokText.append(word)
+    s.finish()
+    if !lineStart {
+        s.error(String("preprocessor directive is not the first token on its line"),
+            String("directives must start their line"))
+        s.newlinePending = false
+        return
+    }
+    local kind = directiveKind(word)
+    if kind < 0 {
+        local msg = String("unknown directive `#")
+        msg.append(word)
+        msg.append(String("`"))
+        s.error(msg, String("expected if, elif, else, endif, ifdef, ifndef or error"))
+        return
+    }
+    s.kind = kind
+    s.emit()
+}
+
+/// `b'x'`, `b'\n'`, `b'\xHH'`: exactly one byte, value 0..255, in `intValue`. Checked before the
+/// identifier rule, because `b` is a letter.
+export fn scanByte(s: *Scanner) {
+    s.begin(K_BYTE_LIT)
+    s.advance() // 'b'
+    s.advance() // opening quote
+    // The error span starts after the opening quote, like the `here(1)` of the C++ reference.
+    local atLine = s.line
+    local atCol = s.column
+    local value: u64 = 0
+    if s.atEnd() || s.peek(0) == b'\n' {
+        s.errorAt(atLine, atCol, s.line, s.column, String("unterminated byte literal"),
+            String("write one byte as `b'x'`"))
+    } else if s.peek(0) == b'\\' {
+        s.advance()
+        local e = s.peek(0)
+        s.advance()
+        value = escapeByte(s, e, atLine, atCol)
+    } else {
+        local raw = s.advance()
+        if raw >= 0x80 {
+            s.errorAt(atLine, atCol, s.line, s.column,
+                String("a byte literal holds one ASCII character"),
+                String("write non-ASCII bytes as `b'\\xHH'`"))
+        }
+        value = raw as u64
+    }
+    if !s.atEnd() && s.peek(0) != b'\'' {
+        s.errorAt(atLine, atCol, s.line, s.column, String("a byte literal holds exactly one byte"),
+            String("write `b'x'`, or use a string literal"))
+        while !s.atEnd() && s.peek(0) != b'\'' && s.peek(0) != b'\n' {
+            s.advance()
+        }
+    }
+    if s.atEnd() || s.peek(0) != b'\'' {
+        s.errorAt(atLine, atCol, s.line, s.column, String("unterminated byte literal"),
+            String("close it with `'`"))
+    } else {
+        s.advance()
+    }
+    s.finish()
+    s.intValue = value
+    s.emit()
+}
+
+/// The value of one escape after the backslash, in a byte literal.
+fn escapeByte(s: *Scanner, e: u8, atLine: u32, atCol: u32) -> u64 {
+    if e == b'n' { return b'\n' as u64 }
+    if e == b't' { return b'\t' as u64 }
+    if e == b'r' { return b'\r' as u64 }
+    if e == b'0' { return 0 }
+    if e == b'\\' { return b'\\' as u64 }
+    if e == b'\'' { return b'\'' as u64 }
+    if e == b'"' { return b'"' as u64 }
+    if e == b'x' {
+        local hi = digitValue(s.peek(0))
+        local lo = hi >= 0 ? digitValue(s.peek(1)) : -1
+        if hi < 0 || lo < 0 {
+            s.errorAt(atLine, atCol, s.line, s.column,
+                String("malformed `\\x` escape in a byte literal"), String("expected two hex digits"))
+            return 0
+        }
+        s.advance()
+        s.advance()
+        return (hi * 16 + lo) as u64
+    }
+    local msg = String("unknown escape `\\")
+    msg.append(printable(e))
+    msg.append(String("` in a byte literal"))
+    s.errorAt(atLine, atCol, s.line, s.column, msg,
+        String("valid escapes: \\n \\t \\r \\0 \\\\ \\' \\\" \\xHH"))
+    return 0
+}

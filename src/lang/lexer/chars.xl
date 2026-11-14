@@ -1,0 +1,36 @@
+// The byte classes the scanner dispatches on.
+//
+// A byte is written as a byte literal `b'x'`, so the scanner reads like the C++ original it
+// replaces. The language has no character type: `b'x'` is a `u8` value 0..255.
+from "../lexer/printable" import printable
+
+/// `[A-Za-z_]`. Bytes above 0x7F are not identifier starts here either.
+export fn isIdentStart(c: u8) -> bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_'
+}
+
+/// `[A-Za-z0-9_]`.
+export fn isIdentPart(c: u8) -> bool {
+    return isIdentStart(c) || (c >= b'0' && c <= b'9')
+}
+
+export fn isDigit(c: u8) -> bool {
+    return c >= b'0' && c <= b'9'
+}
+
+export fn isAlpha(c: u8) -> bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
+}
+
+/// Whitespace the scanner skips: space, tab, CR and LF (LF also ends a line in `advance`).
+export fn isTriviaSpace(c: u8) -> bool {
+    return c == b' ' || c == b'\t' || c == b'\r' || c == b'\n'
+}
+
+/// The digit value of `c` in any base, or -1.
+export fn digitValue(c: u8) -> i32 {
+    if c >= b'0' && c <= b'9' { return c as i32 - b'0' as i32 }
+    if c >= b'a' && c <= b'f' { return c as i32 - b'a' as i32 + 10 }
+    if c >= b'A' && c <= b'F' { return c as i32 - b'A' as i32 + 10 }
+    return -1
+}

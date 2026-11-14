@@ -1,0 +1,248 @@
+// The lexer: the xlang source of src/lang/lexer/lexer.cpp, one file per concern:
+//
+//   tokens.xl     the token kinds and the C structs of include/xlang/lang/lexer_c.h
+//   chars.xl      the byte classes the dispatcher tests
+//   printable.xl  the spelling of a byte inside a diagnostic
+//   keywords.xl   keyword, primitive type and directive tables
+//   punct.xl      the one-byte punctuation table
+//   scanner.xl    the cursor, the token being built and the emitted tokens and errors
+//   literals.xl   identifiers, keywords, directives, byte literals
+//   numbers.xl    integer and float literals
+//   strings.xl    string literals
+//   lexer.xl      this file: the dispatcher and the C entry points
+//
+// The C++ side sees `xlcLex` and `xlcLexFree` only (include/xlang/lang/lexer_c.h); everything here
+// is the implementation behind them.
+from "std" import String
+from "std/str" import fromParts
+from "../lexer/tokens" import CToken, CError, CResult, K_END, K_COLON, K_COLON_ASSIGN, K_DOT,
+    K_DOT_DOT, K_DOT_DOT_EQ, K_PLUS, K_PLUS_ASSIGN, K_PLUS_PLUS, K_STAR, K_STAR_ASSIGN, K_SLASH,
+    K_SLASH_ASSIGN, K_PERCENT, K_PERCENT_ASSIGN, K_MINUS, K_ARROW, K_MINUS_ASSIGN, K_MINUS_MINUS,
+    K_ASSIGN, K_EQ_EQ, K_BANG, K_NOT_EQ, K_LT, K_LE, K_SHL_ASSIGN, K_SHL, K_GT, K_GE, K_SHR_ASSIGN,
+    K_SHR, K_CARET, K_CARET_ASSIGN, K_AMP, K_AND_AND, K_AMP_ASSIGN, K_PIPE, K_OR_OR,
+    K_PIPE_ASSIGN
+from "../lexer/chars" import isIdentStart, isDigit
+from "../lexer/printable" import printable
+from "../lexer/scanner" import Scanner
+from "../lexer/punct" import singlePunctKind
+from "../lexer/literals" import scanWord, scanDirective, scanByte
+from "../lexer/numbers" import scanNumber
+from "../lexer/strings" import scanString
+
+/// One pass over the whole file: skip trivia, then dispatch on the first byte of a token until the
+/// end. The result always ends with an `End` token.
+export fn lexText(text: str) -> *Scanner {
+    local s = new Scanner(text)
+    // A UTF-8 byte order mark is not a token; skip it so line 1 column 1 is the first real
+    // character. The BOM bytes do not count as a column (same as the C++ reference).
+    if text.len >= 3 && text[0] == 0xEF && text[1] == 0xBB && text[2] == 0xBF {
+        s.pos = 3
+    }
+    while true {
+        s.skipTrivia()
+        if s.atEnd() {
+            s.begin(K_END)
+            s.finish()
+            s.emit()
+            break
+        }
+        dispatch(s)
+    }
+    return s
+}
+
+/// @grammar the lexical forms are dispatched by first byte: `b'x'` byte literal, identifier or
+/// @grammar keyword, number, string, `#directive`, then punctuation
+fn dispatch(s: *Scanner) {
+    local c = s.peek(0)
+
+    // `b'x'`: a byte literal. Checked before the identifier rule, because `b` is a letter.
+    if c == b'b' && s.peek(1) == b'\'' {
+        scanByte(s)
+        return
+    }
+    if isIdentStart(c) {
+        scanWord(s)
+        return
+    }
+    if isDigit(c) {
+        scanNumber(s)
+        return
+    }
+    if c == b'"' {
+        scanString(s)
+        return
+    }
+    if c == b'#' {
+        scanDirective(s)
+        return
+    }
+
+    local one = singlePunctKind(c)
+    if one >= 0 {
+        s.single(one, 1)
+        return
+    }
+    if dispatchOperator(s, c) {
+        return
+    }
+
+    // Nothing matches: report the byte and step over it, so the rest of the file still parses.
+    local line = s.line
+    local col = s.column
+    s.advance()
+    local msg = String("unexpected character `")
+    msg.append(printable(c))
+    msg.append(String("`"))
+    s.errorAt(line, col, line, s.column, msg, String("this character is not part of the language"))
+}
+
+/// The punctuation that needs lookahead. True when `c` started one.
+fn dispatchOperator(s: *Scanner, c: u8) -> bool {
+    if c == b':' {
+        if s.peek(1) == b'=' {
+            s.single(K_COLON_ASSIGN, 2)
+        } else {
+            s.single(K_COLON, 1)
+        }
+    } else if c == b'.' {
+        if s.peek(1) == b'.' {
+            if s.peek(2) == b'=' {
+                s.single(K_DOT_DOT_EQ, 3)
+            } else {
+                s.single(K_DOT_DOT, 2)
+            }
+        } else {
+            s.single(K_DOT, 1)
+        }
+    } else if c == b'+' {
+        if s.peek(1) == b'=' {
+            s.single(K_PLUS_ASSIGN, 2)
+        } else if s.peek(1) == b'+' {
+            s.single(K_PLUS_PLUS, 2)
+        } else {
+            s.single(K_PLUS, 1)
+        }
+    } else if c == b'*' {
+        if s.peek(1) == b'=' {
+            s.single(K_STAR_ASSIGN, 2)
+        } else {
+            s.single(K_STAR, 1)
+        }
+    } else if c == b'/' {
+        if s.peek(1) == b'=' {
+            s.single(K_SLASH_ASSIGN, 2)
+        } else {
+            s.single(K_SLASH, 1)
+        }
+    } else if c == b'%' {
+        if s.peek(1) == b'=' {
+            s.single(K_PERCENT_ASSIGN, 2)
+        } else {
+            s.single(K_PERCENT, 1)
+        }
+    } else if c == b'-' {
+        if s.peek(1) == b'>' {
+            s.single(K_ARROW, 2)
+        } else if s.peek(1) == b'=' {
+            s.single(K_MINUS_ASSIGN, 2)
+        } else if s.peek(1) == b'-' {
+            s.single(K_MINUS_MINUS, 2)
+        } else {
+            s.single(K_MINUS, 1)
+        }
+    } else if c == b'=' {
+        if s.peek(1) == b'=' {
+            s.single(K_EQ_EQ, 2)
+        } else {
+            s.single(K_ASSIGN, 1)
+        }
+    } else if c == b'!' {
+        if s.peek(1) == b'=' {
+            s.single(K_NOT_EQ, 2)
+        } else {
+            s.single(K_BANG, 1)
+        }
+    } else if c == b'<' {
+        if s.peek(1) == b'=' {
+            s.single(K_LE, 2)
+        } else if s.peek(1) == b'<' && s.peek(2) == b'=' {
+            s.single(K_SHL_ASSIGN, 3)
+        } else if s.peek(1) == b'<' {
+            s.single(K_SHL, 2)
+        } else {
+            s.single(K_LT, 1)
+        }
+    } else if c == b'>' {
+        if s.peek(1) == b'=' {
+            s.single(K_GE, 2)
+        } else if s.peek(1) == b'>' && s.peek(2) == b'=' {
+            s.single(K_SHR_ASSIGN, 3)
+        } else if s.peek(1) == b'>' {
+            s.single(K_SHR, 2)
+        } else {
+            s.single(K_GT, 1)
+        }
+    } else if c == b'^' {
+        if s.peek(1) == b'=' {
+            s.single(K_CARET_ASSIGN, 2)
+        } else {
+            s.single(K_CARET, 1)
+        }
+    } else if c == b'&' {
+        if s.peek(1) == b'&' {
+            s.single(K_AND_AND, 2)
+        } else if s.peek(1) == b'=' {
+            s.single(K_AMP_ASSIGN, 2)
+        } else {
+            s.single(K_AMP, 1)
+        }
+    } else if c == b'|' {
+        if s.peek(1) == b'|' {
+            s.single(K_OR_OR, 2)
+        } else if s.peek(1) == b'=' {
+            s.single(K_PIPE_ASSIGN, 2)
+        } else {
+            s.single(K_PIPE, 1)
+        }
+    } else {
+        return false
+    }
+    return true
+}
+
+// --- The C entry points -----------------------------------------------------------------------
+
+/// The heap block `xlcLex` returns: the scanner that owns the tokens, the errors and the bytes
+/// they point into, plus the frozen `CResult`. `result.block` hands the block back to
+/// `xlcLexFree`, which drops exactly this, so the pointers handed to C++ stay valid until then.
+class LexBlock {
+    scanner: *Scanner
+    result: CResult
+}
+
+/// `xlcLex`: tokenize `length` bytes at `text` and hand the C++ side a frozen result. The result
+/// points into a `LexBlock` that `xlcLexFree` releases; the spans carry lines and columns only,
+/// the C++ side stamps its own file onto them.
+export(c) fn xlcLex(text: *u8, length: u32) -> CResult {
+    local view = fromParts(text, length as usize)
+    local block = new LexBlock { scanner: lexText(view), result: CResult { tokens: nil, tokenCount: 0, errors: nil, errorCount: 0, block: nil } }
+    local s = block.scanner
+    if s.tokens.length() > 0 {
+        block.result.tokens = s.tokens.data
+        block.result.tokenCount = s.tokens.length() as u32
+    }
+    if s.errors.length() > 0 {
+        block.result.errors = s.errors.data
+        block.result.errorCount = s.errors.length() as u32
+    }
+    block.result.block = block as *u8
+    return block.result
+}
+
+/// `xlcLexFree`: release what `xlcLex` allocated. The block is dropped with its scanner, which
+/// drops the token and error vectors and every `String` a token or error points at.
+export(c) fn xlcLexFree(result: CResult) {
+    if result.block == nil { return }
+    delete (result.block as *LexBlock)
+}

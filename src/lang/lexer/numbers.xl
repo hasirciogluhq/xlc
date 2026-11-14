@@ -1,0 +1,204 @@
+// Number literals: decimal, `0x`, `0b`, `0o`, with `_` separators, and the fraction and exponent
+// of a float.
+//
+// One subtlety carries over from the C++ scanner: right after a `.` a number is a tuple position
+// (`t.0.1` is `t`, `.`, `0`, `.`, `1`), so it takes no fraction and no exponent there.
+from "std" import String
+from "std/math" import pow
+from "../lexer/tokens" import K_INT, K_FLOAT, K_DOT
+from "../lexer/chars" import isIdentPart, isDigit, digitValue
+from "../lexer/scanner" import Scanner
+
+/// `123`, `0x1f`, `0b1010`, `0o17`, `1_000`, `1.5`, `1e9`, `1.5e-3`; after a `.` it is a tuple
+/// position and takes no fraction or exponent.
+export fn scanNumber(s: *Scanner) {
+    s.begin(K_INT)
+    local start = s.pos
+    // A `.` immediately before, on the same line and touching, makes this a tuple position.
+    local afterDot = false
+    if !s.tokens.isEmpty() {
+        local prev = s.tokens.last()
+        afterDot = prev.kind == K_DOT && prev.endLine == s.line && prev.endColumn == s.column
+    }
+    local base: u32 = 10
+    if s.peek(0) == b'0' && (s.peek(1) == b'x' || s.peek(1) == b'X') {
+        base = 16
+        s.advance()
+        s.advance()
+    } else if s.peek(0) == b'0' && (s.peek(1) == b'b' || s.peek(1) == b'B') {
+        base = 2
+        s.advance()
+        s.advance()
+    } else if s.peek(0) == b'0' && (s.peek(1) == b'o' || s.peek(1) == b'O') {
+        base = 8 // `0o644`: a bare leading `0` stays decimal, so `0644` is never silently octal
+        s.advance()
+        s.advance()
+    }
+
+    local digits = String()
+    while true {
+        local c = s.peek(0)
+        if c == b'_' {
+            s.advance()
+            continue
+        }
+        local v = digitValue(c)
+        local ok = base == 16 ? v >= 0 : (v >= 0 && (v as u32) < base && c != b'e' && c != b'E')
+        if !ok { break }
+        digits.push(c)
+        s.advance()
+    }
+
+    local isFloat = false
+    if base == 10 && !afterDot {
+        if s.peek(0) == b'.' && isDigit(s.peek(1)) {
+            isFloat = true
+            digits.push(s.advance())
+            while isDigit(s.peek(0)) || s.peek(0) == b'_' {
+                local c = s.advance()
+                if c != b'_' { digits.push(c) }
+            }
+        }
+        local e = s.peek(0)
+        if e == b'e' || e == b'E' {
+            local next = s.peek(1)
+            local sign = next == b'+' || next == b'-'
+            if isDigit(next) || (sign && isDigit(s.peek(2))) {
+                isFloat = true
+                digits.push(s.advance())
+                if s.peek(0) == b'+' || s.peek(0) == b'-' {
+                    digits.push(s.advance())
+                }
+                while isDigit(s.peek(0)) {
+                    digits.push(s.advance())
+                }
+            }
+        }
+    }
+
+    if isIdentPart(s.peek(0)) {
+        // Digits glued to letters (`12abc`, `0b12`): consume the whole word, report once.
+        while isIdentPart(s.peek(0)) {
+            s.advance()
+        }
+        local whole = s.text[start..s.pos]
+        s.tokText.append(whole)
+        s.finish()
+        local msg = String("malformed number literal")
+        local detail = String("`")
+        detail.append(whole)
+        detail.append(String("` is not a valid number"))
+        s.error(msg, detail)
+        s.emit()
+        return
+    }
+
+    local whole = s.text[start..s.pos]
+    s.tokText.append(whole)
+    s.finish()
+
+    if isFloat {
+        s.kind = K_FLOAT
+        s.floatValue = parseFloatDigits(&digits)
+        if s.floatValue == kFloatInf {
+            s.error(String("float literal is out of range"), String("does not fit in an `f64`"))
+        }
+        s.emit()
+        return
+    }
+    if digits.length() == 0 {
+        s.error(String("malformed number literal"), String("expected digits after the base prefix"))
+        s.emit()
+        return
+    }
+    local overflow = false
+    local value: u64 = 0
+    local view = digits.asStr()
+    for i in 0..view.len {
+        local d = digitValue(view[i]) as u64
+        if value > (0xFFFFFFFFFFFFFFFF - d) / base as u64 {
+            overflow = true
+            break
+        }
+        value = value * base as u64 + d
+    }
+    if overflow {
+        s.error(String("integer literal is too large"), String("does not fit in 64 bits"))
+    }
+    s.intValue = value
+    s.emit()
+}
+
+/// The value a float literal that overflows reports (an impossible magnitude to come back from a
+/// real literal, so the caller can tell it apart).
+const kFloatInf: f64 = 1.0e308 * 10.0
+
+/// Parses the digits of a float literal: an optional fraction and exponent, `_` already removed by
+/// the scanner. `digits` is decimal, so the value is `mantissa * 10^exponent`.
+///
+/// @todo replace this with a stdlib `parseFloat(str)` that handles every form the language docs
+/// promise (rounding, subnormals, `inf`/`nan` are not reached here) and returns `Option<f64>`.
+/// The lexer needs it only for the digits it already validated, so the simple form below is exact
+/// for the literals the language accepts today.
+fn parseFloatDigits(digits: *String) -> f64 {
+    local view = digits.asStr()
+    local mantissa: f64 = 0.0
+    local fraction: i32 = 0
+    local seenDot = false
+    local exponent: i32 = 0
+    local i: usize = 0
+    while i < view.len {
+        local c = view[i]
+        if c == b'.' {
+            seenDot = true
+        } else if c == b'e' || c == b'E' {
+            local sign = 1
+            local j = i + 1
+            if j < view.len && view[j] == b'-' {
+                sign = -1
+                j = j + 1
+            } else if j < view.len && view[j] == b'+' {
+                j = j + 1
+            }
+            while j < view.len {
+                // Clamped: an exponent with more digits than an `i32` holds must overflow the
+                // value to inf or zero, not wrap the counter.
+                if exponent < 1000000 {
+                    exponent = exponent * 10 + (view[j] - b'0') as i32
+                }
+                j = j + 1
+            }
+            exponent = exponent * sign
+            break
+        } else {
+            mantissa = mantissa * 10.0 + (c - b'0') as f64
+            if seenDot {
+                fraction = fraction + 1
+            }
+        }
+        i = i + 1
+    }
+    // `mantissa` holds every digit, so the value is `mantissa * 10^(exponent - fraction)`.
+    local scale = exponent - fraction
+    if scale == 0 {
+        return mantissa
+    }
+    if scale > 0 {
+        local value = mantissa * pow(10.0, scale as f64)
+        if value > 1.7976931348623157e308 {
+            return kFloatInf
+        }
+        return value
+    }
+    // Negative scale: one division by a power of ten rounds straight to the nearest double, like
+    // the `strtod` of the C++ reference (`10005 / 10000.0` is exactly the `f64` of `1.0005`); a
+    // multiply by `pow(10, negative)` would carry the error of the inexact power first. An
+    // underflow to zero comes back as `kFloatInf`, which the scanner reports as out of range —
+    // the same observable behavior as the reference, whose `num_get` sets `failbit` on `ERANGE`.
+    // A real zero literal (`0`, `0.0`) has `mantissa == 0` and never takes that path.
+    local value = mantissa / pow(10.0, (-scale) as f64)
+    if value == 0.0 && mantissa > 0.0 {
+        return kFloatInf
+    }
+    return value
+}

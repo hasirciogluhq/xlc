@@ -1,0 +1,179 @@
+// The scanner state: the text, the cursor and the tokens and errors found so far.
+//
+// One `Scanner` walks one file front to back. It owns no memory a caller sees; `lexer.xl` asks it
+// for the result once and copies the vectors into the C block.
+//
+// Span convention (same as the C++ lexer and `Span` in util/source.h): lines and columns are
+// 1-based and count bytes. `line`/`column` are the cursor now; `begin` freezes it at a token's
+// first byte and `finish` closes the span at the cursor.
+from "std" import String, Vec
+from "../lexer/tokens" import CToken, CError
+from "../lexer/chars" import isTriviaSpace
+
+export class Scanner {
+    /// The whole file. Never mutated.
+    text: str
+    /// Cursor: byte offset into `text`.
+    pos: usize
+    line: u32
+    column: u32
+
+    /// The token being built. `text` is cleared before each one.
+    kind: i32
+    tokText: String
+    intValue: u64
+    floatValue: f64
+    spanLine: u32
+    spanColumn: u32
+    spanEndLine: u32
+    spanEndColumn: u32
+    newlineBefore: bool
+
+    /// True when the cursor has passed a line break that no token has claimed yet.
+    newlinePending: bool
+    /// True while the cursor is still before the first non-blank byte of its line.
+    atLineStart: bool
+
+    tokens: Vec<CToken>
+    errors: Vec<CError>
+    /// The `String`s the emitted tokens point into: their bytes back `CToken.text`.
+    owned: Vec<String>
+
+    fn init(self, text: str) {
+        self.text = text
+        self.pos = 0
+        self.line = 1
+        self.column = 1
+        self.kind = 0
+        self.intValue = 0
+        self.floatValue = 0
+        self.spanLine = 1
+        self.spanColumn = 1
+        self.spanEndLine = 1
+        self.spanEndColumn = 1
+        self.newlineBefore = false
+        self.newlinePending = true
+        self.atLineStart = true
+    }
+
+    /// The byte at `ahead` past the cursor, or 0 at the end of the file.
+    fn peek(self, ahead: usize) -> u8 {
+        local idx = self.pos + ahead
+        return idx < self.text.len ? self.text[idx] : 0
+    }
+
+    /// True when the cursor is past the last byte.
+    fn atEnd(self) -> bool {
+        return self.pos >= self.text.len
+    }
+
+    /// Consumes one byte and moves the cursor. A line break starts a new line and arms
+    /// `newlinePending`.
+    fn advance(self) -> u8 {
+        local c = self.text[self.pos]
+        self.pos = self.pos + 1
+        if c == b'\n' {
+            self.line = self.line + 1
+            self.column = 1
+            self.atLineStart = true
+            self.newlinePending = true
+        } else {
+            self.column = self.column + 1
+        }
+        return c
+    }
+
+    /// Starts a token of `kind` at the cursor.
+    fn begin(self, kind: i32) {
+        self.kind = kind
+        self.tokText.clear()
+        self.intValue = 0
+        self.floatValue = 0
+        self.spanLine = self.line
+        self.spanColumn = self.column
+        self.spanEndLine = self.line
+        self.spanEndColumn = self.column
+        self.newlineBefore = self.newlinePending
+    }
+
+    /// Closes the open token's span at the cursor.
+    fn finish(self) {
+        self.spanEndLine = self.line
+        self.spanEndColumn = self.column
+    }
+
+    /// Skips spaces, tabs, CR, LF and `//` line comments.
+    fn skipTrivia(self) {
+        while !self.atEnd() {
+            local c = self.peek(0)
+            if isTriviaSpace(c) {
+                self.advance()
+            } else if c == b'/' && self.peek(1) == b'/' {
+                while !self.atEnd() && self.peek(0) != b'\n' {
+                    self.advance()
+                }
+            } else {
+                return
+            }
+        }
+    }
+
+    /// Records one lexical error (always E0001) at the open token's span.
+    fn error(self, message: String, label: String) {
+        self.errorAt(self.spanLine, self.spanColumn, self.spanEndLine, self.spanEndColumn, message,
+            label)
+    }
+
+    /// Records one lexical error at an explicit span.
+    fn errorAt(self, line: u32, column: u32, endLine: u32, endColumn: u32, message: String,
+               label: String) {
+        local msg = message.clone()
+        local lbl = label.clone()
+        local e = CError {
+            message: msg.ptr,
+            messageLen: msg.len as u32,
+            label: lbl.ptr,
+            labelLen: lbl.len as u32,
+            line: line,
+            column: column,
+            endLine: endLine,
+            endColumn: endColumn,
+        }
+        self.errors.push(e)
+        self.owned.push(msg)
+        self.owned.push(lbl)
+    }
+
+    /// Turns the open token into a `CToken` and appends it. The spelling is kept in `owned`.
+    fn emit(self) {
+        local t = self.tokText.clone()
+        local tok = CToken {
+            kind: self.kind,
+            text: t.ptr,
+            textLen: t.len as u32,
+            intValue: self.intValue,
+            floatValue: self.floatValue,
+            line: self.spanLine,
+            column: self.spanColumn,
+            endLine: self.spanEndLine,
+            endColumn: self.spanEndColumn,
+            newlineBefore: self.newlineBefore ? 1 : 0,
+        }
+        self.tokens.push(tok)
+        self.owned.push(t)
+        self.newlinePending = false
+        self.atLineStart = false
+    }
+
+    /// Consumes `length` bytes as one token of `kind` (punctuation).
+    fn single(self, kind: i32, length: usize) {
+        self.begin(kind)
+        local i: usize = 0
+        while i < length {
+            self.advance()
+            i = i + 1
+        }
+        self.finish()
+        self.emit()
+    }
+}

@@ -1,0 +1,90 @@
+// The three spelling tables the scanner looks a word up in: keywords, primitive type names and
+// preprocessor directive names.
+//
+// A word that is not in any table stays an `Ident`. `str` cannot be switched on, so each lookup is
+// an if-chain; the tables are short and the compiler folds them.
+from "../lexer/tokens" import K_FN, K_LOCAL, K_RETURN, K_IF, K_ELSE, K_WHILE, K_CONTINUE, K_BREAK,
+    K_DO, K_SWITCH, K_CASE, K_DEFAULT, K_DEFER, K_TRY, K_CATCH, K_UNSAFE, K_IMPORT, K_FROM, K_AS,
+    K_EXPORT, K_DECLARE, K_REGISTER, K_GLOBAL, K_CONST, K_DELETE, K_STRUCT, K_CLASS, K_INTERFACE,
+    K_IMPL, K_ENUM, K_TYPE, K_DEFINE, K_NEW, K_VIRTUAL, K_OVERRIDE, K_SELF_KW, K_FOR, K_EXCEPT,
+    K_TRUE, K_FALSE, K_DIR_IF, K_DIR_ELIF, K_DIR_ELSE, K_DIR_ENDIF, K_DIR_IFDEF, K_DIR_IFNDEF,
+    K_DIR_ERROR
+
+/// The keyword this spelling is, or -1. Mirrors the `keywords()` table of the C++ scanner.
+export fn keywordKind(word: str) -> i32 {
+    if word == "fn" { return K_FN }
+    if word == "local" { return K_LOCAL }
+    if word == "return" { return K_RETURN }
+    if word == "if" { return K_IF }
+    if word == "else" { return K_ELSE }
+    if word == "while" { return K_WHILE }
+    if word == "continue" { return K_CONTINUE }
+    if word == "break" { return K_BREAK }
+    if word == "do" { return K_DO }
+    if word == "switch" { return K_SWITCH }
+    if word == "case" { return K_CASE }
+    if word == "default" { return K_DEFAULT }
+    if word == "defer" { return K_DEFER }
+    if word == "try" { return K_TRY }
+    if word == "catch" { return K_CATCH }
+    if word == "unsafe" { return K_UNSAFE }
+    if word == "import" { return K_IMPORT }
+    if word == "from" { return K_FROM }
+    if word == "as" { return K_AS }
+    if word == "export" { return K_EXPORT }
+    if word == "declare" { return K_DECLARE }
+    if word == "register" { return K_REGISTER }
+    if word == "global" { return K_GLOBAL }
+    if word == "const" { return K_CONST }
+    if word == "delete" { return K_DELETE }
+    if word == "struct" { return K_STRUCT }
+    if word == "class" { return K_CLASS }
+    if word == "interface" { return K_INTERFACE }
+    if word == "impl" { return K_IMPL }
+    if word == "enum" { return K_ENUM }
+    if word == "type" { return K_TYPE }
+    if word == "define" { return K_DEFINE }
+    if word == "new" { return K_NEW }
+    if word == "virtual" { return K_VIRTUAL }
+    if word == "override" { return K_OVERRIDE }
+    if word == "self" { return K_SELF_KW }
+    if word == "for" { return K_FOR }
+    if word == "except" { return K_EXCEPT }
+    if word == "true" { return K_TRUE }
+    if word == "false" { return K_FALSE }
+    return -1
+}
+
+/// True when the word names a primitive type (lang/types `primitiveFromName`). Such a word is a
+/// `PrimType` token, not an `Ident`.
+export fn isPrimitiveTypeName(word: str) -> bool {
+    if word == "i8" { return true }
+    if word == "i16" { return true }
+    if word == "i32" { return true }
+    if word == "i64" { return true }
+    if word == "isize" { return true }
+    if word == "u8" { return true }
+    if word == "u16" { return true }
+    if word == "u32" { return true }
+    if word == "u64" { return true }
+    if word == "usize" { return true }
+    if word == "f32" { return true }
+    if word == "f64" { return true }
+    if word == "bool" { return true }
+    if word == "void" { return true }
+    if word == "never" { return true }
+    if word == "str" { return true }
+    return false
+}
+
+/// The directive kind this spelling is, or -1. Mirrors the `directives()` table of the C++ scanner.
+export fn directiveKind(word: str) -> i32 {
+    if word == "if" { return K_DIR_IF }
+    if word == "elif" { return K_DIR_ELIF }
+    if word == "else" { return K_DIR_ELSE }
+    if word == "endif" { return K_DIR_ENDIF }
+    if word == "ifdef" { return K_DIR_IFDEF }
+    if word == "ifndef" { return K_DIR_IFNDEF }
+    if word == "error" { return K_DIR_ERROR }
+    return -1
+}

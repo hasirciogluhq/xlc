@@ -1,0 +1,81 @@
+// String literals: the form with a body the scanner reads byte by byte.
+//
+// At most one error per literal is reported and the token is always emitted, so parsing continues
+// after a bad literal with the rest of the file intact.
+from "std" import String
+from "../lexer/tokens" import K_STRING
+from "../lexer/chars" import digitValue
+from "../lexer/printable" import printable
+from "../lexer/scanner" import Scanner
+
+/// `"text"` with the escapes `\n \t \r \0 \\ \" \xHH`; may not span a line break.
+export fn scanString(s: *Scanner) {
+    s.begin(K_STRING)
+    s.advance() // opening quote
+    local value = String()
+    local terminated = false
+    while !s.atEnd() {
+        local c = s.peek(0)
+        if c == b'\n' { break }
+        if c == b'"' {
+            s.advance()
+            terminated = true
+            break
+        }
+        if c != b'\\' {
+            local b = s.advance()
+            value.push(b)
+            continue
+        }
+        local escLine = s.line
+        local escCol = s.column
+        s.advance() // backslash
+        if s.atEnd() || s.peek(0) == b'\n' { break }
+        local e = s.peek(0)
+        s.advance()
+        stringEscape(s, e, &value, escLine, escCol)
+    }
+    s.finish()
+    if !terminated {
+        s.error(String("unterminated string literal"),
+            String("the string is not closed before the end of the line"))
+    }
+    s.tokText.append(value)
+    s.emit()
+}
+
+/// Appends the value of one escape (after the backslash) to `value`.
+fn stringEscape(s: *Scanner, e: u8, value: *String, escLine: u32, escCol: u32) {
+    if e == b'n' {
+        value.push(b'\n')
+    } else if e == b't' {
+        value.push(b'\t')
+    } else if e == b'r' {
+        value.push(b'\r')
+    } else if e == b'0' {
+        value.push(0)
+    } else if e == b'\\' {
+        value.push(b'\\')
+    } else if e == b'"' {
+        value.push(b'"')
+    } else if e == b'\'' {
+        value.push(b'\'')
+    } else if e == b'x' {
+        local hi = digitValue(s.peek(0))
+        local lo = hi >= 0 ? digitValue(s.peek(1)) : -1
+        if hi < 0 || lo < 0 {
+            s.errorAt(escLine, escCol, s.line, s.column, String("malformed `\\x` escape"),
+                String("expected two hex digits"))
+        } else {
+            s.advance()
+            s.advance()
+            value.push((hi * 16 + lo) as u8)
+        }
+    } else {
+        local msg = String("unknown escape `\\")
+        msg.append(printable(e))
+        msg.append(String("`"))
+        s.errorAt(escLine, escCol, s.line, s.column, msg,
+            String("valid escapes: \\n \\t \\r \\0 \\\\ \\\" \\' \\xHH"))
+    }
+}

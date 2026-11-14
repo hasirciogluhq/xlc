@@ -1,0 +1,10 @@
+// The spelling of a byte for a diagnostic: printable ASCII as is, else `\xHH`.
+//
+// Split out of chars.xl because it is the only part of the byte classes that allocates (it returns
+// a `String`); the scanner calls it only when it builds an error message.
+from "std" import String, format
+
+export fn printable(c: u8) -> String {
+    if c >= 0x20 && c < 0x7F { return String(1, c) }
+    return format("\\x{:02x}", c as u64)
+}

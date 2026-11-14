@@ -18,12 +18,16 @@ is banned.
   (language, stdlib, tests, CLI). Language rules, stdlib and tests live there. Docs live in
   https://github.com/hasirciogluhq/xlang-docs.
 
-## The compiler does not know the stdlib (hard rule)
+## The compiler does not call the stdlib (hard rule)
 
-- Work in this repository never touches, reads for testing, or depends on the stdlib (xl-std).
-  The compiler knows no stdlib type, function or file; a change here is built and verified with
-  the tests of this repository only (test/unit, test/e2e), never by compiling the stdlib or a
-  program that imports it.
+- The compiler's C++ code never includes, links or calls the stdlib (xl-std) directly. Parts of
+  the compiler may be written in xlang (currently the lexer, src/lang/lexer/*.xl); such a part is
+  compiled by an installed `xl` into one object file and reaches the C++ side only through the C
+  ABI of include/xlang/lang/lexer_c.h. The stdlib is that object's build dependency, resolved
+  from the package cache through xlang.toml; no C++ file sees it.
+- A change here is still built and verified with the tests of this repository only (test/unit,
+  test/e2e). The tests never compile the stdlib itself and never run an xlang program except
+  through a ported part's C entry points.
 - A compiler change that breaks the stdlib is the stdlib's own work, done in its own repository
   and session, not here.
 

@@ -1,0 +1,22 @@
+// The punctuation the dispatcher accepts: one byte in, one token kind out.
+//
+// The multi-byte forms (`->`, `<<=`, `..=`, ...) need lookahead and stay as code in `dispatch`
+// (lexer.xl); this file holds only the bytes that are a complete token on their own.
+from "../lexer/tokens" import K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE, K_LBRACKET, K_RBRACKET,
+    K_COMMA, K_SEMICOLON, K_AT, K_QUESTION, K_TILDE
+
+/// The kind of the one-byte punctuation `c` is, or -1.
+export fn singlePunctKind(c: u8) -> i32 {
+    if c == b'(' { return K_LPAREN }
+    if c == b')' { return K_RPAREN }
+    if c == b'{' { return K_LBRACE }
+    if c == b'}' { return K_RBRACE }
+    if c == b'[' { return K_LBRACKET }
+    if c == b']' { return K_RBRACKET }
+    if c == b',' { return K_COMMA }
+    if c == b';' { return K_SEMICOLON }
+    if c == b'@' { return K_AT }
+    if c == b'?' { return K_QUESTION }
+    if c == b'~' { return K_TILDE }
+    return -1
+}

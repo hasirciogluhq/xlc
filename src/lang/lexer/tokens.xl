@@ -1,0 +1,168 @@
+// The token vocabulary of the lexer and its C boundary.
+//
+// `TokenKind` lives in C++ (include/xlang/lang/lexer.h); this file is the xlang mirror of it. The
+// two lists must agree number for number: K_END is the C++ `TokenKind::End`, K_FN is `Fn`, and so
+// on down the enum. A new token is one line in each file.
+//
+// The `@repr(c)` structs are the layouts of include/xlang/lang/lexer_c.h, field for field. The
+// scanner fills them and hands them over; the C++ side copies what it keeps and never frees them
+// itself (the whole block goes back through `xlcLexFree`).
+
+// --- The C boundary ---------------------------------------------------------------------------
+
+/// One token; field for field the `XlcLexToken` of lexer_c.h.
+/// `text` points into the block the caller owns; it is not NUL-terminated.
+@repr(c)
+export struct CToken {
+    kind: i32
+    text: *u8
+    textLen: u32
+    intValue: u64
+    floatValue: f64
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+    newlineBefore: u32 ///< 0 or 1
+}
+
+/// One lexical error; the `XlcLexError` of lexer_c.h.
+@repr(c)
+export struct CError {
+    message: *u8
+    messageLen: u32
+    label: *u8
+    labelLen: u32
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+}
+
+/// The `XlcLexResult` of lexer_c.h: two blocks the callee allocated, plus the handle
+/// `xlcLexFree` releases. `block` is opaque here; lexer.xl gives it its real type.
+@repr(c)
+export struct CResult {
+    tokens: *CToken
+    tokenCount: u32
+    errors: *CError
+    errorCount: u32
+    block: *u8
+}
+
+// --- Token kinds ------------------------------------------------------------------------------
+// The order is the order of `enum class TokenKind` in lexer.h. Do not reorder: the numbers cross
+// the C boundary.
+
+export const K_END: i32 = 0
+
+// Literals and names
+export const K_IDENT: i32 = 1
+export const K_PRIM_TYPE: i32 = 2 ///< i8 .. i64, isize, u8 .. u64, usize, f32, f64, bool, void, never, str
+export const K_INT: i32 = 3
+export const K_FLOAT: i32 = 4
+export const K_STRING: i32 = 5
+export const K_BYTE_LIT: i32 = 6 ///< `b')'`: one byte (0..255) in `intValue`
+
+// Keywords
+export const K_FN: i32 = 7
+export const K_LOCAL: i32 = 8
+export const K_RETURN: i32 = 9
+export const K_IF: i32 = 10
+export const K_ELSE: i32 = 11
+export const K_WHILE: i32 = 12
+export const K_CONTINUE: i32 = 13
+export const K_BREAK: i32 = 14
+export const K_DO: i32 = 15
+export const K_SWITCH: i32 = 16
+export const K_CASE: i32 = 17
+export const K_DEFAULT: i32 = 18
+export const K_DEFER: i32 = 19
+export const K_TRY: i32 = 20
+export const K_CATCH: i32 = 21
+export const K_UNSAFE: i32 = 22
+export const K_IMPORT: i32 = 23
+export const K_FROM: i32 = 24
+export const K_AS: i32 = 25
+export const K_EXPORT: i32 = 26
+export const K_DECLARE: i32 = 27
+export const K_REGISTER: i32 = 28
+export const K_GLOBAL: i32 = 29
+export const K_CONST: i32 = 30
+export const K_DELETE: i32 = 31
+export const K_STRUCT: i32 = 32
+export const K_CLASS: i32 = 33
+export const K_INTERFACE: i32 = 34
+export const K_IMPL: i32 = 35
+export const K_ENUM: i32 = 36
+export const K_TYPE: i32 = 37
+export const K_DEFINE: i32 = 38
+export const K_NEW: i32 = 39
+export const K_VIRTUAL: i32 = 40
+export const K_OVERRIDE: i32 = 41
+export const K_SELF_KW: i32 = 42
+export const K_FOR: i32 = 43
+export const K_EXCEPT: i32 = 44
+export const K_TRUE: i32 = 45
+export const K_FALSE: i32 = 46
+
+// Punctuation
+export const K_LPAREN: i32 = 47
+export const K_RPAREN: i32 = 48
+export const K_LBRACE: i32 = 49
+export const K_RBRACE: i32 = 50
+export const K_LBRACKET: i32 = 51
+export const K_RBRACKET: i32 = 52
+export const K_COMMA: i32 = 53
+export const K_COLON: i32 = 54
+export const K_COLON_ASSIGN: i32 = 55 ///< `:=` (inferred local type)
+export const K_SEMICOLON: i32 = 56
+export const K_DOT: i32 = 57
+export const K_ARROW: i32 = 58
+export const K_AT: i32 = 59
+export const K_BANG: i32 = 60
+export const K_PLUS: i32 = 61
+export const K_MINUS: i32 = 62
+export const K_STAR: i32 = 63
+export const K_SLASH: i32 = 64
+export const K_PERCENT: i32 = 65
+export const K_AMP: i32 = 66
+export const K_PIPE: i32 = 67
+export const K_CARET: i32 = 68
+export const K_TILDE: i32 = 69
+export const K_SHL: i32 = 70
+export const K_SHR: i32 = 71
+export const K_ASSIGN: i32 = 72
+export const K_EQ_EQ: i32 = 73
+export const K_NOT_EQ: i32 = 74
+export const K_LT: i32 = 75
+export const K_LE: i32 = 76
+export const K_GT: i32 = 77
+export const K_GE: i32 = 78
+export const K_AND_AND: i32 = 79
+export const K_OR_OR: i32 = 80
+export const K_DOT_DOT: i32 = 81 ///< `..` (range in `for i in a..b`)
+export const K_DOT_DOT_EQ: i32 = 82 ///< `..=` (inclusive range in `for i in a..=b`)
+export const K_QUESTION: i32 = 83 ///< `?` (ternary)
+export const K_PLUS_ASSIGN: i32 = 84 ///< `+=`
+export const K_MINUS_ASSIGN: i32 = 85 ///< `-=`
+export const K_STAR_ASSIGN: i32 = 86 ///< `*=`
+export const K_SLASH_ASSIGN: i32 = 87 ///< `/=`
+export const K_PERCENT_ASSIGN: i32 = 88 ///< `%=`
+export const K_AMP_ASSIGN: i32 = 89 ///< `&=`
+export const K_PIPE_ASSIGN: i32 = 90 ///< `|=`
+export const K_CARET_ASSIGN: i32 = 91 ///< `^=`
+export const K_SHL_ASSIGN: i32 = 92 ///< `<<=`
+export const K_SHR_ASSIGN: i32 = 93 ///< `>>=`
+export const K_PLUS_PLUS: i32 = 94 ///< `++` (statement only)
+export const K_MINUS_MINUS: i32 = 95 ///< `--` (statement only)
+
+// Conditional-compilation directives (`#if` ...). The lexer only recognizes them; the
+// preprocessor consumes them.
+export const K_DIR_IF: i32 = 96
+export const K_DIR_ELIF: i32 = 97
+export const K_DIR_ELSE: i32 = 98
+export const K_DIR_ENDIF: i32 = 99
+export const K_DIR_IFDEF: i32 = 100
+export const K_DIR_IFNDEF: i32 = 101
+export const K_DIR_ERROR: i32 = 102
