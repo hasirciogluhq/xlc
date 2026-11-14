@@ -1,8 +1,13 @@
-// The util bridge: the C ABI of the xlang source manager and diagnostic engine
-// (src/util/source.xl, src/util/diagnostics.xl). The C++ side hands flat records over; the xlang
-// side copies every string into its own arenas. Handles are plain pointers to the xlang objects;
-// every function is one simple translation, no state on this side.
+// The util bridge, C++ side: one simple translation per call between the C++ types
+// (include/xlang/util/source.h, include/xlang/util/diagnostics.h) and the flat C ABI of the
+// xlang source manager and diagnostic engine (src/util/source.xl, src/util/diagnostics.xl).
+// The wire records and the entry points live in util_c.h; the C++ DiagnosticEngine itself is a
+// shim over the same entry points. This wrapper exists for the differential unit tests.
 #pragma once
+
+#include "xlang/util/diagnostics.h"
+#include "xlang/util/source.h"
+#include "xlang/util/util_c.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -10,93 +15,7 @@
 #include <string_view>
 #include <vector>
 
-#include "xlang/util/diagnostics.h"
-#include "xlang/util/source.h"
-
 namespace xlang::xl {
-
-struct XbStr {
-    const void* ptr;
-    std::uint32_t len;
-};
-
-struct XbLabel {
-    std::uint32_t file;
-    std::uint32_t line;
-    std::uint32_t column;
-    std::uint32_t end_line;
-    std::uint32_t end_column;
-    const void* text;
-    std::uint32_t text_len;
-};
-
-struct XbNote {
-    std::uint32_t file;
-    std::uint32_t line;
-    std::uint32_t column;
-    std::uint32_t has_span;
-    const void* message;
-    std::uint32_t msg_len;
-};
-
-struct XbDiagnostic {
-    XbStr code;
-    std::uint32_t severity;
-    XbStr message;
-    const XbLabel* labels;
-    std::uint32_t label_count;
-    const XbNote* notes;
-    std::uint32_t note_count;
-    XbStr detail;
-    XbStr reason;
-    XbStr fix;
-};
-
-struct XbOptions {
-    const XbStr* allow;
-    std::uint32_t allow_count;
-    const XbStr* deny;
-    std::uint32_t deny_count;
-    std::uint32_t warn_all;
-    std::uint32_t allow_all;
-    std::uint32_t context_errors;
-    std::uint32_t context_warnings;
-    XbStr log_path;
-    std::uint32_t format;
-    std::uint32_t log_level;
-    std::uint32_t color;
-};
-
-struct XbFlush {
-    const void* text;
-    std::uint32_t text_len;
-    std::uint32_t errors;
-    std::uint32_t warnings;
-};
-
-struct XbSpan {
-    std::uint32_t file;
-    std::uint32_t line;
-    std::uint32_t column;
-    std::uint32_t end_line;
-    std::uint32_t end_column;
-};
-
-extern "C" {
-void* xlcUtilSourcesNew();
-std::uint32_t xlcUtilAddFile(void* sources, const XbStr* path, const XbStr* text);
-void xlcUtilSourcesFree(void* sources);
-void* xlcDiagNew(void* sources);
-void xlcDiagConfigure(void* engine, const XbOptions* options);
-void xlcDiagAddAllowScope(void* engine, const XbSpan* scope, const XbStr* codes,
-                          std::uint32_t count);
-void xlcDiagReport(void* engine, const XbDiagnostic* diagnostic);
-void xlcDiagBeginQuiet(void* engine);
-void xlcDiagEndQuiet(void* engine);
-XbFlush xlcDiagFlush(void* engine);
-std::uint32_t xlcDiagExplain(const XbStr* code, void* out, std::uint32_t cap);
-void xlcDiagFreeEngine(void* engine);
-}
 
 /// The C++ side of the bridge: one engine plus its source manager, fed with the C++ types and
 /// read back as text. Everything is one simple translation per call.

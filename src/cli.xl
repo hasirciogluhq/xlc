@@ -494,6 +494,11 @@ export fn run(args: Vec<String>) -> i32 {
     if !failed && xlcSessionAnalyze(session) != 0 {
         failed = true
     }
+    // `--check` promises parse, analyze and lower; the dumps and the emit paths lower on demand,
+    // so only `--check` needs the explicit step.
+    if !failed && o.check && xlcSessionLower(session) != 0 {
+        failed = true
+    }
     if failed {
         xlcSessionFree(session)
         return 1

@@ -211,13 +211,15 @@ void testJsonFormat() {
 }
 
 void testRegistry() {
+    // The registry lives on the xlang side; the shim reaches it through `explain`, whose first
+    // line is `CODE (error|warning): title`.
     for (const char* code : {"W0201", "W0202", "W0203", "W0301", "E0302", "W0401", "E0401", "E0501",
                              "E0502", "E0503", "E0504", "W0402", "E0601", "E0701", "W0601",
                              "E0726", "E0727", "E0729"}) {
-        CHECK(findDiagnosticInfo(code) != nullptr);
+        CHECK(!DiagnosticEngine::explain(code).empty());
     }
-    CHECK(findDiagnosticInfo("E0601")->severity == Severity::Error);
-    CHECK(findDiagnosticInfo("W0601")->severity == Severity::Warning);
+    CHECK(DiagnosticEngine::explain("E0601").find("(error)") != std::string::npos);
+    CHECK(DiagnosticEngine::explain("W0601").find("(warning)") != std::string::npos);
     CHECK(!DiagnosticEngine::explain("W0601").empty());
     CHECK(DiagnosticEngine::explain("Z9999").empty());
 }

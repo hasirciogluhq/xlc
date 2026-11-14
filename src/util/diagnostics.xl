@@ -1226,7 +1226,10 @@ export(c) fn xlcDiagAddAllowScope(e: *DiagnosticEngine, scope: *Span, codes: *Xb
 }
 
 /// Reports one diagnostic; the bridge copies every string into the engine's arena.
-export(c) fn xlcDiagReport(e: *DiagnosticEngine, d: *XbDiagnostic) {
+/// Copies one wire diagnostic into the engine: strings into the text arena, labels and notes
+/// appended to their arenas (the record keeps first/count indices). Shared by `report` and the
+/// render entry point.
+fn importDiagnostic(e: *DiagnosticEngine, d: *XbDiagnostic) -> Diagnostic {
     local diag: Diagnostic
     diag.code = e.txt(fromParts(d.code.ptr, d.code.len as usize))
     diag.severity = d.severity as i32
@@ -1267,7 +1270,11 @@ export(c) fn xlcDiagReport(e: *DiagnosticEngine, d: *XbDiagnostic) {
         }
         diag.notesCount = (e.notes.length() as u32) - (diag.notesFirst as u32)
     }
-    e.report(diag)
+    return diag
+}
+
+export(c) fn xlcDiagReport(e: *DiagnosticEngine, d: *XbDiagnostic) {
+    e.report(importDiagnostic(e, d))
 }
 
 export(c) fn xlcDiagBeginQuiet(e: *DiagnosticEngine) {
@@ -1293,6 +1300,34 @@ export(c) fn xlcDiagFlush(e: *DiagnosticEngine) -> XbFlush {
 /// when the text does not fit.
 export(c) fn xlcDiagExplain(code: *XbStr, out: *u8, cap: u32) -> u32 {
     local text = explain(fromParts(code.ptr, code.len as usize))
+    local n = text.len < cap as usize ? text.len : cap as usize
+    for i in 0..n {
+        out[i] = text.at(i)
+    }
+    return n as u32
+}
+
+/// The registry index of `code` with its severity (1 error, 0 warning) into `severity`; -1 when
+/// unknown. The C++ shim validates `--allow`/`--deny` with it before configuring.
+export(c) fn xlcDiagFindCode(code: *XbStr, severity: *u32) -> i32 {
+    local info = findDiagnosticInfo(fromParts(code.ptr, code.len as usize))
+    if info >= 0 {
+        *severity = REGISTRY[info].severity as u32
+    }
+    return info
+}
+
+/// The live counts: errors and warnings that survived allow/deny and quiet.
+export(c) fn xlcDiagCounts(e: *DiagnosticEngine, errors: *u32, warnings: *u32) {
+    *errors = e.errors as u32
+    *warnings = e.warnings as u32
+}
+
+/// The text (`json == 0`) or JSON (`json != 0`) form of one diagnostic into `out` (capacity
+/// `cap`); returns the byte count without a NUL.
+export(c) fn xlcDiagRender(e: *DiagnosticEngine, d: *XbDiagnostic, json: u32, out: *u8, cap: u32) -> u32 {
+    local diag = importDiagnostic(e, d)
+    local text = json != 0 ? renderJson(e, &diag) : renderText(e, &diag)
     local n = text.len < cap as usize ? text.len : cap as usize
     for i in 0..n {
         out[i] = text.at(i)

@@ -378,6 +378,11 @@ int32_t XLC_BACKEND_CALL xlcSessionAnalyze(XlcSession* session) {
     return guard([&] { s->analyze(); });
 }
 
+int32_t XLC_BACKEND_CALL xlcSessionLower(XlcSession* session) {
+    Session* s = reinterpret_cast<Session*>(session);
+    return guard([&] { s->ensureLowered(); });
+}
+
 int32_t XLC_BACKEND_CALL xlcSessionDumpHir(XlcSession* session) {
     Session* s = reinterpret_cast<Session*>(session);
     return guard([&] {

@@ -137,6 +137,9 @@ int32_t XLC_BACKEND_CALL xlcSessionLoadRoot(XlcSession* session, XlcStr path);
 /// Resolves the imports and analyzes every module (`finish` + `analyzeAll`).
 int32_t XLC_BACKEND_CALL xlcSessionAnalyze(XlcSession* session);
 
+/// Lowers the program (once) without printing anything (`--check`).
+int32_t XLC_BACKEND_CALL xlcSessionLower(XlcSession* session);
+
 /// Lowers the program (once) and prints the typed HIR (`--dump-hir`).
 int32_t XLC_BACKEND_CALL xlcSessionDumpHir(XlcSession* session);
 

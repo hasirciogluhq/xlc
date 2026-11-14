@@ -107,6 +107,8 @@ export declare fn xlcSessionLoadRoot(session: *XlcSession, path: XlcStr) -> i32
 @allow(W0301)
 export declare fn xlcSessionAnalyze(session: *XlcSession) -> i32
 @allow(W0301)
+export declare fn xlcSessionLower(session: *XlcSession) -> i32
+@allow(W0301)
 export declare fn xlcSessionDumpHir(session: *XlcSession) -> i32
 @allow(W0301)
 export declare fn xlcSessionDumpMir(session: *XlcSession) -> i32
