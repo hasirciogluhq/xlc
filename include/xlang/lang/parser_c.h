@@ -317,6 +317,7 @@ typedef struct XpErrLabel {
 
 /// One syntax error: the message, the labels (the first is primary) and the detail and fix hints.
 typedef struct XpErr {
+    XpStr code;  ///< empty for the plain syntax error E0002
     XpStr message;
     XpStr detail;
     XpStr fix;

@@ -185,12 +185,18 @@ export class Ast {
     /// Records one syntax error: the message, one primary label and the optional detail and fix
     /// hints. The C++ bridge reports it as `E0002`.
     fn error(self, span: XSpan, msg: str, label: str, detail: str, fix: str) {
+        self.errorCode("", span, msg, label, detail, fix)
+    }
+
+    /// Records a diagnostic with its own code; an empty `code` is the plain syntax error E0002.
+    fn errorCode(self, code: str, span: XSpan, msg: str, label: str, detail: str, fix: str) {
         local labelsFirst: u32 = self.errLabels.length() as u32
         local l: XErrLabel
         l.span = span
         l.text = self.text(label)
         self.errLabels.push(l)
         local e: XErr
+        e.code = self.text(code)
         e.message = self.text(msg)
         e.detail = self.text(detail)
         e.fix = self.text(fix)

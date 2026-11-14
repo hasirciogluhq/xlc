@@ -10,7 +10,6 @@
 // statement and item recovery sites catch, so one run reports many problems.
 
 from "std" import String, Vec, format
-from "std/io" import eprint
 from "std/str" import fromParts, eq, view, startsWith
 from "../abi" import CToken
 from "../lexer/tokens" import K_END, K_IDENT, K_PRIM_TYPE, K_INT, K_FLOAT, K_STRING, K_BYTE_LIT
@@ -396,8 +395,6 @@ export class Parser {
             try {
                 self.parseItem()
             } catch e {
-                eprint("[xlparser] item panic: ")
-                eprint(e)
                 self.restore(ParseState())
                 self.syncItem(start)
             }
@@ -514,7 +511,7 @@ export class Parser {
     /// Type parameters on a declaration that cannot have them (E0724); they are consumed.
     fn rejectTypeParams(self) {
         if self.at(K_LT) {
-            self.b.error(self.spanOfCur(),
+            self.b.errorCode("E0724", self.spanOfCur(),
                 "type parameters are only allowed on `fn`, `struct` and `class`",
                 "remove the `<...>`", "", "")
             self.parseGenericParams()
@@ -698,7 +695,7 @@ export class Parser {
             local idx = self.primitiveType(self.textOf(t))
             local p = self.b.types.get(idx as usize)
             if p.kind == XT_NEVER {
-                self.b.error(self.b.spanOf(t), "`never` is only a return type",
+                self.b.errorCode("E0765", self.b.spanOf(t), "`never` is only a return type",
                     "write it after `->` of a function that does not return", "", "")
             }
             p.span = self.spanFrom(start)
@@ -1565,6 +1562,9 @@ export class Parser {
             }
             self.expect(K_PIPE, "`|` closing the closure parameters")
         }
+        // The count is fixed here: a closure in the body pushes its own parameters onto the
+        // same arena, and those belong to the inner closure, not to this one.
+        local paramsCount: u32 = (self.b.params.length() as u32) - paramsFirst
         local hasRet = false
         local ret: i32 = -1
         if self.match(K_ARROW) {
@@ -1600,7 +1600,7 @@ export class Parser {
         }
         local c: XClosure
         c.paramsFirst = paramsFirst
-        c.paramsCount = (self.b.params.length() as u32) - paramsFirst
+        c.paramsCount = paramsCount
         c.hasRet = hasRet ? 1 : 0
         c.ret = ret
         c.isMove = isMove ? 1 : 0
@@ -2629,6 +2629,7 @@ export class Parser {
         while !self.at(K_RPAREN) {
             local paramSpan = self.spanOfCur()
             local param: XParam
+            param.typeIdx = -1 // an untyped parameter (`self`, a pack) has no type index
             if self.at(K_SELF_KW) {
                 self.advance()
                 param.name = self.b.text("self")
@@ -3418,7 +3419,7 @@ export class Parser {
         if p.hasUnderlying != 0 || anyValue {
             local msg = String(self.b.strOf(p.name))
             msg.append(" mixes payload variants with constant values")
-            self.b.error(p.nameSpan, msg.asStr(),
+            self.b.errorCode("E0747", p.nameSpan, msg.asStr(),
                 "a payload enum has no `: T` and no `= value`; the tag is numbered by position",
                 "", "")
         }

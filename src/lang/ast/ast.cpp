@@ -197,8 +197,17 @@ class Dumper {
             return "\"" + escape(e.text) + "\"";
         case Expr::Kind::ByteLiteral:
             return std::format("b'\\x{:02x}'", e.int_value);
-        case Expr::Kind::Name:
-            return e.text;
+        case Expr::Kind::Name: {
+            std::string out = e.text;
+            if (!e.generic_args.empty()) {
+                out += "<";
+                for (std::size_t i = 0; i < e.generic_args.size(); ++i) {
+                    out += (i != 0 ? ", " : "") + typeToString(e.generic_args[i]);
+                }
+                out += ">";
+            }
+            return out;
+        }
         case Expr::Kind::Unary:
             return std::format("({}{})", unaryOpName(e.unary_op), expr(*e.lhs));
         case Expr::Kind::Binary:

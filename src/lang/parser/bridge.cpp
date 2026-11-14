@@ -227,7 +227,12 @@ class FlatReader {
         case 2: e->kind = Expr::Kind::BoolLiteral; break;
         case 3: e->kind = Expr::Kind::StringLiteral; break;
         case 4: e->kind = Expr::Kind::ByteLiteral; break;
-        case 5: e->kind = Expr::Kind::Name; break;
+        case 5:
+            e->kind = Expr::Kind::Name;
+            for (uint32_t i = 0; i < raw.generic_args_count; ++i) {
+                e->generic_args.push_back(type(r_.type_refs[raw.generic_args_first + i]));
+            }
+            break;
         case 6:
             e->kind = Expr::Kind::Unary;
             e->unary_op = static_cast<UnaryOp>(raw.unary_op);
@@ -265,6 +270,9 @@ class FlatReader {
         case 11:
             e->kind = Expr::Kind::Field;
             e->lhs = expr(raw.lhs);
+            for (uint32_t i = 0; i < raw.generic_args_count; ++i) {
+                e->generic_args.push_back(type(r_.type_refs[raw.generic_args_first + i]));
+            }
             break;
         case 12:
             e->kind = Expr::Kind::Cast;
@@ -800,7 +808,10 @@ Program parseTokensXl(std::vector<Token>& tokens, FileId file, DiagnosticEngine&
     for (std::uint32_t i = 0; i < result.err_count; ++i) {
         const XpErr& e = result.errs[i];
         Diagnostic d;
-        d.code = "E0002";
+        d.code = reader.strCopy(e.code);
+        if (d.code.empty()) {
+            d.code = "E0002";
+        }
         d.severity = Severity::Error;
         d.message = reader.strCopy(e.message);
         for (std::uint32_t j = 0; j < e.labels_count; ++j) {

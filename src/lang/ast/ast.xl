@@ -465,6 +465,7 @@ export struct XErrLabel {
 /// One syntax error: the message, the labels (first is primary) and the detail and fix hints.
 @repr(c)
 export struct XErr {
+    code: XStr ///< empty for the plain syntax error E0002
     message: XStr
     detail: XStr
     fix: XStr
