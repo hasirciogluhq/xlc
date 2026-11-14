@@ -1,0 +1,27 @@
+// The native backend: the arm64 encoder (arm64), the Mach-O object writer (macho) and the
+// instruction selector from the HIR (isel). The CLI dispatches here when `--backend=native` and
+// the resolved target is arm64-apple-macos; every other target stays with LLVM.
+//
+// The entry takes the C++ `hir::Module` of the session as a raw pointer (xlcSessionHirModule),
+// flattens it into the flat `XlcHirModule` of hir/abi.xl (hir/flatten.xl), selects it to arm64
+// (isel) and writes the Mach-O object (macho).
+from "std" import String, format, fsWrite
+from "std/io" import fprint
+from "../../hir/flatten" import Flat, flattenModule
+from "../isel" import select
+from "../macho" import MachoObject, writeObject
+
+/// Emits one Mach-O object for `module` to `output`. False (reported) when the module uses
+/// something the native backend does not lower yet.
+export fn emitNativeObj(module: *void, output: *String) -> bool {
+    local f = Flat()
+    flattenModule(&f, module)
+    local o = MachoObject()
+    select(&f.m, &o)
+    local bytes = writeObject(&o)
+    if !fsWrite(output.cstr(), bytes.asStr()) {
+        fprint(2, format("error: cannot write {}\n", output.asStr()).asStr())
+        return false
+    }
+    return true
+}

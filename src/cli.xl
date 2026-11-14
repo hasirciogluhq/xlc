@@ -17,6 +17,7 @@ export class Opts {
     inputs: Vec<String>
     output: String
     emit: String
+    backend: String
     check: bool
     dumpAst: bool
     dumpHir: bool
@@ -65,6 +66,7 @@ export class Opts {
         self.deny = Vec<String>()
         self.linkArgs = Vec<String>()
         self.emit = String("exe")
+        self.backend = String("llvm")
         self.cpu = String("generic")
         self.mangle = String("xl")
         self.safety = String("checked")
@@ -115,6 +117,10 @@ fn validate(o: *Opts) -> bool {
             o.emit.asStr() != "bc" && o.emit.asStr() != "header" &&
             o.emit.asStr() != "static" && o.emit.asStr() != "shared" {
         o.bad = format("`--emit {}` must be exe|obj|ir|bc|header|static|shared", o.emit.asStr())
+        return false
+    }
+    if o.backend.asStr() != "llvm" && o.backend.asStr() != "native" {
+        o.bad = format("`--backend {}` must be llvm|native", o.backend.asStr())
         return false
     }
     if o.opt.len > 0 && o.opt.asStr() != "0" && o.opt.asStr() != "1" && o.opt.asStr() != "2" &&
@@ -183,6 +189,8 @@ export fn parseArgs(args: Vec<String>) -> Opts {
             o.output = String(valueOf(&argv, &i, a, &o))
         } else if startsWith(a, "--emit=") || a == "--emit" {
             o.emit = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--backend=") || a == "--backend" {
+            o.backend = String(valueOf(&argv, &i, a, &o))
         } else if a == "--check" {
             o.check = true
         } else if a == "--dump-ast" {
@@ -301,6 +309,7 @@ export fn printHelp() {
     print("  INPUT...                   Program root (.xl) followed by prebuilt objects/libraries to link\n")
     print("  -o, --output TEXT          Output file (default: next to the input)\n")
     print("      --emit KIND            exe|obj|ir|bc|header|static|shared (default exe)\n")
+    print("      --backend KIND         llvm|native (default llvm; native = our arm64 Mach-O codegen, arm64-apple-macos only)\n")
     print("      --check                Parse, analyze and lower; write nothing (like -fsyntax-only)\n")
     print("      --dump-ast             Parse only: print the AST summary\n")
     print("      --dump-hir             Analyze and lower: print the typed HIR\n")
@@ -390,6 +399,7 @@ fn emitPlan(o: *Opts, rootIdx: usize) -> EmitPlan {
     plan.root = o.inputs.get(rootIdx).clone()
     plan.output = o.output.clone()
     plan.emit = o.emit.clone()
+    plan.backend = o.backend.clone()
     plan.incremental = o.incremental
     plan.cacheDir = o.cacheDir.clone()
     plan.crt = o.crt

@@ -1,6 +1,9 @@
-// The output step of the CLI: where the output goes, code generation through the backend
-// (`xlcSessionEmit`), then the archive (`xlcArchive`, LLVM's writer) or the link
-// (src/driver/link.xl) of the objects it produced.
+// The output step of the CLI: where the output goes, code generation, then the archive
+// (`xlcArchive`, LLVM's writer) or the link (src/driver/link.xl) of the objects it produced.
+//
+// The backend choice by target happens here, before any codegen runs: `--backend=native` with
+// arm64-apple-macos and `--emit=obj` goes to the native backend (src/codegen/native, pure
+// xlang, no LLVM call); everything else goes through the LLVM codegen C API (`xlcLlvmEmit`).
 //
 //   obj, ir, bc, header   written by the backend straight to the output (`-o -` streams)
 //   exe, shared           linked from the backend's objects plus the prebuilt inputs
@@ -10,16 +13,19 @@
 // directory, so the same file system and permissions), removed here whether or not the link
 // succeeds; `--incremental` objects live in the cache and stay.
 from "std" import String, Vec, format
+from "std/io" import fprint
 from "std/io/files" import removeFile
-from "backend" import XlcSession, XlcEmitRequest, XlcEmitResult, XlcTarget, XlcStr, xlcSessionTarget, xlcSessionEmit,
+from "backend" import XlcSession, XlcEmitRequest, XlcEmitResult, XlcTarget, XlcStr, xlcSessionTarget, xlcSessionHirModule, xlcLlvmEmit,
                       xlcSessionHasErrors, xlcArchive, xstr, xlist, ownedOf
 from "../driver/link" import LinkRequest, Import, link
+from "../codegen/native" import emitNativeObj
 
 /// Everything the output step needs from the command line.
 export class EmitPlan {
     root: String
     output: String          // "" = next to `root`, named by `emit`
     emit: String            // exe|obj|ir|bc|header|static|shared
+    backend: String         // llvm|native
     incremental: bool
     cacheDir: String
     inputs: Vec<String>     // prebuilt objects and libraries handed to the linker
@@ -72,7 +78,23 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
     local target: XlcTarget
     xlcSessionTarget(session, &target)
     local os = ownedOf(target.os)
+    local arch = ownedOf(target.arch)
     local output = plan.output.length() > 0 ? plan.output.clone() : defaultOutput(&plan.root, &plan.emit, &os)
+
+    // The backend choice by target: `--backend=native` runs our arm64/Mach-O codegen, but only
+    // where it applies (macOS on arm64); everything else stays with LLVM.
+    if plan.backend.asStr() == "native" {
+        if os.asStr() != "macos" || arch.asStr() != "aarch64" {
+            local triple = ownedOf(target.triple)
+            fprint(2, format("error: the native backend supports only the arm64-apple-macos target, this build targets {}\n", triple.asStr()).asStr())
+            return false
+        }
+        if plan.emit.asStr() != "obj" {
+            fprint(2, format("error: the native backend currently emits obj only, `--emit {}` stays with LLVM\n", plan.emit.asStr()).asStr())
+            return false
+        }
+        return emitNativeObj(xlcSessionHirModule(session), &output)
+    }
 
     local req: XlcEmitRequest
     req.root = xstr(&plan.root)
@@ -82,7 +104,7 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
     req.cacheDir = xstr(&plan.cacheDir)
     req.hasInputs = plan.inputs.length() > 0 ? 1 : 0
     local result: XlcEmitResult
-    if xlcSessionEmit(session, &req, &result) != 0 || xlcSessionHasErrors(session) != 0 {
+    if xlcLlvmEmit(session, &req, &result) != 0 || xlcSessionHasErrors(session) != 0 {
         return false
     }
     if result.objects.count == 0 {

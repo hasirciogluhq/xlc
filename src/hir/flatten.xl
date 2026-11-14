@@ -1,0 +1,951 @@
+// The bridge from the C++ world to the flat form: reads the session's `hir::Module` through raw
+// pointers and builds the flat `XlcHirModule` of abi.xl that the dump, the prune and the native
+// selector read. This is the xl replacement for touching the C++ tree directly; the layouts are
+// pinned by /tmp/hirprobe.cpp (clang++, arm64-apple-macos, libc++): a libc++ or hir.h change
+// moves the offsets and this file moves with them.
+//
+// Representations the reads rely on:
+//   std::string          24 bytes; short strings keep the bytes in place with `size << 1` in the
+//                        last byte, long strings carry the flag in the top bit of the last byte,
+//                        the data pointer at 0 and the size at 8.
+//   std::vector<T>       { begin, end, capacity } pointers; the size is the byte distance.
+//   std::shared_ptr<T>   { pointer, control block }; the object pointer is the first word.
+//   std::unique_ptr<T>   one pointer.
+//
+// Shape: the sub-arrays the flat entities point into (function locals, enum members, aggregate
+// fields and vtables, interface methods) are filled completely before any entity references
+// them, so no reallocation can move a pointer the flat form stores. Expression trees flatten
+// post-order (children first, so a parent carries its children's indices); the arguments of one
+// expression go through the `refs` arena, collected first and appended after, so nested calls
+// cannot interleave another expression's argument range.
+from "std" import String, Vec, format
+from "abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirEnum, XlcHirEnumMember,
+    XlcHirAggregate, XlcHirField, XlcHirVtableSlot, XlcHirInterface, XlcHirIfaceMethod, XlcHirImpl,
+    XlcHirExpr, XlcHirStmt, XlcHirLocal, XlcHirFieldInit, XlcHirAsmOperand, XlcHirStr, view,
+    E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, E_NIL, E_LOCAL_REF, E_GLOBAL_REF,
+    E_FUNC_REF, E_EXTERNAL, E_UNARY, E_BINARY, E_SELECT, E_CAST, E_CALL, E_CALL_INDIRECT,
+    E_CALL_VIRTUAL, E_CALL_ITABLE, E_CALL_EXTERNAL, E_SYSCALL, E_FIELD, E_INDEX, E_SLICE,
+    E_DEREF, E_ADDR_OF, E_ARRAY_LIST, E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_NEW,
+    E_TO_INTERFACE, E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG, E_ATOMIC_CAS, E_ATOMIC_ADD,
+    E_FENCE, E_ASM, E_CONSTRUCT, E_MOVE, E_MATERIALIZE, E_RAW_READ, E_UNWIND_PADS,
+    E_UNWIND_PAD_COUNT, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE, S_CONTINUE,
+    S_BREAK, S_BLOCK, S_TRY
+
+// ---- offsets: hir::Expr (sizeof 568) -----------------------------------------------------------
+
+const XE_KIND: usize = 0
+const XE_TYPE: usize = 8
+const XE_INT_VALUE: usize = 192
+const XE_FLOAT_VALUE: usize = 200
+const XE_BOOL_VALUE: usize = 208
+const XE_TEXT: usize = 216
+const XE_MEMBER: usize = 240
+const XE_LOCAL: usize = 264
+const XE_UNARY_OP: usize = 268
+const XE_BINARY_OP: usize = 272
+const XE_LHS: usize = 280
+const XE_RHS: usize = 288
+const XE_ARGS: usize = 296
+const XE_FIELDS: usize = 320
+const XE_ASM_OPERANDS: usize = 344
+const XE_CLOBBERS: usize = 368
+const XE_TARGET: usize = 392
+const XE_INDEX: usize = 552
+const XE_IMPLICIT: usize = 556
+const XE_CHECKED: usize = 557
+const XE_THROUGH_POINTER: usize = 558
+const XE_REGISTERED: usize = 559
+const XE_NOMEM: usize = 560
+const XE_NORETURN: usize = 561
+
+// ---- offsets: hir::Stmt (sizeof 128) -----------------------------------------------------------
+
+const XS_KIND: usize = 0
+const XS_LOCAL: usize = 24
+const XS_MSG_LOCAL: usize = 28
+const XS_TARGET: usize = 32
+const XS_VALUE: usize = 40
+const XS_BODY: usize = 48
+const XS_ELSE_BODY: usize = 72
+const XS_STEP: usize = 96
+const XS_POST_TEST: usize = 120
+const XS_DEPTH: usize = 124
+
+// ---- offsets: hir::Function (sizeof 432) -------------------------------------------------------
+
+const XF_NAME: usize = 0
+const XF_SYMBOL: usize = 48
+const XF_LOCALS: usize = 96
+const XF_PARAM_COUNT: usize = 120
+const XF_RET: usize = 128
+const XF_BODY: usize = 288
+const XF_UNWIND_BODY: usize = 312
+const XF_HAS_BODY: usize = 337
+const XF_EXPORTED: usize = 338
+const XF_EXPORT_C: usize = 339
+const XF_REGISTERED: usize = 368
+const XF_IS_INIT: usize = 400
+const XF_IS_FINI: usize = 401
+const XF_IS_ENTRY: usize = 402
+
+// ---- offsets: hir::Global (sizeof 296), Local (208), FieldInit (40), AsmOperand (40) -----------
+
+const XG_NAME: usize = 0
+const XG_TYPE: usize = 72
+const XG_INIT: usize = 232
+const XG_CONSTANT: usize = 240
+const XG_EXPORTED: usize = 241
+const XG_EXPORT_C: usize = 242
+const XG_REGISTERED: usize = 244
+
+const XL_NAME: usize = 0
+const XL_TYPE: usize = 24
+
+const XFI_NAME: usize = 0
+const XFI_INDEX: usize = 24
+const XFI_VALUE: usize = 32
+
+const XAO_KIND: usize = 0
+const XAO_REG: usize = 8
+const XAO_VALUE: usize = 32
+
+// ---- offsets: hir::Aggregate (152), Field (184), VtableSlot (48) -------------------------------
+
+const XAG_NAME: usize = 0
+const XAG_VTABLE: usize = 24
+const XAG_IS_CLASS: usize = 49
+const XAG_BASE: usize = 56
+const XAG_FIELDS: usize = 80
+const XAG_METHODS: usize = 104
+const XAG_OPAQUE: usize = 128
+const XAG_IS_UNION: usize = 129
+
+const XAF_NAME: usize = 0
+const XAF_TYPE: usize = 24
+
+const XVS_METHOD: usize = 0
+const XVS_FUNCTION: usize = 24
+
+// ---- offsets: hir::Interface (72), InterfaceMethod (208), Impl (96) ----------------------------
+
+const XIT_NAME: usize = 0
+const XIT_METHODS: usize = 24
+
+const XIM_NAME: usize = 0
+const XIM_PARAMS: usize = 24
+const XIM_RET: usize = 48
+
+const XIMP_INTERFACE: usize = 0
+const XIMP_TYPE: usize = 24
+const XIMP_METHODS: usize = 48
+
+// ---- offsets: hir::Enum (208), EnumMemberValue (56), Module (312) ------------------------------
+
+const XEN_NAME: usize = 0
+const XEN_UNDERLYING: usize = 24
+const XEN_MEMBERS: usize = 184
+
+const XEM_NAME: usize = 0
+const XEM_INT_VALUE: usize = 24
+const XEM_TEXT: usize = 32
+
+const XM_FUNCTIONS: usize = 0
+const XM_GLOBALS: usize = 24
+const XM_AGGREGATES: usize = 48
+const XM_INTERFACES: usize = 72
+const XM_IMPLS: usize = 96
+const XM_ENUMS: usize = 120
+const XM_PANIC: usize = 144
+const XM_ALLOC: usize = 168
+const XM_FREE: usize = 192
+const XM_UNWIND: usize = 216
+const XM_ARGS: usize = 240
+const XM_INIT: usize = 264
+const XM_FINI: usize = 288
+
+// ---- offsets: lang::Type (sizeof 160) and the TypeKind numbers ---------------------------------
+
+const T_KIND: usize = 0
+const T_BITS: usize = 4
+const T_IS_SIGNED: usize = 8
+const T_IS_MUTABLE: usize = 9
+const T_PATH: usize = 16
+const T_ELEM: usize = 40
+const T_PARAMS: usize = 56
+const T_RET: usize = 80
+const T_ARGS: usize = 96
+const T_LENGTH: usize = 120
+
+const TK_VOID: u32 = 0
+const TK_INT: u32 = 3
+const TK_FLOAT: u32 = 4
+const TK_POINTER: u32 = 5
+const TK_FNPTR: u32 = 6
+const TK_ARRAY: u32 = 7
+const TK_SLICE: u32 = 13
+const TK_TUPLE: u32 = 14
+const TK_NAMED: u32 = 15
+
+// ---- offsets: lang::Expr (for an Array length), Kind::IntLiteral = 0, Kind::Name = 5 -----------
+
+const LE_KIND: usize = 0
+const LE_INT_VALUE: usize = 24
+const LE_TEXT: usize = 48
+
+// The element sizes of the C++ containers the flatten walks.
+const ELEM_STRING: usize = 24
+const ELEM_TYPE: usize = 160
+const ELEM_EXPR_PTR: usize = 8
+const ELEM_LOCAL: usize = 208
+const ELEM_STMT: usize = 128
+const ELEM_FIELD_INIT: usize = 40
+const ELEM_ASM_OPERAND: usize = 40
+const ELEM_FIELD: usize = 184
+const ELEM_VTABLE_SLOT: usize = 48
+const ELEM_IFACE_METHOD: usize = 208
+const ELEM_ENUM_MEMBER: usize = 56
+
+/// The flatten result: the flat module plus every arena the flat form points into. Lives while
+/// the selector runs; dropping it releases everything the flatten built. The spellings (the type
+/// texts the flatten generates) live in `spellings`; a `String` is always heap-allocated, so the
+/// bytes stay where they are while the vector moves the headers.
+export class Flat {
+    m: XlcHirModule
+    fns: Vec<XlcHirFunction>
+    globals: Vec<XlcHirGlobal>
+    enums: Vec<XlcHirEnum>
+    aggregates: Vec<XlcHirAggregate>
+    interfaces: Vec<XlcHirInterface>
+    impls: Vec<XlcHirImpl>
+    locals: Vec<XlcHirLocal>
+    enumMembers: Vec<XlcHirEnumMember>
+    aggFields: Vec<XlcHirField>
+    aggVtable: Vec<XlcHirVtableSlot>
+    ifaceMethods: Vec<XlcHirIfaceMethod>
+    exprs: Vec<XlcHirExpr>
+    stmts: Vec<XlcHirStmt>
+    fields: Vec<XlcHirFieldInit>
+    operands: Vec<XlcHirAsmOperand>
+    strings: Vec<XlcHirStr>
+    refs: Vec<u32>
+    spellings: Vec<String>
+
+    fn init(self) {
+        self.fns = Vec<XlcHirFunction>()
+        self.globals = Vec<XlcHirGlobal>()
+        self.enums = Vec<XlcHirEnum>()
+        self.aggregates = Vec<XlcHirAggregate>()
+        self.interfaces = Vec<XlcHirInterface>()
+        self.impls = Vec<XlcHirImpl>()
+        self.locals = Vec<XlcHirLocal>()
+        self.enumMembers = Vec<XlcHirEnumMember>()
+        self.aggFields = Vec<XlcHirField>()
+        self.aggVtable = Vec<XlcHirVtableSlot>()
+        self.ifaceMethods = Vec<XlcHirIfaceMethod>()
+        self.exprs = Vec<XlcHirExpr>()
+        self.stmts = Vec<XlcHirStmt>()
+        self.fields = Vec<XlcHirFieldInit>()
+        self.operands = Vec<XlcHirAsmOperand>()
+        self.strings = Vec<XlcHirStr>()
+        self.refs = Vec<u32>()
+        self.spellings = Vec<String>()
+    }
+}
+
+// ---- raw reads ---------------------------------------------------------------------------------
+
+fn rdU8(p: *void, off: usize) -> u8 {
+    return __builtin_read((p as usize + off) as *u8)
+}
+
+fn rdU32(p: *void, off: usize) -> u32 {
+    return __builtin_read((p as usize + off) as *u32)
+}
+
+fn rdU64(p: *void, off: usize) -> u64 {
+    return __builtin_read((p as usize + off) as *u64)
+}
+
+fn rdI64(p: *void, off: usize) -> i64 {
+    return __builtin_read((p as usize + off) as *i64)
+}
+
+fn rdF64(p: *void, off: usize) -> f64 {
+    return __builtin_read((p as usize + off) as *f64)
+}
+
+fn rdPtr(p: *void, off: usize) -> usize {
+    return __builtin_read((p as usize + off) as *usize)
+}
+
+/// The element `i` of the vector at `off`: the begin pointer plus the byte offset.
+fn elemAt(p: *void, off: usize, i: usize, elem: usize) -> *void {
+    return (rdPtr(p, off) + i * elem) as *void
+}
+
+/// The size of the vector at `off` of elements of `elem` bytes.
+fn vecCount(p: *void, off: usize, elem: usize) -> u32 {
+    local begin = rdPtr(p, off)
+    local end = rdPtr(p, off + 8)
+    return ((end - begin) / elem) as u32
+}
+
+/// The libc++ `std::string` at `p`: zero-copy, the bytes stay in the C++ object. A short string
+/// keeps the bytes in place with the size in the last byte (top bit clear); a long string has the
+/// top bit of the last byte set, the data pointer at 0 and the size at 8.
+fn cxxStr(p: *void) -> XlcHirStr {
+    local last = rdU8(p, 23)
+    if last & 0x80 != 0 {
+        return XlcHirStr { bytes: rdPtr(p, 0) as *u8, len: rdU64(p, 8) as u32 }
+    }
+    return XlcHirStr { bytes: p as *u8, len: (last & 0x7F) as u32 }
+}
+
+/// A generated spelling: builds the text into a `String` the `Flat` keeps alive and points the
+/// boundary string at its bytes.
+fn spelling(f: *Flat, s: *String) -> XlcHirStr {
+    f.spellings.push(s.clone())
+    local kept = f.spellings.get(f.spellings.length() - 1)
+    return XlcHirStr { bytes: kept.ptr, len: kept.len as u32 }
+}
+
+/// The source spelling of the type at `t`: the xl form of `typeToString` (src/lang/types/types.cpp).
+fn typeText(f: *Flat, out: *String, t: *void) {
+    local kind = rdU32(t, T_KIND)
+    if kind == TK_VOID {
+        out.append("void")
+        return
+    }
+    if kind == 1 {
+        out.append("never")
+        return
+    }
+    if kind == 2 {
+        out.append("bool")
+        return
+    }
+    if kind == 12 {
+        out.append("str")
+        return
+    }
+    if kind == TK_SLICE {
+        out.append("[]")
+        if rdU8(t, T_IS_MUTABLE) != 0 {
+            out.append("mut ")
+        }
+        local e = rdPtr(t, T_ELEM)
+        if e != 0 {
+            typeText(f, out, e as *void)
+        } else {
+            out.append("?")
+        }
+        return
+    }
+    if kind == TK_INT {
+        local bits = rdU32(t, T_BITS)
+        if bits == 0 {
+            out.append(rdU8(t, T_IS_SIGNED) != 0 ? "isize" : "usize")
+        } else {
+            out.append(rdU8(t, T_IS_SIGNED) != 0 ? "i" : "u")
+            out.append(format("{}", bits))
+        }
+        return
+    }
+    if kind == TK_FLOAT {
+        out.append(format("f{}", rdU32(t, T_BITS)))
+        return
+    }
+    if kind == TK_POINTER {
+        out.append("*")
+        local e = rdPtr(t, T_ELEM)
+        if e != 0 {
+            typeText(f, out, e as *void)
+        } else {
+            out.append("?")
+        }
+        return
+    }
+    if kind == TK_FNPTR {
+        out.append("fn(")
+        local n = vecCount(t, T_PARAMS, ELEM_TYPE)
+        for i in 0..n as usize {
+            if i != 0 {
+                out.append(", ")
+            }
+            typeText(f, out, elemAt(t, T_PARAMS, i, ELEM_TYPE))
+        }
+        out.append(")")
+        local r = rdPtr(t, T_RET)
+        if r != 0 && rdU32(r as *void, T_KIND) != TK_VOID {
+            out.append(" -> ")
+            typeText(f, out, r as *void)
+        }
+        return
+    }
+    if kind == TK_ARRAY {
+        out.append("[")
+        local e = rdPtr(t, T_ELEM)
+        if e != 0 {
+            typeText(f, out, e as *void)
+        } else {
+            out.append("?")
+        }
+        out.append("; ")
+        lengthText(out, rdPtr(t, T_LENGTH) as *void)
+        out.append("]")
+        return
+    }
+    if kind == TK_TUPLE {
+        out.append("(")
+        local n = vecCount(t, T_ARGS, ELEM_TYPE)
+        for i in 0..n as usize {
+            if i != 0 {
+                out.append(", ")
+            }
+            typeText(f, out, elemAt(t, T_ARGS, i, ELEM_TYPE))
+        }
+        if n == 1 {
+            out.append(",")
+        }
+        out.append(")")
+        return
+    }
+    // Enum, Struct, Class, Interface and Named: the qualified name, the path joined with `.`.
+    local n = vecCount(t, T_PATH, ELEM_STRING)
+    for i in 0..n as usize {
+        if i != 0 {
+            out.append(".")
+        }
+        out.append(view(cxxStr(elemAt(t, T_PATH, i, ELEM_STRING))))
+    }
+}
+
+/// The spelling of the type at `t`, as a boundary string the `Flat` keeps alive.
+fn typeSpelling(f: *Flat, t: *void) -> XlcHirStr {
+    local s = String()
+    typeText(f, &s, t)
+    return spelling(f, &s)
+}
+
+/// The compile-time length of an array type: the xl form of `lengthToString` over the AST
+/// expression the type carries (`Kind::IntLiteral` = 0, `Kind::Name` = 5).
+fn lengthText(out: *String, e: *void) {
+    if e as usize == 0 {
+        out.append("?")
+        return
+    }
+    local kind = rdU32(e, LE_KIND)
+    if kind == 0 {
+        out.append(format("{}", rdU64(e, LE_INT_VALUE)))
+        return
+    }
+    if kind == 5 {
+        out.append(view(cxxStr((e as usize + LE_TEXT) as *void)))
+        return
+    }
+    out.append("<const expr>")
+}
+
+/// The spelling of a `UnaryOp` (Neg=0 Not=1 Deref=2 AddrOf=3 BitNot=4).
+fn unaryOpName(op: u32) -> XlcHirStr {
+    switch {
+        case op == 0 { return strRef("-") }
+        case op == 1 { return strRef("!") }
+        case op == 2 { return strRef("*") }
+        case op == 3 { return strRef("&") }
+        case op == 4 { return strRef("~") }
+    }
+    return strRef("?")
+}
+
+/// The spelling of a `BinaryOp` (Add=0 .. Shr=17, declaration order).
+fn binaryOpName(op: u32) -> XlcHirStr {
+    switch {
+        case op == 0 { return strRef("+") }
+        case op == 1 { return strRef("-") }
+        case op == 2 { return strRef("*") }
+        case op == 3 { return strRef("/") }
+        case op == 4 { return strRef("%") }
+        case op == 5 { return strRef("==") }
+        case op == 6 { return strRef("!=") }
+        case op == 7 { return strRef("<") }
+        case op == 8 { return strRef("<=") }
+        case op == 9 { return strRef(">") }
+        case op == 10 { return strRef(">=") }
+        case op == 11 { return strRef("&&") }
+        case op == 12 { return strRef("||") }
+        case op == 13 { return strRef("&") }
+        case op == 14 { return strRef("|") }
+        case op == 15 { return strRef("^") }
+        case op == 16 { return strRef("<<") }
+        case op == 17 { return strRef(">>") }
+    }
+    return strRef("?")
+}
+
+/// A literal as a boundary string: the bytes sit in read-only data and live forever.
+fn strRef(s: str) -> XlcHirStr {
+    return XlcHirStr { bytes: s.ptr, len: s.len as u32 }
+}
+
+/// A fresh expression node with the child references set to "none"; the caller fills the rest.
+fn exprSlot(f: *Flat, kind: i32, typeName: XlcHirStr) -> i32 {
+    local e: XlcHirExpr
+    e.kind = kind
+    e.typeName = typeName
+    e.lhs = -1
+    e.rhs = -1
+    f.exprs.push(e)
+    return (f.exprs.length() - 1) as i32
+}
+
+/// Flattens the expression tree at `raw` post-order and returns the node index.
+fn exprNode(f: *Flat, raw: *void) -> i32 {
+    local kind = rdU32(raw, XE_KIND) as i32
+    local typeName = typeSpelling(f, (raw as usize + XE_TYPE) as *void)
+
+    // The children first: a parent carries its children's indices.
+    local lhsRaw = rdPtr(raw, XE_LHS)
+    local rhsRaw = rdPtr(raw, XE_RHS)
+    local lhs: i32 = lhsRaw != 0 ? exprNode(f, lhsRaw as *void) : -1
+    local rhs: i32 = rhsRaw != 0 ? exprNode(f, rhsRaw as *void) : -1
+
+    // The arguments: flatten every subtree, then append the indices as one contiguous run of
+    // `refs`, so a nested call's own refs cannot split this expression's range.
+    local argCount = vecCount(raw, XE_ARGS, ELEM_EXPR_PTR)
+    local argFirst: u32 = 0
+    if argCount > 0 {
+        local got = Vec<u32>()
+        got.reserve(argCount as usize)
+        for i in 0..argCount as usize {
+            got.push(exprNode(f, rdPtr(elemAt(raw, XE_ARGS, i, ELEM_EXPR_PTR), 0) as *void) as u32)
+        }
+        argFirst = f.refs.length() as u32
+        for i in 0..argCount as usize {
+            f.refs.push(*got.get(i))
+        }
+    }
+
+    // The struct-literal fields: one arena entry per field, the value flattened in place.
+    local fieldCount = vecCount(raw, XE_FIELDS, ELEM_FIELD_INIT)
+    local fieldFirst: u32 = f.fields.length() as u32
+    for i in 0..fieldCount as usize {
+        local fi = elemAt(raw, XE_FIELDS, i, ELEM_FIELD_INIT) as usize
+        local v = rdPtr(fi as *void, XFI_VALUE)
+        local entry: XlcHirFieldInit
+        entry.name = cxxStr(fi as *void)
+        entry.value = v != 0 ? exprNode(f, v as *void) : -1
+        f.fields.push(entry)
+    }
+
+    // The `__builtin_asm` operands and clobbers.
+    local operandCount = vecCount(raw, XE_ASM_OPERANDS, ELEM_ASM_OPERAND)
+    local operandFirst: u32 = f.operands.length() as u32
+    for i in 0..operandCount as usize {
+        local ao = elemAt(raw, XE_ASM_OPERANDS, i, ELEM_ASM_OPERAND) as usize
+        local v = rdPtr(ao as *void, XAO_VALUE)
+        local entry: XlcHirAsmOperand
+        entry.kind = rdU32(ao as *void, XAO_KIND) as i32
+        entry.reg = cxxStr(ao as *void)
+        entry.value = v != 0 ? exprNode(f, v as *void) : -1
+        f.operands.push(entry)
+    }
+    local clobberCount = vecCount(raw, XE_CLOBBERS, ELEM_STRING)
+    local clobberFirst: u32 = f.strings.length() as u32
+    for i in 0..clobberCount as usize {
+        f.strings.push(cxxStr(elemAt(raw, XE_CLOBBERS, i, ELEM_STRING)))
+    }
+
+    // The node itself, kind by kind.
+    local at = exprSlot(f, kind, typeName)
+    local e = f.exprs.get(at as usize)
+    switch {
+        case kind == E_INT_CONST || kind == E_ARRAY_REPEAT { e.intValue = rdU64(raw, XE_INT_VALUE) }
+        case kind == E_FLOAT_CONST { e.floatValue = rdF64(raw, XE_FLOAT_VALUE) }
+        case kind == E_BOOL_CONST { e.boolValue = rdU8(raw, XE_BOOL_VALUE) != 0 ? 1 : 0 }
+        case kind == E_STR_CONST || kind == E_GLOBAL_REF || kind == E_FUNC_REF || kind == E_CALL || kind == E_CALL_VIRTUAL {
+            e.text = cxxStr((raw as usize + XE_TEXT) as *void)
+        }
+        case kind == E_CALL_ITABLE || kind == E_FIELD || kind == E_TO_INTERFACE || kind == E_ASM || kind == E_CONSTRUCT {
+            e.text = cxxStr((raw as usize + XE_TEXT) as *void)
+        }
+        case kind == E_EXTERNAL || kind == E_CALL_EXTERNAL {
+            e.text = cxxStr((raw as usize + XE_TEXT) as *void)
+            e.member = cxxStr((raw as usize + XE_MEMBER) as *void)
+        }
+        case kind == E_LOCAL_REF || kind == E_MOVE || kind == E_MATERIALIZE {
+            e.localId = rdU32(raw, XE_LOCAL)
+        }
+        case kind == E_UNARY { e.unaryOp = unaryOpName(rdU32(raw, XE_UNARY_OP)) }
+        case kind == E_BINARY { e.binaryOp = binaryOpName(rdU32(raw, XE_BINARY_OP)) }
+        case kind == E_CALL_VIRTUAL || kind == E_CALL_ITABLE { e.index = rdU32(raw, XE_INDEX) }
+        case kind == E_ATOMIC_LOAD || kind == E_ATOMIC_STORE || kind == E_ATOMIC_XCHG || kind == E_ATOMIC_CAS || kind == E_ATOMIC_ADD || kind == E_FENCE {
+            e.index = rdU32(raw, XE_INDEX)
+        }
+        case kind == E_CAST { e.implicit = rdU8(raw, XE_IMPLICIT) != 0 ? 1 : 0 }
+        case kind == E_INDEX || kind == E_SLICE { e.checked = rdU8(raw, XE_CHECKED) != 0 ? 1 : 0 }
+        case kind == E_FIELD { e.throughPointer = rdU8(raw, XE_THROUGH_POINTER) != 0 ? 1 : 0 }
+        case kind == E_NEW { e.registered = rdU8(raw, XE_REGISTERED) != 0 ? 1 : 0 }
+        case kind == E_ASM {
+            e.nomem = rdU8(raw, XE_NOMEM) != 0 ? 1 : 0
+            e.noreturn = rdU8(raw, XE_NORETURN) != 0 ? 1 : 0
+        }
+    }
+    e.lhs = lhs
+    e.rhs = rhs
+    e.argFirst = argFirst
+    e.argCount = argCount
+    e.fieldFirst = fieldFirst
+    e.fieldCount = fieldCount
+    e.operandFirst = operandFirst
+    e.operandCount = operandCount
+    e.clobberFirst = clobberFirst
+    e.clobberCount = clobberCount
+    return at
+}
+
+/// One statement whose nested lists still have to be flattened: the flat node's index and the
+/// raw C++ statement it came from.
+class Pending {
+    idx: u32
+    raw: usize
+
+    fn init(self) {
+        self.idx = 0
+        self.raw = 0
+    }
+}
+
+/// Flattens the statement at `raw`: the scalar fields and child expressions now, the node pushed
+/// with empty nested lists. The lists themselves the caller flattens and patches afterwards, so
+/// every statement list stays contiguous in the arena (a nested body pushed inline would split
+/// the range of the list that contains it).
+fn stmtNode(f: *Flat, raw: *void, pending: *Vec<Pending>) -> i32 {
+    local kind = rdU32(raw, XS_KIND) as i32
+    local targetRaw = rdPtr(raw, XS_TARGET)
+    local valueRaw = rdPtr(raw, XS_VALUE)
+    local target: i32 = targetRaw != 0 ? exprNode(f, targetRaw as *void) : -1
+    local value: i32 = valueRaw != 0 ? exprNode(f, valueRaw as *void) : -1
+
+    local s: XlcHirStmt
+    s.kind = kind
+    s.localId = rdU32(raw, XS_LOCAL)
+    s.msgLocal = rdU32(raw, XS_MSG_LOCAL)
+    s.target = target
+    s.value = value
+    s.postTest = rdU8(raw, XS_POST_TEST) != 0 ? 1 : 0
+    s.depth = rdU32(raw, XS_DEPTH)
+    f.stmts.push(s)
+    local idx = (f.stmts.length() - 1) as u32
+    if kind == S_IF || kind == S_WHILE || kind == S_BLOCK || kind == S_TRY {
+        local p = Pending()
+        p.idx = idx
+        p.raw = raw as usize
+        pending.push(p)
+    }
+    return idx as i32
+}
+
+/// Flattens a run of statements (the vector at `off`) into a contiguous arena range: the nodes
+/// first, then the nested lists of each, patched into the nodes afterwards.
+fn stmtList(f: *Flat, raw: *void, off: usize) -> (u32, u32) {
+    local n = vecCount(raw, off, ELEM_STMT)
+    local first: u32 = f.stmts.length() as u32
+    local pending = Vec<Pending>()
+    for i in 0..n as usize {
+        stmtNode(f, elemAt(raw, off, i, ELEM_STMT), &pending)
+    }
+    for k in 0..pending.length() {
+        local p = pending.get(k as usize)
+        local body = stmtList(f, p.raw as *void, XS_BODY)
+        local elseBody = stmtList(f, p.raw as *void, XS_ELSE_BODY)
+        local step = stmtList(f, p.raw as *void, XS_STEP)
+        // Fetch the node only now: the recursive lists above grew the arena and may have moved it.
+        local node = f.stmts.get(p.idx as usize)
+        node.bodyFirst = body.0
+        node.bodyCount = body.1
+        node.elseFirst = elseBody.0
+        node.elseCount = elseBody.1
+        node.stepFirst = step.0
+        node.stepCount = step.1
+    }
+    return (first, n)
+}
+
+/// Phase A: flattens one function's locals into the shared locals arena and returns the range.
+fn functionLocals(f: *Flat, raw: *void) -> (u32, u32) {
+    local localCount = vecCount(raw, XF_LOCALS, ELEM_LOCAL)
+    local localsFirst: u32 = f.locals.length() as u32
+    for i in 0..localCount as usize {
+        local l = elemAt(raw, XF_LOCALS, i, ELEM_LOCAL) as usize
+        local entry: XlcHirLocal
+        entry.name = cxxStr(l as *void)
+        entry.typeName = typeSpelling(f, (l + XL_TYPE) as *void)
+        f.locals.push(entry)
+    }
+    return (localsFirst, localCount)
+}
+
+/// Phase C: flattens one function's body and builds the flat entity over the locals range that
+/// `functionLocals` produced earlier.
+fn functionNode(f: *Flat, raw: *void, locals: (u32, u32)) {
+    local body = stmtList(f, raw, XF_BODY)
+    local unwind = stmtList(f, raw, XF_UNWIND_BODY)
+
+    local fu: XlcHirFunction
+    fu.name = cxxStr(raw)
+    fu.symbol = cxxStr((raw as usize + XF_SYMBOL) as *void)
+    fu.ret = typeSpelling(f, (raw as usize + XF_RET) as *void)
+    fu.locals = (f.locals.data as usize + locals.0 as usize * sizeOf(XlcHirLocal)) as *XlcHirLocal
+    fu.localCount = locals.1
+    fu.paramCount = rdU32(raw, XF_PARAM_COUNT)
+    fu.bodyFirst = body.0
+    fu.bodyCount = body.1
+    fu.unwindFirst = unwind.0
+    fu.unwindCount = unwind.1
+    fu.hasBody = rdU8(raw, XF_HAS_BODY) != 0 ? 1 : 0
+    fu.exported = rdU8(raw, XF_EXPORTED) != 0 ? 1 : 0
+    fu.exportC = rdU8(raw, XF_EXPORT_C) != 0 ? 1 : 0
+    fu.registered = rdU8(raw, XF_REGISTERED) != 0 ? 1 : 0
+    fu.isEntry = rdU8(raw, XF_IS_ENTRY) != 0 ? 1 : 0
+    fu.isInit = rdU8(raw, XF_IS_INIT) != 0 ? 1 : 0
+    fu.isFini = rdU8(raw, XF_IS_FINI) != 0 ? 1 : 0
+    f.fns.push(fu)
+}
+
+/// Flattens one global.
+fn globalNode(f: *Flat, raw: *void) {
+    local initRaw = rdPtr(raw, XG_INIT)
+    local g: XlcHirGlobal
+    g.name = cxxStr(raw)
+    g.typeName = typeSpelling(f, (raw as usize + XG_TYPE) as *void)
+    g.init = initRaw != 0 ? exprNode(f, initRaw as *void) : -1
+    g.constant = rdU8(raw, XG_CONSTANT) != 0 ? 1 : 0
+    g.exported = rdU8(raw, XG_EXPORTED) != 0 ? 1 : 0
+    g.exportC = rdU8(raw, XG_EXPORT_C) != 0 ? 1 : 0
+    g.registered = rdU8(raw, XG_REGISTERED) != 0 ? 1 : 0
+    f.globals.push(g)
+}
+
+/// Phase A: flattens one enum's members and returns the range.
+fn enumMembersOf(f: *Flat, raw: *void) -> (u32, u32) {
+    local memberCount = vecCount(raw, XEN_MEMBERS, ELEM_ENUM_MEMBER)
+    local membersFirst: u32 = f.enumMembers.length() as u32
+    for i in 0..memberCount as usize {
+        local m = elemAt(raw, XEN_MEMBERS, i, ELEM_ENUM_MEMBER) as usize
+        local entry: XlcHirEnumMember
+        entry.name = cxxStr(m as *void)
+        entry.value = rdI64(m as *void, XEM_INT_VALUE)
+        entry.text = cxxStr((m + XEM_TEXT) as *void)
+        f.enumMembers.push(entry)
+    }
+    return (membersFirst, memberCount)
+}
+
+/// Phase C: builds the flat enum over the member range `enumMembersOf` produced.
+fn enumNode(f: *Flat, raw: *void, members: (u32, u32)) {
+    local e: XlcHirEnum
+    e.name = cxxStr(raw)
+    e.underlying = typeSpelling(f, (raw as usize + XEN_UNDERLYING) as *void)
+    e.members = (f.enumMembers.data as usize + members.0 as usize * sizeOf(XlcHirEnumMember)) as *XlcHirEnumMember
+    e.memberCount = members.1
+    f.enums.push(e)
+}
+
+/// Phase A: flattens one aggregate's fields and vtable slots; the four-part range comes back.
+fn aggregateParts(f: *Flat, raw: *void) -> (u32, u32, u32, u32) {
+    local fieldCount = vecCount(raw, XAG_FIELDS, ELEM_FIELD)
+    local fieldsFirst: u32 = f.aggFields.length() as u32
+    for i in 0..fieldCount as usize {
+        local fl = elemAt(raw, XAG_FIELDS, i, ELEM_FIELD) as usize
+        local entry: XlcHirField
+        entry.name = cxxStr(fl as *void)
+        entry.typeName = typeSpelling(f, (fl + XAF_TYPE) as *void)
+        f.aggFields.push(entry)
+    }
+    local vtableCount = vecCount(raw, XAG_VTABLE, ELEM_VTABLE_SLOT)
+    local vtableFirst: u32 = f.aggVtable.length() as u32
+    for i in 0..vtableCount as usize {
+        local v = elemAt(raw, XAG_VTABLE, i, ELEM_VTABLE_SLOT) as usize
+        local entry: XlcHirVtableSlot
+        entry.method = cxxStr(v as *void)
+        entry.function = cxxStr((v + XVS_FUNCTION) as *void)
+        f.aggVtable.push(entry)
+    }
+    return (fieldsFirst, fieldCount, vtableFirst, vtableCount)
+}
+
+/// Phase C: builds the flat aggregate over the ranges `aggregateParts` produced.
+fn aggregateNode(f: *Flat, raw: *void, parts: (u32, u32, u32, u32)) {
+    local a: XlcHirAggregate
+    a.name = cxxStr(raw)
+    a.base = cxxStr((raw as usize + XAG_BASE) as *void)
+    a.fields = (f.aggFields.data as usize + parts.0 as usize * sizeOf(XlcHirField)) as *XlcHirField
+    a.fieldCount = parts.1
+    a.vtable = (f.aggVtable.data as usize + parts.2 as usize * sizeOf(XlcHirVtableSlot)) as *XlcHirVtableSlot
+    a.vtableCount = parts.3
+    a.isClass = rdU8(raw, XAG_IS_CLASS) != 0 ? 1 : 0
+    a.isUnion = rdU8(raw, XAG_IS_UNION) != 0 ? 1 : 0
+    a.opaque = rdU8(raw, XAG_OPAQUE) != 0 ? 1 : 0
+    f.aggregates.push(a)
+}
+
+/// Phase A: flattens one interface's methods (their parameter spellings land in the strings
+/// arena) and returns the range.
+fn interfaceMethodsOf(f: *Flat, raw: *void) -> (u32, u32) {
+    local methodCount = vecCount(raw, XIT_METHODS, ELEM_IFACE_METHOD)
+    local methodsFirst: u32 = f.ifaceMethods.length() as u32
+    for i in 0..methodCount as usize {
+        local m = elemAt(raw, XIT_METHODS, i, ELEM_IFACE_METHOD) as usize
+        local paramCount = vecCount(m as *void, XIM_PARAMS, ELEM_TYPE)
+        local paramFirst: u32 = f.strings.length() as u32
+        for k in 0..paramCount as usize {
+            f.strings.push(typeSpelling(f, elemAt(m as *void, XIM_PARAMS, k, ELEM_TYPE)))
+        }
+        local entry: XlcHirIfaceMethod
+        entry.name = cxxStr(m as *void)
+        entry.ret = typeSpelling(f, (m + XIM_RET) as *void)
+        entry.paramFirst = paramFirst
+        entry.paramCount = paramCount
+        f.ifaceMethods.push(entry)
+    }
+    return (methodsFirst, methodCount)
+}
+
+/// Phase C: builds the flat interface over the method range `interfaceMethodsOf` produced.
+fn interfaceNode(f: *Flat, raw: *void, methods: (u32, u32)) {
+    local it: XlcHirInterface
+    it.name = cxxStr(raw)
+    it.methods = (f.ifaceMethods.data as usize + methods.0 as usize * sizeOf(XlcHirIfaceMethod)) as *XlcHirIfaceMethod
+    it.methodCount = methods.1
+    f.interfaces.push(it)
+}
+
+/// Flattens one `impl`; the method names are a range in the strings arena.
+fn implNode(f: *Flat, raw: *void) {
+    local methodCount = vecCount(raw, XIMP_METHODS, ELEM_STRING)
+    local methodFirst: u32 = f.strings.length() as u32
+    for i in 0..methodCount as usize {
+        f.strings.push(cxxStr(elemAt(raw, XIMP_METHODS, i, ELEM_STRING)))
+    }
+    local im: XlcHirImpl
+    im.interfaceName = cxxStr(raw)
+    im.typeName = cxxStr((raw as usize + XIMP_TYPE) as *void)
+    im.methodFirst = methodFirst
+    im.methodCount = methodCount
+    f.impls.push(im)
+}
+
+/// A run of `std::string`s (the vector at `off`) as a range in the strings arena.
+fn stringRange(f: *Flat, raw: *void, off: usize) -> (u32, u32) {
+    local n = vecCount(raw, off, ELEM_STRING)
+    local first: u32 = f.strings.length() as u32
+    for i in 0..n as usize {
+        f.strings.push(cxxStr(elemAt(raw, off, i, ELEM_STRING)))
+    }
+    return (first, n)
+}
+
+/// Flattens the whole `hir::Module` at `raw` into `f.m`. The C++ memory stays alive for as long
+/// as the session does; the arenas the flatten built live in `f`.
+export fn flattenModule(f: *Flat, raw: *void) {
+    // Phase A: the sub-arrays the flat entities point into, complete before any entity is built,
+    // so no later push can move memory a stored pointer still names. The ranges come back as
+    // pairs in one u32 vector.
+    local functionCount = vecCount(raw, XM_FUNCTIONS, 432)
+    local fnLocals = Vec<u32>()
+    for i in 0..functionCount as usize {
+        local r = functionLocals(f, elemAt(raw, XM_FUNCTIONS, i, 432))
+        fnLocals.push(r.0)
+        fnLocals.push(r.1)
+    }
+    local enumCount = vecCount(raw, XM_ENUMS, 208)
+    local enumRanges = Vec<u32>()
+    for i in 0..enumCount as usize {
+        local r = enumMembersOf(f, elemAt(raw, XM_ENUMS, i, 208))
+        enumRanges.push(r.0)
+        enumRanges.push(r.1)
+    }
+    local aggregateCount = vecCount(raw, XM_AGGREGATES, 152)
+    local aggregateRanges = Vec<u32>()
+    for i in 0..aggregateCount as usize {
+        local p = aggregateParts(f, elemAt(raw, XM_AGGREGATES, i, 152))
+        aggregateRanges.push(p.0)
+        aggregateRanges.push(p.1)
+        aggregateRanges.push(p.2)
+        aggregateRanges.push(p.3)
+    }
+    local interfaceCount = vecCount(raw, XM_INTERFACES, 72)
+    local interfaceRanges = Vec<u32>()
+    for i in 0..interfaceCount as usize {
+        local r = interfaceMethodsOf(f, elemAt(raw, XM_INTERFACES, i, 72))
+        interfaceRanges.push(r.0)
+        interfaceRanges.push(r.1)
+    }
+
+    // Phase C: the entities, in the flat form's order. The functions' bodies fill the shared
+    // expression and statement arenas.
+    for i in 0..functionCount as usize {
+        functionNode(f, elemAt(raw, XM_FUNCTIONS, i, 432),
+            (*fnLocals.get(2 * i), *fnLocals.get(2 * i + 1)))
+    }
+    local globalCount = vecCount(raw, XM_GLOBALS, 296)
+    for i in 0..globalCount as usize {
+        globalNode(f, elemAt(raw, XM_GLOBALS, i, 296))
+    }
+    for i in 0..enumCount as usize {
+        enumNode(f, elemAt(raw, XM_ENUMS, i, 208), (*enumRanges.get(2 * i), *enumRanges.get(2 * i + 1)))
+    }
+    for i in 0..aggregateCount as usize {
+        aggregateNode(f, elemAt(raw, XM_AGGREGATES, i, 152),
+            (*aggregateRanges.get(4 * i), *aggregateRanges.get(4 * i + 1),
+             *aggregateRanges.get(4 * i + 2), *aggregateRanges.get(4 * i + 3)))
+    }
+    for i in 0..interfaceCount as usize {
+        interfaceNode(f, elemAt(raw, XM_INTERFACES, i, 72),
+            (*interfaceRanges.get(2 * i), *interfaceRanges.get(2 * i + 1)))
+    }
+    local implCount = vecCount(raw, XM_IMPLS, 96)
+    for i in 0..implCount as usize {
+        implNode(f, elemAt(raw, XM_IMPLS, i, 96))
+    }
+
+    local init = stringRange(f, raw, XM_INIT)
+    local fini = stringRange(f, raw, XM_FINI)
+
+    local m: XlcHirModule
+    m.functions = f.fns.data
+    m.functionCount = f.fns.length() as u32
+    m.globals = f.globals.data
+    m.globalCount = f.globals.length() as u32
+    m.enums = f.enums.data
+    m.enumCount = f.enums.length() as u32
+    m.aggregates = f.aggregates.data
+    m.aggregateCount = f.aggregates.length() as u32
+    m.interfaces = f.interfaces.data
+    m.interfaceCount = f.interfaces.length() as u32
+    m.impls = f.impls.data
+    m.implCount = f.impls.length() as u32
+    m.exprs = f.exprs.data
+    m.exprCount = f.exprs.length() as u32
+    m.stmts = f.stmts.data
+    m.stmtCount = f.stmts.length() as u32
+    m.fields = f.fields.data
+    m.fieldCount = f.fields.length() as u32
+    m.operands = f.operands.data
+    m.operandCount = f.operands.length() as u32
+    m.strings = f.strings.data
+    m.stringCount = f.strings.length() as u32
+    m.refs = f.refs.data
+    m.refCount = f.refs.length() as u32
+    m.panicFunction = cxxStr((raw as usize + XM_PANIC) as *void)
+    m.allocFunction = cxxStr((raw as usize + XM_ALLOC) as *void)
+    m.freeFunction = cxxStr((raw as usize + XM_FREE) as *void)
+    m.unwindFunction = cxxStr((raw as usize + XM_UNWIND) as *void)
+    m.argsFunction = cxxStr((raw as usize + XM_ARGS) as *void)
+    m.initFirst = init.0
+    m.initCount = init.1
+    m.finiFirst = fini.0
+    m.finiCount = fini.1
+    f.m = m
+}

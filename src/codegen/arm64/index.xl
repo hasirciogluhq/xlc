@@ -1,0 +1,363 @@
+// The arm64 (AArch64) instruction encoder: one function per instruction form, each writing the
+// 32-bit instruction word into a code buffer. The ARM ARM (DDI 0487J) is the reference; the
+// comment on every function spells out its instruction-word layout.
+//
+// The buffer is a `Vec<u32>`, one word per instruction; `macho.xl` writes the words out
+// little-endian when it emits the section. The register numbers are shared by the 64-bit (`x`)
+// and 32-bit (`w`) views: the `sf` bit of each encoding picks the width, so `X0` means both.
+from "std" import Vec
+
+// The general-purpose registers. `SP` and `XZR` share the number 31; the instruction decides
+// which meaning the field has (add/sub immediate and load/store take SP, operand fields take XZR).
+export const X0: u32 = 0
+export const X1: u32 = 1
+export const X2: u32 = 2
+export const X3: u32 = 3
+export const X4: u32 = 4
+export const X5: u32 = 5
+export const X6: u32 = 6
+export const X7: u32 = 7
+export const X8: u32 = 8        // indirect result register (struct returns)
+export const X9: u32 = 9
+export const X10: u32 = 10
+export const X11: u32 = 11
+export const X12: u32 = 12
+export const X13: u32 = 13
+export const X14: u32 = 14
+export const X15: u32 = 15
+export const X16: u32 = 16      // intra-procedure call scratch (IP0)
+export const X17: u32 = 17      // intra-procedure call scratch (IP1)
+export const X18: u32 = 18      // platform register, reserved
+export const X19: u32 = 19      // callee-saved
+export const X20: u32 = 20
+export const X21: u32 = 21
+export const X22: u32 = 22
+export const X23: u32 = 23
+export const X24: u32 = 24
+export const X25: u32 = 25
+export const X26: u32 = 26
+export const X27: u32 = 27
+export const X28: u32 = 28
+export const X29: u32 = 29      // frame pointer (FP)
+export const X30: u32 = 30      // link register (LR)
+export const SP: u32 = 31       // stack pointer (immediate add/sub, load/store base)
+export const XZR: u32 = 31      // zero register (operand position)
+
+// The condition codes of `b.cond`/`cset` (ARM ARM `cond` field).
+export const EQ: u32 = 0
+export const NE: u32 = 1
+export const CS: u32 = 2
+export const CC: u32 = 3
+export const MI: u32 = 4
+export const PL: u32 = 5
+export const VS: u32 = 6
+export const VC: u32 = 7
+export const HI: u32 = 8
+export const LS: u32 = 9
+export const GE: u32 = 10
+export const LT: u32 = 11
+export const GT: u32 = 12
+export const LE: u32 = 13
+
+// ---------------------------------------------------------------------------------------------
+// Moves and constants
+
+/// `ret` — return to `x30`. `1101011 0 0 101111110000 Rn 00000`, Rn = x30.
+export fn ret(out: *Vec<u32>) {
+    out.push(0xd65f03c0)
+}
+
+/// `nop` — the hint encoding, a true no-op.
+export fn nop(out: *Vec<u32>) {
+    out.push(0xd503201f)
+}
+
+/// `movz Rd, #imm16, lsl #hw*16` — write a 16-bit chunk into the register, zeroing the rest.
+/// 64-bit: `110100101 hw(2) imm16(16) Rd(5)`; 32-bit: `010100101 ...`.
+export fn movz64(out: *Vec<u32>, rd: u32, imm16: u32, hw: u32) {
+    out.push(0xd2800000 | (hw << 21) | (imm16 << 5) | rd)
+}
+
+/// `movz` on the 32-bit view.
+export fn movz32(out: *Vec<u32>, rd: u32, imm16: u32, hw: u32) {
+    out.push(0x52800000 | (hw << 21) | (imm16 << 5) | rd)
+}
+
+/// `movk Rd, #imm16, lsl #hw*16` — overwrite one 16-bit chunk, keep the rest.
+/// 64-bit: `111100101 hw(2) imm16(16) Rd(5)`.
+export fn movk64(out: *Vec<u32>, rd: u32, imm16: u32, hw: u32) {
+    out.push(0xf2800000 | (hw << 21) | (imm16 << 5) | rd)
+}
+
+/// `movk` on the 32-bit view.
+export fn movk32(out: *Vec<u32>, rd: u32, imm16: u32, hw: u32) {
+    out.push(0x72800000 | (hw << 21) | (imm16 << 5) | rd)
+}
+
+/// Loads any 64-bit constant: `movz` for the first nonzero chunk, `movk` for the rest. Zero
+/// chunks are skipped, so small constants cost one word.
+export fn loadConst64(out: *Vec<u32>, rd: u32, v: u64) {
+    local started: bool = false
+    local hw: u32 = 0
+    while hw < 4 {
+        local chunk: u32 = ((v >> (hw * 16)) & 0xffff) as u32
+        if chunk != 0 {
+            if !started {
+                movz64(out, rd, chunk, hw)
+                started = true
+            } else {
+                movk64(out, rd, chunk, hw)
+            }
+        }
+        hw += 1
+    }
+    if !started {
+        movz64(out, rd, 0, 0)  // the constant is zero
+    }
+}
+
+/// Loads any 32-bit constant; chunks above bit 31 never exist, so at most two words.
+export fn loadConst32(out: *Vec<u32>, rd: u32, v: u32) {
+    local low: u32 = v & 0xffff
+    local high: u32 = (v >> 16) & 0xffff
+    if high == 0 {
+        movz32(out, rd, low, 0)
+    } else {
+        movz32(out, rd, low, 0)
+        movk32(out, rd, high, 1)
+    }
+}
+
+/// `mov Rd, Rm` — the alias of `orr Rd, xzr, Rm` (`sf 01 01010 shift=00 Rm 000000 Rn=11111 Rd`).
+export fn movReg64(out: *Vec<u32>, rd: u32, rm: u32) {
+    out.push(0xaa0003e0 | (rm << 16) | rd)
+}
+
+/// `mov` on the 32-bit view.
+export fn movReg32(out: *Vec<u32>, rd: u32, rm: u32) {
+    out.push(0x2a0003e0 | (rm << 16) | rd)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Arithmetic and logic
+
+/// `add Rd, Rn, #imm12 {, lsl #12}` — 64-bit: `sf=1 0010001 0 sh imm12(12) Rn(5) Rd(5)`.
+export fn add64Imm(out: *Vec<u32>, rd: u32, rn: u32, imm12: u32, shift12: bool) {
+    out.push(0x91000000 | ((shift12 ? 1 : 0) << 22) | (imm12 << 10) | (rn << 5) | rd)
+}
+
+/// `sub Rd, Rn, #imm12 {, lsl #12}` — 64-bit.
+export fn sub64Imm(out: *Vec<u32>, rd: u32, rn: u32, imm12: u32, shift12: bool) {
+    out.push(0xd1000000 | ((shift12 ? 1 : 0) << 22) | (imm12 << 10) | (rn << 5) | rd)
+}
+
+/// `add` immediate on the 32-bit view.
+export fn add32Imm(out: *Vec<u32>, rd: u32, rn: u32, imm12: u32, shift12: bool) {
+    out.push(0x11000000 | ((shift12 ? 1 : 0) << 22) | (imm12 << 10) | (rn << 5) | rd)
+}
+
+/// `sub` immediate on the 32-bit view.
+export fn sub32Imm(out: *Vec<u32>, rd: u32, rn: u32, imm12: u32, shift12: bool) {
+    out.push(0x51000000 | ((shift12 ? 1 : 0) << 22) | (imm12 << 10) | (rn << 5) | rd)
+}
+
+/// `adds Rd, Rn, #imm12` — 64-bit; pass `XZR` as `rd` for `cmp`.
+export fn adds64Imm(out: *Vec<u32>, rd: u32, rn: u32, imm12: u32) {
+    out.push(0xb1000000 | (imm12 << 10) | (rn << 5) | rd)
+}
+
+/// `subs Rd, Rn, #imm12` — 64-bit; `cmp Rn, #imm` is this with `rd = XZR`.
+export fn subs64Imm(out: *Vec<u32>, rd: u32, rn: u32, imm12: u32) {
+    out.push(0xf1000000 | (imm12 << 10) | (rn << 5) | rd)
+}
+
+/// `cmp Rn, #imm12` — `subs xzr, Rn, #imm12`.
+export fn cmp64Imm(out: *Vec<u32>, rn: u32, imm12: u32) {
+    subs64Imm(out, XZR, rn, imm12)
+}
+
+/// `add Rd, Rn, Rm` — 64-bit: `sf=1 0001011 shift=00 Rm(5) 0 Rn(5) Rd(5)`.
+export fn add64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x8b000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `sub Rd, Rn, Rm` — 64-bit.
+export fn sub64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0xcb000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `adds` register form — 64-bit.
+export fn adds64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0xab000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `subs` register form — 64-bit; `cmp Rn, Rm` is this with `rd = XZR`.
+export fn subs64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0xeb000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `cmp Rn, Rm` — `subs xzr, Rn, Rm`.
+export fn cmp64Reg(out: *Vec<u32>, rn: u32, rm: u32) {
+    subs64Reg(out, XZR, rn, rm)
+}
+
+/// `and Rd, Rn, Rm` — 64-bit: `sf=1 0001010 shift=00 Rm 0 Rn Rd`.
+export fn and64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x8a000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `orr Rd, Rn, Rm` — 64-bit.
+export fn orr64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0xaa000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `eor Rd, Rn, Rm` — 64-bit.
+export fn eor64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0xca000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `mul Rd, Rn, Rm` — the alias of `madd Rd, Rn, Rm, xzr`
+/// (`sf 00 11011 000 Rm 0 Ra=11111 Rn Rd`).
+export fn mul64(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x9b007c00 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `sdiv Rd, Rn, Rm` — `sf 00 11010 1100 Rm 0001 Rn Rd`; divide by zero yields zero.
+export fn sdiv64(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x9ac00c00 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `udiv Rd, Rn, Rm`.
+export fn udiv64(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x9ac00800 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `lsl Rd, Rn, Rm` — the alias of `lslv Rd, Rn, Rm` (`sf 00 11010110 Rm 001000 Rn Rd`).
+export fn lsl64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x9ac02000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `lsr Rd, Rn, Rm` — `lsrv`.
+export fn lsr64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x9ac02400 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `asr Rd, Rn, Rm` — `asrv`.
+export fn asr64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x9ac02800 | (rm << 16) | (rn << 5) | rd)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Loads and stores (unsigned-offset immediate forms; the offset is in bytes and must be a
+// multiple of the access size, which the imm12 field encodes in units of that size)
+
+/// `ldr Rt, [Rn, #off]` — 64-bit: `11 111 0 01 01 imm12(12) Rn(5) Rt(5)`, imm12 = off/8.
+export fn ldr64Imm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0xf9400000 | ((byteOff / 8) << 10) | (rn << 5) | rt)
+}
+
+/// `str Rt, [Rn, #off]` — 64-bit.
+export fn str64Imm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0xf9000000 | ((byteOff / 8) << 10) | (rn << 5) | rt)
+}
+
+/// `ldr` — 32-bit, imm12 in units of 4.
+export fn ldr32Imm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0xb9400000 | ((byteOff / 4) << 10) | (rn << 5) | rt)
+}
+
+/// `str` — 32-bit.
+export fn str32Imm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0xb9000000 | ((byteOff / 4) << 10) | (rn << 5) | rt)
+}
+
+/// `ldrb Rt, [Rn, #off]` — imm12 in units of 1.
+export fn ldrbImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0x38400000 | (byteOff << 10) | (rn << 5) | rt)
+}
+
+/// `strb Rt, [Rn, #off]`.
+export fn strbImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0x39000000 | (byteOff << 10) | (rn << 5) | rt)
+}
+
+/// `ldrsw Rt, [Rn, #off]` — sign-extended 32-bit load: `10 111 0 10 10 imm12 Rn Rt`.
+export fn ldrswImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0xb9800000 | ((byteOff / 4) << 10) | (rn << 5) | rt)
+}
+
+/// `stp Rt1, Rt2, [Rn, #off]!` (pre-index writeback) — the standard prologue pair save.
+/// `10 101 0 011 0 imm7(7) Rt2(5) Rn(5) Rt1(5)`, imm7 = off/8, signed.
+export fn stp64Pre(out: *Vec<u32>, rt1: u32, rt2: u32, rn: u32, byteOff: i32) {
+    local imm7: u32 = ((byteOff / 8) & 0x7f) as u32
+    out.push(0xa9800000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+/// `ldp Rt1, Rt2, [Rn, #off]` (post-index writeback) — the standard epilogue pair load.
+/// `10 101 0 001 1 imm7 Rt2 Rn Rt1`.
+export fn ldp64Post(out: *Vec<u32>, rt1: u32, rt2: u32, rn: u32, byteOff: i32) {
+    local imm7: u32 = ((byteOff / 8) & 0x7f) as u32
+    out.push(0xa8c00000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+/// `ldur Xt, [Xn, #off]` — the unscaled load with a signed 9-bit byte offset, the form for
+/// negative frame-pointer offsets: `11 111 0 00 0 1 0 imm9(9) 00 Rn(5) Rt(5)`.
+export fn ldur64(out: *Vec<u32>, rt: u32, rn: u32, byteOff: i32) {
+    out.push(0xf8400000 | (((byteOff & 0x1ff) as u32) << 12) | (rn << 5) | rt)
+}
+
+/// `stur Xt, [Xn, #off]` — the unscaled store: `11 111 0 00 0 0 0 imm9(9) 00 Rn(5) Rt(5)`.
+export fn stur64(out: *Vec<u32>, rt: u32, rn: u32, byteOff: i32) {
+    out.push(0xf8000000 | (((byteOff & 0x1ff) as u32) << 12) | (rn << 5) | rt)
+}
+
+/// `cset Rd, cond` — the alias of `csinc Rd, xzr, xzr, invert(cond)`: the instruction carries
+/// `cond ^ 1` in the condition field (`sf 00 110101 00 Rm=11111 cond 01 Rn=11111 Rd`).
+export fn cset64(out: *Vec<u32>, rd: u32, cond: u32) {
+    out.push(0x9a9f0000 | ((cond ^ 1) << 12) | (1 << 10) | (31 << 5) | rd)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Branches
+
+/// `b label` — `000101 imm26`, imm26 in instruction words.
+export fn b(out: *Vec<u32>, wordOff: i32) {
+    out.push(0x14000000 | ((wordOff & 0x3ffffff) as u32))
+}
+
+/// `bl label` — `100101 imm26`.
+export fn bl(out: *Vec<u32>, wordOff: i32) {
+    out.push(0x94000000 | ((wordOff & 0x3ffffff) as u32))
+}
+
+/// `b.cond label` — `0101010 0 imm19(19) 0 cond(4)`.
+export fn bCond(out: *Vec<u32>, cond: u32, wordOff: i32) {
+    out.push(0x54000000 | (((wordOff & 0x7ffff) as u32) << 5) | cond)
+}
+
+/// `cbz Rt, label` — 64-bit: `11 011010 0 imm19(19) Rt(5)`.
+export fn cbz64(out: *Vec<u32>, rt: u32, wordOff: i32) {
+    out.push(0xb4000000 | (((wordOff & 0x7ffff) as u32) << 5) | rt)
+}
+
+/// `cbnz Rt, label` — 64-bit.
+export fn cbnz64(out: *Vec<u32>, rt: u32, wordOff: i32) {
+    out.push(0xb5000000 | (((wordOff & 0x7ffff) as u32) << 5) | rt)
+}
+
+/// `adrp Rd, label` — page address into `Rd`: `1 immlo(2) 10000 immhi(19) Rd(5)`. `imm21` is
+/// the signed PC-relative page distance in 4 KiB pages (immlo = bits 0-1, immhi = bits 2-20).
+export fn adrp(out: *Vec<u32>, rd: u32, pageOff: i32) {
+    local imm: u32 = (pageOff & 0x1fffff) as u32
+    out.push(0x90000000 | ((imm & 3) << 29) | ((imm >> 2) << 5) | rd)
+}
+
+/// `br Rn` — indirect branch: `1101011 0 0 11 000000 Rn 00000`.
+export fn br(out: *Vec<u32>, rn: u32) {
+    out.push(0xd61f0000 | (rn << 5))
+}
+
+/// `blr Rn` — indirect call, return address into `x30`.
+export fn blr(out: *Vec<u32>, rn: u32) {
+    out.push(0xd63f0000 | (rn << 5))
+}

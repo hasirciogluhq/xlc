@@ -1,0 +1,413 @@
+// The instruction selector of the native macOS backend: walks the flat HIR module (hir/abi.xl)
+// and emits arm64 machine code into a Mach-O object (macho.xl) through the arm64.xl encoder.
+//
+// First cut, a naive stack-machine scheme with no register allocation: every expression
+// evaluates into the scratch register `x9`, binary operands spill through a 16-byte slot below
+// the stack pointer, locals live in frame-pointer-relative slots, and the first eight integer
+// arguments arrive in `x0`-`x7` and spill to their slots in the prolog. Everything is treated
+// as 64-bit. Internal calls patch through labels, external calls through `BRANCH26`
+// relocations; the callee symbol is the C-spelled `_name`.
+from "std" import String, Vec
+from "std/runtime" import panic
+from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, view, owned,
+    E_INT_CONST, E_BOOL_CONST, E_LOCAL_REF, E_UNARY, E_BINARY, E_CAST, E_CALL, E_SELECT,
+    S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE, S_CONTINUE, S_BREAK, S_BLOCK
+from "../arm64" import X0, X29, X30, SP, XZR, EQ, NE, LT, LE, GT, GE, movReg64, loadConst64,
+    add64Imm, sub64Imm, add64Reg, sub64Reg, mul64, sdiv64, cmp64Reg, cset64, ldur64, stur64,
+    stp64Pre, ldp64Post, b, bl, cbz64, cbnz64, ret
+from "../macho" import MachoObject, TEXT_FLAGS, RELOC_BRANCH26
+
+const SCRATCH: u32 = 9    // x9: the result of every expression
+const SCRATCH2: u32 = 10  // x10: the left operand, popped back from the expression stack
+
+/// A branch whose target word index is not known yet: patch the immediate of the word at `at`
+/// to reach `label` once `bind` records it.
+@repr(c)
+struct Fixup {
+    at: u32
+    label: u32
+}
+
+/// A call to a symbol outside this module: a `BRANCH26` relocation against the C-spelled name.
+@repr(c)
+struct RelReq {
+    addr: u32     // byte offset of the `bl` inside the text section
+    extIndex: u32 // index into `externals`
+}
+
+class Isel {
+    m: *XlcHirModule
+    o: *MachoObject
+    text: u32
+    code: Vec<u32>        // the text of every emitted function, one word per instruction
+    fixups: Vec<Fixup>
+    labelPos: Vec<u32>    // word index per bound label; labels `0..functionCount` are the entries
+    labels: u32           // the next label id to hand out
+    loopTop: u32          // the label of the innermost loop's condition
+    loopEnd: u32          // the label after the innermost loop's body
+    epilog: u32           // the label of the current function's epilogue
+    externals: Vec<String>
+    rels: Vec<RelReq>
+
+    fn init(self, m: *XlcHirModule, o: *MachoObject) {
+        self.m = m
+        self.o = o
+        self.text = o.addSection("__text", TEXT_FLAGS, 2)
+        self.code = Vec<u32>()
+        self.fixups = Vec<Fixup>()
+        self.labelPos = Vec<u32>()
+        // The first `functionCount` labels are the function entries, bound as they are emitted.
+        self.labels = m.functionCount
+        self.loopTop = 0
+        self.loopEnd = 0
+        self.epilog = 0
+        self.externals = Vec<String>()
+        self.rels = Vec<RelReq>()
+    }
+
+    /// A fresh label id.
+    fn newLabel(self) -> u32 {
+        local id: u32 = self.labels
+        self.labels += 1
+        return id
+    }
+
+    /// Binds `label` to the next word that will be appended.
+    fn bind(self, label: u32) {
+        while self.labelPos.length() <= label as usize {
+            self.labelPos.push(0)
+        }
+        self.labelPos.set(label, self.code.length() as u32)
+    }
+
+    /// Marks the word just appended as a branch to `label`, to patch after emission.
+    fn fixup(self, label: u32) {
+        self.fixups.push(Fixup { at: (self.code.length() - 1) as u32, label: label })
+    }
+
+    /// Resolves every pending branch: the immediate reaches from the branch word to its label.
+    fn patchAll(self) {
+        for i in 0..self.fixups.length() {
+            local f: *Fixup = self.fixups.get(i)
+            local off: i32 = (*self.labelPos.get(f.label) as i32) - (f.at as i32)
+            local w: u32 = *self.code.get(f.at)
+            local op: u32 = w & 0xfe000000
+            if op == 0xb4000000 || op == 0xb5000000 {
+                // cbz/cbnz: the 19-bit signed distance sits at bits 5..23.
+                self.code.set(f.at, w | (((off & 0x7ffff) as u32) << 5))
+            } else {
+                // b/bl: the 26-bit signed distance sits at bits 0..25.
+                self.code.set(f.at, w | ((off & 0x3ffffff) as u32))
+            }
+        }
+    }
+
+    /// The byte offset of local `i`'s slot below the frame pointer: local 0 at `[fp, #-8]`.
+    fn slot(self, i: u32) -> i32 {
+        return -8 * ((i + 1) as i32)
+    }
+
+    /// The frame size for `localCount` slots, rounded to the 16-byte stack alignment.
+    fn frameSize(self, localCount: u32) -> i32 {
+        local bytes: i32 = (localCount * 8) as i32
+        return (bytes + 15) / 16 * 16
+    }
+
+    /// The index of the defined function named `name`, or -1 when the callee is external.
+    fn findFunction(self, name: str) -> i32 {
+        local n: String = String(name)
+        local m: *XlcHirModule = self.m
+        for i in 0..m.functionCount as usize {
+            local f: *XlcHirFunction = &m.functions[i]
+            if f.hasBody != 0 && (n.equals(view(f.symbol)) || n.equals(view(f.name))) {
+                return i as i32
+            }
+        }
+        return -1
+    }
+
+    /// The index of an external symbol name, deduplicated; the name is C-spelled (`_` prefix).
+    fn extIndex(self, name: str) -> u32 {
+        for i in 0..self.externals.length() {
+            if self.externals.get(i).equals(name) {
+                return i as u32
+            }
+        }
+        self.externals.push(String(name))
+        return (self.externals.length() - 1) as u32
+    }
+
+    /// Pushes `SCRATCH` onto the expression stack: one aligned 16-byte slot below `sp`.
+    fn push(self) {
+        sub64Imm(&self.code, SP, SP, 16, false)
+        stur64(&self.code, SCRATCH, SP, 0)
+    }
+
+    /// Pops the expression stack into `r`.
+    fn pop(self, r: u32) {
+        ldur64(&self.code, r, SP, 0)
+        add64Imm(&self.code, SP, SP, 16, false)
+    }
+
+    /// Emits one function: the prolog, the body, the epilogue. The entry is label `fi`.
+    fn function(self, fi: u32, f: *XlcHirFunction) {
+        self.bind(fi)
+        // Prolog: the frame record Apple requires at `x29`, then room for the locals.
+        stp64Pre(&self.code, X29, X30, SP, -16)
+        add64Imm(&self.code, X29, SP, 0, false)  // mov x29, sp
+        local frame: i32 = self.frameSize(f.localCount)
+        if frame > 0 {
+            sub64Imm(&self.code, SP, SP, frame as u32, false)
+        }
+        // The first `paramCount` locals arrive in x0..x7; spill them into their slots.
+        for i in 0..f.paramCount as usize {
+            stur64(&self.code, i as u32, X29, self.slot(i as u32))
+        }
+        self.epilog = self.newLabel()
+        self.stmtRange(f.bodyFirst, f.bodyCount)
+        self.bind(self.epilog)
+        add64Imm(&self.code, SP, X29, 0, false)  // mov sp, x29
+        ldp64Post(&self.code, X29, X30, SP, 16)
+        ret(&self.code)
+    }
+
+    fn stmtRange(self, first: u32, count: u32) {
+        for i in 0..count as usize {
+            self.stmt(&self.m.stmts[first as usize + i])
+        }
+    }
+
+    fn stmt(self, s: *XlcHirStmt) {
+        switch {
+            case s.kind == S_LOCAL {
+                if s.value >= 0 {
+                    self.expr(&self.m.exprs[s.value as usize])
+                    stur64(&self.code, SCRATCH, X29, self.slot(s.localId))
+                }
+            }
+            case s.kind == S_ASSIGN {
+                local t: *XlcHirExpr = &self.m.exprs[s.target as usize]
+                if t.kind != E_LOCAL_REF {
+                    panic(String("isel: assign to a non-local target").cstr())
+                }
+                self.expr(&self.m.exprs[s.value as usize])
+                stur64(&self.code, SCRATCH, X29, self.slot(t.localId))
+            }
+            case s.kind == S_RETURN {
+                if s.value >= 0 {
+                    self.expr(&self.m.exprs[s.value as usize])
+                    movReg64(&self.code, X0, SCRATCH)
+                }
+                b(&self.code, 0)
+                self.fixup(self.epilog)
+            }
+            case s.kind == S_EXPR {
+                self.expr(&self.m.exprs[s.value as usize])
+            }
+            case s.kind == S_BLOCK {
+                self.stmtRange(s.bodyFirst, s.bodyCount)
+            }
+            case s.kind == S_IF {
+                self.expr(&self.m.exprs[s.value as usize])
+                local elseL: u32 = self.newLabel()
+                cbz64(&self.code, SCRATCH, 0)
+                self.fixup(elseL)
+                self.stmtRange(s.bodyFirst, s.bodyCount)
+                if s.elseCount > 0 {
+                    local endL: u32 = self.newLabel()
+                    b(&self.code, 0)
+                    self.fixup(endL)
+                    self.bind(elseL)
+                    self.stmtRange(s.elseFirst, s.elseCount)
+                    self.bind(endL)
+                } else {
+                    self.bind(elseL)
+                }
+            }
+            case s.kind == S_WHILE {
+                local top: u32 = self.newLabel()
+                local end: u32 = self.newLabel()
+                local oldTop: u32 = self.loopTop
+                local oldEnd: u32 = self.loopEnd
+                self.loopTop = top
+                self.loopEnd = end
+                if s.postTest != 0 {
+                    // do-while: the body runs first, the test decides whether to go around.
+                    self.bind(top)
+                    self.stmtRange(s.bodyFirst, s.bodyCount)
+                    if s.stepCount > 0 {
+                        self.stmtRange(s.stepFirst, s.stepCount)
+                    }
+                    self.expr(&self.m.exprs[s.value as usize])
+                    cbnz64(&self.code, SCRATCH, 0)
+                    self.fixup(top)
+                } else {
+                    self.bind(top)
+                    self.expr(&self.m.exprs[s.value as usize])
+                    cbz64(&self.code, SCRATCH, 0)
+                    self.fixup(end)
+                    self.stmtRange(s.bodyFirst, s.bodyCount)
+                    if s.stepCount > 0 {
+                        self.stmtRange(s.stepFirst, s.stepCount)
+                    }
+                    b(&self.code, 0)
+                    self.fixup(top)
+                }
+                self.bind(end)
+                self.loopTop = oldTop
+                self.loopEnd = oldEnd
+            }
+            case s.kind == S_CONTINUE {
+                b(&self.code, 0)
+                self.fixup(self.loopTop)
+            }
+            case s.kind == S_BREAK {
+                b(&self.code, 0)
+                self.fixup(self.loopEnd)
+            }
+            case true {
+                panic(String("isel: unsupported statement kind").cstr())
+            }
+        }
+    }
+
+    /// Emits one expression; the result lands in `SCRATCH`.
+    fn expr(self, e: *XlcHirExpr) {
+        switch {
+            case e.kind == E_INT_CONST {
+                loadConst64(&self.code, SCRATCH, e.intValue)
+            }
+            case e.kind == E_BOOL_CONST {
+                loadConst64(&self.code, SCRATCH, e.boolValue as u64)
+            }
+            case e.kind == E_LOCAL_REF {
+                ldur64(&self.code, SCRATCH, X29, self.slot(e.localId))
+            }
+            case e.kind == E_BINARY {
+                local op: String = owned(e.binaryOp)
+                self.expr(&self.m.exprs[e.lhs as usize])
+                self.push()
+                self.expr(&self.m.exprs[e.rhs as usize])
+                self.pop(SCRATCH2)
+                // `SCRATCH2` holds the left operand, `SCRATCH` the right one.
+                if op.equals("+") {
+                    add64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
+                } else if op.equals("-") {
+                    sub64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
+                } else if op.equals("*") {
+                    mul64(&self.code, SCRATCH, SCRATCH2, SCRATCH)
+                } else if op.equals("/") {
+                    sdiv64(&self.code, SCRATCH, SCRATCH2, SCRATCH)
+                } else if op.equals("==") {
+                    cmp64Reg(&self.code, SCRATCH2, SCRATCH)
+                    cset64(&self.code, SCRATCH, EQ)
+                } else if op.equals("!=") {
+                    cmp64Reg(&self.code, SCRATCH2, SCRATCH)
+                    cset64(&self.code, SCRATCH, NE)
+                } else if op.equals("<") {
+                    cmp64Reg(&self.code, SCRATCH2, SCRATCH)
+                    cset64(&self.code, SCRATCH, LT)
+                } else if op.equals("<=") {
+                    cmp64Reg(&self.code, SCRATCH2, SCRATCH)
+                    cset64(&self.code, SCRATCH, LE)
+                } else if op.equals(">") {
+                    cmp64Reg(&self.code, SCRATCH2, SCRATCH)
+                    cset64(&self.code, SCRATCH, GT)
+                } else if op.equals(">=") {
+                    cmp64Reg(&self.code, SCRATCH2, SCRATCH)
+                    cset64(&self.code, SCRATCH, GE)
+                } else {
+                    panic(String("isel: unsupported binary operator").cstr())
+                }
+            }
+            case e.kind == E_UNARY {
+                local op: String = owned(e.unaryOp)
+                self.expr(&self.m.exprs[e.lhs as usize])
+                if op.equals("-") {
+                    sub64Reg(&self.code, SCRATCH, XZR, SCRATCH)
+                } else if op.equals("!") {
+                    cmp64Reg(&self.code, SCRATCH, XZR)
+                    cset64(&self.code, SCRATCH, EQ)
+                } else {
+                    panic(String("isel: unsupported unary operator").cstr())
+                }
+            }
+            case e.kind == E_CAST {
+                // Integer casts of the same width are no-ops at this naive 64-bit width.
+                self.expr(&self.m.exprs[e.lhs as usize])
+            }
+            case e.kind == E_SELECT {
+                self.expr(&self.m.exprs[e.lhs as usize])
+                local elseL: u32 = self.newLabel()
+                local endL: u32 = self.newLabel()
+                cbz64(&self.code, SCRATCH, 0)
+                self.fixup(elseL)
+                self.expr(&self.m.exprs[e.rhs as usize])
+                b(&self.code, 0)
+                self.fixup(endL)
+                self.bind(elseL)
+                self.expr(&self.m.exprs[self.m.refs[e.argFirst as usize] as usize])
+                self.bind(endL)
+            }
+            case e.kind == E_CALL {
+                // The arguments, left to right, then popped back into x7..x0.
+                for i in 0..e.argCount as usize {
+                    self.expr(&self.m.exprs[self.m.refs[e.argFirst as usize + i] as usize])
+                    self.push()
+                }
+                local i: i32 = e.argCount as i32 - 1
+                while i >= 0 {
+                    self.pop(i as u32)
+                    i -= 1
+                }
+                local name: str = view(e.text)
+                local callee: i32 = self.findFunction(name)
+                bl(&self.code, 0)
+                if callee >= 0 {
+                    self.fixup(callee as u32)
+                } else {
+                    // An external symbol: C spelling, resolved by the linker.
+                    local underscore: String = String("_")
+                    underscore.append(name)
+                    self.rels.push(RelReq { addr: ((self.code.length() - 1) as u32) * 4, extIndex: self.extIndex(underscore.asStr()) })
+                }
+                movReg64(&self.code, SCRATCH, X0)
+            }
+            case true {
+                panic(String("isel: unsupported expression kind").cstr())
+            }
+        }
+    }
+}
+
+/// Selects the whole module into `o`: every function with a body becomes one defined symbol in
+/// `__text`, every external call an undefined symbol and a `BRANCH26` relocation.
+export fn select(m: *XlcHirModule, o: *MachoObject) {
+    local g: Isel = Isel(m, o)
+    for fi in 0..m.functionCount as usize {
+        local f: *XlcHirFunction = &m.functions[fi]
+        if f.hasBody != 0 {
+            g.function(fi as u32, f)
+        }
+    }
+    g.patchAll()
+    for i in 0..g.code.length() {
+        o.addWord(g.text, *g.code.get(i))
+    }
+    // The defined symbols, in emission order; the entry label is the word index of the function.
+    for fi in 0..m.functionCount as usize {
+        local f: *XlcHirFunction = &m.functions[fi]
+        if f.hasBody != 0 {
+            o.addDefined(view(f.symbol), g.text, (*g.labelPos.get(fi as u32) as u64) * 4)
+        }
+    }
+    // The undefined symbols, then the relocations against them (the symbol table wants every
+    // defined symbol before the first undefined one).
+    for i in 0..g.externals.length() {
+        o.addUndefined(g.externals.get(i).asStr())
+    }
+    for i in 0..g.rels.length() {
+        local r: *RelReq = g.rels.get(i)
+        o.addReloc(g.text, r.addr, r.extIndex, RELOC_BRANCH26)
+    }
+}

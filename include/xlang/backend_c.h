@@ -81,7 +81,8 @@ typedef struct XlcImport {
     XlcStr symbol;
 } XlcImport;
 
-/// What `xlcSessionEmit` produced for the CLI to archive or link. Empty for obj, ir, bc and
+/// What the LLVM codegen entry (`xlcLlvmEmit`) produced for the CLI to archive or link. Empty
+/// for obj, ir, bc and
 /// header, which are written in place. The strings live in the session until the next emit or
 /// `xlcSessionFree`.
 typedef struct XlcEmitResult {
@@ -150,12 +151,19 @@ int32_t XLC_BACKEND_CALL xlcSessionDumpLayout(XlcSession* session, XlcStr type_n
 /// The resolved target of the session's configuration. The strings live as long as the session.
 void XLC_BACKEND_CALL xlcSessionTarget(XlcSession* session, XlcTarget* target);
 
-/// Lowers the program (once) and generates code (`--emit`). obj, ir, bc and header are written
-/// to `request->output`; for exe, static and shared `result` names the objects to archive or
-/// link. The request's `root` must be the path given to `loadRoot`. Code generation errors are
-/// diagnostics: check `xlcSessionHasErrors` before using `result`.
-int32_t XLC_BACKEND_CALL xlcSessionEmit(XlcSession* session, const XlcEmitRequest* request,
-                                        XlcEmitResult* result);
+/// Lowers the program (once) and returns the `hir::Module` of the session for a backend written
+/// in xlang (the native arm64/Mach-O path). The pointer lives as long as the session; the layout
+/// is the C++ one, mirrored field for field by src/hir/abi.xl.
+const void* XLC_BACKEND_CALL xlcSessionHirModule(XlcSession* session);
+
+/// The LLVM codegen step behind the C API: the only codegen entry the xlang CLI calls, and
+/// only when the backend dispatch picks LLVM (`--backend=llvm`, or native on a target it does
+/// not cover). Lowers the program (once) and generates code (`--emit`). obj, ir, bc and header
+/// are written to `request->output`; for exe, static and shared `result` names the objects to
+/// archive or link. The request's `root` must be the path given to `loadRoot`. Code generation
+/// errors are diagnostics: check `xlcSessionHasErrors` before using `result`.
+int32_t XLC_BACKEND_CALL xlcLlvmEmit(XlcSession* session, const XlcEmitRequest* request,
+                                     XlcEmitResult* result);
 
 /// Writes `objects` into the static library `output`, in-process (LLVM's archive writer, no
 /// external `ar`): the BSD format for `os` macos, the GNU format otherwise. 0 = written.

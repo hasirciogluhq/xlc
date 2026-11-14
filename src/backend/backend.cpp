@@ -431,8 +431,14 @@ void XLC_BACKEND_CALL xlcSessionTarget(XlcSession* session, XlcTarget* target) {
     *target = XlcTarget{viewOf(t.triple), viewOf(t.os), viewOf(t.arch)};
 }
 
-int32_t XLC_BACKEND_CALL xlcSessionEmit(XlcSession* session, const XlcEmitRequest* request,
-                                        XlcEmitResult* result) {
+const void* XLC_BACKEND_CALL xlcSessionHirModule(XlcSession* session) {
+    Session* s = reinterpret_cast<Session*>(session);
+    s->ensureLowered();
+    return &s->hirModule();
+}
+
+int32_t XLC_BACKEND_CALL xlcLlvmEmit(XlcSession* session, const XlcEmitRequest* request,
+                                     XlcEmitResult* result) {
     Session* s = reinterpret_cast<Session*>(session);
     s->publish({}, *result);
     return guard([&] {

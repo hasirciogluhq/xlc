@@ -115,7 +115,9 @@ export declare fn xlcSessionDumpLayout(session: *XlcSession, typeName: XlcStr, r
 @allow(W0301)
 export declare fn xlcSessionTarget(session: *XlcSession, target: *XlcTarget)
 @allow(W0301)
-export declare fn xlcSessionEmit(session: *XlcSession, request: *XlcEmitRequest, result: *XlcEmitResult) -> i32
+export declare fn xlcSessionHirModule(session: *XlcSession) -> *void
+@allow(W0301)
+export declare fn xlcLlvmEmit(session: *XlcSession, request: *XlcEmitRequest, result: *XlcEmitResult) -> i32
 @allow(W0301)
 export declare fn xlcArchive(objects: XlcStrList, output: XlcStr, os: XlcStr) -> i32
 @allow(W0301)
