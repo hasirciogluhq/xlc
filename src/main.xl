@@ -1,0 +1,134 @@
+// The xlc binary: the CLI lives here in xlang and drives the whole C++ backend
+// (src/backend, include/xlang/backend_c.h) one stage at a time. The stage order is the one
+// src/cli/main.cpp had before the move: explain, print-cfg, dump-ast, then the session pipeline
+// load -> analyze -> lower -> dump/emit, then the summary.
+from "std" import String, Vec
+from "std/io" import eprint
+from "std/os/args" import fromArgv
+from "std/str" import endsWith
+from "cli" import Opts, XlcConfig, XlcEmitRequest, XlcSession, XlcStr, ConfigArena, parseArgs,
+    printHelp, buildConfig, buildEmitRequest, xstr, xlcExplain, xlcVersion, xlcPrintCfg,
+    xlcDumpAst, xlcSessionNew, xlcSessionFree, xlcSessionAddModuleRoot,
+    xlcSessionAddImplicitImport, xlcSessionLoadRoot, xlcSessionAnalyze, xlcSessionDumpHir,
+    xlcSessionDumpMir, xlcSessionDumpLayout, xlcSessionEmit, xlcSessionHasErrors,
+    xlcSessionPrintSummary
+
+/// The first `.xl` input is the program; the rest are link inputs. -1 when there is none.
+fn sourceIndex(o: *Opts) -> i64 {
+    for i in 0..o.inputs.length() {
+        if endsWith((*o.inputs.get(i)).asStr(), ".xl") {
+            return i as i64
+        }
+    }
+    return -1
+}
+
+// The program entry: the installed `main` the platform CRT calls when the binary is linked with
+// `--crt` (the boot hooks register as image constructors/destructors in that mode).
+@entry fn main(argc: i32, argv: **u8) -> i32 {
+    local args: Vec<String> = fromArgv(argc, argv)
+    local o: Opts = parseArgs(args)
+    if o.bad.len > 0 {
+        eprint("error: {}\n", o.bad.asStr())
+        return 2
+    }
+    if o.version {
+        xlcVersion()
+        return 0
+    }
+    if o.explain.len > 0 {
+        if xlcExplain(xstr(&o.explain)) != 0 {
+            return 1
+        }
+        return 0
+    }
+
+    // The configuration and the arenas it points into live as long as the session does.
+    local arena: ConfigArena = ConfigArena()
+    local cfg = buildConfig(&o, &arena)
+    if o.printCfg {
+        return xlcPrintCfg(cfg)
+    }
+    if o.inputs.length() == 0 {
+        printHelp()
+        return 0
+    }
+
+    local rootIdx = sourceIndex(&o)
+    if rootIdx < 0 {
+        eprint("error: no input: give a `.xl` file\n")
+        return 1
+    }
+    local root = (*o.inputs.get(rootIdx as usize)).clone()
+
+    // `--dump-ast` needs no session: parse one file and print the summary.
+    if o.dumpAst {
+        return xlcDumpAst(cfg, xstr(&root))
+    }
+
+    local session = xlcSessionNew(cfg)
+    if session == nil {
+        return 1
+    }
+    local failed = false
+    for i in 0..o.moduleRoots.length() {
+        if xlcSessionAddModuleRoot(session, xstr(o.moduleRoots.get(i))) != 0 {
+            failed = true
+            break
+        }
+    }
+    if !failed {
+        for i in 0..o.imports.length() {
+            if xlcSessionAddImplicitImport(session, xstr(o.imports.get(i))) != 0 {
+                failed = true
+                break
+            }
+        }
+    }
+    if !failed && xlcSessionLoadRoot(session, xstr(&root)) != 0 {
+        failed = true
+    }
+    if !failed && xlcSessionAnalyze(session) != 0 {
+        failed = true
+    }
+    if failed {
+        xlcSessionFree(session)
+        return 1
+    }
+
+    // `--check`, a dump or a layout print writes nothing; everything else emits.
+    local wantsLayout = o.dumpLayoutSeen
+    local emits = !o.check && !o.dumpHir && !o.dumpMir && !wantsLayout
+    if xlcSessionHasErrors(session) == 0 {
+        if o.dumpHir {
+            xlcSessionDumpHir(session)
+        }
+        if o.dumpMir {
+            xlcSessionDumpMir(session)
+        }
+        if emits {
+            // The link inputs: every input that is not the program root.
+            local inputs: Vec<String> = Vec<String>()
+            for i in 0..o.inputs.length() {
+                if i != rootIdx as usize {
+                    inputs.push((*o.inputs.get(i)).clone())
+                }
+            }
+            local listArena: Vec<XlcStr> = Vec<XlcStr>()
+            local linkArena: Vec<XlcStr> = Vec<XlcStr>()
+            local req = buildEmitRequest(&o, &root, &inputs, &listArena, &linkArena)
+            xlcSessionEmit(session, &req)
+        }
+    }
+    if wantsLayout && xlcSessionHasErrors(session) == 0 {
+        xlcSessionDumpLayout(session, xstr(&o.dumpLayout), o.layoutRecord ? 1 : 0)
+    }
+
+    local code: i32 = 0
+    if xlcSessionHasErrors(session) != 0 {
+        xlcSessionPrintSummary(session)
+        code = 1
+    }
+    xlcSessionFree(session)
+    return code
+}

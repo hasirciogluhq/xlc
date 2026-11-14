@@ -21,6 +21,7 @@ struct EmitRequest {
     bool incremental{false};                    ///< one object per module, reused from `cache_dir`
     std::filesystem::path cache_dir;            ///< empty = `.xlc-cache` next to the output
     std::vector<std::filesystem::path> inputs;  ///< prebuilt objects/libraries handed to the linker
+    std::vector<std::string> link_args;         ///< `--link-arg`: appended to the linker command
 };
 
 /// Code generation for the lowered program `module`, then (for exe/static/shared) archive or link.

@@ -322,7 +322,9 @@ export class Expander {
                 if !isParam && !already {
                     local fresh = format("{}__m{}", n, self.counter)
                     self.arena.push(fresh)
-                    renamed.push(Renamed(n, fresh.asStr()))
+                    // The view borrows from the arena's copy: `fresh` was moved into the arena,
+                    // and a `str` into a moved local would be use-after-move.
+                    renamed.push(Renamed(n, self.arena.get(self.arena.length() - 1).asStr()))
                 }
             }
             i = i + 1
@@ -537,13 +539,14 @@ class MacroBlock {
                 flat.push(CMacroParam { kind: p.kind, name: p.name.ptr,
                                         nameLen: p.name.len as u32 })
             }
+            local paramCount = flat.length() as u32
             self.params.push(flat)
             self.bodies.push(d.body.clone())
             self.defs.push(CMacro {
                 name: d.name.ptr,
                 nameLen: d.name.len as u32,
                 params: self.params.get(self.params.length() - 1).data,
-                paramCount: flat.length() as u32,
+                paramCount: paramCount,
                 body: self.bodies.get(self.bodies.length() - 1).data,
                 bodyLen: d.body.length() as u32,
                 line: d.line,

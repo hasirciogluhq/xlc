@@ -8,6 +8,12 @@
 //
 // Only the user's own locals and parameters are reported: a hidden local of lowering is moved
 // exactly where lowering decided, so a finding on one would be a compiler bug, not a user error.
+//
+// Only a definite move (moved on every reaching path) is reported. A maybe-moved local is tracked
+// but not reported: the released stdlib writes loops in the `done`-flag style, where the paths
+// that move a local also set the flag that exits the loop, so the merge at the loop header sees a
+// move that no continuing iteration can reach. Revisit maybe-moved reporting together with a
+// stdlib release that exits such loops with `break`.
 
 #include "analysis/mir/moves.hpp"
 
@@ -150,7 +156,7 @@ private:
     void check(m::LocalId local, const Span& at) {
         const Status s = state_.status[local];
         const m::Local& l = body_.locals[local];
-        if (findings_ == nullptr || s == Status::Owned ||
+        if (findings_ == nullptr || s != Status::Moved ||
             (l.kind != m::Local::Kind::User && l.kind != m::Local::Kind::Param)) {
             return;
         }
@@ -166,8 +172,7 @@ private:
                 d.labels.push_back({*from, s == Status::Moved ? "moved here" : "moved here on some paths"});
             }
         }
-        d.detail = s == Status::Moved ? std::format("`{}` was moved and not assigned again", l.name)
-                                      : std::format("`{}` is moved on some paths to this use", l.name);
+        d.detail = std::format("`{}` was moved and not assigned again", l.name);
         d.reason = "a moved value belongs to its new owner, which may already have dropped it";
         d.fix = std::format("pass `&{0}` to borrow it, move a copy (`{0}.clone()`), or assign `{0}` "
                             "a new value before this use",

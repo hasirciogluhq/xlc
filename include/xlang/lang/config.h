@@ -50,6 +50,13 @@ struct BuildConfig {
     std::string layout_scheme;     ///< --layout-scheme (empty = newest)
     std::string layout_history;    ///< --layout-history (empty = xl.layout next to the input)
 
+    /// `--crt`: link the platform C runtime and C++ runtime instead of the freestanding entry.
+    /// The `@entry` function stays a plain `main` the CRT calls, the boot hooks register as image
+    /// constructors/destructors, and the linker step goes through the C++ compiler driver, which
+    /// brings the CRT startup files and the static-initializer runners a freestanding link lacks.
+    /// This is how a program that links C++ code (the `xlc` binary itself) is linked.
+    bool crt_link{false};
+
     /// Builtins (`os`, `arch`, `pointerWidth`, `endian`, `debug`, `optLevel`) and user definitions.
     /// `-D` overrides a builtin of the same name; `-U` (handled by the driver) removes user
     /// definitions only.

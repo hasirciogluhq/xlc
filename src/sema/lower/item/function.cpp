@@ -128,6 +128,12 @@ void Lowerer::lowerFunction(const FnDecl& f,
                  overloaded,
                  out.symbol,
                  f.name_span);
+    // `--crt`: the platform CRT calls `main` directly, so the entry keeps its plain C name instead
+    // of the mangled form; the signature (i32, **u8) -> i32 is all-scalar, so the xlang and C
+    // calling conventions coincide for it.
+    if (out.is_entry && s_.config_.crt_link) {
+        out.symbol = local_name;
+    }
     if (f.has_body) {
         if (!base_call.empty()) {
             // A derived `init` first runs the base class constructor on `self`.

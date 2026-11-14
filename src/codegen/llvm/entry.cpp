@@ -220,20 +220,29 @@ bool Gen::run() {
         // order.
         llvm::Function* fini_all =
             emitHookAll("_xl_finiAll", hm_.fini_functions | std::views::reverse);
-        switch (in_.output) {
-        case Output::Executable:
-            emitEntry();
-            break;
-        case Output::Shared:
-            emitSharedHooks(init_all, fini_all);
-            break;
-        case Output::Static:
-        case Output::Object:
-            // Weak, so an executable that links the archive keeps its own strong hooks without a
-            // duplicate-symbol error, and a host without them gets these definitions.
-            init_all->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
-            fini_all->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
-            break;
+        if (in_.config.crt_link && in_.output == Output::Executable) {
+            // `--crt`: the platform CRT calls `main` and runs the static initializers, so the
+            // boot hooks register as image constructors/destructors and no freestanding entry
+            // stub is emitted. On Mach-O `llvm.global_dtors` lowers through `__cxa_atexit`,
+            // which the C++ runtime link provides.
+            llvm::appendToGlobalCtors(mod_, init_all, 65535, nullptr);
+            llvm::appendToGlobalDtors(mod_, fini_all, 65535, nullptr);
+        } else {
+            switch (in_.output) {
+            case Output::Executable:
+                emitEntry();
+                break;
+            case Output::Shared:
+                emitSharedHooks(init_all, fini_all);
+                break;
+            case Output::Static:
+            case Output::Object:
+                // Weak, so an executable that links the archive keeps its own strong hooks without a
+                // duplicate-symbol error, and a host without them gets these definitions.
+                init_all->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
+                fini_all->setLinkage(llvm::GlobalValue::WeakAnyLinkage);
+                break;
+            }
         }
     }
     if (pads_ptr_ != nullptr) {

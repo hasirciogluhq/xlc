@@ -19,6 +19,12 @@ struct LinkRequest {
     /// `@library("x")` imports: (library, symbol). Only Windows uses them: an import library is
     /// generated per DLL (llvm-dlltool) and handed to the linker. Nothing else is ever linked.
     std::vector<std::pair<std::string, std::string>> imports;
+    /// `--crt`: link through the C++ compiler driver (crt1, libc, the C++ runtime and the
+    /// static-initializer runners) instead of the freestanding link. `entry` is then unused: the
+    /// CRT calls `main`.
+    bool crt_link{false};
+    /// Extra arguments appended to the linker command verbatim (`--link-arg`).
+    std::vector<std::string> extra_args;
 };
 
 /// Plan 5.9: picks the target's linker, passes no libc/libSystem/kernel32 and links only the

@@ -142,7 +142,26 @@ void link(const LinkRequest& r) {
     std::vector<std::filesystem::path> temporaries;  ///< generated import libraries, removed after linking
     std::filesystem::path tool;
     const bool shared = r.kind == LinkKind::Shared;
-    if (t.os == "macos") {
+    if (r.crt_link && !shared) {
+        // `--crt`: hand everything to the platform C++ compiler driver. It brings the CRT startup
+        // files, the C++ runtime and the static-initializer runners the freestanding link has none
+        // of, so C++ code (the `xlc` binary's own backend) links and runs. Cross targets are not
+        // supported here: the driver links the host it runs on.
+        tool = findTool({"clang++"});
+        if (tool.empty()) {
+            throw XlangError("no C++ compiler driver found (`clang++`); install LLVM/clang, or stop at `--emit=obj`");
+        }
+        args = {"-o", r.output.string()};
+        // The root object and the program's own static archives can carry the same stdlib code
+        // (each archive was built with its imports compiled in); the dead-code pass removes the
+        // copy nothing reaches, which the linker would otherwise report as duplicate symbols. The
+        // same flags the freestanding link of this platform uses.
+        if (t.os == "macos") {
+            args.push_back("-Wl,-dead_strip");
+        } else if (t.os == "linux") {
+            args.push_back("-Wl,--gc-sections");
+        }
+    } else if (t.os == "macos") {
         tool = findTool({"ld64.lld"});
         if (tool.empty()) {
             throw XlangError("no Mach-O linker found (`ld64.lld`); install LLVM's lld, or stop at `--emit=obj`");
@@ -243,6 +262,24 @@ void link(const LinkRequest& r) {
     }
     for (const std::filesystem::path& o : r.objects) {
         args.push_back(o.string());
+    }
+    if (r.crt_link && !shared) {
+        for (const std::string& a : r.extra_args) {
+            args.push_back(a);
+        }
+        std::string command = quote(tool.string());
+        for (const std::string& a : args) {
+            command += " " + quote(a);
+        }
+        command += " 2>&1";
+        const int status = runShell(command);
+        for (const std::filesystem::path& tmp : temporaries) {
+            std::filesystem::remove(tmp);
+        }
+        if (status != 0) {
+            throw XlangError(std::format("linker failed: {}", command));
+        }
+        return;
     }
     // Plan 24: the OS libraries the program imports with `@library`, after pruning, so only what is
     // reachable is linked. They come after the objects so that static archives resolve.

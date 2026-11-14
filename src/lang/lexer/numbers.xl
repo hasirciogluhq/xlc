@@ -185,7 +185,10 @@ fn parseFloatDigits(digits: *String) -> f64 {
     }
     if scale > 0 {
         local value = mantissa * pow(10.0, scale as f64)
-        if value > 1.7976931348623157e308 {
+        // Overflow shows as IEEE infinity (the reference `strtod` returns HUGE_VAL with ERANGE),
+        // so the range check is the infinity check, not a comparison against `DBL_MAX`: the
+        // boundary literal `1.7976931348623157e308` rounds past the limit in some compilers.
+        if value == kFloatInf {
             return kFloatInf
         }
         return value

@@ -80,14 +80,14 @@ void collectImports(const hir::Module& module, codegen::LinkRequest& req) {
                           std::format("`{}` has no entry point: no `@entry` function", request.root.filename().string()),
                           "mark one module-level function `@entry fn main()`, or build the file as a library with "
                           "`--emit=obj`, `--emit=static` or `--emit=shared`");
-    } else if (entry != nullptr && (emit == "static" || emit == "obj")) {
+    } else if (entry != nullptr && emit == "static") {
         diagnostics.error("E0754", entry->span,
-                          std::format("`@entry` on `{}` in a static library or object file", entry->name),
-                          "remove `@entry`: a library has no entry point, use `@init` for startup work or `@fini` "
-                          "for teardown");
+                          std::format("`@entry` on `{}` in a static library", entry->name),
+                          "remove `@entry`: a static library has no entry point, use `@init` for startup work or "
+                          "`@fini` for teardown");
     } else if (entry != nullptr && entry->param_count > 0 &&
                (output == codegen::Output::Shared ||
-                (config.target.os == "windows" && module.args_function.empty()))) {
+                (config.target.os == "windows" && !config.crt_link && module.args_function.empty()))) {
         const bool shared = output == codegen::Output::Shared;
         diagnostics.error("E0755", entry->span,
                           std::format("`@entry` on `{}` takes arguments, which {}", entry->name,
@@ -116,6 +116,8 @@ void archiveOrLink(const EmitRequest& request, const fs::path& out, std::vector<
     req.output = out;
     req.kind = request.emit == "shared" ? codegen::LinkKind::Shared : codegen::LinkKind::Executable;
     req.config = &config;
+    req.crt_link = config.crt_link;
+    req.extra_args = request.link_args;
     collectImports(module, req);
     codegen::link(req);
 }

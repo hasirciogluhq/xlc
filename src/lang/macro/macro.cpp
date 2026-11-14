@@ -50,43 +50,57 @@ std::vector<Token> expandMacros(std::vector<Token> tokens, MacroTable& table,
     std::vector<XlcMacroParam> params;
     std::vector<XlcLexToken> bodies;
     std::vector<XlcMacroDef> defs;
-    defs.reserve(table.macros.size());
+    // Where each def's params/body start inside `params`/`bodies`: the pointers are assigned only
+    // after every push, because a push can reallocate the vector and an empty vector's `data()`
+    // is null, so an offset captured before filling would dangle or stay null.
+    struct DefRange {
+        std::size_t params_begin;
+        std::size_t params_count;
+        std::size_t body_begin;
+        std::size_t body_count;
+    };
+    std::vector<DefRange> ranges;
+    ranges.reserve(table.macros.size());
     for (const auto& [name, def] : table.macros) {
+        const std::size_t params_begin = params.size();
+        for (const MacroParam& p : def.params) {
+            XlcMacroParam raw_param;
+            raw_param.kind = static_cast<std::int32_t>(p.kind);
+            raw_param.name = p.name.data();
+            raw_param.name_len = static_cast<std::uint32_t>(p.name.size());
+            params.push_back(raw_param);
+        }
+        const std::size_t body_begin = bodies.size();
+        for (const Token& t : def.body) {
+            XlcLexToken raw_token;
+            raw_token.kind = static_cast<std::int32_t>(t.kind);
+            raw_token.text = t.text.empty() ? kEmptyText : t.text.data();
+            raw_token.text_len = static_cast<std::uint32_t>(t.text.size());
+            raw_token.int_value = t.int_value;
+            raw_token.float_value = t.float_value;
+            raw_token.line = t.span.line;
+            raw_token.column = t.span.column;
+            raw_token.end_line = t.span.end_line;
+            raw_token.end_column = t.span.end_column;
+            raw_token.newline_before = t.newline_before ? 1 : 0;
+            bodies.push_back(raw_token);
+        }
+        ranges.push_back({params_begin, def.params.size(), body_begin, def.body.size()});
         XlcMacroDef raw;
         raw.name = name.data();
         raw.name_len = static_cast<std::uint32_t>(name.size());
-        raw.params = nullptr;
         raw.param_count = static_cast<std::uint32_t>(def.params.size());
-        if (!def.params.empty()) {
-            raw.params = params.data() + params.size();
-            for (const MacroParam& p : def.params) {
-                XlcMacroParam raw_param;
-                raw_param.kind = static_cast<std::int32_t>(p.kind);
-                raw_param.name = p.name.data();
-                raw_param.name_len = static_cast<std::uint32_t>(p.name.size());
-                params.push_back(raw_param);
-            }
-        }
-        raw.body = nullptr;
         raw.body_len = static_cast<std::uint32_t>(def.body.size());
-        if (!def.body.empty()) {
-            raw.body = bodies.data() + bodies.size();
-            for (const Token& t : def.body) {
-                XlcLexToken raw_token;
-                raw_token.kind = static_cast<std::int32_t>(t.kind);
-                raw_token.text = t.text.empty() ? kEmptyText : t.text.data();
-                raw_token.text_len = static_cast<std::uint32_t>(t.text.size());
-                raw_token.int_value = t.int_value;
-                raw_token.float_value = t.float_value;
-                raw_token.line = t.span.line;
-                raw_token.column = t.span.column;
-                raw_token.end_line = t.span.end_line;
-                raw_token.end_column = t.span.end_column;
-                raw_token.newline_before = t.newline_before ? 1 : 0;
-                bodies.push_back(raw_token);
-            }
-        }
+        raw.line = 0;
+        raw.column = 0;
+        raw.end_line = 0;
+        raw.end_column = 0;
         defs.push_back(raw);
+    }
+    for (std::size_t i = 0; i < defs.size(); ++i) {
+        const DefRange& range = ranges[i];
+        defs[i].params = range.params_count > 0 ? params.data() + range.params_begin : nullptr;
+        defs[i].body = range.body_count > 0 ? bodies.data() + range.body_begin : nullptr;
     }
 
     std::vector<XlcLexToken> raw_tokens;

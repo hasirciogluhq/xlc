@@ -1,0 +1,517 @@
+// The boundary between the CLI written in xlang and the C++ backend: the flat structs of
+// include/xlang/backend_c.h mirrored field for field, the `declare fn` bindings, and the
+// command-line parser that produces them. The parser keeps the behavior of the C++ CLI
+// (src/cli/main.cpp before the move): `--opt value` and `--opt=value`, attached short values
+// (`-O2`), repeatable lists, `-Wno-CODE` rewritten to `--allow CODE`, and the same defaults.
+from "std" import String, Vec, format
+from "std/io" import print, eprint
+from "std/str" import view, find, startsWith, toU64, fromParts
+
+// ---- the boundary ---------------------------------------------------------------------------
+
+/// One string across the boundary: the bytes are not NUL-terminated.
+@repr(c)
+export struct XlcStr {
+    bytes: *u8
+    len: u32
+}
+
+/// A list of strings across the boundary.
+@repr(c)
+export struct XlcStrList {
+    items: *XlcStr
+    count: u32
+}
+
+/// The command-line configuration, already parsed into values. Field order and types match
+/// `XlcConfig` in include/xlang/backend_c.h exactly.
+@repr(c)
+export struct XlcConfig {
+    target: XlcStr
+    opt: XlcStr
+    debug: i32
+    cpu: XlcStr
+    mangle: XlcStr
+    safety: XlcStr
+    layoutScheme: XlcStr
+    layoutHistory: XlcStr
+    defines: XlcStrList
+    undefs: XlcStrList
+    allow: XlcStrList
+    deny: XlcStrList
+    warnAll: i32
+    allowAll: i32
+    contextErrors: u64
+    contextWarnings: u64
+    logPath: XlcStr
+    diagFormat: XlcStr
+    diagLogLevel: XlcStr
+    colorMode: XlcStr
+    crt: i32
+}
+
+/// What to write and where. Field order and types match `XlcEmitRequest` exactly.
+@repr(c)
+export struct XlcEmitRequest {
+    root: XlcStr
+    output: XlcStr
+    emit: XlcStr
+    incremental: i32
+    cacheDir: XlcStr
+    inputs: XlcStrList
+    linkArgs: XlcStrList
+}
+
+/// The opaque backend session, behind `xlcSessionNew`/`xlcSessionFree`.
+export type XlcSession = u8
+
+// Every backend function is `declare`d: it resolves at link time from the backend archive
+// (`xlc-backend`), so `--emit=obj` alone always warns W0301; silenced per declaration.
+@allow(W0301)
+export declare fn xlcExplain(code: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcVersion()
+@allow(W0301)
+export declare fn xlcPrintCfg(config: *XlcConfig) -> i32
+@allow(W0301)
+export declare fn xlcDumpAst(config: *XlcConfig, path: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionNew(config: *XlcConfig) -> *XlcSession
+@allow(W0301)
+export declare fn xlcSessionFree(session: *XlcSession)
+@allow(W0301)
+export declare fn xlcSessionAddModuleRoot(session: *XlcSession, spec: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionAddImplicitImport(session: *XlcSession, spec: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionLoadRoot(session: *XlcSession, path: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionAnalyze(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionDumpHir(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionDumpMir(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionDumpLayout(session: *XlcSession, typeName: XlcStr, record: i32) -> i32
+@allow(W0301)
+export declare fn xlcSessionEmit(session: *XlcSession, request: *XlcEmitRequest) -> i32
+@allow(W0301)
+export declare fn xlcSessionHasErrors(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionErrorCount(session: *XlcSession) -> i64
+@allow(W0301)
+export declare fn xlcSessionWarningCount(session: *XlcSession) -> i64
+@allow(W0301)
+export declare fn xlcSessionPrintSummary(session: *XlcSession)
+@allow(W0301)
+export declare fn xlcSessionFlush(session: *XlcSession)
+
+/// The byte an empty boundary string points at: the C++ side wants a valid pointer even for
+/// length zero.
+global kEmptyByte: u8 = 0
+
+/// `String` -> boundary string. The bytes live as long as the String does.
+export fn xstr(s: *String) -> XlcStr {
+    if s.len == 0 {
+        return XlcStr { bytes: &kEmptyByte, len: 0 }
+    }
+    return XlcStr { bytes: s.ptr, len: s.len as u32 }
+}
+
+/// Copies one list into the arena and returns the boundary list. The arena Vec must outlive the
+/// call that uses the result.
+fn xlist(items: *Vec<String>, arena: *Vec<XlcStr>) -> XlcStrList {
+    for i in 0..items.length() {
+        arena.push(xstr(items.get(i)))
+    }
+    return XlcStrList { items: arena.data, count: arena.length() as u32 }
+}
+
+// ---- the options ----------------------------------------------------------------------------
+
+/// Every command-line option, in the order `--help` shows them.
+export class Opts {
+    inputs: Vec<String>
+    output: String
+    emit: String
+    check: bool
+    dumpAst: bool
+    dumpHir: bool
+    dumpMir: bool
+    dumpLayoutSeen: bool
+    dumpLayout: String
+    layoutRecord: bool
+    printCfg: bool
+    incremental: bool
+    cacheDir: String
+    crt: bool
+    linkArgs: Vec<String>
+    moduleRoots: Vec<String>
+    imports: Vec<String>
+    defines: Vec<String>
+    undefs: Vec<String>
+    target: String
+    opt: String
+    debug: bool
+    cpu: String
+    mangle: String
+    safety: String
+    layoutScheme: String
+    layoutHistory: String
+    allow: Vec<String>
+    deny: Vec<String>
+    warnAll: bool
+    allowAll: bool
+    contextErrors: u64
+    contextWarnings: u64
+    logPath: String
+    diagFormat: String
+    diagLogLevel: String
+    color: String
+    explain: String
+    version: bool
+    bad: String
+
+    fn init(self) {
+        self.inputs = Vec<String>()
+        self.moduleRoots = Vec<String>()
+        self.imports = Vec<String>()
+        self.defines = Vec<String>()
+        self.undefs = Vec<String>()
+        self.allow = Vec<String>()
+        self.deny = Vec<String>()
+        self.linkArgs = Vec<String>()
+        self.emit = String("exe")
+        self.cpu = String("generic")
+        self.mangle = String("xl")
+        self.safety = String("checked")
+        self.diagFormat = String("text")
+        self.diagLogLevel = String("all")
+        self.color = String("auto")
+        self.contextErrors = 10
+        self.contextWarnings = 2
+    }
+}
+
+/// The value of `--name=value`, or "" when the argument is the name alone.
+fn eqValue(a: str) -> str {
+    local eq = find(a, "=")
+    if eq < 0 {
+        return ""
+    }
+    return view(a, eq as usize + 1, a.len - eq as usize - 1)
+}
+
+/// Takes the value of an option from the next argument; "" when there is none.
+fn takeValue(argv: *Vec<str>, i: *usize) -> str {
+    if *i >= argv.length() {
+        return ""
+    }
+    local v = *argv.get(*i)
+    *i = *i + 1
+    return v
+}
+
+/// One option value from `--name=value` or the next argument; "" leaves `bad` set.
+fn valueOf(argv: *Vec<str>, i: *usize, a: str, o: *Opts) -> str {
+    local v = eqValue(a)
+    if v.len > 0 {
+        return v
+    }
+    v = takeValue(argv, i)
+    if v.len == 0 {
+        o.bad = format("option `{}` needs a value", a)
+    }
+    return v
+}
+
+/// Checks the enumerated values the C++ CLI checked with `CLI::IsMember`. Sets `bad` and returns
+/// false on the first mismatch.
+fn validate(o: *Opts) -> bool {
+    if o.emit.asStr() != "exe" && o.emit.asStr() != "obj" && o.emit.asStr() != "ir" &&
+            o.emit.asStr() != "bc" && o.emit.asStr() != "header" &&
+            o.emit.asStr() != "static" && o.emit.asStr() != "shared" {
+        o.bad = format("`--emit {}` must be exe|obj|ir|bc|header|static|shared", o.emit.asStr())
+        return false
+    }
+    if o.opt.len > 0 && o.opt.asStr() != "0" && o.opt.asStr() != "1" && o.opt.asStr() != "2" &&
+            o.opt.asStr() != "3" {
+        o.bad = format("`-O {}` must be 0..3", o.opt.asStr())
+        return false
+    }
+    if o.mangle.asStr() != "xl" && o.mangle.asStr() != "none" {
+        o.bad = format("`--mangle {}` must be xl|none", o.mangle.asStr())
+        return false
+    }
+    if o.safety.asStr() != "checked" && o.safety.asStr() != "unchecked" {
+        o.bad = format("`--safety {}` must be checked|unchecked", o.safety.asStr())
+        return false
+    }
+    if o.diagFormat.asStr() != "text" && o.diagFormat.asStr() != "json" {
+        o.bad = format("`--diag-format {}` must be text|json", o.diagFormat.asStr())
+        return false
+    }
+    if o.diagLogLevel.asStr() != "all" && o.diagLogLevel.asStr() != "warn" &&
+            o.diagLogLevel.asStr() != "error" {
+        o.bad = format("`--diag-log-level {}` must be all|warn|error", o.diagLogLevel.asStr())
+        return false
+    }
+    if o.color.asStr() != "auto" && o.color.asStr() != "always" && o.color.asStr() != "never" {
+        o.bad = format("`--color {}` must be auto|always|never", o.color.asStr())
+        return false
+    }
+    return true
+}
+
+/// Parses the command line (without the program name) into `Opts`. On a bad option the message
+/// lands in `bad` and the rest of the line is ignored.
+export fn parseArgs(args: Vec<String>) -> Opts {
+    // The comparisons below run on `str` views into `args`; nothing outlives the call.
+    local argv: Vec<str> = Vec<str>()
+    for i in 0..args.length() {
+        local s = args.get(i)
+        argv.push(fromParts(s.ptr, s.len))
+    }
+    local o: Opts = Opts()
+    local i: usize = 1  // argv[0] is the program name
+    while i < argv.length() {
+        local a = *argv.get(i)
+        i++
+        if !startsWith(a, "-") {
+            o.inputs.push(String(a))
+        } else if a == "--help" {
+            // `--help` prints the usage and stops; nothing after it matters.
+            break
+        } else if a == "--version" {
+            o.version = true
+        } else if startsWith(a, "-Wno-") && a.len > 5 {
+            o.allow.push(String(view(a, 5, a.len - 5)))
+        } else if startsWith(a, "-D") && a.len > 2 {
+            // Attached short forms (`-DNAME=VALUE`): the C++ CLI accepted them, so the CLI keeps
+            // accepting them.
+            o.defines.push(String(view(a, 2, a.len - 2)))
+        } else if startsWith(a, "-U") && a.len > 2 {
+            o.undefs.push(String(view(a, 2, a.len - 2)))
+        } else if startsWith(a, "-M") && a.len > 2 {
+            o.moduleRoots.push(String(view(a, 2, a.len - 2)))
+        } else if startsWith(a, "-o") && a.len > 2 {
+            o.output = String(view(a, 2, a.len - 2))
+        } else if startsWith(a, "--output=") || a == "--output" || a == "-o" {
+            o.output = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--emit=") || a == "--emit" {
+            o.emit = String(valueOf(&argv, &i, a, &o))
+        } else if a == "--check" {
+            o.check = true
+        } else if a == "--dump-ast" {
+            o.dumpAst = true
+        } else if a == "--dump-hir" {
+            o.dumpHir = true
+        } else if a == "--dump-mir" {
+            o.dumpMir = true
+        } else if startsWith(a, "--dump-layout=") || a == "--dump-layout" {
+            // The type name is optional: a following option is not the value.
+            o.dumpLayoutSeen = true
+            if eqValue(a).len > 0 {
+                o.dumpLayout = String(eqValue(a))
+            } else if i < argv.length() && !startsWith(*argv.get(i), "-") {
+                o.dumpLayout = String(takeValue(&argv, &i))
+            }
+        } else if a == "--layout-record" {
+            o.layoutRecord = true
+        } else if a == "--print-cfg" {
+            o.printCfg = true
+        } else if a == "--incremental" {
+            o.incremental = true
+        } else if a == "--crt" {
+            o.crt = true
+        } else if startsWith(a, "--link-arg=") {
+            o.linkArgs.push(String(eqValue(a)))
+        } else if startsWith(a, "--cache-dir=") || a == "--cache-dir" {
+            o.cacheDir = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--module-root=") || a == "--module-root" || a == "-M" {
+            o.moduleRoots.push(String(valueOf(&argv, &i, a, &o)))
+        } else if startsWith(a, "--import=") || a == "--import" {
+            o.imports.push(String(valueOf(&argv, &i, a, &o)))
+        } else if startsWith(a, "--define=") || a == "--define" || a == "-D" {
+            o.defines.push(String(valueOf(&argv, &i, a, &o)))
+        } else if startsWith(a, "--undef=") || a == "--undef" || a == "-U" {
+            o.undefs.push(String(valueOf(&argv, &i, a, &o)))
+        } else if startsWith(a, "--target=") || a == "--target" {
+            o.target = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "-O") && a.len > 2 {
+            o.opt = String(view(a, 2, a.len - 2))
+        } else if a == "-O" {
+            o.opt = String(valueOf(&argv, &i, a, &o))
+        } else if a == "-g" {
+            o.debug = true
+        } else if startsWith(a, "--cpu=") || a == "--cpu" {
+            o.cpu = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--mangle=") || a == "--mangle" {
+            o.mangle = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--safety=") || a == "--safety" {
+            o.safety = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--layout-scheme=") || a == "--layout-scheme" {
+            o.layoutScheme = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--layout-history=") || a == "--layout-history" {
+            o.layoutHistory = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--allow=") || a == "--allow" {
+            o.allow.push(String(valueOf(&argv, &i, a, &o)))
+        } else if startsWith(a, "--deny=") || a == "--deny" {
+            o.deny.push(String(valueOf(&argv, &i, a, &o)))
+        } else if a == "--warn-all" {
+            o.warnAll = true
+        } else if a == "--allow-all" {
+            o.allowAll = true
+        } else if startsWith(a, "--context=") || a == "--context" {
+            // `--context` sets both counts; `--context-errors`/`--context-warnings` below win.
+            local v = String(valueOf(&argv, &i, a, &o))
+            local n: u64 = 0
+            if toU64(v.asStr(), &n) {
+                o.contextErrors = n
+                o.contextWarnings = n
+            } else {
+                o.bad = format("`--context {}` must be a count", v.asStr())
+            }
+        } else if startsWith(a, "--context-errors=") || a == "--context-errors" {
+            local v = String(valueOf(&argv, &i, a, &o))
+            local n: u64 = 0
+            if toU64(v.asStr(), &n) {
+                o.contextErrors = n
+            } else {
+                o.bad = format("`--context-errors {}` must be a count", v.asStr())
+            }
+        } else if startsWith(a, "--context-warnings=") || a == "--context-warnings" {
+            local v = String(valueOf(&argv, &i, a, &o))
+            local n: u64 = 0
+            if toU64(v.asStr(), &n) {
+                o.contextWarnings = n
+            } else {
+                o.bad = format("`--context-warnings {}` must be a count", v.asStr())
+            }
+        } else if startsWith(a, "--diag-log=") || a == "--diag-log" {
+            o.logPath = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--diag-format=") || a == "--diag-format" {
+            o.diagFormat = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--diag-log-level=") || a == "--diag-log-level" {
+            o.diagLogLevel = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--color=") || a == "--color" {
+            o.color = String(valueOf(&argv, &i, a, &o))
+        } else if startsWith(a, "--explain=") || a == "--explain" {
+            o.explain = String(valueOf(&argv, &i, a, &o))
+        } else {
+            o.bad = format("did not expect argument `{}`", a)
+        }
+        if o.bad.len > 0 {
+            return o
+        }
+    }
+    if !validate(&o) {
+        return o
+    }
+    return o
+}
+
+/// The usage the C++ CLI printed through CLI11.
+export fn printHelp() {
+    print("xlc: the xlang compiler\n")
+    print("Usage: xlc [OPTIONS] INPUT.xl [INPUTS...] [-o OUT] [--emit=KIND]\n\n")
+    print("  INPUT...                   Program root (.xl) followed by prebuilt objects/libraries to link\n")
+    print("  -o, --output TEXT          Output file (default: next to the input)\n")
+    print("      --emit KIND            exe|obj|ir|bc|header|static|shared (default exe)\n")
+    print("      --check                Parse, analyze and lower; write nothing (like -fsyntax-only)\n")
+    print("      --dump-ast             Parse only: print the AST summary\n")
+    print("      --dump-hir             Analyze and lower: print the typed HIR\n")
+    print("      --dump-mir             Analyze and lower: print the control-flow graph (MIR)\n")
+    print("      --dump-layout [TYPE]   Print offset/size/align of every struct and class, or of TYPE\n")
+    print("      --layout-record        With --dump-layout: write the layouts to the history file\n")
+    print("      --print-cfg            Print every resolved definition and exit\n")
+    print("      --incremental          One object per module, reused from the cache when unchanged\n")
+    print("      --crt                  Link the platform CRT and C++ runtime (for programs with C++ code)\n")
+    print("      --link-arg ARG         Extra argument passed to the linker verbatim\n")
+    print("      --cache-dir TEXT       Object cache directory (default: .xlc-cache next to the output)\n")
+    print("  -M, --module-root NAME=DIR `import \"NAME\"` and `\"NAME/x\"` resolve inside DIR (repeatable)\n")
+    print("      --import SPEC          Load module SPEC into the program though nothing imports it (repeatable)\n")
+    print("  -D, --define NAME[=VALUE]  Define NAME (repeatable)\n")
+    print("  -U, --undef NAME           Remove a user definition (repeatable)\n")
+    print("      --target TEXT          Target triple, e.g. aarch64-apple-darwin\n")
+    print("  -O LEVEL                   Optimization level 0..3 (`-O2`)\n")
+    print("  -g                         Debug info (`debug` = true)\n")
+    print("      --cpu TEXT             Target CPU (default generic)\n")
+    print("      --mangle SCHEME        xl|none\n")
+    print("      --safety MODE          checked|unchecked\n")
+    print("      --layout-scheme TEXT   Pin the default layout scheme (v1)\n")
+    print("      --layout-history FILE  Layout history file (default xl.layout next to the input)\n")
+    print("      --allow CODE           Silence warning CODE (repeatable); `-Wno-CODE` is the same\n")
+    print("      --deny CODE            Turn warning CODE into an error (repeatable)\n")
+    print("      --warn-all             Enable every warning, ignoring --allow and @allow\n")
+    print("      --allow-all            Silence every warning\n")
+    print("      --context N            Context lines around marks for errors and warnings\n")
+    print("      --context-errors N     Context lines for errors (default 10)\n")
+    print("      --context-warnings N   Context lines for warnings (default 2)\n")
+    print("      --diag-log FILE        Write every diagnostic (suppressed ones included) to FILE\n")
+    print("      --diag-format FMT      Diagnostic format: text|json\n")
+    print("      --diag-log-level LVL   Log level: all|warn|error\n")
+    print("      --color MODE           Colored output: auto (terminals; NO_COLOR turns it off), always or never\n")
+    print("      --explain CODE         Print the long explanation of a diagnostic code\n")
+    print("      --version              Print the version\n")
+    print("  -h, --help                 Print this help and exit\n")
+}
+
+// ---- the boundary configuration -------------------------------------------------------------
+
+/// The arenas a `XlcConfig` points into: keep it alive as long as the config is in use.
+export class ConfigArena {
+    defines: Vec<XlcStr>
+    undefs: Vec<XlcStr>
+    allow: Vec<XlcStr>
+    deny: Vec<XlcStr>
+    cfg: XlcConfig
+
+    fn init(self) {
+        self.defines = Vec<XlcStr>()
+        self.undefs = Vec<XlcStr>()
+        self.allow = Vec<XlcStr>()
+        self.deny = Vec<XlcStr>()
+    }
+}
+
+/// Fills the boundary configuration from the parsed options.
+export fn buildConfig(o: *Opts, arena: *ConfigArena) -> *XlcConfig {
+    arena.cfg.target = xstr(&o.target)
+    arena.cfg.opt = xstr(&o.opt)
+    arena.cfg.debug = o.debug ? 1 : 0
+    arena.cfg.cpu = xstr(&o.cpu)
+    arena.cfg.mangle = xstr(&o.mangle)
+    arena.cfg.safety = xstr(&o.safety)
+    arena.cfg.layoutScheme = xstr(&o.layoutScheme)
+    arena.cfg.layoutHistory = xstr(&o.layoutHistory)
+    arena.cfg.defines = xlist(&o.defines, &arena.defines)
+    arena.cfg.undefs = xlist(&o.undefs, &arena.undefs)
+    arena.cfg.allow = xlist(&o.allow, &arena.allow)
+    arena.cfg.deny = xlist(&o.deny, &arena.deny)
+    arena.cfg.warnAll = o.warnAll ? 1 : 0
+    arena.cfg.allowAll = o.allowAll ? 1 : 0
+    arena.cfg.contextErrors = o.contextErrors
+    arena.cfg.contextWarnings = o.contextWarnings
+    arena.cfg.logPath = xstr(&o.logPath)
+    arena.cfg.diagFormat = xstr(&o.diagFormat)
+    arena.cfg.diagLogLevel = xstr(&o.diagLogLevel)
+    arena.cfg.colorMode = xstr(&o.color)
+    arena.cfg.crt = o.crt ? 1 : 0
+    return &arena.cfg
+}
+
+/// Fills the boundary emit request from the parsed options; `inputs` are the link inputs (the
+/// program root excluded). The arena must outlive the call.
+export fn buildEmitRequest(o: *Opts, root: *String, inputs: *Vec<String>, arena: *Vec<XlcStr>,
+                           linkArena: *Vec<XlcStr>) -> XlcEmitRequest {
+    local req: XlcEmitRequest
+    req.root = xstr(root)
+    req.output = xstr(&o.output)
+    req.emit = xstr(&o.emit)
+    req.incremental = o.incremental ? 1 : 0
+    req.cacheDir = xstr(&o.cacheDir)
+    req.inputs = xlist(inputs, arena)
+    req.linkArgs = xlist(&o.linkArgs, linkArena)
+    return req
+}

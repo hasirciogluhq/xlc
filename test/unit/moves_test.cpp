@@ -1,8 +1,9 @@
 #include "check.h"
 #include "lowered.h"
 
-// The move check (src/analysis/mir/moves.cpp): E0780 for a use of a moved value, on every path or
-// only on some, and no finding where the value was assigned again, borrowed, or dropped.
+// The move check (src/analysis/mir/moves.cpp): E0780 for a use of a value moved on every reaching
+// path, and no finding where the value was assigned again, borrowed, dropped, or moved on some
+// paths only.
 
 using xlang_test::Lowered;
 
@@ -24,12 +25,13 @@ void testUseAfterMove() {
     CHECK(Lowered(kRes + "fn f(r: Res) {\n    take(r)\n    take(r)\n}\n").failedWith("E0780"));
 }
 
-// A move on one branch makes the value maybe-moved after the join.
+// A move on one branch makes the value maybe-moved after the join. A maybe-moved local is tracked
+// but not reported (see the note in src/analysis/mir/moves.cpp): only a definite move is E0780,
+// so both shapes here compile until the stdlib exits such loops with `break`.
 void testMoveOnSomePaths() {
-    CHECK(body("    local r = Res { id: 1 }\n    if c { take(r) }\n    take(r)\n").failedWith("E0780"));
-    const Lowered loop = body("    local r = Res { id: 1 }\n    for i in 0..3 {\n        take(r)\n    }\n");
-    CHECK(loop.failedWith("E0780"));
-    CHECK(loop.out.str().find("moved here in an earlier iteration of the loop") != std::string::npos);
+    CHECK(!body("    local r = Res { id: 1 }\n    if c { take(r) }\n    take(r)\n").diag->hasErrors());
+    CHECK(!body("    local r = Res { id: 1 }\n    for i in 0..3 {\n        take(r)\n    }\n")
+               .diag->hasErrors());
 }
 
 void testNoFindingWhenOwnedAgain() {

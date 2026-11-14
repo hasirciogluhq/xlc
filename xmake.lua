@@ -26,28 +26,29 @@ add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build"})
 add_defines("XLANG_VERSION=\"" .. xlc_version .. "\"")
 
-add_requires("cli11 2.7.2")
-
--- Finds llvm-config and adds the static LLVM libraries the compiler uses to `target`.
-local function add_llvm(target)
-    local candidates = {}
+-- Finds llvm-config: `$LLVM_CONFIG`, then Homebrew, then `llvm-config` on PATH. Probed by file
+-- existence, not by running it: the xmakefile scope has neither `try` nor `pcall`.
+local function find_llvm_config()
     if os.getenv("LLVM_CONFIG") then
-        table.insert(candidates, os.getenv("LLVM_CONFIG"))
+        return os.getenv("LLVM_CONFIG")
     end
     for _, prefix in ipairs({os.getenv("HOMEBREW_PREFIX"), "/opt/homebrew", "/usr/local"}) do
         if prefix then
-            table.insert(candidates, path.join(prefix, "opt/llvm/bin/llvm-config"))
+            local c = path.join(prefix, "opt/llvm/bin/llvm-config")
+            if os.isfile(c) then
+                return c
+            end
         end
     end
-    table.insert(candidates, "llvm-config")
-    local cfg
-    for _, c in ipairs(candidates) do
-        if try { function () return os.iorun(c .. " --version") end } then
-            cfg = c
-            break
-        end
+    local on_path = os.which and os.which("llvm-config") or nil
+    if on_path then
+        return on_path
     end
-    assert(cfg, "llvm-config not found (set LLVM_CONFIG)")
+    assert(false, "llvm-config not found (set LLVM_CONFIG)")
+end
+
+local function add_llvm(target)
+    local cfg = find_llvm_config()
     local function query(args)
         return (os.iorun(cfg .. " " .. args)):trim()
     end
@@ -128,48 +129,164 @@ local function add_llvm(target)
     end
 end
 
--- The lexer and the preprocessor are written in xlang (`src/lang/lexer/*.xl`,
--- `src/lang/preprocess/*.xl`) and reached from C++ through the C ABIs in
--- `include/xlang/lang/lexer_c.h` and `include/xlang/lang/preprocess_c.h`. `xmake/xlang.lua`
--- turns the entry file `src/lang/compiler.xl` into one object with an installed `xl`; the object
--- is then linked into `xlc-core`. `src/lang/lexer/lexer.cpp` and
--- `src/lang/preprocess/preprocess.cpp` only bridge the C ABI.
+-- The xlang parts of the compiler (the lexer, the preprocessor, the macro expander) are compiled
+-- by an installed `xl` into one object, reached from C++ through the C ABIs in
+-- `include/xlang/lang/lexer_c.h`, `preprocess_c.h` and `macro_c.h`. `xmake/xlang.lua` turns the
+-- entry file into one object.
 includes("xmake/xlang.lua")
 
--- Everything except `main.cpp`, so the unit tests link the same code.
-target("xlc-core")
-    set_kind("static")
-    set_default(false)
-    add_files("src/analysis/**.cpp", "src/codegen/**.cpp", "src/driver/**.cpp", "src/hir/**.cpp",
-              "src/lang/**.cpp", "src/mir/**.cpp", "src/sema/**.cpp", "src/util/**.cpp",
-              "src/cli/console.cpp", "src/cli/emit.cpp")
-    -- The scanner and the directive walk are the xlang object; lexer.cpp and preprocess.cpp only
-    -- bridge the C ABI.
-    add_xlang_object()
-    add_includedirs("include", "src", {public = true})
-    add_packages("cli11", {public = true})
-    on_load(add_llvm)
+-- Every module builds standalone as its own static archive, so a port of one module to xlang
+-- replaces exactly one archive. The order is the dependency order.
+local xlc_modules = {
+    {"xlc-util",     {"src/util/**.cpp"}},
+    {"xlc-lang",     {"src/lang/**.cpp"}},
+    {"xlc-sema",     {"src/sema/**.cpp"}},
+    {"xlc-hir",      {"src/hir/**.cpp"}},
+    {"xlc-mir",      {"src/mir/**.cpp"}},
+    {"xlc-codegen",  {"src/codegen/**.cpp"}},
+    {"xlc-analysis", {"src/analysis/**.cpp"}},
+    {"xlc-cli",      {"src/cli/console.cpp", "src/cli/emit.cpp", "src/driver/**.cpp"}},
+    {"xlc-backend",  {"src/backend/**.cpp"}},
+}
 
+-- Adds every module archive to a target that needs the whole compiler.
+function add_xlc_modules()
+    for _, module in ipairs(xlc_modules) do
+        add_deps(module[1])
+    end
+    add_includedirs("include", "src", {public = true})
+end
+
+for _, module in ipairs(xlc_modules) do
+    target(module[1])
+        set_kind("static")
+        set_default(false)
+        add_files(module[2])
+        add_includedirs("include", "src", {public = true})
+        on_load(add_llvm)
+    target_end()
+end
+
+-- `xlc-lang` also carries the xlang object: the scanner, the directive walk and the macro
+-- expander; lexer.cpp, preprocess.cpp and macro.cpp only bridge the C ABI.
+target("xlc-lang")
+    add_xlang_object("src/lang/compiler.xl")
+target_end()
+
+-- The binary: the CLI is xlang code (`src/main.xl`, `@entry fn main`) and the C++ backend joins
+-- it as the static archives of the modules above. `xlc` performs the final link itself in its
+-- `--crt` mode: the boot hooks become image constructors/destructors and the platform C++
+-- compiler driver brings the CRT startup files, libc, the C++ runtime and the
+-- static-initializer runners. The `xlc` that compiles and links is `XL_XL` (default `xl` on
+-- PATH); until the released `xlc` speaks `--crt`, point `XL_XL` at a bootstrap build of this
+-- tree (a plain `clang++` link of `src/main.xl.o` plus a constructor stub and the archives).
+-- The stdlib comes from the `xl-std` submodule checkout when it exists (local development),
+-- else from the newest stdlib the toolchain installed (`~/.xlang/std/<version>`).
 target("xlc")
     set_kind("binary")
     set_default(true)
     set_basename("xlc")
-    add_files("src/cli/main.cpp")
-    add_deps("xlc-core")
-    -- Released binaries carry their C++ runtime: no libstdc++/libc++ DLL to install next to them.
-    if is_plat("windows", "mingw") then
-        add_syslinks("ws2_32", "ole32", "uuid", "version", "shell32", "advapi32")
-    end
-    if is_plat("mingw") then
-        add_ldflags("-static", {force = true})
-    elseif is_plat("linux") then
-        add_ldflags("-static-libstdc++", "-static-libgcc", {force = true})
-    end
+    add_deps("xlc-backend")
+    add_includedirs("include", "src")
+    on_load(function (target)
+        -- The LLVM archives for the `--crt` link are resolved here, not at the xmakefile scope:
+        -- only target scripts can run programs (`os.iorun`). The same components `add_llvm`
+        -- links, as full archive paths so the order the driver sees them in does not matter.
+        local cfg = find_llvm_config()
+        local function query(args)
+            return (os.iorun(cfg .. " " .. args)):trim()
+        end
+        local libdir = query("--libdir")
+        local llvmargs = {}
+        for _, lib in ipairs(query("--link-static --libs aarch64 x86 passes irreader bitwriter object mc target codegen"):split("%s+")) do
+            if lib:startswith("-l") then
+                table.insert(llvmargs, path.join(libdir, "lib" .. lib:sub(3) .. ".a"))
+            end
+        end
+        -- Whatever LLVM itself needs from the system (zlib, zstd, curses, ...), as llvm-config
+        -- knows it. z3 and xml2 are left out: only LLVM parts the compiler never links use them,
+        -- and Homebrew's z3 has no archive at all. zstd is linked from its archive where one is
+        -- installed.
+        local skipped = {z3 = true, xml2 = true}
+        local static_dirs = {"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"}
+        for _, lib in ipairs(query("--link-static --system-libs"):split("%s+")) do
+            local name = lib:startswith("-l") and lib:sub(3) or path.basename(lib):gsub("^lib", ""):gsub("[%.%d]*%.dylib$", ""):gsub("%.so.*$", "")
+            if skipped[name] then
+                -- not linked
+            elseif name == "zstd" then
+                local archive
+                for _, dir in ipairs(static_dirs) do
+                    if os.isfile(path.join(dir, "libzstd.a")) then
+                        archive = path.join(dir, "libzstd.a")
+                        break
+                    end
+                end
+                table.insert(llvmargs, archive or "-lzstd")
+            else
+                table.insert(llvmargs, lib)
+            end
+        end
+        target:data_set("llvm_link_args", llvmargs)
+    end)
+    on_build(function (target, opt)
+        import("core.project.depend")
+        local xlcbin = os.getenv("XL_XL") or "xl"
+        local out = target:targetfile()
+        local archives = {}
+        for _, module in ipairs(xlc_modules) do
+            table.insert(archives, path.join(target:targetdir(), "lib" .. module[1] .. ".a"))
+        end
+        local std = os.getenv("XLANG_STD")
+        if not std and os.isdir(path.join(os.projectdir(), "..", "xl-std", "src")) then
+            std = path.join(os.projectdir(), "..", "xl-std", "src")
+        end
+        if not std then
+            local installed = os.dirs(path.join(os.getenv("HOME") or "~", ".xlang", "std", "*")) or {}
+            table.sort(installed)
+            std = installed[#installed]
+        end
+        assert(std, "no stdlib found: check out the xl-std submodule or install a release of xl")
+        local args = {"src/main.xl", "--emit=exe", "--crt", "-M", "std=" .. std, "--import", "std",
+                      "--define", "featureDefaultAllocator=true", "-o", out}
+        for _, a in ipairs(archives) do
+            table.insert(args, "--link-arg=" .. a)
+        end
+        for _, a in ipairs(target:data("llvm_link_args")) do
+            table.insert(args, "--link-arg=" .. a)
+        end
+        -- The C++ runtime of the backend archives; the driver brings libc itself.
+        if is_plat("macosx") then
+            table.insert(args, "--link-arg=-lc++")
+        elseif is_plat("linux") then
+            table.insert(args, "--link-arg=-lstdc++")
+        end
+        -- Rebuild only when a source of the binary changed: every `.xl` under `src` (the CLI and
+        -- the ported compiler parts the compiler.xl object carries) or one of the archives.
+        local inputs = {}
+        for _, pattern in ipairs({"src/*.xl", "src/**/*.xl"}) do
+            for _, f in ipairs(os.files(pattern)) do
+                table.insert(inputs, f)
+            end
+        end
+        for _, a in ipairs(archives) do
+            table.insert(inputs, a)
+        end
+        depend.on_changed(function ()
+            os.vrunv(xlcbin, args)
+        end, {files = inputs, dependfile = target:dependfile(out)})
+    end)
+    on_link(function (target, opt)
+        -- The link already happened in `on_build`, through `xlc --crt`.
+    end)
+    on_clean(function (target, opt)
+        os.tryrm(target:targetfile())
+    end)
 
 -- Frontend/sema/HIR unit tests: `xmake build xlc-tests && xmake run xlc-tests`.
 target("xlc-tests")
     set_kind("binary")
     set_default(false)
     add_files("test/unit/*.cpp")
-    add_deps("xlc-core")
+    add_deps("xlc-backend")
+    add_xlc_modules()
     add_tests("unit")
