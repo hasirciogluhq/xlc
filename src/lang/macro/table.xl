@@ -1,0 +1,86 @@
+// The macro table on the xlang side of the C ABI: the seed macros the C++ side passes in (the
+// exported macros of the imported modules) plus the ones collected from the token stream itself.
+//
+// The boundary structs are the flat `CMacro`/`CMacroParam` of ../abi; this file copies them into
+// owned `String`/`Vec` storage so the expander never reads behind C++'s back.
+from "std" import String, Vec
+from "std/str" import fromParts
+from "../abi" import CMacro, CMacroParam, CToken, MP_EXPR
+
+/// One macro parameter: its kind (`MP_EXPR`..`MP_ITEMS`) and its name.
+export class MParam {
+    kind: i32
+    name: String
+
+    fn init(self, kind: i32, name: String) {
+        self.kind = kind
+        self.name = name
+    }
+}
+
+/// One macro definition: the name, the parameters and the raw body tokens between the outer
+/// braces. The body tokens' texts point into the caller's blocks, which outlive one
+/// `xlcExpandMacros` call.
+export class MDef {
+    name: String
+    params: Vec<MParam>
+    body: Vec<CToken>
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+
+    fn init(self, name: String, line: u32, column: u32, endLine: u32, endColumn: u32) {
+        self.name = name
+        self.params = Vec<MParam>()
+        self.body = Vec<CToken>()
+        self.line = line
+        self.column = column
+        self.endLine = endLine
+        self.endColumn = endColumn
+    }
+}
+
+/// The macros visible to one expansion, seeded from the imported modules and grown by the
+/// definitions the expander collects from the token stream. Lookup is a linear scan: the tables
+/// hold a handful of macros at most.
+export class MTable {
+    defs: Vec<MDef>
+
+    fn init(self) {
+        self.defs = Vec<MDef>()
+    }
+
+    /// The index of the macro called `name`, or -1 when there is none.
+    fn find(self, name: str) -> i32 {
+        for i in 0..self.defs.length() {
+            if self.defs.get(i).name.asStr() == name {
+                return i as i32
+            }
+        }
+        return -1
+    }
+
+    /// Appends `def`; the caller checks for duplicates first.
+    fn put(self, def: MDef) {
+        self.defs.push(def)
+    }
+
+    /// Copies the flat `CMacro` array of the boundary into owned storage.
+    fn load(self, macros: *CMacro, count: u32) {
+        for i in 0..count as usize {
+            local m = (macros as usize + i * sizeOf(CMacro)) as *CMacro
+            local name = String(fromParts(m.name, m.nameLen as usize))
+            local def = MDef(name, m.line, m.column, m.endLine, m.endColumn)
+            for k in 0..m.paramCount as usize {
+                local p = (m.params as usize + k * sizeOf(CMacroParam)) as *CMacroParam
+                def.params.push(MParam(p.kind, String(fromParts(p.name, p.nameLen as usize))))
+            }
+            for k in 0..m.bodyLen as usize {
+                local t = (m.body as usize + k * sizeOf(CToken)) as *CToken
+                def.body.push(*t)
+            }
+            self.defs.push(def)
+        }
+    }
+}

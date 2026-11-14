@@ -138,7 +138,7 @@ which keeps the view in the same commit as the tag it came from.
 <!-- written by scripts/tags.sh sync; every line below is a tag found in src/ and
      include/, grouped by tag and then by file. Do not edit inside the markers. -->
 
-### @grammar (107)
+### @grammar (105)
 
 ```
 include/xlang/lang/ast.h:21:/// @grammar the five prefix operators: `-e`, `!e`, `*e`, `&e`, `~e`
@@ -147,8 +147,6 @@ include/xlang/lang/ast.h:25:/// @grammar `&&`, `||`, `&`, `|`, `^`, `<<`, `>>` (
 include/xlang/lang/lexer.h:12:/// @grammar every lexical token the parser can see; the spellings are fixed by `lexer.cpp` and
 include/xlang/lang/lexer.h:13:/// @grammar the language grammar in the parser's `@grammar` comments uses these tokens
 src/lang/lexer/lexer.cpp:18:/// @grammar the whole token stream of one file, always ending with `TokenKind::End`
-src/lang/macro/macro.cpp:375:/// @grammar `name!(args...)`: each argument is matched against the parameter kinds `expr`,
-src/lang/macro/macro.cpp:376:/// @grammar `type`, `ident`, `block`, `items`, and the body is substituted hygienically
 src/lang/parser/attributes.cpp:7:/// @grammar `@name`, `@name(a, key = v, ...)`, `@file(name(...))` at the top of a file
 src/lang/parser/attributes.cpp:37:/// @grammar the value of an attribute argument: an identifier, an integer literal or a string
 src/lang/parser/attributes.cpp:65:/// @grammar one or more `@attribute` lines before an item, a statement or a parameter
@@ -354,5 +352,5 @@ include/xlang/mir/mir.h:29:// @todo MIR does not yet carry what only code genera
 src/mir/dataflow/forward.hpp:25:/// @cost each block is processed once per change of its entry fact: at most (lattice height) times.
 ```
 
-Total: 176 tag lines.
+Total: 174 tag lines.
 <!-- END COLLECTED TAGS -->

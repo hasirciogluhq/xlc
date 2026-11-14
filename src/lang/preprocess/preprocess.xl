@@ -10,7 +10,7 @@
 // (include/xlang/lang/preprocess_c.h); everything here is the implementation behind them.
 from "std" import String, Vec, format
 from "std/str" import fromParts
-from "../abi" import CToken, CDefine, CPreResult
+from "../abi" import CToken, CDefine, CPreResult, CError, CLabel
 from "../lexer/tokens" import K_EXPORT, K_DEFINE, K_IDENT, K_ASSIGN, K_INT, K_STRING, K_TRUE,
     K_FALSE, K_END, K_DIR_IF, K_DIR_ELIF, K_DIR_ELSE, K_DIR_ENDIF, K_DIR_IFDEF, K_DIR_IFNDEF,
     K_DIR_ERROR
@@ -50,6 +50,10 @@ class Preprocessor {
     out: Vec<CToken>
     sink: *DiagSink
     parser: *CondParser
+    /// The frozen error arrays of `run`: their buffers back the result's `CError`/`CLabel`
+    /// pointers and are dropped with the preprocessor.
+    errorVecs: Vec<CError>
+    labelVecs: Vec<CLabel>
 
     fn init(self, tokens: *CToken, count: u32, defs: *CDefine, defCount: u32) {
         self.toks = Vec<CToken>()
@@ -336,9 +340,14 @@ class Preprocessor {
             result.tokens = self.out.data
             result.tokenCount = self.out.length() as u32
         }
-        if self.sink.errors.length() > 0 {
-            result.errors = self.sink.errors.data
-            result.errorCount = self.sink.errors.length() as u32
+        if self.sink.hasErrors() {
+            local errs = Vec<CError>()
+            local labels = Vec<CLabel>()
+            self.sink.build(&errs, &labels)
+            result.errors = errs.data
+            result.errorCount = errs.length() as u32
+            self.errorVecs = errs
+            self.labelVecs = labels
         }
         return result
     }

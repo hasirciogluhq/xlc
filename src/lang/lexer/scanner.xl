@@ -7,7 +7,7 @@
 // 1-based and count bytes. `line`/`column` are the cursor now; `begin` freezes it at a token's
 // first byte and `finish` closes the span at the cursor.
 from "std" import String, Vec
-from "../abi" import CToken, CError
+from "../abi" import CToken, CError, CLabel
 from "../lexer/tokens" import K_END
 from "../lexer/chars" import isTriviaSpace
 
@@ -39,6 +39,9 @@ export class Scanner {
     errors: Vec<CError>
     /// The `String`s the emitted tokens point into: their bytes back `CToken.text`.
     owned: Vec<String>
+    /// The per-error label vectors: `CError.labels` points into their buffers, which stop moving
+    /// once the error is recorded.
+    labelVecs: Vec<Vec<CLabel>>
 
     fn init(self, text: str) {
         self.text = text
@@ -55,6 +58,7 @@ export class Scanner {
         self.newlineBefore = false
         self.newlinePending = true
         self.atLineStart = true
+        self.labelVecs = Vec<Vec<CLabel>>()
     }
 
     /// The byte at `ahead` past the cursor, or 0 at the end of the file.
@@ -130,19 +134,25 @@ export class Scanner {
                label: String) {
         local msg = message.clone()
         local lbl = label.clone()
-        local e = CError {
-            message: msg.ptr,
-            messageLen: msg.len as u32,
-            label: lbl.ptr,
-            labelLen: lbl.len as u32,
+        local labels = Vec<CLabel>()
+        labels.push(CLabel {
+            text: lbl.ptr,
+            textLen: lbl.len as u32,
             line: line,
             column: column,
             endLine: endLine,
             endColumn: endColumn,
+        })
+        local e = CError {
+            message: msg.ptr,
+            messageLen: msg.len as u32,
+            labelCount: 1,
+            labels: labels.data,
         }
         self.errors.push(e)
         self.owned.push(msg)
         self.owned.push(lbl)
+        self.labelVecs.push(labels)
     }
 
     /// Turns the open token into a `CToken` and appends it. The spelling is kept in `owned`.

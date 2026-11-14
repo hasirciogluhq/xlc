@@ -103,12 +103,16 @@ std::vector<Token> preprocess(std::vector<Token> tokens, const BuildConfig& conf
         const XlcLexError& raw = result.errors[i];
         Span span;
         span.file = file;
-        span.line = raw.line;
-        span.column = raw.column;
-        span.end_line = raw.end_line;
-        span.end_column = raw.end_column;
+        if (raw.label_count > 0) {
+            span.line = raw.labels[0].line;
+            span.column = raw.labels[0].column;
+            span.end_line = raw.labels[0].end_line;
+            span.end_column = raw.labels[0].end_column;
+        }
         diagnostics.error("E0003", span, std::string(raw.message, raw.message_len),
-                          std::string(raw.label, raw.label_len));
+                          raw.label_count > 0
+                              ? std::string(raw.labels[0].text, raw.labels[0].text_len)
+                              : std::string());
     }
     xlcPreprocessFree(result);
     return out;

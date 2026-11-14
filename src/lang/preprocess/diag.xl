@@ -1,41 +1,115 @@
-// The diagnostic sink of the preprocessor: the E0003 records of one run and the strings behind
-// them. The C++ side stamps the code and the file onto what lands here.
+// The diagnostic sink of the preprocessor and the macro expander: the error records of one run
+// and the strings behind them. The C++ side stamps the code and the file onto what lands here.
 //
-// The sink is its own class so the condition parser and the structure walk can share it without
-// importing each other.
+// The sink is its own class so the condition parser, the structure walk and the expander can
+// share it without importing each other. Errors are collected as owned `Diag` values and frozen
+// into the flat `CError`/`CLabel` arrays only once, at the end of the run: the label pointers of
+// a `CError` must point into a buffer that no longer moves.
 from "std" import String, Vec
-from "../abi" import CError
+from "../abi" import CError, CLabel
+
+/// One label at freeze time: the text and the span it points at.
+export class Lbl {
+    text: String
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+
+    fn init(self, text: String, line: u32, column: u32, endLine: u32, endColumn: u32) {
+        self.text = text
+        self.line = line
+        self.column = column
+        self.endLine = endLine
+        self.endColumn = endColumn
+    }
+}
+
+/// One recorded error: the message and every label, primary first.
+export class Diag {
+    message: String
+    labels: Vec<Lbl>
+
+    fn init(self, message: String) {
+        self.message = message
+        self.labels = Vec<Lbl>()
+    }
+}
 
 export class DiagSink {
-    errors: Vec<CError>
-    /// The `String`s the recorded errors point into; dropped with the sink.
-    owned: Vec<String>
+    diags: Vec<Diag>
 
     fn init(self) {
-        self.errors = Vec<CError>()
-        self.owned = Vec<String>()
+        self.diags = Vec<Diag>()
     }
 
-    /// Records one error at the given span, unless `quiet` is above zero: a nested directive peek
-    /// parses a condition only to find where its body starts, and its failures stay silent.
+    /// Records one error with one label at the given span, unless `quiet` is above zero: a
+    /// nested directive peek parses a condition only to find where its body starts, and its
+    /// failures stay silent.
     fn fail(self, quiet: i32, line: u32, column: u32, endLine: u32, endColumn: u32,
             message: String, label: String) {
         if quiet > 0 {
             return
         }
-        local msg = message.clone()
-        local lbl = label.clone()
-        self.errors.push(CError {
-            message: msg.ptr,
-            messageLen: msg.len as u32,
-            label: lbl.ptr,
-            labelLen: lbl.len as u32,
-            line: line,
-            column: column,
-            endLine: endLine,
-            endColumn: endColumn,
-        })
-        self.owned.push(msg)
-        self.owned.push(lbl)
+        local d = Diag(message.clone())
+        d.labels.push(Lbl(label.clone(), line, column, endLine, endColumn))
+        self.diags.push(d)
+    }
+
+    /// Records one error with a label per expansion chain entry, primary first, unless `quiet`
+    /// is above zero.
+    fn failChain(self, quiet: i32, message: String, labels: Vec<Lbl>) {
+        if quiet > 0 {
+            return
+        }
+        local d = Diag(message.clone())
+        for i in 0..labels.length() {
+            local l = labels.get(i)
+            d.labels.push(Lbl(l.text.clone(), l.line, l.column, l.endLine, l.endColumn))
+        }
+        self.diags.push(d)
+    }
+
+    /// True when at least one error was recorded.
+    fn hasErrors(self) -> bool {
+        return self.diags.length() > 0
+    }
+
+    /// Freezes the recorded errors into the flat boundary arrays. The `CError.labels` pointers
+    /// point into `*allLabels`, which must outlive the result; both vectors are dropped by the
+    /// owner of the block.
+    fn build(self, errs: *Vec<CError>, allLabels: *Vec<CLabel>) {
+        local count = self.diags.length()
+        for i in 0..count {
+            local d = self.diags.get(i)
+            local first = allLabels.length()
+            for k in 0..d.labels.length() {
+                local l = d.labels.get(k)
+                allLabels.push(CLabel {
+                    text: l.text.ptr,
+                    textLen: l.text.len as u32,
+                    line: l.line,
+                    column: l.column,
+                    endLine: l.endLine,
+                    endColumn: l.endColumn,
+                })
+            }
+            errs.push(CError {
+                message: d.message.ptr,
+                messageLen: d.message.len as u32,
+                labelCount: (allLabels.length() - first) as u32,
+                labels: nil, ///< fixed below, once `allLabels` stops growing
+            })
+        }
+        // The label buffer is final now; point every error at its slice.
+        local base = allLabels.data as usize
+        for i in 0..errs.length() {
+            local e = errs.get(i)
+            local first: usize = 0
+            for k in 0..i {
+                first = first + (errs.get(k).labelCount as usize)
+            }
+            e.labels = (base + (first * (sizeOf(CLabel) as usize))) as *CLabel
+        }
     }
 }

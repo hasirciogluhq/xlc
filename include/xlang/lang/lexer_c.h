@@ -37,16 +37,23 @@ typedef struct XlcLexToken {
     int32_t newline_before;  ///< 0 or 1
 } XlcLexToken;
 
-/// One lexical error: the code is always E0001, as the C++ lexer reported it.
-typedef struct XlcLexError {
-    const char* message;  ///< not NUL-terminated
-    uint32_t message_len;
-    const char* label;  ///< not NUL-terminated; empty when there is none
-    uint32_t label_len;
+/// One label of an error: a span and its text. The first label of an error is the primary one.
+typedef struct XlcLexLabel {
+    const char* text;  ///< not NUL-terminated
+    uint32_t text_len;
     uint32_t line;
     uint32_t column;
     uint32_t end_line;
     uint32_t end_column;
+} XlcLexLabel;
+
+/// One lexical error: the code is always E0001, as the C++ lexer reported it. A lexical error
+/// carries exactly one label.
+typedef struct XlcLexError {
+    const char* message;  ///< not NUL-terminated
+    uint32_t message_len;
+    uint32_t label_count;
+    const XlcLexLabel* labels;
 } XlcLexError;
 
 /// The frozen outcome of one file: tokens (always ending in kind 0, end of file) and the errors

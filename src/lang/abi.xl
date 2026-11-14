@@ -1,9 +1,12 @@
-// The C ABI shared by the xlang parts of the compiler (the lexer, the preprocessor).
+// The C ABI shared by the xlang parts of the compiler (the lexer, the preprocessor, the macro
+// expander).
 //
-// Every struct here is the layout of a struct in include/xlang/lang/lexer_c.h or
-// include/xlang/lang/preprocess_c.h, field for field. A part fills its result and hands it to
-// C++; the C++ side copies what it keeps and releases the whole block through the result's
-// `block` handle, so nothing on this side is freed behind C++'s back.
+// Every struct here is the layout of a struct in include/xlang/lang/lexer_c.h,
+// include/xlang/lang/preprocess_c.h or include/xlang/lang/macro_c.h, field for field. A part
+// fills its result and hands it to C++; the C++ side copies what it keeps and releases the whole
+// block through the result's `block` handle, so nothing on this side is freed behind C++'s back.
+// The structs stay flat: a nested struct shifted the offsets once already (a u32 followed by an
+// i64-aligned nested struct), so every struct is one flat field list mirrored on both sides.
 
 /// One token; field for field the `XlcLexToken` of lexer_c.h.
 /// `text` points into a block the caller owns; it is not NUL-terminated.
@@ -21,19 +24,27 @@ export struct CToken {
     newlineBefore: u32 ///< 0 or 1
 }
 
-/// One lexical or preprocessing error; the `XlcLexError` of lexer_c.h. The code that reports it
-/// (`E0001` for the lexer, `E0003` for the preprocessor) is a fact of the caller, not of the
-/// struct, so it does not cross the boundary.
+/// One label of an error: a span and its text. The first label of an error is the primary one.
 @repr(c)
-export struct CError {
-    message: *u8
-    messageLen: u32
-    label: *u8
-    labelLen: u32
+export struct CLabel {
+    text: *u8
+    textLen: u32
     line: u32
     column: u32
     endLine: u32
     endColumn: u32
+}
+
+/// One lexical or preprocessing error. The code that reports it (`E0001` for the lexer, `E0003`
+/// for the preprocessor, `E0004` for the macro expander) is a fact of the caller, not of the
+/// struct, so it does not cross the boundary. A macro error carries one label per expansion
+/// chain entry; the other parts carry exactly one.
+@repr(c)
+export struct CError {
+    message: *u8
+    messageLen: u32
+    labelCount: u32
+    labels: *CLabel
 }
 
 /// The `XlcLexResult` of lexer_c.h: the lexer's frozen outcome, plus the handle
@@ -45,6 +56,60 @@ export struct CResult {
     errors: *CError
     errorCount: u32
     block: *u8
+}
+
+/// One macro parameter kind: `expr`, `type`, `ident`, `block`, `items` (0..4).
+export const MP_EXPR: i32 = 0
+export const MP_TYPE: i32 = 1
+export const MP_IDENT: i32 = 2
+export const MP_BLOCK: i32 = 3
+export const MP_ITEMS: i32 = 4
+
+/// One macro parameter; field for field the `XlcMacroParam` of macro_c.h.
+@repr(c)
+export struct CMacroParam {
+    kind: i32
+    name: *u8
+    nameLen: u32
+}
+
+/// One macro definition; field for field the `XlcMacroDef` of macro_c.h. `body` holds the raw
+/// tokens between the outer braces of `define name(params) { ... }`.
+@repr(c)
+export struct CMacro {
+    name: *u8
+    nameLen: u32
+    params: *CMacroParam
+    paramCount: u32
+    body: *CToken
+    bodyLen: u32
+    line: u32      ///< the span of the name token; zeros for a seed macro
+    column: u32
+    endLine: u32
+    endColumn: u32
+}
+
+/// The `XlcMacroResult` of macro_c.h: the expanded tokens, the errors, the macros the run
+/// collected from the token stream itself (the C++ side writes them back into its table), and
+/// the handle `xlcExpandMacrosFree` releases.
+@repr(c)
+export struct CMacroResult {
+    tokens: *CToken
+    tokenCount: u32
+    errors: *CError
+    errorCount: u32
+    defs: *CMacro
+    defCount: u32
+    block: *u8
+}
+
+/// The value of one definition: a builtin, a `-D NAME=VALUE` or a file `define`.
+@repr(c)
+export struct CValue {
+    kind: i32      ///< V_BOOL, V_INT or V_STRING
+    intValue: i64  ///< the value when `kind` is V_INT; 0 or 1 when V_BOOL
+    bytes: *u8     ///< the bytes when `kind` is V_STRING; not NUL-terminated
+    strLen: u32
 }
 
 /// One definition that crossed the boundary: a name and its value. The value fields are flat so

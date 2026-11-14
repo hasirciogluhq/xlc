@@ -1,0 +1,613 @@
+// The macro expander behind the C ABI: `xlcExpandMacros` expands `name!(args...)` calls on the
+// token stream exactly as the C++ original did (src/lang/macro/macro.cpp before the port):
+// parameters are substituted as token groups (an `expr` argument with more than one token is
+// parenthesized, so precedence is preserved), `local` names introduced by a macro body are
+// renamed (hygiene), expansion repeats until no call is left (depth limit 64), `define` bodies
+// are not expanded where they are written, only when used, and calls of unknown macros are left
+// in place for a later module-aware stage.
+//
+// The C++ side sees `xlcExpandMacros` and `xlcExpandMacrosFree` only
+// (include/xlang/lang/macro_c.h); everything here is the implementation behind them.
+from "std" import String, Vec, format
+from "std/str" import fromParts
+from "../abi" import CToken, CError, CLabel, CMacro, CMacroParam, CMacroResult, MP_EXPR,
+    MP_TYPE, MP_IDENT, MP_BLOCK, MP_ITEMS
+from "../lexer/tokens" import K_DEFINE, K_IDENT, K_LPAREN, K_RPAREN, K_LBRACE, K_RBRACE,
+    K_LBRACKET, K_RBRACKET, K_COLON, K_COMMA, K_LOCAL, K_DOT, K_BANG, K_PRIM_TYPE, K_FN, K_STAR,
+    K_END, K_TYPE
+from "../preprocess/diag" import DiagSink, Lbl
+from "../macro/table" import MTable, MDef, MParam
+
+/// The expansion depth limit, shared with the C++ side (`kMacroDepthLimit`).
+export const MACRO_DEPTH_LIMIT: i32 = 64
+
+fn opens(k: i32) -> bool {
+    return k == K_LPAREN || k == K_LBRACKET || k == K_LBRACE
+}
+
+fn closes(k: i32) -> bool {
+    return k == K_RPAREN || k == K_RBRACKET || k == K_RBRACE
+}
+
+/// True when `b` starts exactly where `a` ends: the `!(` of a macro call must be adjacent.
+fn adjacent(a: CToken, b: CToken) -> bool {
+    return a.endLine == b.line && a.endColumn == b.column
+}
+
+/// Index just past the token that closes the group opened at `openIndex`, or `end` when the
+/// group is never closed (the parser reports that).
+fn matching(t: *Vec<CToken>, openIndex: usize, end: usize) -> usize {
+    local depth: i32 = 0
+    for i in openIndex..end {
+        local k = t.get(i).kind
+        if opens(k) {
+            depth = depth + 1
+        } else if closes(k) {
+            depth = depth - 1
+            if depth == 0 {
+                return i + 1
+            }
+        }
+    }
+    return end
+}
+
+/// One entry of an expansion chain: the call site and the macro name, for the
+/// `in the expansion of \`name!\`` labels of a diagnostic.
+class Origin {
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
+    name: String
+
+    fn init(self, line: u32, column: u32, endLine: u32, endColumn: u32, name: String) {
+        self.line = line
+        self.column = column
+        self.endLine = endLine
+        self.endColumn = endColumn
+        self.name = name
+    }
+}
+
+/// One hygiene renaming: the `local` name in the body and its fresh name.
+class Renamed {
+    old: str
+    fresh: str
+
+    fn init(self, old: str, fresh: str) {
+        self.old = old
+        self.fresh = fresh
+    }
+}
+
+/// The arguments of one call: one token list per argument and the index past the closing `)`.
+class CallArgs {
+    args: Vec<Vec<CToken>>
+    end: usize
+
+    fn init(self) {
+        self.args = Vec<Vec<CToken>>()
+        self.end = 0
+    }
+}
+
+/// One pass over one token range: directives are definitions and calls, everything else is
+/// copied. The expander owns the strings it invents (hygiene names, the empty spelling) in its
+/// arena, so the result tokens can point into them.
+export class Expander {
+    table: *MTable
+    sink: *DiagSink
+    /// Names `name__m<N>` per expansion round, so two rounds never collide.
+    counter: i32
+    /// The `String`s the result tokens point into beyond the inputs; dropped with the block.
+    arena: Vec<String>
+    /// The spelling of the synthesized `(`/`)` tokens: one valid byte, zero length.
+    emptyPtr: *u8
+
+    fn init(self, table: *MTable, sink: *DiagSink) {
+        self.table = table
+        self.sink = sink
+        self.counter = 0
+        self.arena = Vec<String>()
+        local empty = String(1, 0)
+        self.emptyPtr = empty.ptr
+        self.arena.push(empty)
+    }
+
+    /// Records one E0004 with the primary label and one label per chain entry, newest last: the
+    /// C++ side reports the chain in reverse order of the walk.
+    fn error(self, line: u32, column: u32, endLine: u32, endColumn: u32, message: String,
+             label: String, chain: *Vec<Origin>) {
+        local labels = Vec<Lbl>()
+        labels.push(Lbl(label, line, column, endLine, endColumn))
+        for j in 0..chain.length() {
+            local it = chain.get(chain.length() - 1 - j)
+            labels.push(Lbl(format("in the expansion of `{}`", it.name.asStr()), it.line, it.column,
+                            it.endLine, it.endColumn))
+        }
+        self.sink.failChain(0, message, labels)
+    }
+
+    // --- definitions -----------------------------------------------------------------------
+
+    /// Collects every `define name(params) { ... }` of the range into the table. A second
+    /// definition of one name is E0004; the first one wins, like the C++ map did.
+    fn collectDefinitions(self, t: *Vec<CToken>, end: usize) {
+        local i: usize = 0
+        while i + 2 < end {
+            if t.get(i).kind != K_DEFINE || t.get(i + 1).kind != K_IDENT ||
+               t.get(i + 2).kind != K_LPAREN {
+                i = i + 1
+                continue
+            }
+            local name = String(fromParts(t.get(i + 1).text, t.get(i + 1).textLen as usize))
+            local def = MDef(name, t.get(i + 1).line, t.get(i + 1).column, t.get(i + 1).endLine,
+                             t.get(i + 1).endColumn)
+            local paramsEnd = matching(t, i + 2, end)
+            local p = i + 3
+            while p + 1 < paramsEnd {
+                if t.get(p).kind != K_IDENT || t.get(p + 1).kind != K_COLON {
+                    break
+                }
+                local kindToken = p + 2 < paramsEnd ? t.get(p + 2) : t.get(p)
+                local kind: i32 = MP_EXPR
+                if kindToken.kind == K_TYPE {
+                    kind = MP_TYPE
+                } else {
+                    local kt = fromParts(kindToken.text, kindToken.textLen as usize)
+                    if kt == "ident" {
+                        kind = MP_IDENT
+                    } else if kt == "block" {
+                        kind = MP_BLOCK
+                    } else if kt == "items" {
+                        kind = MP_ITEMS
+                    }
+                }
+                def.params.push(MParam(kind,
+                                       String(fromParts(t.get(p).text, t.get(p).textLen as usize))))
+                p = p + 3
+                if p < paramsEnd && t.get(p).kind == K_COMMA {
+                    p = p + 1
+                }
+            }
+            if paramsEnd >= end || t.get(paramsEnd).kind != K_LBRACE {
+                i = i + 1
+                continue // malformed: the parser reports it
+            }
+            local bodyEnd = matching(t, paramsEnd, end)
+            for k in paramsEnd + 1..bodyEnd - 1 {
+                def.body.push(*t.get(k))
+            }
+            if self.table.find(def.name.asStr()) >= 0 {
+                self.sink.fail(0, def.line, def.column, def.endLine, def.endColumn,
+                               format("macro `{}` is defined twice", def.name.asStr()),
+                               String("second definition"))
+            } else {
+                self.table.put(def)
+            }
+            i = bodyEnd
+        }
+    }
+
+    // --- expansion -------------------------------------------------------------------------
+
+    /// Splits the arguments of the call opened at `openParen`: one token list per top-level
+    /// comma. An empty argument is an empty list; no arguments at all is no list.
+    fn splitArgs(self, t: *Vec<CToken>, openParen: usize, limit: usize) -> CallArgs {
+        local call = CallArgs()
+        local close = matching(t, openParen, limit)
+        call.end = close
+        local cur = Vec<CToken>()
+        local depth: i32 = 0
+        local any = false
+        local i = openParen + 1
+        while i + 1 < close {
+            local k = t.get(i).kind
+            if depth == 0 && k == K_COMMA {
+                call.args.push(cur)
+                cur = Vec<CToken>()
+                i = i + 1
+                continue
+            }
+            if opens(k) {
+                depth = depth + 1
+            } else if closes(k) {
+                depth = depth - 1
+            }
+            any = true
+            cur.push(*t.get(i))
+            i = i + 1
+        }
+        if any || call.args.length() > 0 {
+            call.args.push(cur)
+        }
+        return call
+    }
+
+    /// True when the first token of an argument can start a type.
+    fn startsType(self, t: CToken) -> bool {
+        return t.kind == K_PRIM_TYPE || t.kind == K_IDENT || t.kind == K_STAR || t.kind == K_FN ||
+               t.kind == K_LBRACKET
+    }
+
+    /// The spelling of one parameter kind, as the diagnostic names it.
+    fn kindName(self, k: i32) -> str {
+        if k == MP_EXPR { return "expr" }
+        if k == MP_TYPE { return "type" }
+        if k == MP_IDENT { return "ident" }
+        if k == MP_BLOCK { return "block" }
+        return "items"
+    }
+
+    /// Checks one argument against its parameter kind; a failure is recorded and reported.
+    fn checkArg(self, def: *MDef, index: usize, arg: *Vec<CToken>, callLine: u32, callColumn: u32,
+                callEndLine: u32, callEndColumn: u32, chain: *Vec<Origin>) -> bool {
+        local p = def.params.get(index)
+        local line = callLine
+        local column = callColumn
+        local endLine = callEndLine
+        local endColumn = callEndColumn
+        if arg.length() > 0 {
+            line = arg.get(0).line
+            column = arg.get(0).column
+            endLine = arg.get(0).endLine
+            endColumn = arg.get(0).endColumn
+        }
+        local bad = false
+        if p.kind == MP_EXPR {
+            if arg.length() == 0 {
+                bad = true
+                self.error(line, column, endLine, endColumn,
+                           format("argument {} of `{}!` ({}) {}", index + 1, def.name.asStr(),
+                                  p.name.asStr(), "is empty, an expression is expected"),
+                           format("`{}` is declared `{}`", p.name.asStr(), self.kindName(p.kind)),
+                           chain)
+            }
+        } else if p.kind == MP_TYPE {
+            if !(arg.length() > 0 && self.startsType(*arg.get(0))) {
+                bad = true
+                self.error(line, column, endLine, endColumn,
+                           format("argument {} of `{}!` ({}) {}", index + 1, def.name.asStr(),
+                                  p.name.asStr(), "is not a type"),
+                           format("`{}` is declared `{}`", p.name.asStr(), self.kindName(p.kind)),
+                           chain)
+            }
+        } else if p.kind == MP_IDENT {
+            if !(arg.length() == 1 && arg.get(0).kind == K_IDENT) {
+                bad = true
+                self.error(line, column, endLine, endColumn,
+                           format("argument {} of `{}!` ({}) {}", index + 1, def.name.asStr(),
+                                  p.name.asStr(), "is not a single identifier"),
+                           format("`{}` is declared `{}`", p.name.asStr(), self.kindName(p.kind)),
+                           chain)
+            }
+        } else if p.kind == MP_BLOCK {
+            if !(arg.length() >= 2 && arg.get(0).kind == K_LBRACE &&
+                 arg.get(arg.length() - 1).kind == K_RBRACE) {
+                bad = true
+                self.error(line, column, endLine, endColumn,
+                           format("argument {} of `{}!` ({}) {}", index + 1, def.name.asStr(),
+                                  p.name.asStr(), "is not a `{ ... }` block"),
+                           format("`{}` is declared `{}`", p.name.asStr(), self.kindName(p.kind)),
+                           chain)
+            }
+        }
+        // MP_ITEMS accepts anything.
+        return !bad
+    }
+
+    /// The body of `def` with every parameter replaced by its argument and every `local` name
+    /// not a parameter renamed to `name__m<N>`. The first token takes the call's line position.
+    fn substitute(self, def: *MDef, args: *Vec<Vec<CToken>>, call: CToken) -> Vec<CToken> {
+        // Hygiene: names bound by `local` inside the body (and not parameters) get fresh names.
+        local renamed = Vec<Renamed>()
+        self.counter = self.counter + 1
+        local i: usize = 0
+        while i + 1 < def.body.length() {
+            if def.body.get(i).kind == K_LOCAL && def.body.get(i + 1).kind == K_IDENT {
+                local n = fromParts(def.body.get(i + 1).text, def.body.get(i + 1).textLen as usize)
+                local isParam = false
+                for k in 0..def.params.length() {
+                    if def.params.get(k).name.asStr() == n {
+                        isParam = true
+                    }
+                }
+                local already = false
+                for k in 0..renamed.length() {
+                    if renamed.get(k).old == n {
+                        already = true
+                    }
+                }
+                if !isParam && !already {
+                    local fresh = format("{}__m{}", n, self.counter)
+                    self.arena.push(fresh)
+                    renamed.push(Renamed(n, fresh.asStr()))
+                }
+            }
+            i = i + 1
+        }
+
+        local out = Vec<CToken>()
+        for i in 0..def.body.length() {
+            local t = def.body.get(i)
+            if t.kind == K_IDENT {
+                local afterDot = i > 0 && def.body.get(i - 1).kind == K_DOT
+                if !afterDot {
+                    local index: i32 = -1
+                    for k in 0..def.params.length() {
+                        if def.params.get(k).name.asStr() ==
+                           fromParts(t.text, t.textLen as usize) {
+                            index = k as i32
+                        }
+                    }
+                    if index >= 0 && (index as usize) < args.length() {
+                        local arg = args.get(index as usize)
+                        local group = def.params.get(index as usize).kind == MP_EXPR &&
+                                      arg.length() > 1
+                        if group {
+                            local open = *t
+                            open.kind = K_LPAREN
+                            open.text = self.emptyPtr
+                            open.textLen = 0
+                            out.push(open)
+                        }
+                        for a in 0..arg.length() {
+                            local copy = *arg.get(a)
+                            if a == 0 && !group {
+                                copy.newlineBefore = t.newlineBefore
+                            } else if a == 0 {
+                                copy.newlineBefore = 0
+                            }
+                            out.push(copy)
+                        }
+                        if group {
+                            local close = *t
+                            close.kind = K_RPAREN
+                            close.text = self.emptyPtr
+                            close.textLen = 0
+                            close.newlineBefore = 0
+                            out.push(close)
+                        }
+                        continue
+                    }
+                    local hit: i32 = -1
+                    for k in 0..renamed.length() {
+                        if renamed.get(k).old == fromParts(t.text, t.textLen as usize) {
+                            hit = k as i32
+                        }
+                    }
+                    if hit >= 0 {
+                        local copy = *t
+                        local to = renamed.get(hit as usize).fresh
+                        copy.text = to.ptr
+                        copy.textLen = to.len as u32
+                        out.push(copy)
+                        continue
+                    }
+                }
+            }
+            out.push(*t)
+        }
+        if out.length() > 0 {
+            out.get(0).newlineBefore = call.newlineBefore
+        }
+        return out
+    }
+
+    /// Expands the range `[begin, end)` of `t` into `*out`.
+    fn expandRange(self, t: *Vec<CToken>, begin: usize, end: usize, depth: i32,
+                   chain: *Vec<Origin>, out: *Vec<CToken>) {
+        local i = begin
+        while i < end {
+            // Do not expand inside definitions: they expand where they are used.
+            if t.get(i).kind == K_DEFINE && i + 2 < end && t.get(i + 1).kind == K_IDENT &&
+               t.get(i + 2).kind == K_LPAREN {
+                local paramsEnd = matching(t, i + 2, end)
+                local bodyEnd = paramsEnd
+                if paramsEnd < end && t.get(paramsEnd).kind == K_LBRACE {
+                    bodyEnd = matching(t, paramsEnd, end)
+                }
+                for k in i..bodyEnd {
+                    out.push(*t.get(k))
+                }
+                i = bodyEnd
+                continue
+            }
+
+            local call = t.get(i).kind == K_IDENT && i + 2 < end &&
+                         t.get(i + 1).kind == K_BANG && t.get(i + 2).kind == K_LPAREN &&
+                         adjacent(*t.get(i), *t.get(i + 1)) && adjacent(*t.get(i + 1), *t.get(i + 2))
+            local found: i32 = -1
+            if call {
+                found = self.table.find(fromParts(t.get(i).text, t.get(i).textLen as usize))
+            }
+            if !call || found < 0 {
+                out.push(*t.get(i))
+                i = i + 1
+                continue
+            }
+
+            local def = self.table.defs.get(found as usize)
+            local head = t.get(i)
+            local nextChain = Vec<Origin>()
+            for k in 0..chain.length() {
+                local prev = chain.get(k)
+                nextChain.push(Origin(prev.line, prev.column, prev.endLine, prev.endColumn,
+                                      prev.name.clone()))
+            }
+            nextChain.push(Origin(head.line, head.column, head.endLine, head.endColumn,
+                                  def.name.clone()))
+
+            local parsed = self.splitArgs(t, i + 2, end)
+            i = parsed.end
+
+            if depth >= MACRO_DEPTH_LIMIT {
+                self.error(head.line, head.column, head.endLine, head.endColumn,
+                           format("macro expansion is deeper than {}", MACRO_DEPTH_LIMIT),
+                           String("recursion limit reached"), chain)
+                continue
+            }
+            if parsed.args.length() != def.params.length() {
+                self.error(head.line, head.column, head.endLine, head.endColumn,
+                           format("`{}!` takes {} argument(s), {} given", def.name.asStr(),
+                                  def.params.length(), parsed.args.length()),
+                           String("wrong number of arguments"), chain)
+                continue
+            }
+            local ok = true
+            for a in 0..parsed.args.length() {
+                ok = self.checkArg(def, a, parsed.args.get(a), head.line, head.column,
+                                   head.endLine, head.endColumn, chain) && ok
+            }
+            if !ok {
+                continue
+            }
+
+            local body = self.substitute(def, &parsed.args, *head)
+            local expanded = Vec<CToken>()
+            self.expandRange(&body, 0, body.length(), depth + 1, &nextChain, &expanded)
+
+            // Expression position: keep the result a single operand.
+            local statementPosition = head.newlineBefore != 0 || out.length() == 0 ||
+                                      out.get(out.length() - 1).kind == K_LBRACE ||
+                                      out.get(out.length() - 1).kind == K_RBRACE
+            if !statementPosition {
+                local open = *head
+                open.kind = K_LPAREN
+                open.text = self.emptyPtr
+                open.textLen = 0
+                out.push(open)
+                for k in 0..expanded.length() {
+                    out.push(*expanded.get(k))
+                }
+                local close = *head
+                close.kind = K_RPAREN
+                close.text = self.emptyPtr
+                close.textLen = 0
+                close.newlineBefore = 0
+                out.push(close)
+            } else {
+                for k in 0..expanded.length() {
+                    out.push(*expanded.get(k))
+                }
+            }
+        }
+    }
+}
+
+/// The heap block `xlcExpandMacros` returns: the table, the sink and the expander with its
+/// arena, plus the frozen arrays the result points into. `result.block` hands the block back to
+/// `xlcExpandMacrosFree`.
+class MacroBlock {
+    table: *MTable
+    sink: *DiagSink
+    expander: *Expander
+    result: CMacroResult
+    out: Vec<CToken>
+    errs: Vec<CError>
+    labels: Vec<CLabel>
+    defs: Vec<CMacro>
+    params: Vec<Vec<CMacroParam>>
+    bodies: Vec<Vec<CToken>>
+
+    fn init(self, table: *MTable, sink: *DiagSink, expander: *Expander) {
+        self.table = table
+        self.sink = sink
+        self.expander = expander
+        self.result = CMacroResult { tokens: nil, tokenCount: 0, errors: nil, errorCount: 0,
+                                     defs: nil, defCount: 0, block: nil }
+        self.out = Vec<CToken>()
+        self.errs = Vec<CError>()
+        self.labels = Vec<CLabel>()
+        self.defs = Vec<CMacro>()
+        self.params = Vec<Vec<CMacroParam>>()
+        self.bodies = Vec<Vec<CToken>>()
+    }
+
+    /// Freezes the macros collected from the token stream (everything past the seed count) into
+    /// the flat boundary arrays, so the C++ side can write them back into its table.
+    fn freezeDefs(self, seedCount: usize) {
+        local defs = &self.table.defs
+        for i in seedCount..defs.length() {
+            local d = defs.get(i)
+            local flat = Vec<CMacroParam>()
+            for k in 0..d.params.length() {
+                local p = d.params.get(k)
+                flat.push(CMacroParam { kind: p.kind, name: p.name.ptr,
+                                        nameLen: p.name.len as u32 })
+            }
+            self.params.push(flat)
+            self.bodies.push(d.body.clone())
+            self.defs.push(CMacro {
+                name: d.name.ptr,
+                nameLen: d.name.len as u32,
+                params: self.params.get(self.params.length() - 1).data,
+                paramCount: flat.length() as u32,
+                body: self.bodies.get(self.bodies.length() - 1).data,
+                bodyLen: d.body.length() as u32,
+                line: d.line,
+                column: d.column,
+                endLine: d.endLine,
+                endColumn: d.endColumn,
+            })
+        }
+        if self.defs.length() > 0 {
+            self.result.defs = self.defs.data
+            self.result.defCount = self.defs.length() as u32
+        }
+    }
+}
+
+/// `xlcExpandMacros`: expands the macro calls of `tokenCount` tokens against `macroCount` seed
+/// macros and hands the C++ side the frozen result. The spans carry lines and columns only; the
+/// caller stamps its own file onto them.
+export(c) fn xlcExpandMacros(tokens: *CToken, tokenCount: u32, macros: *CMacro,
+                             macroCount: u32) -> CMacroResult {
+    local table = new MTable()
+    table.load(macros, macroCount)
+    local seedCount = table.defs.length()
+    local sink = new DiagSink()
+    local expander = new Expander(table, sink)
+    local block = new MacroBlock(table, sink, expander)
+
+    local toks = Vec<CToken>()
+    for i in 0..tokenCount as usize {
+        local p = (tokens as usize + i * (sizeOf(CToken) as usize)) as *CToken
+        toks.push(*p)
+    }
+    // Keep the End token out of the scan, like the C++ original did.
+    local hasEnd = toks.length() > 0 && toks.get(toks.length() - 1).kind == K_END
+    local scanEnd = toks.length()
+    if hasEnd {
+        scanEnd = scanEnd - 1
+    }
+    expander.collectDefinitions(&toks, scanEnd)
+    local chain = Vec<Origin>()
+    expander.expandRange(&toks, 0, scanEnd, 0, &chain, &block.out)
+    if hasEnd {
+        block.out.push(*toks.get(scanEnd))
+    }
+
+    if block.out.length() > 0 {
+        block.result.tokens = block.out.data
+        block.result.tokenCount = block.out.length() as u32
+    }
+    if sink.hasErrors() {
+        sink.build(&block.errs, &block.labels)
+        block.result.errors = block.errs.data
+        block.result.errorCount = block.errs.length() as u32
+    }
+    block.freezeDefs(seedCount)
+    block.result.block = block as *u8
+    return block.result
+}
+
+/// `xlcExpandMacrosFree`: release what `xlcExpandMacros` allocated. The block is dropped with
+/// the table, the sink and the expander.
+export(c) fn xlcExpandMacrosFree(result: CMacroResult) {
+    if result.block == nil {
+        return
+    }
+    delete (result.block as *MacroBlock)
+}
