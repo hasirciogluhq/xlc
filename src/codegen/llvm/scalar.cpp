@@ -17,11 +17,14 @@ llvm::Value* Gen::genScalar(const hir::Expr& e) {
             return llvm::ConstantFP::get(
                 sty(t), static_cast<double>(static_cast<std::int64_t>(e.int_value)));
         }
-        // `int_value` is the two's-complement pattern in 64 bits (-2 is 0xff..fe); the type keeps its
-        // low bits. Without ImplicitTrunc a release LLVM stores the pattern as is (`APInt` only asserts
-        // that it fits), the high bits stay set, and an `i32 -2` compares above every normal value:
-        // IPSCCP then merged a function's returns into a range that left out 0 and -1.
-        return llvm::ConstantInt::get(sty(t), e.int_value, /*IsSigned=*/false, /*ImplicitTrunc=*/true);
+        // `int_value` is the two's-complement pattern in 64 bits (-2 is 0xff..fe); the type keeps
+        // its low bits, so mask before building the `APInt`: an unmasked value keeps the high bits
+        // (a release LLVM only asserts, never clears), and an `i32 -2` compares above every normal
+        // value: IPSCCP then merged a function's returns into a range that left out 0 and -1.
+        auto *ity = llvm::cast<llvm::IntegerType>(sty(t));
+        unsigned width = ity->getBitWidth();
+        uint64_t pattern = width < 64 ? (e.int_value & ((1ull << width) - 1)) : e.int_value;
+        return llvm::ConstantInt::get(ity->getContext(), llvm::APInt(width, pattern));
     }
     case hir::ExprKind::FloatConst:
         return llvm::ConstantFP::get(sty(e.type), e.float_value);

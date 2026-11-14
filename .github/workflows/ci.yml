@@ -81,8 +81,8 @@ jobs:
       - name: Build and test
         if: runner.os != 'Windows'
         env:
-          # `xl build` (the wrapper) drives the released compiler and stdlib: `XLC` and
-          # `XLANG_STD` name them (the install script installs the binary only).
+          # The released compiler and stdlib: `XLC` and `XLANG_STD` name them for the
+          # xlang.object rule (the install script installs the binary only).
           XLC: ${{ steps.toolchain.outputs.xlc-bin }}
           XLANG_STD: ${{ steps.toolchain.outputs.std }}
         run: |
@@ -104,8 +104,9 @@ jobs:
           git diff --exit-code -- COMPILER-TAGS.md
           export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
           xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
+          # The xlc-bootstrap and xlc targets are disabled on Windows: the released xlc has no
+          # lowering for `try` (E0714), so no bootstrap object can be built there and there is no
+          # compiler binary or e2e until a release with Windows unwinding.
           xmake -P . -y
           xmake build -P . -y xlc-tests
           xmake run -P . xlc-tests
-          # The compiler itself must start, build and run programs and link only the OS (test/e2e).
-          test/e2e/run.sh build/windows/x64/release/xlc.exe

@@ -186,6 +186,13 @@ target_end()
 -- constructor shim src/bootstrap.cpp and the module archives. It ships in no release; the
 -- `xlc` target below builds the real binary from src/main.xl with `--crt` through it.
 target("xlc-bootstrap")
+    -- The released xlc for Windows has no lowering for `try` (E0714 on windows/x86_64), and
+    -- every stdlib-importing program reaches it, so no bootstrap object can be built there:
+    -- the rung needs a compiler release with Windows unwinding. The Windows CI builds the C++
+    -- archives and the unit tests only.
+    if is_plat("windows") then
+        set_enabled(false)
+    end
     set_kind("binary")
     set_default(false)
     set_basename("xlc-bootstrap")
@@ -208,6 +215,10 @@ target("xlc-bootstrap")
 -- toolchain action sets it), else the `xl-std` submodule checkout when it exists (local
 -- development), else the newest stdlib the toolchain installed (`~/.xlang/std/<version>`).
 target("xlc")
+    -- See `xlc-bootstrap` above: without a bootstrap there is no compiler to build this with.
+    if is_plat("windows") then
+        set_enabled(false)
+    end
     set_kind("binary")
     set_default(true)
     set_basename("xlc")
