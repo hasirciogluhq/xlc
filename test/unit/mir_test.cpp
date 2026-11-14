@@ -45,6 +45,12 @@ void testLoopsAndJumps() {
     // The body (bb2) continues at the step (bb3), which goes back to the test (bb1).
     CHECK(s.hasMir("  bb2:\n    goto bb3"));
     CHECK(s.hasMir("  bb3:\n"));
+    // A `?` in a `do` loop's condition is hoisted into the step, which leaves with `break`.
+    const Lowered d("enum R {\n Ok(i32)\n Err(i32)\n}\n"
+                    "fn g() -> R { return R.Ok(1) }\n"
+                    "fn f() -> R {\n    do { } while g()? < 0\n    return R.Ok(0)\n}\n");
+    CHECK(!d.diag->hasErrors());
+    CHECK(d.hasMir("goto bb4"));
 }
 
 // `&&` evaluates its right side only when the left one is true.

@@ -109,9 +109,17 @@ Signature classifySysV(llvm::LLVMContext& ctx, const Value& ret, const std::vect
             s.params.push_back({Pass::Ignore});
             continue;
         }
-        const Eightbytes e = eightbytes(ctx, p);
-        if (memoryClass(p) || e.ints > free_ints || e.sses > free_sses) {
+        // A MEMORY value is never split into eightbytes: over 16 bytes it has more than the two.
+        const auto by_val = [&] {
             s.params.push_back({Pass::ByVal, nullptr, std::max<std::uint64_t>(p.align, 8)});
+        };
+        if (memoryClass(p)) {
+            by_val();
+            continue;
+        }
+        const Eightbytes e = eightbytes(ctx, p);
+        if (e.ints > free_ints || e.sses > free_sses) {
+            by_val();
             continue;
         }
         free_ints -= e.ints;

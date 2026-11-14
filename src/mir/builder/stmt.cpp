@@ -88,9 +88,13 @@ void BodyBuilder::lowerWhile(const hir::Stmt& s) {
     loops_.pop_back();
     fallTo(step, s.span);
 
+    // The step is part of the loop: a `?` hoisted into it (a `do` loop's condition) ends it with
+    // `break`.
     if (step != test) {
         enter(step);
+        loops_.push_back({test, exit});
         lowerStmts(s.step);
+        loops_.pop_back();
         fallTo(test, s.span);
     }
     enter(exit);
