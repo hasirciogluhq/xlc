@@ -55,7 +55,10 @@ cmd_list() {
         found=$(hits "$tag")
         if [ -n "$found" ]; then
             echo "== @$tag"
-            echo "$found"
+            # printf, never echo: dash's echo interprets backslash escapes, so a tag text that
+            # contains a literal `\n\t\r` (the lexer escape list) would print real control
+            # bytes and git would see the generated file as binary.
+            printf '%s\n' "$found"
             echo
         fi
     done
@@ -96,7 +99,7 @@ cmd_check() {
     ' $(sources))
     if [ -n "$orphans" ]; then
         echo "COMPILER-TAGS.md: a tag continuation line must repeat its tag:"
-        echo "$orphans" | sed 's/^/  /'
+        printf '%s\n' "$orphans" | sed 's/^/  /'
         status=1
     fi
 
@@ -118,7 +121,7 @@ cmd_check() {
     ' $(sources))
     if [ -n "$dangling" ]; then
         echo "COMPILER-TAGS.md: a tag must sit right above its declaration:"
-        echo "$dangling" | sed 's/^/  /'
+        printf '%s\n' "$dangling" | sed 's/^/  /'
         status=1
     fi
 
@@ -158,12 +161,13 @@ cmd_sync() {
         for tag in $known; do
             found=$(hits "$tag")
             [ -n "$found" ] || continue
-            count=$(echo "$found" | wc -l | tr -d ' ')
+            count=$(printf '%s\n' "$found" | wc -l | tr -d ' ')
             total=$((total + count))
             echo "### @$tag ($count)"
             echo
             echo '```'
-            echo "$found"
+            # printf, never echo: see the note in cmd_list.
+            printf '%s\n' "$found"
             echo '```'
             echo
         done

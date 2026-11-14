@@ -138,7 +138,7 @@ which keeps the view in the same commit as the tag it came from.
 <!-- written by scripts/tags.sh sync; every line below is a tag found in src/ and
      include/, grouped by tag and then by file. Do not edit inside the markers. -->
 
-### @grammar (121)
+### @grammar (119)
 
 ```
 include/xlang/lang/ast.h:21:/// @grammar the five prefix operators: `-e`, `!e`, `*e`, `&e`, `~e`
@@ -151,10 +151,8 @@ src/lang/lexer/lexer.cpp:177:    /// @grammar identifier or keyword, number, str
 src/lang/lexer/lexer.cpp:345:    /// @grammar `[A-Za-z_][A-Za-z0-9_]*`, a keyword or a primitive type name
 src/lang/lexer/lexer.cpp:361:    /// @grammar `#if`, `#elif`, `#else`, `#endif`, `#ifdef`, `#ifndef`, `#error`, first token of
 src/lang/lexer/lexer.cpp:362:    /// @grammar its line only; `#` anywhere else is an error
-src/lang/lexer/lexer.cpp:392:    /// @grammar `b'x'`, `b'
-'`, `b'\xHH'`, `b'\u{...}'`: exactly one byte, value 0..255
-src/lang/lexer/lexer.cpp:453:    /// @grammar `"text"` with the escapes `
- 	  
+src/lang/lexer/lexer.cpp:392:    /// @grammar `b'x'`, `b'\n'`, `b'\xHH'`, `b'\u{...}'`: exactly one byte, value 0..255
+src/lang/lexer/lexer.cpp:453:    /// @grammar `"text"` with the escapes `\n \t \r \0 \\ \" \xHH \u{...}`; may not span a
 src/lang/lexer/lexer.cpp:454:    /// @grammar line break
 src/lang/lexer/lexer.cpp:514:    /// @grammar `123`, `0x1f`, `0b1010`, `0o17`, `1_000`, `1.5`, `1e9`, `1.5e-3`; after a `.` it is
 src/lang/lexer/lexer.cpp:515:    /// @grammar a tuple position, so it takes no fraction and no exponent there
@@ -352,5 +350,5 @@ src/codegen/llvm/c_abi/sysv_x86_64.cpp:86:/// @spec https://gitlab.com/x86-psABI
 src/codegen/llvm/c_abi/win_x64.cpp:34:/// @spec https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
 ```
 
-Total: 184 tag lines.
+Total: 182 tag lines.
 <!-- END COLLECTED TAGS -->
