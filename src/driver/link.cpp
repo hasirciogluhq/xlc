@@ -166,6 +166,25 @@ void link(const LinkRequest& r) {
         } else if (t.os == "windows") {
             args.push_back("-Wl,/FORCE:MULTIPLE");
         }
+        // The module archives are cyclic (the xlang object calls the backend C API, and the
+        // backend calls the pipeline through it), and the ELF linker scans archives once; a link
+        // group over every archive lets it rescan.
+        if (t.os == "linux") {
+            std::vector<std::string> grouped, loose;
+            for (const std::string& a : r.extra_args) {
+                (a.size() > 2 && a.compare(a.size() - 2, 2, ".a") == 0 ? grouped : loose).push_back(a);
+            }
+            if (!grouped.empty()) {
+                args.push_back("-Wl,--start-group");
+                for (const std::string& a : grouped) {
+                    args.push_back(a);
+                }
+                args.push_back("-Wl,--end-group");
+            }
+            for (const std::string& a : loose) {
+                args.push_back(a);
+            }
+        }
     } else if (t.os == "macos") {
         tool = findTool({"ld64.lld"});
         if (tool.empty()) {

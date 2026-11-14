@@ -160,6 +160,14 @@ function add_xlc_modules()
     for _, module in ipairs(xlc_modules) do
         add_deps(module[1])
     end
+    -- The modules are cyclic (the xlang object in `xlc-lang` calls the backend C API, and the
+    -- backend calls the pipeline through it), and the ELF linker scans archives once; a link
+    -- group lets it rescan. Platforms without link groups fall back to plain libraries.
+    local names = {}
+    for _, module in ipairs(xlc_modules) do
+        table.insert(names, module[1])
+    end
+    add_linkgroups(names, {group = true})
     add_includedirs("include", "src", {public = true})
 end
 
