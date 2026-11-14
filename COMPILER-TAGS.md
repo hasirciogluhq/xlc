@@ -262,9 +262,12 @@ src/sema/lower/item/roles.cpp:129:/// @grammar `@init fn`, `@fini fn`, `@entry f
 src/sema/sema/const_eval.cpp:325:/// @grammar `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)` are the only calls that are compile-time constants; every other call in a constant position is E0707.
 ```
 
-### @invariant (38)
+### @invariant (42)
 
 ```
+include/xlang/analysis/analysis.h:14:/// @invariant findings are reported sorted by source position, never in the order the passes or functions ran.
+include/xlang/mir/mir.h:27:// @invariant MIR is built only from HIR and never refers back to it; a span on every statement and
+src/analysis/findings.hpp:10:/// @invariant `reportTo` emits them sorted by the position of their first label, without duplicates, whatever order the passes and functions ran in.
 src/lang/parser/expr/binary.cpp:8:/// @invariant `open_ternaries_` holds the token index of every `?` whose `:` is still owed, so
 src/lang/parser/expr/binary.cpp:9:/// @invariant `ternaryColonAhead` can tell a ternary `?` from a propagating one
 src/lang/parser/expr/binary.cpp:154:/// @invariant `cast_type_` stays true for the whole target type and is cleared right after
@@ -288,6 +291,7 @@ src/lang/parser/types.cpp:33:/// @invariant inside `<...>` a nested `<` always o
 src/lang/parser/types.cpp:34:/// @invariant cast, so `cast_type_` is cleared here and restored on exit
 src/lang/parser/types.cpp:182:/// @invariant `nl_depth_` is raised around every bracket the rule consumes and lowered on every
 src/lang/parser/types.cpp:183:/// @invariant exit path, so a newline inside a type does not end the enclosing statement
+src/mir/dataflow/forward.hpp:24:/// @invariant the worklist is FIFO from block 0, so the result and the step count depend only on the body, never on hashing or addresses.
 src/sema/lower/call/builtins.cpp:70:/// @invariant the `__builtin_` set is closed: a name not listed here is not a builtin, and the compiler never learns a new one from the standard library.
 src/sema/lower/call/builtins.cpp:71:/// @invariant `__builtin_read` copies the value out of the pointer and drops nothing, so two reads of one pointer yield two owners of the same bytes and only the caller's discipline keeps that sound.
 src/sema/lower/call/builtins.cpp:72:/// @invariant `__builtin_write` is a statement, never a value, and moves the value through the pointer without running a destructor on the old bytes.
@@ -350,5 +354,17 @@ src/codegen/llvm/c_abi/sysv_x86_64.cpp:86:/// @spec https://gitlab.com/x86-psABI
 src/codegen/llvm/c_abi/win_x64.cpp:34:/// @spec https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
 ```
 
-Total: 182 tag lines.
+### @todo (1)
+
+```
+include/xlang/mir/mir.h:29:// @todo MIR does not yet carry what only code generation needs (the `asm` template and clobbers,
+```
+
+### @cost (1)
+
+```
+src/mir/dataflow/forward.hpp:25:/// @cost each block is processed once per change of its entry fact: at most (lattice height) times.
+```
+
+Total: 188 tag lines.
 <!-- END COLLECTED TAGS -->

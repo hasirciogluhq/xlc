@@ -16,7 +16,7 @@ xlc [options] main.xl [prebuilt.o ...] [-o out] [--emit=exe|obj|ir|bc|header|sta
 | Static / shared library, C header | `xlc lib.xl --emit=static\|shared\|header` |
 | Type-check only | `xlc main.xl --check` |
 | Cross-compile | `xlc main.xl --target=x86_64-linux-gnu` |
-| Dumps | `--dump-ast`, `--dump-hir`, `--dump-layout[=Type]`, `--print-cfg` |
+| Dumps | `--dump-ast`, `--dump-hir`, `--dump-mir`, `--dump-layout[=Type]`, `--print-cfg` |
 | Explain a diagnostic | `xlc --explain E0501` |
 
 The first `.xl` input is the program root. Every other input is a prebuilt object or library that
@@ -209,14 +209,16 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 ## Layout
 
 ```
-include/xlang/   public headers (lang, sema, hir, codegen, util)
+include/xlang/   public headers (lang, sema, hir, mir, analysis, codegen, util)
 src/lang/        lexer, preprocessor, macros, parser, AST, types, build configuration
 src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR
 src/hir/         HIR dump and reachability pruning
+src/mir/         HIR -> MIR (control-flow graph per function): builder/, dataflow/ solver, dump
+src/analysis/    static analyses over HIR (hir/) and MIR (mir/): read only, findings sorted by position
 src/codegen/     HIR -> LLVM IR, optimization, object writers, C header
 src/driver/      linker driver and archiver
 src/util/        source files and diagnostics
 src/cli/         command line (`main.cpp`), output selection (`emit.cpp`), terminal color
-test/unit/       frontend/sema/HIR unit tests (platform independent)
+test/unit/       frontend/sema/HIR/MIR/analysis unit tests (platform independent)
 test/e2e/        the binary on the host OS: starts, links only the OS, builds and runs programs (platform related)
 ```

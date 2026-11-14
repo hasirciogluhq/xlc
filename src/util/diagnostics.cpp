@@ -358,6 +358,12 @@ constexpr std::size_t kLeadWidth = 40;
          "the operator function with the operands' addresses, so comparing never moves or drops "
          "a value. Declare every operand parameter as a pointer: `fn ==(a: *T, b: *T) -> bool`, "
          "or `fn <(self, other: *T) -> bool` in a class."},
+        {"E0780", Severity::Error, "use of a moved value",
+         "Passing, returning or assigning a value whose type needs drop moves it: the new owner "
+         "drops it, and the old name no longer holds a value. Reading the old name afterwards "
+         "(on every path or only on some, such as after a move inside an `if` or a loop) would "
+         "read an object that may already be dropped. Borrow it instead (`f(&x)` with a pointer "
+         "parameter), move a copy (`x.clone()`), or assign `x` a new value before the use."},
         {"W0770", Severity::Warning, "`next` takes `self` by value",
          "Each call of `next` works on a copy of the iterator, so its position never advances and "
          "the loop does not end. Write `fn next(self: *T)`."},

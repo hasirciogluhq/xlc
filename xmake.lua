@@ -132,8 +132,9 @@ end
 target("xlc-core")
     set_kind("static")
     set_default(false)
-    add_files("src/codegen/**.cpp", "src/driver/**.cpp", "src/hir/**.cpp", "src/lang/**.cpp",
-              "src/sema/**.cpp", "src/util/**.cpp", "src/cli/console.cpp", "src/cli/emit.cpp")
+    add_files("src/analysis/**.cpp", "src/codegen/**.cpp", "src/driver/**.cpp", "src/hir/**.cpp",
+              "src/lang/**.cpp", "src/mir/**.cpp", "src/sema/**.cpp", "src/util/**.cpp",
+              "src/cli/console.cpp", "src/cli/emit.cpp")
     add_includedirs("include", "src", {public = true})
     add_packages("cli11", {public = true})
     on_load(add_llvm)

@@ -8,10 +8,12 @@
 
 #include "cli/emit.h"
 #include "cli/style.h"
+#include "xlang/analysis/analysis.h"
 #include "xlang/hir/hir.h"
 #include "xlang/lang/ast.h"
 #include "xlang/lang/config.h"
 #include "xlang/lang/frontend.h"
+#include "xlang/mir/build.h"
 #include "xlang/sema/compilation.h"
 #include "xlang/sema/sema.h"
 #include "xlang/util/diagnostics.h"
@@ -41,6 +43,7 @@ struct Options {
     bool check{false};
     bool dump_ast{false};
     bool dump_hir{false};
+    bool dump_mir{false};
     std::string dump_layout;
     bool layout_record{false};
     bool print_cfg{false};
@@ -83,6 +86,7 @@ void declareOptions(CLI::App& app, Options& o) {
     app.add_flag("--check", o.check, "Parse, analyze and lower; write nothing (like -fsyntax-only)");
     app.add_flag("--dump-ast", o.dump_ast, "Parse only: print the AST summary");
     app.add_flag("--dump-hir", o.dump_hir, "Analyze and lower: print the typed HIR");
+    app.add_flag("--dump-mir", o.dump_mir, "Analyze and lower: print the control-flow graph (MIR)");
     app.add_option("--dump-layout", o.dump_layout, "Print offset/size/align of every struct and class, or of TYPE")
         ->expected(0, 1)
         ->default_str("");
@@ -286,12 +290,21 @@ void printError(std::string_view message) {
     }
 
     const bool wants_layout = app.count("--dump-layout") != 0;
-    const bool emits = !o.check && !o.dump_hir && !wants_layout;
+    const bool emits = !o.check && !o.dump_hir && !o.dump_mir && !wants_layout;
     if (!diagnostics.hasErrors()) {
+        // lowering -> HIR -> MIR -> static analysis (both layers) -> pruning and code generation.
         xlang::hir::Module module = compilation.lowerAll();
+        const xlang::mir::Module mir = xlang::mir::build(module);
+        if (!diagnostics.hasErrors()) {
+            xlang::analysis::analyze(module, mir, diagnostics);
+        }
         if (o.dump_hir && !diagnostics.hasErrors()) {
             diagnostics.flush();
             xlang::hir::dumpModule(std::cout, module);
+        }
+        if (o.dump_mir && !diagnostics.hasErrors()) {
+            diagnostics.flush();
+            xlang::mir::dumpModule(std::cout, mir);
         }
         if (emits && !diagnostics.hasErrors()) {
             xlang::cli::emitOutput(compilation, module, config, sources, diagnostics, request);

@@ -728,6 +728,8 @@ void runCodegenTests();
 void runReturnTests();
 void runDropTests();
 void runCAbiTests();
+void runMirTests();
+void runMoveTests();
 
 int main() {
     RUN(runSemaTests);
@@ -739,6 +741,8 @@ int main() {
     RUN(runIteratorTests);
     RUN(runReturnTests);
     RUN(runDropTests);
+    RUN(runMirTests);
+    RUN(runMoveTests);
     RUN(testWarningContextAndTwoSidedLabels);
     RUN(testErrorContextIsWiderAndGutterIsAligned);
     RUN(testDistantMarksAreSeparatedAndNearOnesMerged);
