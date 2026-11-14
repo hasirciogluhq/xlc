@@ -2,21 +2,15 @@
 
 #include "xlang/lang/config.h"
 #include "xlang/lang/lexer.h"
-#include "xlang/util/diagnostics.h"
 
 #include <vector>
 
 namespace xlang {
 
-/// Conditional compilation over the token stream: the directive walk (plan 3.1-3.3, 3.5). This is
-/// the C++ face of the seam in directives_c.h; the walk itself is src/lang/preprocess/*.xl.
-///
-/// `#if/#elif/#else/#endif/#ifdef/#ifndef/#error` are removed; tokens of inactive regions are
-/// dropped (they were only lexed). A body on the same line as the condition is the rest of that
-/// line and has no `#endif`; a body starting on a later line needs `#endif`.
-/// `define NAME = literal` lines seen in active code are visible to later conditions unless
-/// `-D` already defines NAME (CLI wins).
-[[nodiscard]] std::vector<Token> preprocess(std::vector<Token> tokens, const BuildConfig& config,
-                                            DiagnosticEngine& diagnostics);
+// The directive walk (`#if/#elif/#else/#endif/#ifdef/#ifndef/#error`, plan 3.1-3.3, 3.5) lives
+// in src/lang/preprocess/*.xl and runs inside the frontend pipeline
+// (src/lang/frontend/frontend.xl); there is no C++ entry point. `define NAME = literal` lines
+// seen in active code are visible to later conditions unless `-D` already defines NAME (CLI
+// wins).
 
 }  // namespace xlang

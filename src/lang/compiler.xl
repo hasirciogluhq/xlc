@@ -6,6 +6,7 @@
 from "lexer/lexer" import xlcLex, xlcLexFree
 from "preprocess/preprocess" import xlcPreprocess, xlcPreprocessFree
 from "macro/expand" import xlcExpandMacros, xlcExpandMacrosFree
+from "frontend/frontend" import xlcFrontendParse
 from "../hir/dump" import xlcHirDump, xlcHirDumpFree
 from "../hir/prune" import xlcHirPrune, xlcHirPruneFree
 from "parser/parser" import xlcParse

@@ -121,6 +121,9 @@ public:
     DiagnosticEngine(const DiagnosticEngine&) = delete;
     DiagnosticEngine& operator=(const DiagnosticEngine&) = delete;
 
+    /// The xlang-side engine the frontend pipeline reports to.
+    [[nodiscard]] void* handle() const { return engine_; }
+
     /// Applies CLI options. Throws XlangError on unknown codes or when an error code is
     /// asked to be allowed (errors cannot be silenced).
     void configure(const DiagnosticOptions& options) {

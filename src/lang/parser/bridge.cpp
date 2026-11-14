@@ -742,44 +742,12 @@ class FlatReader {
     DiagnosticEngine& diag_;
 };
 
-/// Packs the token stream into the C array the xlang parser reads (the `XlcLexToken` layout with
-/// one shared byte buffer for the spellings) and runs the xlang parser.
-Program parseTokensXl(std::vector<Token>& tokens, FileId file, DiagnosticEngine& diagnostics) {
-    // The spellings of all tokens, copied into one buffer that outlives the call.
-    std::string bytes;
-    std::uint32_t total = 0;
-    for (const Token& t : tokens) {
-        bytes.append(t.text);
-        total += 1;
-    }
-    std::vector<std::uint32_t> offsets;
-    offsets.reserve(total + 1);
-    std::uint32_t off = 0;
-    for (const Token& t : tokens) {
-        offsets.push_back(off);
-        off += static_cast<std::uint32_t>(t.text.size());
-    }
+}  // namespace
 
-    std::vector<XlcLexToken> raw;
-    raw.reserve(total);
-    for (std::size_t i = 0; i < tokens.size(); ++i) {
-        const Token& t = tokens[i];
-        XlcLexToken rt{};
-        rt.kind = static_cast<std::int32_t>(t.kind);
-        rt.text = bytes.data() + offsets[i];
-        rt.text_len = static_cast<std::uint32_t>(t.text.size());
-        rt.int_value = t.int_value;
-        rt.float_value = t.float_value;
-        rt.line = t.span.line;
-        rt.column = t.span.column;
-        rt.end_line = t.span.end_line;
-        rt.end_column = t.span.end_column;
-        rt.newline_before = t.newline_before ? 1 : 0;
-        raw.push_back(rt);
-    }
-
-    const XlcParseResult result = xlcParse(raw.data(), static_cast<std::uint32_t>(raw.size()),
-                                           file);
+/// Rebuilds the `Program` tree from the frozen arena result of `xlcParse` and reports the
+/// recorded syntax errors as E0002. The result stays owned by the caller (`xlcParseFree`);
+/// the frontend shim gets it straight from `xlcFrontendParse`.
+Program readFlatProgram(const XlcParseResult& result, FileId file, DiagnosticEngine& diagnostics) {
     FlatReader reader(result, file, diagnostics);
     Program program;
     program.file = file;
@@ -822,21 +790,7 @@ Program parseTokensXl(std::vector<Token>& tokens, FileId file, DiagnosticEngine&
         d.fix = reader.strCopy(e.fix);
         diagnostics.report(std::move(d));
     }
-    xlcParseFree(result);
     return program;
-}
-
-/// The full dump of one program as a string (the differential test compares these).
-std::string dumpToString(const Program& program) {
-    std::ostringstream out;
-    dumpProgram(out, program, false);
-    return out.str();
-}
-
-}  // namespace
-
-Program parseTokensFlat(std::vector<Token> tokens, FileId file, DiagnosticEngine& diagnostics) {
-    return parseTokensXl(tokens, file, diagnostics);
 }
 
 }  // namespace xlang

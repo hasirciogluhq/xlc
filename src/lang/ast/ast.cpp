@@ -9,6 +9,115 @@
 
 namespace xlang {
 
+const char* tokenKindName(TokenKind kind) {
+    switch (kind) {
+    case TokenKind::End: return "end of file";
+    case TokenKind::Ident: return "identifier";
+    case TokenKind::PrimType: return "type name";
+    case TokenKind::Int: return "integer literal";
+    case TokenKind::Float: return "float literal";
+    case TokenKind::String: return "string literal";
+    case TokenKind::ByteLit: return "byte literal";
+    case TokenKind::Fn: return "fn";
+    case TokenKind::Local: return "local";
+    case TokenKind::Return: return "return";
+    case TokenKind::If: return "if";
+    case TokenKind::Else: return "else";
+    case TokenKind::While: return "while";
+    case TokenKind::Continue: return "continue";
+    case TokenKind::Break: return "break";
+    case TokenKind::Do: return "do";
+    case TokenKind::Switch: return "switch";
+    case TokenKind::Case: return "case";
+    case TokenKind::Default: return "default";
+    case TokenKind::Defer: return "defer";
+    case TokenKind::Try: return "try";
+    case TokenKind::Catch: return "catch";
+    case TokenKind::Unsafe: return "unsafe";
+    case TokenKind::Import: return "import";
+    case TokenKind::From: return "from";
+    case TokenKind::As: return "as";
+    case TokenKind::Export: return "export";
+    case TokenKind::Declare: return "declare";
+    case TokenKind::Register: return "register";
+    case TokenKind::Global: return "global";
+    case TokenKind::Const: return "const";
+    case TokenKind::Delete: return "delete";
+    case TokenKind::Struct: return "struct";
+    case TokenKind::Class: return "class";
+    case TokenKind::Interface: return "interface";
+    case TokenKind::Impl: return "impl";
+    case TokenKind::Enum: return "enum";
+    case TokenKind::Type: return "type";
+    case TokenKind::Define: return "define";
+    case TokenKind::New: return "new";
+    case TokenKind::Virtual: return "virtual";
+    case TokenKind::Override: return "override";
+    case TokenKind::SelfKw: return "self";
+    case TokenKind::For: return "for";
+    case TokenKind::Except: return "except";
+    case TokenKind::True: return "true";
+    case TokenKind::False: return "false";
+    case TokenKind::LParen: return "(";
+    case TokenKind::RParen: return ")";
+    case TokenKind::LBrace: return "{";
+    case TokenKind::RBrace: return "}";
+    case TokenKind::LBracket: return "[";
+    case TokenKind::RBracket: return "]";
+    case TokenKind::Comma: return ",";
+    case TokenKind::Colon: return ":";
+    case TokenKind::ColonAssign: return ":=";
+    case TokenKind::Semicolon: return ";";
+    case TokenKind::Dot: return ".";
+    case TokenKind::Arrow: return "->";
+    case TokenKind::At: return "@";
+    case TokenKind::Bang: return "!";
+    case TokenKind::Plus: return "+";
+    case TokenKind::Minus: return "-";
+    case TokenKind::Star: return "*";
+    case TokenKind::Slash: return "/";
+    case TokenKind::Percent: return "%";
+    case TokenKind::Amp: return "&";
+    case TokenKind::Pipe: return "|";
+    case TokenKind::Caret: return "^";
+    case TokenKind::Tilde: return "~";
+    case TokenKind::Shl: return "<<";
+    case TokenKind::Shr: return ">>";
+    case TokenKind::Assign: return "=";
+    case TokenKind::EqEq: return "==";
+    case TokenKind::NotEq: return "!=";
+    case TokenKind::Lt: return "<";
+    case TokenKind::Le: return "<=";
+    case TokenKind::Gt: return ">";
+    case TokenKind::Ge: return ">=";
+    case TokenKind::AndAnd: return "&&";
+    case TokenKind::OrOr: return "||";
+    case TokenKind::DotDot: return "..";
+    case TokenKind::DotDotEq: return "..=";
+    case TokenKind::Question: return "?";
+    case TokenKind::PlusAssign: return "+=";
+    case TokenKind::MinusAssign: return "-=";
+    case TokenKind::StarAssign: return "*=";
+    case TokenKind::SlashAssign: return "/=";
+    case TokenKind::PercentAssign: return "%=";
+    case TokenKind::AmpAssign: return "&=";
+    case TokenKind::PipeAssign: return "|=";
+    case TokenKind::CaretAssign: return "^=";
+    case TokenKind::ShlAssign: return "<<=";
+    case TokenKind::ShrAssign: return ">>=";
+    case TokenKind::PlusPlus: return "++";
+    case TokenKind::MinusMinus: return "--";
+    case TokenKind::DirIf: return "#if";
+    case TokenKind::DirElif: return "#elif";
+    case TokenKind::DirElse: return "#else";
+    case TokenKind::DirEndif: return "#endif";
+    case TokenKind::DirIfdef: return "#ifdef";
+    case TokenKind::DirIfndef: return "#ifndef";
+    case TokenKind::DirError: return "#error";
+    }
+    return "?";
+}
+
 const char* unaryOpName(UnaryOp op) {
     switch (op) {
     case UnaryOp::Neg:

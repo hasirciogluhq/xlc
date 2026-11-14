@@ -418,9 +418,12 @@ void testDefineAndMacros() {
     const auto& macro = std::get<DefineMacroDecl>(p.program.items[1].decl);
     CHECK(macro.params.size() == 1 && macro.body.size() == 3);
     const auto& fn = std::get<FnDecl>(p.program.items[3].decl);
+    // The pipeline expands the call before the parser: `square!(1 + 2)` becomes the multiplied
+    // sum, so no MacroCall node survives into the AST.
     const Expr& call = *fn.body.statements[0].expr;
-    CHECK(call.kind == Expr::Kind::MacroCall);
-    CHECK(call.macro_args.size() == 1 && call.macro_args[0].size() == 3);
+    CHECK(call.kind == Expr::Kind::Binary);
+    CHECK(call.binary_op == BinaryOp::Mul);
+    CHECK(call.lhs->kind == Expr::Kind::Binary && call.rhs->kind == Expr::Kind::Binary);
 }
 
 void testNewForms() {
@@ -487,9 +490,12 @@ void testRecoveryReportsSeveralErrors() {
     CHECK(fns >= 3);  // ok, b (with recovered body), c
 }
 
-void testDirectivesAreRejectedByTheParser() {
+void testDirectivesAreHandledBeforeTheParser() {
+    // The directive walk consumes the directive and its same-line body before the parser sees
+    // anything; on this target the condition is false, so the function is dropped whole.
     Parsed p("#if os == \"linux\" fn pageSize() -> usize { return 4096 }\n");
-    CHECK(p.engine.hasErrors());
+    CHECK(!p.engine.hasErrors());
+    CHECK(p.program.items.empty());
 }
 
 void testOperatorPrecedenceAndCasts() {
@@ -771,7 +777,7 @@ int main() {
     RUN(testAsmOperands);
     RUN(testAttributesOnStatementsRegisterAllowScope);
     RUN(testRecoveryReportsSeveralErrors);
-    RUN(testDirectivesAreRejectedByTheParser);
+    RUN(testDirectivesAreHandledBeforeTheParser);
     RUN(testOperatorPrecedenceAndCasts);
     RUN(testByteLiteralParsesAsExpr);
     RUN(testSliceParsing);

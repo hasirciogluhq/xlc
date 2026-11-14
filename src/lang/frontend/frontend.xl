@@ -1,0 +1,54 @@
+// The frontend pipeline in xlang: lex, preprocess, expand macros and parse, in one call.
+//
+// Each stage is the export(c) entry of its own module (../lexer, ../preprocess, ../macro,
+// ../parser); they speak the same flat C ABI of ../abi, so this file chains their results
+// directly and no token ever crosses into C++. The stage errors (E0001, E0003, E0004) go
+// straight to the diagnostic engine; the parse errors stay in the result for the C++ bridge,
+// which reports them as E0002 with the full registry text.
+from "../abi" import CError, CDefine, CMacro
+from "../lexer/lexer" import xlcLex, xlcLexFree
+from "../preprocess/preprocess" import xlcPreprocess, xlcPreprocessFree
+from "../macro/expand" import xlcExpandMacros, xlcExpandMacrosFree
+from "../parser/parser" import xlcParse, CParseResult
+from "std/str" import fromParts
+from "../../util/source" import SourceManager, Span, spanAt
+from "../../util/diagnostics" import DiagnosticEngine
+
+/// Reports the errors of one stage: the code is the stage's (`E0001` lexer, `E0003`
+/// preprocessor, `E0004` macro expander), the span carries `file`, which the stages do not
+/// know, and the primary label is the message's mark, like the C++ seams reported them.
+fn reportStage(e: *DiagnosticEngine, code: str, errors: *CError, count: u32, file: u32) {
+    for i in 0..count {
+        local err = errors[i]
+        local span = spanAt(file, 1, 1)
+        local label = ""
+        if err.labelCount > 0 {
+            local l = err.labels[0]
+            span = spanAt(file, l.line, l.column)
+            span.endLine = l.endLine
+            span.endColumn = l.endColumn
+            label = fromParts(l.text, l.textLen as usize)
+        }
+        e.error(code, span, fromParts(err.message, err.messageLen as usize), label)
+    }
+}
+
+/// The whole frontend of one file: `text` is lexed, the directive walk runs over the tokens with
+/// `defines`, the macro calls expand with the seeded `macros`, and the parser produces the flat
+/// AST. The result is owned by the caller and released with `xlcParseFree`; the intermediate
+/// stage blocks are released here once the parse has read their tokens.
+export(c) fn xlcFrontendParse(m: *SourceManager, file: u32, defines: *CDefine, defineCount: u32,
+                              macros: *CMacro, macroCount: u32, e: *DiagnosticEngine) -> CParseResult {
+    local f = m.file(file)
+    local lexed = xlcLex(f.text.ptr, f.text.len as u32)
+    reportStage(e, "E0001", lexed.errors, lexed.errorCount, file)
+    local pre = xlcPreprocess(lexed.tokens, lexed.tokenCount, defines, defineCount)
+    reportStage(e, "E0003", pre.errors, pre.errorCount, file)
+    local expanded = xlcExpandMacros(pre.tokens, pre.tokenCount, macros, macroCount)
+    reportStage(e, "E0004", expanded.errors, expanded.errorCount, file)
+    local parsed = xlcParse(expanded.tokens, expanded.tokenCount, file)
+    xlcExpandMacrosFree(expanded)
+    xlcPreprocessFree(pre)
+    xlcLexFree(lexed)
+    return parsed
+}

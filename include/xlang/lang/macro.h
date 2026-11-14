@@ -2,7 +2,6 @@
 
 #include "xlang/lang/ast.h"
 #include "xlang/lang/lexer.h"
-#include "xlang/util/diagnostics.h"
 
 #include <map>
 #include <string>
@@ -23,13 +22,9 @@ struct MacroTable {
     std::map<std::string, MacroDef> macros;
 };
 
-/// Expands `name!(args)` calls on the token stream (plan 3.7): parameters are substituted as
-/// token groups (an `expr` argument is parenthesized, so precedence is preserved), `local` names
-/// introduced by a macro body are renamed (hygiene), expansion repeats until no call is left
-/// (depth limit 64). `define` bodies are not expanded where they are written, only when used.
-/// Calls of unknown macros are left in place for a later module-aware stage.
-[[nodiscard]] std::vector<Token> expandMacros(std::vector<Token> tokens, MacroTable& table,
-                                              DiagnosticEngine& diagnostics);
+/// Macros visible to an expansion. Seed it with exported macros of imported modules; the
+/// module's own `define` macros are visible to later uses in the same file inside the pipeline
+/// itself and are collected from the AST by `Compilation::collectMacros` for the dependents.
 
 inline constexpr int kMacroDepthLimit = 64;
 

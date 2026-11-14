@@ -137,13 +137,11 @@ struct Token {
     bool newline_before{false};
 };
 
-/// Tokenizes `file`. Lexical problems are reported to `diagnostics` (E0001) and lexing continues.
-/// The result always ends with a `TokenKind::End` token.
+/// Tokenizes `file` for the lexer unit test. Lexical problems are reported to `diagnostics`
+/// (E0001) and lexing continues. The result always ends with a `TokenKind::End` token.
 [[nodiscard]] std::vector<Token> lex(const SourceManager& sources, FileId file,
                                      DiagnosticEngine& diagnostics);
 
 [[nodiscard]] const char* tokenKindName(TokenKind kind);
-/// Human-readable spelling for diagnostics: "`fn`", "identifier", "end of file", ...
-[[nodiscard]] std::string describeToken(const Token& token);
 
 }  // namespace xlang
