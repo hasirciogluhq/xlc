@@ -38,26 +38,24 @@ rule("xlang.object")
     set_extensions(".xl")
     on_buildcmd_file(function (target, batchcmds, sourcefile, opt)
         local objectfile = target:objectfile(sourcefile)
-        local xl = os.getenv("XL_XL") or "xl"
-        -- `xl` is the driver (`xl build <file> ...`); a raw `xlc` binary takes the file directly.
-        -- The self-hosted `xlc` has no `build` subcommand, so pick the form by the binary name.
+        -- The raw compiler (`$XLC`, else `$XL_XL` when that is not the `xl` driver) takes the
+        -- file directly and needs the stdlib mapped in with `-M std`; the `xl` driver resolves
+        -- `std` itself and takes a `build` subcommand. CI names the released compiler and
+        -- stdlib with `XLC` and `XLANG_STD`.
+        local std = script_std_dir()
+        local bin = os.getenv("XLC") or os.getenv("XL_XL") or "xl"
         local argv
-        if path.filename(xl) == "xl" then
+        if path.filename(bin) == "xl" and not os.getenv("XLC") then
             argv = {"build", path(sourcefile), "--emit=obj", "-o", path(objectfile)}
+        elseif std then
+            argv = {path(sourcefile), "--emit=obj", "-o", path(objectfile),
+                    "-M", "std=" .. std, "--define", "featureDefaultAllocator=true"}
         else
-            -- A raw `xlc` resolves no packages: point it at the stdlib and set the feature flag
-            -- the stdlib requires.
-            local std = script_std_dir()
-            if std then
-                argv = {path(sourcefile), "--emit=obj", "-o", path(objectfile),
-                        "-M", "std=" .. std, "--define", "featureDefaultAllocator=true"}
-            else
-                argv = {path(sourcefile), "--emit=obj", "-o", path(objectfile)}
-            end
+            argv = {path(sourcefile), "--emit=obj", "-o", path(objectfile)}
         end
         batchcmds:show_progress(opt.progress, "${color.build.object}compiling.xlang %s", sourcefile)
         batchcmds:mkdir(path.directory(objectfile))
-        batchcmds:vrunv(xl, argv)
+        batchcmds:vrunv(bin, argv)
         -- The object is not a toolchain product, so the linker does not know it: register it on
         -- the target's object list, the way the built-in `utils.bin2obj` rule does.
         table.insert(target:objectfiles(), objectfile)

@@ -154,12 +154,17 @@ void link(const LinkRequest& r) {
         args = {"-o", r.output.string()};
         // The root object and the program's own static archives can carry the same stdlib code
         // (each archive was built with its imports compiled in); the dead-code pass removes the
-        // copy nothing reaches, which the linker would otherwise report as duplicate symbols. The
-        // same flags the freestanding link of this platform uses.
+        // copy nothing reaches, which the linker would otherwise report as duplicate symbols.
+        // The ELF and COFF linkers error on duplicate strong definitions where the Mach-O one
+        // only warns, so they get the multiple-definition escape hatch explicitly. The rest are
+        // the same flags the freestanding link of this platform uses.
         if (t.os == "macos") {
             args.push_back("-Wl,-dead_strip");
         } else if (t.os == "linux") {
             args.push_back("-Wl,--gc-sections");
+            args.push_back("-Wl,--allow-multiple-definition");
+        } else if (t.os == "windows") {
+            args.push_back("-Wl,/FORCE:MULTIPLE");
         }
     } else if (t.os == "macos") {
         tool = findTool({"ld64.lld"});

@@ -26,25 +26,31 @@ add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build"})
 add_defines("XLANG_VERSION=\"" .. xlc_version .. "\"")
 
--- Finds llvm-config: `$LLVM_CONFIG`, then Homebrew, then `llvm-config` on PATH. Probed by file
--- existence, not by running it: the xmakefile scope has neither `try` nor `pcall`.
+-- Finds llvm-config: `$LLVM_CONFIG`, then Homebrew, then the versioned llvm.org installs on
+-- Linux (`/usr/lib/llvm-23/bin/llvm-config`), then `llvm-config` on PATH. Probed by file
+-- existence only: this function runs with the xmakefile's restricted environment, which has no
+-- `os.which`, no `assert` and no way to run a program. When nothing matches it returns the bare
+-- name, so the caller's `llvm-config` invocation fails with the linker's own clear message.
 local function find_llvm_config()
     if os.getenv("LLVM_CONFIG") then
         return os.getenv("LLVM_CONFIG")
     end
+    local candidates = {}
     for _, prefix in ipairs({os.getenv("HOMEBREW_PREFIX"), "/opt/homebrew", "/usr/local"}) do
         if prefix then
-            local c = path.join(prefix, "opt/llvm/bin/llvm-config")
-            if os.isfile(c) then
-                return c
-            end
+            table.insert(candidates, path.join(prefix, "opt/llvm/bin/llvm-config"))
         end
     end
-    local on_path = os.which and os.which("llvm-config") or nil
-    if on_path then
-        return on_path
+    for _, dir in ipairs(os.dirs("/usr/lib/llvm-*/bin") or {}) do
+        table.insert(candidates, path.join(dir, "llvm-config"))
     end
-    assert(false, "llvm-config not found (set LLVM_CONFIG)")
+    table.insert(candidates, "/usr/bin/llvm-config")
+    for _, c in ipairs(candidates) do
+        if os.isfile(c) then
+            return c
+        end
+    end
+    return "llvm-config"
 end
 
 local function add_llvm(target)
