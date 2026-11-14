@@ -2,7 +2,7 @@
 # Generator: collects the compiler comment tags into one view, and checks that every tag is
 # well-formed. This is the tool behind COMPILER-TAGS.md; it needs nothing but grep and sort.
 #
-#   scripts/tags.sh list [tag]    print every tag line, grouped by tag then file, as grep finds it
+#   scripts/tags.sh list [tag]    print every tag line, grouped by tag then by path and line
 #   scripts/tags.sh check         validate the tags and exit non-zero when one is malformed
 #   scripts/tags.sh sync          rewrite the collected view inside COMPILER-TAGS.md, when it differs
 #
@@ -24,8 +24,20 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 known="grammar comment invariant ownership errno layout abi spec todo cost"
 
 usage() {
-    echo "usage: scripts/tags.sh list [tag] | check" >&2
+    echo "usage: scripts/tags.sh list [tag] | check | sync" >&2
     exit 2
+}
+
+# Every occurrence of one tag, as `path:line:text`.
+#
+# The order is forced here, not left to grep: `grep -r` walks directories in readdir order, which
+# is the filesystem's business (inode order on Linux, hash order on APFS) and differs between the
+# developer's machine and CI. The collected view is a committed file, so it must be derived from
+# the source alone. LC_ALL=C keeps the collation the same on every host.
+# -t: -k1,1 -k2,2n sorts by path, then by line number numerically (99 before 100).
+hits() {
+    (cd "$root" && grep -rn "@$1 " --include='*.cpp' --include='*.h' --include='*.hpp' \
+        src include 2>/dev/null || true) | LC_ALL=C sort -t: -k1,1 -k2,2n
 }
 
 # Every scanned source: the compiler itself. Docs and tests never carry tags.
@@ -40,11 +52,10 @@ cmd_list() {
         if [ -n "$want" ] && [ "$want" != "$tag" ]; then
             continue
         fi
-        hits=$(cd "$root" && grep -rn "@$tag " --include='*.cpp' --include='*.h' --include='*.hpp' \
-            src include 2>/dev/null || true)
-        if [ -n "$hits" ]; then
+        found=$(hits "$tag")
+        if [ -n "$found" ]; then
             echo "== @$tag"
-            echo "$hits"
+            echo "$found"
             echo
         fi
     done
@@ -145,15 +156,14 @@ cmd_sync() {
         echo
         total=0
         for tag in $known; do
-            hits=$(cd "$root" && grep -rn "@$tag " --include='*.cpp' --include='*.h' \
-                --include='*.hpp' src include 2>/dev/null || true)
-            [ -n "$hits" ] || continue
-            count=$(echo "$hits" | wc -l | tr -d ' ')
+            found=$(hits "$tag")
+            [ -n "$found" ] || continue
+            count=$(echo "$found" | wc -l | tr -d ' ')
             total=$((total + count))
             echo "### @$tag ($count)"
             echo
             echo '```'
-            echo "$hits"
+            echo "$found"
             echo '```'
             echo
         done
