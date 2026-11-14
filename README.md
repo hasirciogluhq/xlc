@@ -51,7 +51,7 @@ struct Vec2 { x: f32, y: f32 }
 
 impl Vec2 {
     fn +(self: Vec2, other: Vec2) -> Vec2 { return Vec2 { x: self.x + other.x, y: self.y + other.y } }
-    fn ==(self: Vec2, other: Vec2) -> bool { return self.x == other.x && self.y == other.y }
+    fn ==(self: *Vec2, other: *Vec2) -> bool { return self.x == other.x && self.y == other.y }
     fn +=(self: *Vec2, other: Vec2) { self.x += other.x; self.y += other.y }
     fn *(self: Vec2, k: f32) -> Vec2 { return Vec2 { x: self.x * k, y: self.y * k } }
     fn *(k: f32, self: Vec2) -> Vec2 { return self * k }
@@ -66,9 +66,9 @@ by value); the block holds operators only. The operand types decide: `a + b` is 
 | Source | Calls | When not defined |
 | --- | --- | --- |
 | `a + b` `- * / % & \| ^ << >>` | `operator+(a, b)` ... | error `E0709` |
-| `a == b` | `operator==(a, b)` | error `E0709` |
-| `a != b` | `operator!=(a, b)` | `!(a == b)` |
-| `a < b` | `operator<(a, b)` | error `E0709` |
+| `a == b` | `operator==(&a, &b)` | error `E0709` |
+| `a != b` | `operator!=(&a, &b)` | `!(a == b)` |
+| `a < b` | `operator<(&a, &b)` | error `E0709` |
 | `a > b` `a <= b` `a >= b` | `operator>` `operator<=` `operator>=` | from `<`: `b < a`, `!(b < a)`, `!(a < b)` |
 | `-a` `!a` `~a` | `operator-(a)` `operator!(a)` `operator~(a)` | error `E0709` |
 | `*a` | `*operator*(a)`: the function returns a pointer, `*a` is the place it addresses | error `E0709` |
@@ -78,6 +78,11 @@ by value); the block holds operators only. The operand types decide: `a + b` is 
 | `a++` `a--` | `operator++(&a)` `operator--(&a)` | `operator+=(&a, 1)`, then `a = a + 1` |
 | `a(x, y)` | `operator()(&a, x, y)` | error `E0709` |
 
+- A comparison (`==` `!=` `<` `<=` `>` `>=`) borrows both operands: every operand parameter is a
+  pointer (`fn ==(a: *T, b: *T) -> bool`, or `fn ==(self, other: *T)` in a class), and a
+  by-value one is error `E0779`. Comparing never moves or drops a value, so a generic `sort` or
+  `contains` compares elements that need drop in place. A temporary operand (`make() == a`) lives
+  in a hidden local until the end of the block.
 - The operand that is a place is passed by address when the function's first parameter is a
   pointer to the type and none takes it by value (`fn [](self: *Grid, i: usize)`). `+=`, `++`,
   `[]=` and `()` always pass the address, so `self` is `*T` there.

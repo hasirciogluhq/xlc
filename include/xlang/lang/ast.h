@@ -31,6 +31,11 @@ enum class BinaryOp {
 [[nodiscard]] const char* unaryOpName(UnaryOp op);
 [[nodiscard]] const char* binaryOpName(BinaryOp op);
 
+/// `==`, `!=`, `<`, `<=`, `>`, `>=`: the operators whose user functions borrow their operands.
+[[nodiscard]] constexpr bool isComparison(BinaryOp op) {
+    return op >= BinaryOp::Eq && op <= BinaryOp::Ge;
+}
+
 /// `@name`, `@name(arg, key = value, ...)`.
 struct AttributeArg {
     enum class Kind { Ident, Int, String } kind{Kind::Ident};

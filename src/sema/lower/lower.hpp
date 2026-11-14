@@ -705,6 +705,9 @@ class Lowerer {
                                   const std::vector<Type>& types,
                                   const Span& span,
                                   bool& found);
+    /// E0779: an `operator==` ... `operator>=` function or method whose operand parameters are not
+    /// pointers (`fn ==(a: *T, b: *T)`): a comparison borrows its operands, it never consumes them.
+    void checkComparisonOperator(const FnDecl& f, const std::vector<Type>& params);
     [[nodiscard]] EP userBinary(const Expr& e, const Type& lt, const Type& rt, std::size_t mark);
     [[nodiscard]] EP userUnary(const Expr& e, const Type& t, std::size_t mark);
     [[nodiscard]] EP userIndex(const Expr& e, const Type& base, std::size_t mark);

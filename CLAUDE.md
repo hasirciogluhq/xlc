@@ -18,6 +18,15 @@ is banned.
   (language, stdlib, tests, CLI). Language rules, stdlib and tests live there. Docs live in
   https://github.com/hasirciogluhq/xlang-docs.
 
+## The compiler does not know the stdlib (hard rule)
+
+- Work in this repository never touches, reads for testing, or depends on the stdlib (xl-std).
+  The compiler knows no stdlib type, function or file; a change here is built and verified with
+  the tests of this repository only (test/unit, test/e2e), never by compiling the stdlib or a
+  program that imports it.
+- A compiler change that breaks the stdlib is the stdlib's own work, done in its own repository
+  and session, not here.
+
 ## Tests (hard rule)
 
 - **Unit tests are platform independent; e2e tests are platform related.** A unit test checks

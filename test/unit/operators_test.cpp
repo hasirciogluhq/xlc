@@ -15,7 +15,7 @@ constexpr const char* kVec2 =
     "    fn +(self: Vec2, other: Vec2) -> Vec2 {\n"
     "        return Vec2 { x: self.x + other.x, y: self.y + other.y }\n"
     "    }\n"
-    "    fn ==(self: Vec2, other: Vec2) -> bool {\n"
+    "    fn ==(self: *Vec2, other: *Vec2) -> bool {\n"
     "        return self.x == other.x && self.y == other.y\n"
     "    }\n"
     "    fn +=(self: *Vec2, other: Vec2) {\n"
@@ -35,10 +35,10 @@ void testInherentImplMakesOperatorFunctions() {
               "}\n");
     CHECK(!r.diag->hasErrors());
     CHECK(r.has("fn operator+(self: Vec2, other: Vec2) -> Vec2"));
-    CHECK(r.has("fn operator==(self: Vec2, other: Vec2) -> bool"));
+    CHECK(r.has("fn operator==(self: *Vec2, other: *Vec2) -> bool"));
     CHECK(r.has("fn operator+=(self: *Vec2, other: Vec2)"));
     CHECK(r.has("(call operator+ a#"));
-    CHECK(r.has("(call operator== a#"));
+    CHECK(r.has("(call operator== (addr a#"));
     CHECK(r.has("(call operator+= (addr a#"));
 }
 
@@ -54,7 +54,7 @@ void testDerivedComparisons() {
 
     // `>`, `<=` and `>=` follow from `<`.
     Lowered ord("struct N { v: i32 }\n"
-                "impl N { fn <(self: N, o: N) -> bool { return self.v < o.v } }\n"
+                "impl N { fn <(self: *N, o: *N) -> bool { return self.v < o.v } }\n"
                 "fn main() {\n"
                 "    local a = N { v: 1 }\n"
                 "    local b = N { v: 2 }\n"
@@ -64,6 +64,55 @@ void testDerivedComparisons() {
                 "}\n");
     CHECK(!ord.diag->hasErrors());
     CHECK(ord.has("(call operator<"));
+}
+
+// A comparison borrows: a value that needs drop is passed by address, never moved into the
+// operator (which would drop it there and leave the caller reading freed storage).
+void testComparisonsBorrowTheirOperands() {
+    const std::string res = "class Res {\n    id: i32\n    fn drop(self) { }\n}\n"
+                            "impl Res {\n"
+                            "    fn ==(a: *Res, b: *Res) -> bool { return a.id == b.id }\n"
+                            "    fn <(a: *Res, b: *Res) -> bool { return a.id < b.id }\n"
+                            "}\n";
+    Lowered r(res + "fn make() -> Res { return Res { id: 2 } }\n"
+                    "fn main() -> i32 {\n"
+                    "    local a = Res { id: 1 }\n"
+                    "    local b = Res { id: 1 }\n"
+                    "    local same = a == b\n"
+                    "    local other = a != b\n"
+                    "    local less = a >= make()\n"
+                    "    return a.id + b.id\n"
+                    "}\n");
+    CHECK(!r.diag->hasErrors());
+    CHECK(r.has("(call operator== (addr a#"));
+    CHECK(r.has("(call operator< (addr a#"));
+    CHECK(!r.has("move#")); // neither operand is moved into the operator
+
+    // A generic body compares `T` the same way.
+    Lowered generic(res + "fn least<T>(a: *T, b: *T) -> bool { return *a < *b }\n"
+                          "fn main() {\n"
+                          "    local a = Res { id: 1 }\n"
+                          "    local b = Res { id: 2 }\n"
+                          "    local x = least<Res>(&a, &b)\n"
+                          "}\n");
+    CHECK(!generic.diag->hasErrors());
+    CHECK(generic.has("(call operator< (addr"));
+
+    // A class method compares as `a.operator==(&b)`.
+    Lowered method("class K {\n    n: i32\n    fn ==(self, o: *K) -> bool { return self.n == o.n }\n}\n"
+                   "fn main() -> bool {\n    local a = K()\n    local b = K()\n    return a == b\n}\n");
+    CHECK(!method.diag->hasErrors());
+    CHECK(method.has("K.operator=="));
+
+    // By-value operand parameters are E0779, in an impl, at module level and in a class.
+    CHECK(Lowered("struct V { x: i32 }\nimpl V { fn ==(self: V, o: V) -> bool { return true } }\n")
+              .failedWith("E0779"));
+    CHECK(Lowered("struct V { x: i32 }\nfn <(a: *V, b: V) -> bool { return true }\n").failedWith("E0779"));
+    CHECK(Lowered("class K {\n    n: i32\n    fn >=(self, o: K) -> bool { return true }\n}\n")
+              .failedWith("E0779"));
+    // Other operators keep their written signature.
+    CHECK(!Lowered("struct V { x: i32 }\nimpl V { fn +(self: V, o: V) -> V { return self } }\n")
+               .diag->hasErrors());
 }
 
 void testUnaryOperators() {
@@ -281,6 +330,7 @@ void testDerefOperatorReturnsAPlace() {
 void runOperatorTests() {
     RUN(testInherentImplMakesOperatorFunctions);
     RUN(testDerivedComparisons);
+    RUN(testComparisonsBorrowTheirOperands);
     RUN(testUnaryOperators);
     RUN(testUnaryAndBinaryMinusAreOverloads);
     RUN(testMixedOperandTypes);

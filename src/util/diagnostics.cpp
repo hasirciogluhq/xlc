@@ -353,6 +353,11 @@ constexpr std::size_t kLeadWidth = 40;
          "convention). An `export(c)` or `declare` function that takes or returns a struct by "
          "value follows the C convention, so it can only be called by name. Call it directly, or "
          "change it to take and return the struct through a pointer."},
+        {"E0779", Severity::Error, "comparison operator takes an operand by value",
+         "`a == b`, `a != b`, `a < b`, `a <= b`, `a > b` and `a >= b` on a struct or class call "
+         "the operator function with the operands' addresses, so comparing never moves or drops "
+         "a value. Declare every operand parameter as a pointer: `fn ==(a: *T, b: *T) -> bool`, "
+         "or `fn <(self, other: *T) -> bool` in a class."},
         {"W0770", Severity::Warning, "`next` takes `self` by value",
          "Each call of `next` works on a copy of the iterator, so its position never advances and "
          "the loop does not end. Write `fn next(self: *T)`."},

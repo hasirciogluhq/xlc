@@ -1,5 +1,7 @@
 #include "sema/lower/lower.hpp"
 
+#include <array>
+
 namespace xlang::lower {
 
 // User-defined operators. An operator is a function named `operator<symbol>` (the parser makes it
@@ -8,8 +10,12 @@ namespace xlang::lower {
 // expression into the call of that function when an operand is a struct or a class:
 //
 //   a + b   a - b ... a >> b   operator<sym>(a, b)            all binary arithmetic and bit operators
-//   a == b                     operator==(a, b)               `!=` is `!(a == b)` when not defined
-//   a < b                      operator<(a, b)                `>` `<=` `>=` follow from `<` when not defined
+//   a == b                     operator==(&a, &b)             `!=` is `!(a == b)` when not defined
+//   a < b                      operator<(&a, &b)              `>` `<=` `>=` follow from `<` when not defined
+//
+// A comparison borrows: its operand parameters must be pointers (E0779), so `a == b` neither
+// moves nor drops `a` or `b`, and a generic `sort`/`contains` compares droppable elements in
+// place. A class method compares as `a.operator==(&b)`.
 //   -a  !a  ~a                 operator-(a)  operator!(a)  operator~(a)
 //   *a                         *operator*(a)                  the result is a pointer, `*a` is its place
 //   a[i]                       operator[](a, i)
@@ -201,6 +207,29 @@ Lowerer::EP Lowerer::operatorCall(const std::string& name,
     return callEntry(*call, *pick, name);
 }
 
+void Lowerer::checkComparisonOperator(const FnDecl& f, const std::vector<Type>& params) {
+    constexpr std::array kComparisons{BinaryOp::Eq, BinaryOp::Ne, BinaryOp::Lt,
+                                      BinaryOp::Le, BinaryOp::Gt, BinaryOp::Ge};
+    const auto op = std::ranges::find_if(kComparisons, [&](BinaryOp o) { return f.name == binaryName(o); });
+    if (op == kComparisons.end()) {
+        return;
+    }
+    for (std::size_t i = 0; i < f.params.size() && i < params.size(); ++i) {
+        const Type& t = params[i];
+        if (f.params[i].is_self || lower::isUnknown(t) || t.kind == TypeKind::Pointer) {
+            continue; // a class method's `self` is already its address
+        }
+        err("E0779",
+            f.params[i].span,
+            std::format("`{}` takes `{}` by value", binaryOpName(*op), typeToString(t)),
+            std::format("write `{}: *{}`: `a {} b` passes `&a` and `&b`, a comparison borrows its "
+                        "operands",
+                        f.params[i].name.empty() ? "self" : f.params[i].name,
+                        typeToString(t),
+                        binaryOpName(*op)));
+    }
+}
+
 Lowerer::EP Lowerer::userBinary(const Expr& e, const Type& lt, const Type& rt, std::size_t mark) {
     cutPrelude(mark);
     const std::vector<Type> types{lt, rt};
@@ -224,10 +253,16 @@ Lowerer::EP Lowerer::userBinary(const Expr& e, const Type& lt, const Type& rt, s
     if (derived) {
         return expr(*derived, nullptr);
     }
+    // A comparison borrows both operands: `a == b` is `operator==(&a, &b)`, so comparing never
+    // moves or drops a value (a temporary operand lives in a hidden local, see `&make()`).
+    const bool borrows = isComparison(op);
     std::vector<ExprPtr> rest;
-    rest.push_back(cloneAst(*e.rhs));
+    rest.push_back(borrows ? astUnary(UnaryOp::AddrOf, cloneAst(*e.rhs), e.span) : cloneAst(*e.rhs));
+    const std::vector<Type> arg_types =
+        borrows ? std::vector<Type>{Type::makePointer(lt), Type::makePointer(rt)} : types;
     bool found = false;
-    EP call = operatorCall(binaryName(op), cloneAst(*e.lhs), false, std::move(rest), types, e.span, found);
+    EP call =
+        operatorCall(binaryName(op), cloneAst(*e.lhs), borrows, std::move(rest), arg_types, e.span, found);
     if (!found) {
         err("E0709",
             e.span,

@@ -99,6 +99,7 @@ void Lowerer::lowerFunction(const FnDecl& f,
     if (out.is_entry) {
         checkEntrySignature(f, param_types, out.ret);
     }
+    checkComparisonOperator(f, param_types);
     out.param_count = static_cast<std::uint32_t>(out.locals.size());
     // The drop flags follow the parameters (the first `param_count` locals).
     for (const OwnedParam& p : owned_params) {
