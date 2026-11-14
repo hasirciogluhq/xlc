@@ -1,7 +1,6 @@
 #include "cli/emit.h"
 
 #include "xlang/codegen/codegen.h"
-#include "xlang/codegen/link.h"
 #include "xlang/hir/prune.h"
 #include "xlang/util/error.h"
 
@@ -21,39 +20,15 @@ namespace {
 
 namespace fs = std::filesystem;
 
-/// Default output path: next to the input, named after it (`main.xl` -> `main`, `main.exe`, `libmain.a`...).
-[[nodiscard]] fs::path defaultOutput(const fs::path& root, std::string_view emit, std::string_view os) {
-    const bool windows = os == "windows";
-    const std::string stem = root.stem().string();
-    const fs::path dir = root.parent_path();
-    if (emit == "exe") {
-        return dir / (stem + (windows ? ".exe" : ""));
-    }
-    if (emit == "obj") {
-        return dir / (stem + (windows ? ".obj" : ".o"));
-    }
-    if (emit == "ir") {
-        return dir / (stem + ".ll");
-    }
-    if (emit == "bc") {
-        return dir / (stem + ".bc");
-    }
-    if (emit == "header") {
-        return dir / (stem + ".h");
-    }
-    if (emit == "static") {
-        return dir / (windows ? stem + ".lib" : "lib" + stem + ".a");
-    }
-    return dir / ((windows ? "" : "lib") + stem + (windows ? ".dll" : os == "macos" ? ".dylib" : ".so"));
-}
-
-/// `@library("x")` imports of the program, for the Windows linker step.
-void collectImports(const hir::Module& module, codegen::LinkRequest& req) {
+/// `@library("x")` imports of the program, for the Windows link (src/driver/link.xl).
+[[nodiscard]] std::vector<std::pair<std::string, std::string>> collectImports(const hir::Module& module) {
+    std::vector<std::pair<std::string, std::string>> imports;
     for (const auto& f : module.functions) {
         if (f.declared && !f.import_library.empty()) {
-            req.imports.emplace_back(f.import_library, f.symbol);
+            imports.emplace_back(f.import_library, f.symbol);
         }
     }
+    return imports;
 }
 
 /// FNV-1a step over `s` (with a separator), used for the incremental cache keys.
@@ -103,30 +78,13 @@ void collectImports(const hir::Module& module, codegen::LinkRequest& req) {
     return false;
 }
 
-/// Archives (`static`) or links (`exe`, `shared`) `objects` plus the prebuilt inputs into `out`.
-void archiveOrLink(const EmitRequest& request, const fs::path& out, std::vector<fs::path> objects,
-                   const hir::Module& module, const BuildConfig& config) {
-    if (request.emit == "static") {
-        codegen::archive(objects, out, config);
-        return;
-    }
-    codegen::LinkRequest req;
-    req.objects = std::move(objects);
-    req.objects.insert(req.objects.end(), request.inputs.begin(), request.inputs.end());
-    req.output = out;
-    req.kind = request.emit == "shared" ? codegen::LinkKind::Shared : codegen::LinkKind::Executable;
-    req.config = &config;
-    req.crt_link = config.crt_link;
-    req.extra_args = request.link_args;
-    collectImports(module, req);
-    codegen::link(req);
-}
-
 /// Plan 8.1/8.2: one object per module, keyed by the content hash of the module, its dependencies
 /// and the build configuration; an object that is already in the cache is not generated again.
-void emitIncremental(Compilation& compilation, hir::Module& module, const BuildConfig& config,
-                     SourceManager& sources, DiagnosticEngine& diagnostics, const EmitRequest& request,
-                     const fs::path& out, const codegen::LayoutQuery& layoutOf) {
+/// Returns the objects to link (cache entries, kept); empty after a reported error.
+[[nodiscard]] std::vector<fs::path> emitIncremental(Compilation& compilation, hir::Module& module,
+                                                    const BuildConfig& config, SourceManager& sources,
+                                                    DiagnosticEngine& diagnostics, const EmitRequest& request,
+                                                    const fs::path& out, const codegen::LayoutQuery& layoutOf) {
     const bool windows = config.target.os == "windows";
     const std::string stem = request.root.stem().string();
     const fs::path dir = request.cache_dir.empty() ? out.parent_path() / ".xlc-cache" : request.cache_dir;
@@ -182,37 +140,34 @@ void emitIncremental(Compilation& compilation, hir::Module& module, const BuildC
                                       std::format("code generation for module `{}` failed without a diagnostic", name),
                                       "internal error: the back end returned no object");
                 }
-                return;
+                return {};
             }
             artifact->optimize(config.opt_level);
             artifact->writeObject(obj);
         }
         objects.push_back(obj);
     }
-    if (!diagnostics.hasErrors()) {
-        archiveOrLink(request, out, std::move(objects), module, config);
-    }
+    return diagnostics.hasErrors() ? std::vector<fs::path>{} : objects;
 }
 
 } // namespace
 
-void emitOutput(Compilation& compilation, hir::Module& module, const BuildConfig& config, SourceManager& sources,
-                DiagnosticEngine& diagnostics, const EmitRequest& request) {
+EmitResult emitOutput(Compilation& compilation, hir::Module& module, const BuildConfig& config,
+                      SourceManager& sources, DiagnosticEngine& diagnostics, const EmitRequest& request) {
     // Plan 24: only what the roots reach is code-generated and linked. Libraries and objects keep
     // every `export` as part of their interface; an executable keeps its `export(c)` functions only
     // when it links prebuilt objects (they may call back into it), and nothing else.
     hir::pruneUnreachable(module,
-                          request.emit != "exe"     ? hir::KeepExports::All
-                          : request.inputs.empty() ? hir::KeepExports::None
-                                                   : hir::KeepExports::C);
+                          request.emit != "exe" ? hir::KeepExports::All
+                          : request.has_inputs  ? hir::KeepExports::C
+                                                : hir::KeepExports::None);
     Sema& root = *compilation.rootSema();
     const codegen::LayoutQuery layoutOf = [&root](const Type& t) { return root.layoutOf(t, Span{}); };
-    const fs::path out =
-        request.output.empty() ? defaultOutput(request.root, request.emit, config.target.os) : request.output;
+    const fs::path& out = request.output;
     const std::string stem = request.root.stem().string();
 
     if (!checkEntry(module, config, diagnostics, request)) {
-        return;
+        return {};
     }
     if (request.emit == "header") {
         std::string guard = "XLANG_" + stem + "_H";
@@ -220,24 +175,24 @@ void emitOutput(Compilation& compilation, hir::Module& module, const BuildConfig
         const std::string text = codegen::generateHeader(module, layoutOf, guard);
         if (out == "-") { // `-o -` streams, like the LLVM writers of ir, bc and obj
             std::cout << text;
-            return;
+            return {};
         }
         std::ofstream file(out);
         if (!(file << text)) {
             throw XlangError("cannot write `" + out.string() + "`");
         }
-        return;
+        return {};
     }
     const bool linked = request.emit == "exe" || request.emit == "static" || request.emit == "shared";
     if (request.incremental && linked) {
-        emitIncremental(compilation, module, config, sources, diagnostics, request, out, layoutOf);
-        return;
+        return {emitIncremental(compilation, module, config, sources, diagnostics, request, out, layoutOf),
+                collectImports(module), false};
     }
 
     codegen::CodegenInput cg{module, config, sources, diagnostics, layoutOf, stem, codegen::outputOf(request.emit)};
     auto artifact = codegen::generate(cg);
     if (!artifact) {
-        return;
+        return {};
     }
     artifact->optimize(config.opt_level);
     if (request.emit == "ir") {
@@ -248,18 +203,13 @@ void emitOutput(Compilation& compilation, hir::Module& module, const BuildConfig
         artifact->writeObject(out);
     } else {
         // The intermediate object sits next to the output (same directory, so the same permissions
-        // and file system) and is removed whether or not the link succeeds.
+        // and file system); the CLI removes it whether or not the link succeeds.
         fs::path obj = out;
         obj += config.target.os == "windows" ? ".tmp.obj" : ".tmp.o";
         artifact->writeObject(obj);
-        try {
-            archiveOrLink(request, out, {obj}, module, config);
-        } catch (...) {
-            fs::remove(obj);
-            throw;
-        }
-        fs::remove(obj);
+        return {{obj}, collectImports(module), true};
     }
+    return {};
 }
 
 } // namespace xlang::cli

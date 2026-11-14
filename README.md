@@ -216,9 +216,13 @@ src/hir/         HIR dump and reachability pruning
 src/mir/         HIR -> MIR (control-flow graph per function): builder/, dataflow/ solver, dump
 src/analysis/    static analyses over HIR (hir/) and MIR (mir/): read only, findings sorted by position
 src/codegen/     HIR -> LLVM IR, optimization, object writers, C header
-src/driver/      linker driver and archiver
+src/driver/      linker driver (`link.xl`) and the in-process archiver (`archive.cpp`, LLVM's writer)
 src/util/        source files and diagnostics
-src/cli/         command line (`main.cpp`), output selection (`emit.cpp`), terminal color
+src/main.xl      the CLI entry; `bootstrap.xl` is the same CLI behind a plain C `main`
+src/cli.xl       command line parser and the run it drives
+src/cli/         the C ABI of the backend (`backend.xl`), the output step (`emit.xl`), terminal
+                 color (`console.xl`); `emit.cpp` is the code generation behind `xlcSessionEmit`
+src/backend/     the C++ pipeline behind include/xlang/backend_c.h
 test/unit/       frontend/sema/HIR/MIR/analysis unit tests (platform independent)
 test/e2e/        the binary on the host OS: starts, links only the OS, builds and runs programs (platform related)
 ```

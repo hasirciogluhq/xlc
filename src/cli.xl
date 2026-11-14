@@ -1,131 +1,14 @@
-// The boundary between the CLI written in xlang and the C++ backend: the flat structs of
-// include/xlang/backend_c.h mirrored field for field, the `declare fn` bindings, and the
-// command-line parser that produces them. The parser keeps the behavior of the C++ CLI
-// (src/cli/main.cpp before the move): `--opt value` and `--opt=value`, attached short values
-// (`-O2`), repeatable lists, `-Wno-CODE` rewritten to `--allow CODE`, and the same defaults.
+// The command line of xlc and the run it drives: the parser, then the backend one stage at a
+// time through the boundary of src/cli/backend.xl, then the output step (src/cli/emit.xl). The
+// parser keeps the behavior of the C++ CLI it replaced: `--opt value` and `--opt=value`,
+// attached short values (`-O2`), repeatable lists, `-Wno-CODE` rewritten to `--allow CODE`, and
+// the same defaults.
 from "std" import String, Vec, format
 from "std/io" import print, eprint
 from "std/str" import view, find, startsWith, endsWith, toU64, fromParts
-
-// ---- the boundary ---------------------------------------------------------------------------
-
-/// One string across the boundary: the bytes are not NUL-terminated.
-@repr(c)
-export struct XlcStr {
-    bytes: *u8
-    len: u32
-}
-
-/// A list of strings across the boundary.
-@repr(c)
-export struct XlcStrList {
-    items: *XlcStr
-    count: u32
-}
-
-/// The command-line configuration, already parsed into values. Field order and types match
-/// `XlcConfig` in include/xlang/backend_c.h exactly.
-@repr(c)
-export struct XlcConfig {
-    target: XlcStr
-    opt: XlcStr
-    debug: i32
-    cpu: XlcStr
-    mangle: XlcStr
-    safety: XlcStr
-    layoutScheme: XlcStr
-    layoutHistory: XlcStr
-    defines: XlcStrList
-    undefs: XlcStrList
-    allow: XlcStrList
-    deny: XlcStrList
-    warnAll: i32
-    allowAll: i32
-    contextErrors: u64
-    contextWarnings: u64
-    logPath: XlcStr
-    diagFormat: XlcStr
-    diagLogLevel: XlcStr
-    colorMode: XlcStr
-    crt: i32
-}
-
-/// What to write and where. Field order and types match `XlcEmitRequest` exactly.
-@repr(c)
-export struct XlcEmitRequest {
-    root: XlcStr
-    output: XlcStr
-    emit: XlcStr
-    incremental: i32
-    cacheDir: XlcStr
-    inputs: XlcStrList
-    linkArgs: XlcStrList
-}
-
-/// The opaque backend session, behind `xlcSessionNew`/`xlcSessionFree`.
-export type XlcSession = u8
-
-// Every backend function is `declare`d: it resolves at link time from the backend archive
-// (`xlc-backend`), so `--emit=obj` alone always warns W0301; silenced per declaration.
-@allow(W0301)
-export declare fn xlcExplain(code: XlcStr) -> i32
-@allow(W0301)
-export declare fn xlcVersion()
-@allow(W0301)
-export declare fn xlcPrintCfg(config: *XlcConfig) -> i32
-@allow(W0301)
-export declare fn xlcDumpAst(config: *XlcConfig, path: XlcStr) -> i32
-@allow(W0301)
-export declare fn xlcSessionNew(config: *XlcConfig) -> *XlcSession
-@allow(W0301)
-export declare fn xlcSessionFree(session: *XlcSession)
-@allow(W0301)
-export declare fn xlcSessionAddModuleRoot(session: *XlcSession, spec: XlcStr) -> i32
-@allow(W0301)
-export declare fn xlcSessionAddImplicitImport(session: *XlcSession, spec: XlcStr) -> i32
-@allow(W0301)
-export declare fn xlcSessionLoadRoot(session: *XlcSession, path: XlcStr) -> i32
-@allow(W0301)
-export declare fn xlcSessionAnalyze(session: *XlcSession) -> i32
-@allow(W0301)
-export declare fn xlcSessionDumpHir(session: *XlcSession) -> i32
-@allow(W0301)
-export declare fn xlcSessionDumpMir(session: *XlcSession) -> i32
-@allow(W0301)
-export declare fn xlcSessionDumpLayout(session: *XlcSession, typeName: XlcStr, record: i32) -> i32
-@allow(W0301)
-export declare fn xlcSessionEmit(session: *XlcSession, request: *XlcEmitRequest) -> i32
-@allow(W0301)
-export declare fn xlcSessionHasErrors(session: *XlcSession) -> i32
-@allow(W0301)
-export declare fn xlcSessionErrorCount(session: *XlcSession) -> i64
-@allow(W0301)
-export declare fn xlcSessionWarningCount(session: *XlcSession) -> i64
-@allow(W0301)
-export declare fn xlcSessionPrintSummary(session: *XlcSession)
-@allow(W0301)
-export declare fn xlcSessionFlush(session: *XlcSession)
-
-/// The byte an empty boundary string points at: the C++ side wants a valid pointer even for
-/// length zero.
-global kEmptyByte: u8 = 0
-
-/// `String` -> boundary string. The bytes live as long as the String does.
-export fn xstr(s: *String) -> XlcStr {
-    if s.len == 0 {
-        return XlcStr { bytes: &kEmptyByte, len: 0 }
-    }
-    return XlcStr { bytes: s.ptr, len: s.len as u32 }
-}
-
-/// Copies one list into the arena and returns the boundary list. The arena Vec must outlive the
-/// call that uses the result.
-fn xlist(items: *Vec<String>, arena: *Vec<XlcStr>) -> XlcStrList {
-    for i in 0..items.length() {
-        arena.push(xstr(items.get(i)))
-    }
-    return XlcStrList { items: arena.data, count: arena.length() as u32 }
-}
+import * from "cli/backend"
+from "cli/console" import decideColor, STDERR
+from "cli/emit" import EmitPlan, emitProgram
 
 // ---- the options ----------------------------------------------------------------------------
 
@@ -496,24 +379,25 @@ export fn buildConfig(o: *Opts, arena: *ConfigArena) -> *XlcConfig {
     arena.cfg.logPath = xstr(&o.logPath)
     arena.cfg.diagFormat = xstr(&o.diagFormat)
     arena.cfg.diagLogLevel = xstr(&o.diagLogLevel)
-    arena.cfg.colorMode = xstr(&o.color)
     arena.cfg.crt = o.crt ? 1 : 0
     return &arena.cfg
 }
 
-/// Fills the boundary emit request from the parsed options; `inputs` are the link inputs (the
-/// program root excluded). The arena must outlive the call.
-export fn buildEmitRequest(o: *Opts, root: *String, inputs: *Vec<String>, arena: *Vec<XlcStr>,
-                           linkArena: *Vec<XlcStr>) -> XlcEmitRequest {
-    local req: XlcEmitRequest
-    req.root = xstr(root)
-    req.output = xstr(&o.output)
-    req.emit = xstr(&o.emit)
-    req.incremental = o.incremental ? 1 : 0
-    req.cacheDir = xstr(&o.cacheDir)
-    req.inputs = xlist(inputs, arena)
-    req.linkArgs = xlist(&o.linkArgs, linkArena)
-    return req
+/// The output step's plan from the parsed options: every input but the program root
+/// (`rootIdx`) is a link input.
+fn emitPlan(o: *Opts, rootIdx: usize) -> EmitPlan {
+    local plan = EmitPlan()
+    plan.root = o.inputs.get(rootIdx).clone()
+    plan.output = o.output.clone()
+    plan.emit = o.emit.clone()
+    plan.incremental = o.incremental
+    plan.cacheDir = o.cacheDir.clone()
+    plan.crt = o.crt
+    for input, i in o.inputs {
+        if i != rootIdx { plan.inputs.push(input.clone()) }
+    }
+    for a in o.linkArgs { plan.linkArgs.push(a.clone()) }
+    return plan
 }
 
 // ---- the program ---------------------------------------------------------------------------
@@ -539,6 +423,8 @@ export fn run(args: Vec<String>) -> i32 {
         eprint("error: {}\n", o.bad.asStr())
         return 2
     }
+    // One color decision for the CLI and the backend, before either prints.
+    xlcSetColor(decideColor(STDERR, &o.color) ? 1 : 0)
     if o.version {
         xlcVersion()
         return 0
@@ -606,6 +492,9 @@ export fn run(args: Vec<String>) -> i32 {
     // `--check`, a dump or a layout print writes nothing; everything else emits.
     local wantsLayout = o.dumpLayoutSeen
     local emits = !o.check && !o.dumpHir && !o.dumpMir && !wantsLayout
+    // A failed archive or link is no diagnostic: it is reported as an `error:` line and only
+    // fails the exit status.
+    local emitFailed = false
     if xlcSessionHasErrors(session) == 0 {
         if o.dumpHir {
             xlcSessionDumpHir(session)
@@ -614,24 +503,15 @@ export fn run(args: Vec<String>) -> i32 {
             xlcSessionDumpMir(session)
         }
         if emits {
-            // The link inputs: every input that is not the program root.
-            local inputs: Vec<String> = Vec<String>()
-            for i in 0..o.inputs.length() {
-                if i != rootIdx as usize {
-                    inputs.push((*o.inputs.get(i)).clone())
-                }
-            }
-            local listArena: Vec<XlcStr> = Vec<XlcStr>()
-            local linkArena: Vec<XlcStr> = Vec<XlcStr>()
-            local req = buildEmitRequest(&o, &root, &inputs, &listArena, &linkArena)
-            xlcSessionEmit(session, &req)
+            local plan = emitPlan(&o, rootIdx as usize)
+            emitFailed = !emitProgram(session, &plan)
         }
     }
     if wantsLayout && xlcSessionHasErrors(session) == 0 {
         xlcSessionDumpLayout(session, xstr(&o.dumpLayout), o.layoutRecord ? 1 : 0)
     }
 
-    local code: i32 = 0
+    local code: i32 = emitFailed ? 1 : 0
     if xlcSessionHasErrors(session) != 0 {
         xlcSessionPrintSummary(session)
         code = 1

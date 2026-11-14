@@ -1,0 +1,302 @@
+// Plan 5.9: the linker driver. It picks the target's linker, builds its command line and runs it:
+//
+//   --crt    the platform C++ compiler driver (`clang++`), which brings crt1, libc, the C++
+//            runtime and the static-initializer runners; used for programs with C++ code (the
+//            xlc binary itself). Host only: the driver links the machine it runs on.
+//   macos    ld64.lld, entry `_start` (`-e`), no libSystem unless an `@library` import asks.
+//   linux    ld.lld (any CPU) or the system `ld` (its own CPU only), `-nostdlib -static`.
+//   windows  lld-link with `/nodefaultlib`; every `@library` DLL gets an import library made by
+//            llvm-dlltool from the symbols the program declares, so no Windows SDK is needed.
+//
+// Nothing else is linked: no libc, no libSystem, no kernel32 beyond what the program imports.
+// The archiver stays C++ (`xlcArchive`, LLVM's writer); this file only links.
+from "std" import String, Vec, Option, format
+from "std/os/process" import Command
+from "std/os/env" import get as envGet
+from "std/io" import fsWrite
+from "std/io/files" import exists, isDir, removeFile
+from "../cli/console" import printError
+
+/// One `@library("lib") declare fn sym` import of the program.
+export class Import {
+    library: String
+    symbol: String
+
+    fn init(self, library: String, symbol: String) {
+        self.library = library
+        self.symbol = symbol
+    }
+}
+
+/// What to link: the objects in order, the output, and the target the objects were made for.
+export class LinkRequest {
+    objects: Vec<String>
+    output: String
+    shared: bool           // a shared library (`-dylib`, `-shared`, `/dll`) instead of a program
+    crt: bool              // `--crt`: link through the C++ compiler driver
+    os: String             // linux|macos|windows
+    arch: String           // x86_64|aarch64
+    imports: Vec<Import>   // `@library` imports reachable after pruning
+    extraArgs: Vec<String> // `--link-arg`, appended verbatim
+
+    fn init(self) {
+        self.objects = Vec<String>()
+        self.imports = Vec<Import>()
+        self.extraArgs = Vec<String>()
+    }
+}
+
+/// Appends every word of `words` (an array of `str`) to `args`. Generic over the array because an
+/// array literal converts neither to `[]str` nor to a `Vec`.
+fn pushAll<A>(args: *Vec<String>, words: A) {
+    for w in words { args.push(String(*w)) }
+}
+
+/// The directories searched for a tool: PATH first, then where the LLVM installers put it.
+fn toolDirs() -> Vec<String> {
+    local name = String("PATH")
+    local path = envGet(&name).unwrapOr(String())
+    // `;` separates PATH entries on Windows, `:` elsewhere (a drive letter `C:` is why).
+#if os == "windows"
+    local dirs = path.split(";")
+    local programFiles = String("ProgramFiles")
+    local root = envGet(&programFiles).unwrapOr(String())
+    if root.length() > 0 { dirs.push(format("{}\\LLVM\\bin", root.asStr())) }
+    pushAll(&dirs, ["C:\\Program Files\\LLVM\\bin"])
+#else
+    local dirs = path.split(":")
+    pushAll(&dirs, ["/opt/homebrew/opt/llvm/bin", "/usr/local/opt/llvm/bin", "/opt/homebrew/bin", "/usr/lib/llvm/bin",
+                    "/usr/bin"])
+#endif
+    return dirs
+}
+
+/// The full path of the first of `names` found in `toolDirs`, or "" when none is: then the
+/// missing `what` is reported.
+fn findTool<A>(names: A, what: str) -> String {
+    local dirs = toolDirs()
+    for name in names {
+        // A Win32 program is `name.exe` on disk.
+        local file = String(*name)
+#if os == "windows"
+        if !file.contains(".") { file.append(".exe") }
+#endif
+        for dir in dirs {
+            if dir.length() == 0 { continue }
+            local candidate = format("{}/{}", dir.asStr(), file.asStr())
+            if exists(&candidate) && !isDir(&candidate) {
+                return candidate
+            }
+        }
+    }
+    fail(format("no {} found; install it, or stop at `--emit=obj`", what))
+    return String()
+}
+
+/// The macOS SDK root (`xcrun --show-sdk-path`), where ld64 finds `usr/lib/libSystem.tbd`. ""
+/// when xcrun is missing or fails; the linker then reports the undefined library itself.
+fn macosSdkRoot() -> String {
+    local xcrun = Command(String("xcrun"))
+    xcrun.arg(String("--show-sdk-path"))
+    if xcrun.output().isSome() || !xcrun.status.success {
+        return String()
+    }
+    return xcrun.outText.trim()
+}
+
+/// Prints `error: message` and fails.
+fn fail(message: String) -> bool {
+    printError(&message)
+    return false
+}
+
+/// Runs `tool` with `args`, its output going to this process's streams. False (reported) when it
+/// cannot start or fails.
+fn runTool(tool: *String, args: *Vec<String>) -> bool {
+    local cmd = Command(tool.clone())
+    local line = tool.clone()
+    for a in args {
+        cmd.arg(a.clone())
+        line.push(b' ')
+        line.append(a)
+    }
+    if cmd.run().isSome() || !cmd.status.success {
+        return fail(format("linker failed: {}", line.asStr()))
+    }
+    return true
+}
+
+/// The flags of the `--crt` link: everything goes to the platform C++ compiler driver.
+fn crtArgs(r: *LinkRequest, args: *Vec<String>) {
+    pushAll(args, ["-o"])
+    args.push(r.output.clone())
+    // The root object and the program's own static archives can carry the same stdlib code (each
+    // archive was built with its imports compiled in). The dead-code pass removes the copy
+    // nothing reaches; the ELF and COFF linkers reject duplicate strong definitions where Mach-O
+    // only warns, so they get the multiple-definition escape hatch explicitly.
+    if r.os.asStr() == "macos" {
+        pushAll(args, ["-Wl,-dead_strip"])
+    } else if r.os.asStr() == "linux" {
+        pushAll(args, ["-Wl,--gc-sections", "-Wl,--allow-multiple-definition"])
+    } else if r.os.asStr() == "windows" {
+        pushAll(args, ["-Wl,/FORCE:MULTIPLE"])
+    }
+    for o in r.objects { args.push(o.clone()) }
+    // The ELF linker scans each archive once, and the module archives of a program are cyclic;
+    // a link group over every `.a` lets it rescan (ld(1) `--start-group`).
+    if r.os.asStr() != "linux" {
+        for a in r.extraArgs { args.push(a.clone()) }
+        return
+    }
+    pushAll(args, ["-Wl,--start-group"])
+    for a in r.extraArgs { if a.endsWith(".a") { args.push(a.clone()) } }
+    pushAll(args, ["-Wl,--end-group"])
+    for a in r.extraArgs { if !a.endsWith(".a") { args.push(a.clone()) } }
+}
+
+/// The index of `name` in `names`, or `names.length()` when it is not there.
+fn indexOf(names: *Vec<String>, name: *String) -> usize {
+    for n, i in names { if n.asStr() == name.asStr() { return i } }
+    return names.length()
+}
+
+/// The `.def` text of one DLL: its name and the symbols the program imports from it.
+///   https://learn.microsoft.com/en-us/cpp/build/reference/module-definition-dot-def-files
+fn defText(dll: *String, symbols: *Vec<String>) -> String {
+    local text = format("LIBRARY {}\nEXPORTS\n", dll.asStr())
+    for s in symbols { text.append(format("    {}\n", s.asStr())) }
+    return text
+}
+
+/// Writes one import library per `@library` DLL with llvm-dlltool and adds it to `args`; the
+/// files land in `made` for removal after the link.
+fn windowsImports(r: *LinkRequest, args: *Vec<String>, made: *Vec<String>) -> bool {
+    // (library, symbols) in first-seen order, each symbol once. The entry stub of a program ends
+    // the process through ntdll.
+    local libraries = Vec<String>()
+    local symbols = Vec<Vec<String>>()
+    local wanted = Vec<Import>()
+    for imp in r.imports { wanted.push(Import(imp.library.clone(), imp.symbol.clone())) }
+    if !r.shared { wanted.push(Import(String("ntdll"), String("NtTerminateProcess"))) }
+    for imp in wanted {
+        local at = indexOf(&libraries, &imp.library)
+        if at == libraries.length() {
+            libraries.push(imp.library.clone())
+            symbols.push(Vec<String>())
+        }
+        local list = symbols.get(at)
+        if indexOf(list, &imp.symbol) == list.length() { list.push(imp.symbol.clone()) }
+    }
+    if libraries.length() == 0 { return true }
+    local dlltool = findTool(["llvm-dlltool"], "import-library tool (`llvm-dlltool`)")
+    if dlltool.length() == 0 { return false }
+    local slash = r.output.findLast("/")
+    local backslash = r.output.findLast("\\")
+    local cut = slash > backslash ? slash : backslash
+    local dir = cut < 0 ? String(".") : r.output.slice(0, cut as usize)
+    for lib, i in libraries {
+        local dll = lib.endsWith(".dll") ? lib.clone() : format("{}.dll", lib.asStr())
+        local def = format("{}/{}.xl-import.def", dir.asStr(), lib.asStr())
+        local implib = format("{}/{}.xl-import.lib", dir.asStr(), lib.asStr())
+        local text = defText(&dll, symbols.get(i))
+        if !fsWrite(def.cstr(), text.asStr()) { return fail(format("cannot write `{}`", def.asStr())) }
+        local toolArgs = Vec<String>()
+        pushAll(&toolArgs, ["-m", r.arch.asStr() == "aarch64" ? "arm64" : "i386:x86-64", "-d"])
+        toolArgs.push(def.clone())
+        pushAll(&toolArgs, ["-l"])
+        toolArgs.push(implib.clone())
+        local ok = runTool(&dlltool, &toolArgs)
+        removeFile(&def)
+        if !ok { return fail(format("cannot create the import library for `{}`", dll.asStr())) }
+        args.push(implib.clone())
+        made.push(implib)
+    }
+    return true
+}
+
+/// The linker and its leading flags for the freestanding link of `r.os`, or "" (reported).
+fn freestanding(r: *LinkRequest, args: *Vec<String>, made: *Vec<String>) -> String {
+    if r.os.asStr() == "macos" {
+        local tool = findTool(["ld64.lld"], "Mach-O linker (`ld64.lld`)")
+        if tool.length() == 0 { return tool }
+        pushAll(args, ["-arch", r.arch.asStr() == "aarch64" ? "arm64" : "x86_64", "-platform_version", "macos", "11.0",
+                       "11.0", "-o"])
+        args.push(r.output.clone())
+        if r.shared {
+            pushAll(args, ["-dylib"])
+        } else {
+            pushAll(args, ["-e", "_start", "-no_uuid", "-dead_strip"])
+        }
+        return tool
+    }
+    if r.os.asStr() == "linux" {
+        local tool = findTool(["ld.lld", "ld"], "ELF linker (`ld.lld` or `ld`)")
+        if tool.length() == 0 { return tool }
+        // The system `ld` links its own CPU only; `ld.lld` links every one. Say so instead of
+        // letting the host `ld` fail with "file in wrong format".
+#if arch == "x86_64"
+        local host = "x86_64"
+#else
+        local host = "aarch64"
+#endif
+        if !tool.endsWith("/ld.lld") && r.arch.asStr() != host {
+            fail(format("linking for `{}` on a `{}` host needs `ld.lld` (LLVM's lld); install it, or stop at `--emit=obj`",
+                        r.arch.asStr(), host))
+            return String()
+        }
+        pushAll(args, ["-o"])
+        args.push(r.output.clone())
+        pushAll(args, ["-nostdlib", r.shared ? "-shared" : "-static"])
+        if !r.shared { pushAll(args, ["-e", "_start", "--gc-sections"]) }
+        return tool
+    }
+    if r.os.asStr() == "windows" {
+        local tool = findTool(["lld-link"], "COFF linker (`lld-link`)")
+        if tool.length() == 0 { return tool }
+        pushAll(args, ["/nodefaultlib"])
+        args.push(format("/out:{}", r.output.asStr()))
+        pushAll(args, ["/subsystem:console"])
+        if !windowsImports(r, args, made) { return String() }
+        pushAll(args, [r.shared ? "/dll" : "/entry:mainCRTStartup"])
+        return tool
+    }
+    fail(format("cannot link for target OS `{}`", r.os.asStr()))
+    return String()
+}
+
+/// Links `r`. False when the link failed; the reason is already on stderr.
+export fn link(r: *LinkRequest) -> bool {
+    local args = Vec<String>()
+    if r.crt && !r.shared {
+        local tool = findTool(["clang++"], "C++ compiler driver (`clang++`)")
+        if tool.length() == 0 { return false }
+        crtArgs(r, &args)
+        return runTool(&tool, &args)
+    }
+    local made = Vec<String>()  // generated import libraries, removed after the link
+    local tool = freestanding(r, &args, &made)
+    local ok = tool.length() > 0
+    if ok {
+        for o in r.objects { args.push(o.clone()) }
+        // Plan 24: the OS libraries the program imports with `@library`, after pruning, each once
+        // and after the objects so that static archives resolve. Windows has them as import
+        // libraries already.
+        if r.os.asStr() != "windows" {
+            local libs = Vec<String>()
+            for imp in r.imports {
+                if indexOf(&libs, &imp.library) == libs.length() { libs.push(imp.library.clone()) }
+            }
+            if r.os.asStr() == "macos" && libs.length() > 0 {
+                local sdk = macosSdkRoot()
+                if sdk.length() > 0 {
+                    pushAll(&args, ["-syslibroot"])
+                    args.push(sdk)
+                }
+            }
+            for l in libs { args.push(format("-l{}", l.asStr())) }
+        }
+        ok = runTool(&tool, &args)
+    }
+    for f in made { removeFile(f) }
+    return ok
+}

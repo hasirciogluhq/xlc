@@ -6,8 +6,8 @@
 #include "xlang/backend_c.h"
 
 #include "cli/emit.h"
-#include "cli/style.h"
 #include "xlang/analysis/analysis.h"
+#include "xlang/codegen/archive.h"
 #include "xlang/hir/hir.h"
 #include "xlang/lang/config.h"
 #include "xlang/lang/frontend.h"
@@ -35,6 +35,26 @@ namespace {
 /// The bytes of an empty string: the boundary wants a valid pointer even for length zero.
 const char kEmptyBytes[1] = {'\0'};
 
+/// Whether the backend colors stderr; the CLI decides once with `xlcSetColor`
+/// (src/cli/console.xl).
+bool g_color = false;
+
+/// The ANSI style `code` (`1;31` bold red, `1;33` bold yellow), or nothing when color is off.
+std::string style(std::string_view code) {
+    return g_color ? std::format("\x1b[{}m", code) : std::string();
+}
+
+/// The bold-red or bold-yellow `N error(s), M warning(s)` line, as the CLI always printed it.
+void printSummary(const DiagnosticEngine& diagnostics) {
+    std::cerr << std::format("{}{} error(s), {} warning(s){}\n",
+                             style(diagnostics.hasErrors() ? "1;31" : "1;33"), diagnostics.errorCount(),
+                             diagnostics.warningCount(), style("0"));
+}
+
+XlcStr viewOf(const std::string& s) {
+    return XlcStr{s.empty() ? kEmptyBytes : s.data(), static_cast<uint32_t>(s.size())};
+}
+
 std::string_view textOf(XlcStr s) {
     return std::string_view(s.bytes == nullptr ? kEmptyBytes : s.bytes, s.len);
 }
@@ -59,7 +79,7 @@ DiagnosticOptions diagnosticOptions(const XlcConfig& config) {
     out.deny = listOf(config.deny);
     out.warn_all = config.warn_all != 0;
     out.allow_all = config.allow_all != 0;
-    out.color = cli::useColor(host::kStderrFd);
+    out.color = g_color;
     out.context_errors = static_cast<std::size_t>(config.context_errors);
     out.context_warnings = static_cast<std::size_t>(config.context_warnings);
     out.log_path = stringOf(config.log_path);
@@ -115,8 +135,7 @@ BuildConfig buildConfig(const XlcConfig& raw) {
 }
 
 void printError(std::string_view message) {
-    const cli::Palette c{cli::useColor(host::kStderrFd)};
-    std::cerr << std::format("{}error:{} {}\n", c.boldRed(), c.reset(), message);
+    std::cerr << std::format("{}error:{} {}\n", style("1;31"), style("0"), message);
 }
 
 /// The state of one compilation: everything `run()` of the old C++ CLI held between the stages
@@ -124,8 +143,6 @@ void printError(std::string_view message) {
 class Session {
 public:
     explicit Session(const XlcConfig& raw) : config_(buildConfig(raw)) {
-        // The color mode of the CLI decides what `useColor` reports everywhere below.
-        cli::colorMode() = textOf(raw.color_mode) == "auto" ? "" : stringOf(raw.color_mode);
         diagnostics_.configure(diagnosticOptions(raw));
     }
 
@@ -187,6 +204,28 @@ public:
     LayoutHistory& history() { return *history_; }
     const fs::path& root() const { return root_; }
 
+    /// Keeps `result` alive in the session and points `out` at it; the views stay valid until the
+    /// next emit or the end of the session.
+    void publish(cli::EmitResult result, XlcEmitResult& out) {
+        emitted_ = std::move(result);
+        object_names_.clear();
+        object_views_.clear();
+        import_views_.clear();
+        for (const fs::path& o : emitted_.objects) {
+            object_names_.push_back(o.string());
+        }
+        for (const std::string& name : object_names_) {
+            object_views_.push_back(viewOf(name));
+        }
+        for (const auto& [library, symbol] : emitted_.imports) {
+            import_views_.push_back(XlcImport{viewOf(library), viewOf(symbol)});
+        }
+        out.objects = XlcStrList{object_views_.data(), static_cast<uint32_t>(object_views_.size())};
+        out.imports = import_views_.data();
+        out.import_count = static_cast<uint32_t>(import_views_.size());
+        out.temporary = emitted_.temporary ? 1 : 0;
+    }
+
 private:
     BuildConfig config_;
     SourceManager sources_;
@@ -200,6 +239,10 @@ private:
     bool lowered_{false};
     hir::Module hir_module_;
     std::optional<mir::Module> mir_module_;
+    cli::EmitResult emitted_;
+    std::vector<std::string> object_names_;
+    std::vector<XlcStr> object_views_;
+    std::vector<XlcImport> import_views_;
 };
 
 /// The guard every entry point uses: report an `XlangError` (or anything else) and fail. An
@@ -227,12 +270,7 @@ cli::EmitRequest emitRequestOf(const XlcEmitRequest& raw) {
     request.emit = stringOf(raw.emit);
     request.incremental = raw.incremental != 0;
     request.cache_dir = stringOf(raw.cache_dir);
-    for (const std::string& input : listOf(raw.inputs)) {
-        request.inputs.emplace_back(input);
-    }
-    for (const std::string& arg : listOf(raw.link_args)) {
-        request.link_args.push_back(arg);
-    }
+    request.has_inputs = raw.has_inputs != 0;
     return request;
 }
 
@@ -241,6 +279,10 @@ cli::EmitRequest emitRequestOf(const XlcEmitRequest& raw) {
 }  // namespace xlang
 
 using namespace xlang;
+
+void XLC_BACKEND_CALL xlcSetColor(int32_t on) {
+    g_color = on != 0;
+}
 
 int32_t XLC_BACKEND_CALL xlcExplain(XlcStr code) {
     return guard([&] {
@@ -280,11 +322,7 @@ int32_t XLC_BACKEND_CALL xlcDumpAst(const XlcConfig* config, XlcStr path) {
         const Program program = parseSource(sources, file, built, diagnostics);
         diagnostics.flush();
         if (diagnostics.hasErrors()) {
-            const cli::Palette c{cli::useColor(host::kStderrFd)};
-            std::cerr << std::format("{}{} error(s), {} warning(s){}\n",
-                                     diagnostics.hasErrors() ? c.boldRed() : c.boldYellow(),
-                                     diagnostics.errorCount(), diagnostics.warningCount(),
-                                     c.reset());
+            printSummary(diagnostics);
             throw XlangError("");
         }
         dumpProgram(std::cout, program, true);
@@ -388,14 +426,34 @@ int32_t XLC_BACKEND_CALL xlcSessionDumpLayout(XlcSession* session, XlcStr type_n
     });
 }
 
-int32_t XLC_BACKEND_CALL xlcSessionEmit(XlcSession* session, const XlcEmitRequest* request) {
+void XLC_BACKEND_CALL xlcSessionTarget(XlcSession* session, XlcTarget* target) {
+    const TargetInfo& t = reinterpret_cast<Session*>(session)->config().target;
+    *target = XlcTarget{viewOf(t.triple), viewOf(t.os), viewOf(t.arch)};
+}
+
+int32_t XLC_BACKEND_CALL xlcSessionEmit(XlcSession* session, const XlcEmitRequest* request,
+                                        XlcEmitResult* result) {
     Session* s = reinterpret_cast<Session*>(session);
+    s->publish({}, *result);
     return guard([&] {
         s->ensureLowered();
         if (!s->diagnostics().hasErrors()) {
-            cli::emitOutput(s->compilation(), s->hirModule(), s->config(), s->sources(),
-                            s->diagnostics(), emitRequestOf(*request));
+            s->publish(cli::emitOutput(s->compilation(), s->hirModule(), s->config(), s->sources(),
+                                       s->diagnostics(), emitRequestOf(*request)),
+                       *result);
         }
+    });
+}
+
+int32_t XLC_BACKEND_CALL xlcArchive(XlcStrList objects, XlcStr output, XlcStr os) {
+    return guard([&] {
+        std::vector<fs::path> paths;
+        for (const std::string& o : listOf(objects)) {
+            paths.emplace_back(o);
+        }
+        TargetInfo target;
+        target.os = stringOf(os);
+        codegen::archive(paths, stringOf(output), target);
     });
 }
 
@@ -415,11 +473,7 @@ int64_t XLC_BACKEND_CALL xlcSessionWarningCount(XlcSession* session) {
 void XLC_BACKEND_CALL xlcSessionPrintSummary(XlcSession* session) {
     Session* s = reinterpret_cast<Session*>(session);
     s->diagnostics().flush();
-    const cli::Palette c{cli::useColor(host::kStderrFd)};
-    std::cerr << std::format("{}{} error(s), {} warning(s){}\n",
-                             s->diagnostics().hasErrors() ? c.boldRed() : c.boldYellow(),
-                             s->diagnostics().errorCount(), s->diagnostics().warningCount(),
-                             c.reset());
+    printSummary(s->diagnostics());
 }
 
 void XLC_BACKEND_CALL xlcSessionFlush(XlcSession* session) {

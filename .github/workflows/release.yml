@@ -163,7 +163,11 @@ jobs:
           xmake build -P . -y xlc-tests
           # A release is never built from a failing tree: the unit tests and the e2e run on this OS.
           xmake run -P . xlc-tests
-          test/e2e/run.sh "$(find build -type f -name xlc | head -n1)"
+          # The binary of this tree, never a fallback: an empty path would test `$XLC`, the
+          # released compiler.
+          bin=$(find build -type f -name xlc | head -n1)
+          [ -n "$bin" ] || { echo "error: the xlc binary was not built" >&2; exit 1; }
+          test/e2e/run.sh "$bin"
 
       - name: Build (Windows)
         if: matrix.os == 'windows'

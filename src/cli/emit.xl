@@ -1,0 +1,117 @@
+// The output step of the CLI: where the output goes, code generation through the backend
+// (`xlcSessionEmit`), then the archive (`xlcArchive`, LLVM's writer) or the link
+// (src/driver/link.xl) of the objects it produced.
+//
+//   obj, ir, bc, header   written by the backend straight to the output (`-o -` streams)
+//   exe, shared           linked from the backend's objects plus the prebuilt inputs
+//   static                archived from the backend's objects
+//
+// Without `--incremental` the backend writes one scratch object next to the output (same
+// directory, so the same file system and permissions), removed here whether or not the link
+// succeeds; `--incremental` objects live in the cache and stay.
+from "std" import String, Vec, format
+from "std/io/files" import removeFile
+from "backend" import XlcSession, XlcEmitRequest, XlcEmitResult, XlcTarget, XlcStr, xlcSessionTarget, xlcSessionEmit,
+                      xlcSessionHasErrors, xlcArchive, xstr, xlist, ownedOf
+from "../driver/link" import LinkRequest, Import, link
+
+/// Everything the output step needs from the command line.
+export class EmitPlan {
+    root: String
+    output: String          // "" = next to `root`, named by `emit`
+    emit: String            // exe|obj|ir|bc|header|static|shared
+    incremental: bool
+    cacheDir: String
+    inputs: Vec<String>     // prebuilt objects and libraries handed to the linker
+    linkArgs: Vec<String>   // `--link-arg`
+    crt: bool
+
+    fn init(self) {
+        self.inputs = Vec<String>()
+        self.linkArgs = Vec<String>()
+    }
+}
+
+/// The index of the last path separator in `path`, or -1: `/` everywhere, `\` too on Windows.
+fn lastSeparator(path: *String) -> i64 {
+    local at = path.findLast("/")
+#if os == "windows"
+    local back = path.findLast("\\")
+    at = back > at ? back : at
+#endif
+    return at
+}
+
+/// The default output: next to the input, named after it (`main.xl` -> `main`, `main.exe`,
+/// `libmain.a`, `main.dll`, ...).
+export fn defaultOutput(root: *String, emit: *String, os: *String) -> String {
+    local cut = lastSeparator(root)
+    local dir = cut < 0 ? String() : root.slice(0, cut as usize + 1)
+    local name = cut < 0 ? root.clone() : root.slice(cut as usize + 1, root.length() - cut as usize - 1)
+    local dot = name.findLast(".")
+    local stem = dot > 0 ? name.slice(0, dot as usize) : name.clone()
+    local windows = os.asStr() == "windows"
+    local kind = emit.asStr()
+    // (prefix, suffix) around the stem; the last row is `shared`.
+    local (prefix, suffix) = kind == "exe" ? ("", windows ? ".exe" : "")
+                           : kind == "obj" ? ("", windows ? ".obj" : ".o")
+                           : kind == "ir" ? ("", ".ll")
+                           : kind == "bc" ? ("", ".bc")
+                           : kind == "header" ? ("", ".h")
+                           : kind == "static" ? (windows ? "" : "lib", windows ? ".lib" : ".a")
+                           : (windows ? "" : "lib", windows ? ".dll" : os.asStr() == "macos" ? ".dylib" : ".so")
+    dir.append(prefix)
+    dir.append(&stem)
+    dir.append(suffix)
+    return dir
+}
+
+/// Generates code and archives or links the result. False when anything failed; the failure is
+/// already reported (a diagnostic, or an `error:` line).
+export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
+    local target: XlcTarget
+    xlcSessionTarget(session, &target)
+    local os = ownedOf(target.os)
+    local output = plan.output.length() > 0 ? plan.output.clone() : defaultOutput(&plan.root, &plan.emit, &os)
+
+    local req: XlcEmitRequest
+    req.root = xstr(&plan.root)
+    req.output = xstr(&output)
+    req.emit = xstr(&plan.emit)
+    req.incremental = plan.incremental ? 1 : 0
+    req.cacheDir = xstr(&plan.cacheDir)
+    req.hasInputs = plan.inputs.length() > 0 ? 1 : 0
+    local result: XlcEmitResult
+    if xlcSessionEmit(session, &req, &result) != 0 || xlcSessionHasErrors(session) != 0 {
+        return false
+    }
+    if result.objects.count == 0 {
+        return true  // obj, ir, bc, header: written in place
+    }
+
+    local objects = Vec<String>()
+    for i in 0..result.objects.count as usize { objects.push(ownedOf(result.objects.items[i])) }
+    local ok = false
+    if plan.emit.asStr() == "static" {
+        local arena = Vec<XlcStr>()
+        ok = xlcArchive(xlist(&objects, &arena), xstr(&output), target.os) == 0
+    } else {
+        local r = LinkRequest()
+        for o in objects { r.objects.push(o.clone()) }
+        for o in plan.inputs { r.objects.push(o.clone()) }
+        r.output = output.clone()
+        r.shared = plan.emit.asStr() == "shared"
+        r.crt = plan.crt
+        r.os = os.clone()
+        r.arch = ownedOf(target.arch)
+        for i in 0..result.importCount as usize {
+            r.imports.push(Import(ownedOf(result.imports[i].library), ownedOf(result.imports[i].symbol)))
+        }
+        for a in plan.linkArgs { r.extraArgs.push(a.clone()) }
+        ok = link(&r)
+    }
+    if result.temporary != 0 {
+        for o in objects { removeFile(o) }
+    }
+    return ok
+}

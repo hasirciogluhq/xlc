@@ -1,0 +1,156 @@
+// The boundary between the CLI written in xlang and the C++ backend: the flat structs of
+// include/xlang/backend_c.h mirrored field for field, the `declare fn` bindings, and the helpers
+// that turn `String`s into boundary strings and back.
+from "std" import String, Vec
+from "std/str" import fromParts
+
+/// One string across the boundary: the bytes are not NUL-terminated.
+@repr(c)
+export struct XlcStr {
+    bytes: *u8
+    len: u32
+}
+
+/// A list of strings across the boundary.
+@repr(c)
+export struct XlcStrList {
+    items: *XlcStr
+    count: u32
+}
+
+/// The command-line configuration, already parsed into values. Field order and types match
+/// `XlcConfig` in include/xlang/backend_c.h exactly.
+@repr(c)
+export struct XlcConfig {
+    target: XlcStr
+    opt: XlcStr
+    debug: i32
+    cpu: XlcStr
+    mangle: XlcStr
+    safety: XlcStr
+    layoutScheme: XlcStr
+    layoutHistory: XlcStr
+    defines: XlcStrList
+    undefs: XlcStrList
+    allow: XlcStrList
+    deny: XlcStrList
+    warnAll: i32
+    allowAll: i32
+    contextErrors: u64
+    contextWarnings: u64
+    logPath: XlcStr
+    diagFormat: XlcStr
+    diagLogLevel: XlcStr
+    crt: i32
+}
+
+/// What code generation writes and where. Field order and types match `XlcEmitRequest`.
+@repr(c)
+export struct XlcEmitRequest {
+    root: XlcStr
+    output: XlcStr
+    emit: XlcStr
+    incremental: i32
+    cacheDir: XlcStr
+    hasInputs: i32
+}
+
+/// One `@library` import. Matches `XlcImport`.
+@repr(c)
+export struct XlcImport {
+    library: XlcStr
+    symbol: XlcStr
+}
+
+/// The objects to archive or link. Matches `XlcEmitResult`; the strings live in the session.
+@repr(c)
+export struct XlcEmitResult {
+    objects: XlcStrList
+    imports: *XlcImport
+    importCount: u32
+    temporary: i32
+}
+
+/// The resolved target. Matches `XlcTarget`; the strings live in the session.
+@repr(c)
+export struct XlcTarget {
+    triple: XlcStr
+    os: XlcStr
+    arch: XlcStr
+}
+
+/// The opaque backend session, behind `xlcSessionNew`/`xlcSessionFree`.
+export type XlcSession = u8
+
+// Every backend function is `declare`d: it resolves at link time from the backend archive
+// (`xlc-backend`), so `--emit=obj` alone always warns W0301; silenced per declaration.
+@allow(W0301)
+export declare fn xlcSetColor(on: i32)
+@allow(W0301)
+export declare fn xlcExplain(code: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcVersion()
+@allow(W0301)
+export declare fn xlcPrintCfg(config: *XlcConfig) -> i32
+@allow(W0301)
+export declare fn xlcDumpAst(config: *XlcConfig, path: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionNew(config: *XlcConfig) -> *XlcSession
+@allow(W0301)
+export declare fn xlcSessionFree(session: *XlcSession)
+@allow(W0301)
+export declare fn xlcSessionAddModuleRoot(session: *XlcSession, spec: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionAddImplicitImport(session: *XlcSession, spec: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionLoadRoot(session: *XlcSession, path: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionAnalyze(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionDumpHir(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionDumpMir(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionDumpLayout(session: *XlcSession, typeName: XlcStr, record: i32) -> i32
+@allow(W0301)
+export declare fn xlcSessionTarget(session: *XlcSession, target: *XlcTarget)
+@allow(W0301)
+export declare fn xlcSessionEmit(session: *XlcSession, request: *XlcEmitRequest, result: *XlcEmitResult) -> i32
+@allow(W0301)
+export declare fn xlcArchive(objects: XlcStrList, output: XlcStr, os: XlcStr) -> i32
+@allow(W0301)
+export declare fn xlcSessionHasErrors(session: *XlcSession) -> i32
+@allow(W0301)
+export declare fn xlcSessionErrorCount(session: *XlcSession) -> i64
+@allow(W0301)
+export declare fn xlcSessionWarningCount(session: *XlcSession) -> i64
+@allow(W0301)
+export declare fn xlcSessionPrintSummary(session: *XlcSession)
+@allow(W0301)
+export declare fn xlcSessionFlush(session: *XlcSession)
+
+/// The byte an empty boundary string points at: the C++ side wants a valid pointer even for
+/// length zero.
+global kEmptyByte: u8 = 0
+
+/// `String` -> boundary string. The bytes live as long as the String does.
+export fn xstr(s: *String) -> XlcStr {
+    if s.len == 0 {
+        return XlcStr { bytes: &kEmptyByte, len: 0 }
+    }
+    return XlcStr { bytes: s.ptr, len: s.len as u32 }
+}
+
+/// Boundary string -> an owned `String` copy.
+export fn ownedOf(s: XlcStr) -> String {
+    return String(fromParts(s.bytes, s.len as usize))
+}
+
+/// Copies one list into the arena and returns the boundary list. The arena Vec must outlive the
+/// call that uses the result.
+export fn xlist(items: *Vec<String>, arena: *Vec<XlcStr>) -> XlcStrList {
+    for i in 0..items.length() {
+        arena.push(xstr(items.get(i)))
+    }
+    return XlcStrList { items: arena.data, count: arena.length() as u32 }
+}

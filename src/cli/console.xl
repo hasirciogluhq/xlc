@@ -1,0 +1,57 @@
+// The terminal side of the CLI: whether stderr is colored, and the `error:` line the CLI itself
+// prints. The backend prints its diagnostics with the same decision, handed over once through
+// `xlcSetColor` (include/xlang/backend_c.h).
+//
+// The decision, in order:
+//   1. `--color=always|never`, or without it `XLANG_COLOR=always|never`, decides outright.
+//   2. Otherwise a stream is colored when it is a terminal that takes ANSI escapes and `NO_COLOR`
+//      is unset or empty (https://no-color.org).
+// "Takes ANSI escapes" is `files.enableEscapes`: `isatty` on Linux and macOS; on Windows the
+// console must accept ENABLE_VIRTUAL_TERMINAL_PROCESSING
+// (https://learn.microsoft.com/en-us/windows/console/setconsolemode), which the call switches on
+// for that handle. A console that refuses it (Windows 10 before 1511) gets no escape bytes.
+from "std" import String
+from "std/io" import eprint
+from "std/io/files" import enableEscapes
+from "std/os/env" import get as envGet
+
+/// The descriptors the CLI writes to.
+export define STDOUT = 1
+export define STDERR = 2
+
+/// Whether the CLI colors its own `error:` lines; set once by `decideColor`.
+global colorOn: bool
+
+/// The value of the environment variable `name`, or "" when it is unset.
+fn envOr(name: str) -> String {
+    local key = String(name)
+    return envGet(&key).unwrapOr(String())
+}
+
+/// Decides whether output to `fd` is colored for the `--color` value `mode` (auto|always|never)
+/// and remembers it for `printError`.
+export fn decideColor(fd: i32, mode: *String) -> bool {
+    local forced = mode.asStr() == "auto" ? envOr("XLANG_COLOR") : mode.clone()
+    if forced.asStr() == "always" || forced.asStr() == "never" {
+        colorOn = forced.asStr() == "always"
+    } else {
+        colorOn = enableEscapes(fd) && envOr("NO_COLOR").length() == 0
+    }
+    return colorOn
+}
+
+/// The ANSI style `code` (`1;31` is bold red), or "" when color is off.
+export fn style(code: str) -> String {
+    if !colorOn {
+        return String()
+    }
+    local out = String("\x1b[")
+    out.append(code)
+    out.push(b'm')
+    return out
+}
+
+/// Prints `error: message` on stderr, the shape the backend prints its own failures in.
+export fn printError(message: *String) {
+    eprint("{}error:{} {}\n", style("1;31").asStr(), style("0").asStr(), message.asStr())
+}

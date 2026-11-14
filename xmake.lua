@@ -151,7 +151,7 @@ local xlc_modules = {
     {"xlc-mir",      {"src/mir/**.cpp"}},
     {"xlc-codegen",  {"src/codegen/**.cpp"}},
     {"xlc-analysis", {"src/analysis/**.cpp"}},
-    {"xlc-cli",      {"src/cli/console.cpp", "src/cli/emit.cpp", "src/driver/**.cpp"}},
+    {"xlc-cli",      {"src/cli/emit.cpp", "src/driver/**.cpp"}},
     {"xlc-backend",  {"src/backend/**.cpp"}},
 }
 
@@ -304,11 +304,14 @@ target("xlc")
         for _, a in ipairs(target:data("llvm_link_args")) do
             table.insert(args, "--link-arg=" .. a)
         end
-        -- The C++ runtime of the backend archives; the driver brings libc itself.
+        -- The C++ runtime of the backend archives; the driver brings libc itself. On Linux the
+        -- released binary carries it (as the bootstrap does): no libstdc++/libgcc_s DSO is part
+        -- of the base system (test/e2e `links-only-system-libraries`).
         if is_plat("macosx") then
             table.insert(args, "--link-arg=-lc++")
         elseif is_plat("linux") then
-            table.insert(args, "--link-arg=-lstdc++")
+            table.insert(args, "--link-arg=-static-libstdc++")
+            table.insert(args, "--link-arg=-static-libgcc")
         end
         -- Rebuild only when a source of the binary changed: every `.xl` under `src` (the CLI and
         -- the ported compiler parts the compiler.xl object carries) or one of the archives.
