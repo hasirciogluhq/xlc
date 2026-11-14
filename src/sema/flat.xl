@@ -1,0 +1,151 @@
+// The semantic analysis' view of the flat AST: one wrapper over the frozen arenas the parser
+// handed across the C boundary (see ../ast/ast.xl), with the accessors every pass needs. The
+// block stays alive for the whole compilation; nothing here owns memory.
+//
+// Text reads copy the bytes into an owned `String` only through `text`; the hot paths take the
+// `XStr` and compare through `eqStr` without copying.
+from "std" import String, Vec
+from "std/str" import fromParts
+from "../lang/ast/ast" import XStr, XSpan, XExpr, XStmt, XBlock, XType, XAttr, XAttrArg, XParam,
+    XField, XSumVariant, XEnumMember, XMacroParam, XImportName, XTok, XTokList, XDecl, XItem,
+    XErrLabel, XErr, XFieldInit, XClosure, XSwitchCase
+from "../lang/parser/parser" import CParseResult
+
+/// `(offset, length)` of one byte run in the arena of the result.
+export fn bytesOf(b: *CParseResult, s: XStr) -> str {
+    local p = (b.bytes as usize + s.off as usize) as *u8
+    return fromParts(p, s.len as usize)
+}
+
+/// True when the two views of `r` hold the same bytes.
+export fn eqStr(r: *CParseResult, a: XStr, c: XStr) -> bool {
+    if a.len != c.len { return false }
+    if a.off == c.off { return true }
+    local i: usize = 0
+    while i < a.len as usize {
+        if r.bytes[a.off as usize + i] != r.bytes[c.off as usize + i] { return false }
+        i++
+    }
+    return true
+}
+
+/// True when the view holds exactly the bytes of `s`.
+export fn eqText(b: *CParseResult, s: XStr, t: str) -> bool {
+    if s.len != t.len as u32 { return false }
+    local i: usize = 0
+    while i < s.len as usize {
+        if b.bytes[s.off as usize + i] != t[i] { return false }
+        i++
+    }
+    return true
+}
+
+/// The flat AST of one module: the frozen result of the parse plus the spans it stamps.
+export class Flat {
+    r: CParseResult
+
+    fn init(self, result: CParseResult) {
+        self.r = result
+    }
+
+    fn text(self, s: XStr) -> String {
+        return String(bytesOf(&(self.r), s))
+    }
+
+    fn strOf(self, s: XStr) -> str {
+        return bytesOf(&(self.r), s)
+    }
+
+    fn exprAt(self, idx: i32) -> *XExpr {
+        if idx < 0 { return nil }
+        return (self.r.exprs as usize + idx as usize * sizeOf(XExpr)) as *XExpr
+    }
+
+    fn stmtAt(self, idx: i32) -> *XStmt {
+        if idx < 0 { return nil }
+        return (self.r.stmts as usize + idx as usize * sizeOf(XStmt)) as *XStmt
+    }
+
+    fn blockAt(self, idx: i32) -> *XBlock {
+        if idx < 0 { return nil }
+        return (self.r.blocks as usize + idx as usize * sizeOf(XBlock)) as *XBlock
+    }
+
+    fn typeAt(self, idx: i32) -> *XType {
+        if idx < 0 { return nil }
+        return (self.r.types as usize + idx as usize * sizeOf(XType)) as *XType
+    }
+
+    fn declAt(self, idx: i32) -> *XDecl {
+        if idx < 0 { return nil }
+        return (self.r.decls as usize + idx as usize * sizeOf(XDecl)) as *XDecl
+    }
+
+    fn attrAt(self, idx: i32) -> *XAttr {
+        if idx < 0 { return nil }
+        return (self.r.attrs as usize + idx as usize * sizeOf(XAttr)) as *XAttr
+    }
+
+    fn paramAt(self, idx: i32) -> *XParam {
+        if idx < 0 { return nil }
+        return (self.r.params as usize + idx as usize * sizeOf(XParam)) as *XParam
+    }
+
+    fn fieldAt(self, idx: i32) -> *XField {
+        if idx < 0 { return nil }
+        return (self.r.fields as usize + idx as usize * sizeOf(XField)) as *XField
+    }
+
+    fn variantAt(self, idx: i32) -> *XSumVariant {
+        if idx < 0 { return nil }
+        return (self.r.variants as usize + idx as usize * sizeOf(XSumVariant)) as *XSumVariant
+    }
+
+    fn memberAt(self, idx: i32) -> *XEnumMember {
+        if idx < 0 { return nil }
+        return (self.r.enumMembers as usize + idx as usize * sizeOf(XEnumMember)) as *XEnumMember
+    }
+
+    fn closureAt(self, idx: i32) -> *XClosure {
+        if idx < 0 { return nil }
+        return (self.r.closures as usize + idx as usize * sizeOf(XClosure)) as *XClosure
+    }
+
+    fn initAt(self, idx: i32) -> *XFieldInit {
+        if idx < 0 { return nil }
+        return (self.r.fieldInits as usize + idx as usize * sizeOf(XFieldInit)) as *XFieldInit
+    }
+
+    fn caseAt(self, idx: i32) -> *XSwitchCase {
+        if idx < 0 { return nil }
+        return (self.r.cases as usize + idx as usize * sizeOf(XSwitchCase)) as *XSwitchCase
+    }
+
+    fn importAt(self, idx: i32) -> *XImportName {
+        if idx < 0 { return nil }
+        return (self.r.importNames as usize + idx as usize * sizeOf(XImportName)) as *XImportName
+    }
+
+    fn tokAt(self, idx: i32) -> *XTok {
+        if idx < 0 { return nil }
+        return (self.r.toks as usize + idx as usize * sizeOf(XTok)) as *XTok
+    }
+
+    /// One path segment of a named type or declaration (`pathFirst` ranges over the `strs` arena).
+    fn pathSeg(self, i: u32) -> XStr {
+        local p = (self.r.strs as usize + i as usize * sizeOf(XStr)) as *XStr
+        return *p
+    }
+
+    /// One entry of an index arena (`exprRefs`, `stmtRefs`, `typeRefs`).
+    fn ref(self, arena: *i32, i: u32) -> i32 {
+        local p = (arena as usize + i as usize * sizeOf(i32)) as *i32
+        return *p
+    }
+
+    /// The item record `i` of the program.
+    fn itemAt(self, i: u32) -> *XItem {
+        local p = (self.r.items as usize + i as usize * sizeOf(XItem)) as *XItem
+        return p
+    }
+}

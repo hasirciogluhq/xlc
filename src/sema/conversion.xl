@@ -1,0 +1,162 @@
+// The implicit conversion rules (plan 2.2, eg/02 + eg/02.1) and the result type of an arithmetic
+// or comparison operation, the xlang source of src/sema/conversion.cpp. Everything reads type
+// indices of ../sema/types.xl; `pointerBits` resolves isize/usize.
+from "std" import String
+from "./types" import Types, T_VOID, T_NEVER, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ARRAY,
+    T_ENUM, T_STRUCT, T_CLASS, T_INTERFACE, T_STR, T_SLICE, T_TUPLE, T_NAMED
+
+/// What an implicit conversion from one type to another may do.
+export const C_OK: i32 = 0          ///< allowed without a cast, silently
+export const C_WARN: i32 = 1        ///< allowed, W0601 (signed integer -> float)
+export const C_SIGNEDNESS: i32 = 2  ///< E0601: signedness changes; `as`, or inside `unsafe { }`
+export const C_NEEDS_CAST: i32 = 3  ///< not implicit: write `as`
+export const C_INVALID: i32 = 4     ///< no conversion exists
+
+/// The result of `implicitConversion`: a status, whether `unsafe` accepted a signedness change,
+/// and the note a diagnostic may quote (a static literal, never owned).
+export struct ConversionResult {
+    status: i32
+    usedUnsafe: bool
+    note: str
+}
+
+/// The result type of an operation on `a` and `b`, with the same statuses.
+export struct CommonTypeResult {
+    status: i32
+    ty: i32
+    warn: bool ///< an operand was a signed integer widened to float (W0601)
+}
+
+/// isize/usize carry their width from the target.
+fn widthOf(t: *Types, idx: i32, pointerBits: u32) -> u32 {
+    local rec = t.get(idx)
+    return rec.bits == 0 ? pointerBits : rec.bits
+}
+
+/// The same kind, width and signedness; everything else compares by spelling.
+fn sameShape(t: *Types, a: i32, b: i32) -> bool {
+    local x = t.get(a)
+    local y = t.get(b)
+    if x.kind != y.kind { return false }
+    switch {
+        case x.kind == T_INT { return x.bits == y.bits && x.isSigned == y.isSigned }
+        case x.kind == T_FLOAT { return x.bits == y.bits }
+        case x.kind == T_VOID || x.kind == T_BOOL { return true }
+        default { return t.same(a, b) }
+    }
+}
+
+/// Implicit conversion rules. `pointerBits` resolves isize/usize.
+export fn implicitConversion(t: *Types, src: i32, dst: i32, inUnsafe: bool,
+                             pointerBits: u32) -> ConversionResult {
+    local r: ConversionResult
+    r.status = C_INVALID
+    r.note = ""
+    if sameShape(t, src, dst) {
+        r.status = C_OK
+        return r
+    }
+
+    local f = t.get(src)
+    local g = t.get(dst)
+    local fromNum = f.kind == T_INT || f.kind == T_FLOAT
+    local toNum = g.kind == T_INT || g.kind == T_FLOAT
+    if !fromNum || !toNum {
+        // bool, pointers, enums, aggregates: only an explicit `as` can convert (when anything
+        // can).
+        local castable = (fromNum || f.kind == T_BOOL || f.kind == T_POINTER || f.kind == T_ENUM)
+            && (toNum || g.kind == T_BOOL || g.kind == T_POINTER || g.kind == T_ENUM)
+        r.status = castable ? C_NEEDS_CAST : C_INVALID
+        return r
+    }
+
+    local fw = f.kind == T_INT ? widthOf(t, src, pointerBits) : f.bits
+    local tw = g.kind == T_INT ? widthOf(t, dst, pointerBits) : g.bits
+
+    if f.kind == T_INT && g.kind == T_INT {
+        if f.isSigned == g.isSigned {
+            r.status = tw >= fw ? C_OK : C_NEEDS_CAST
+            return r
+        }
+        // Signedness changes: E0601, accepted in `unsafe` only for the same or a wider target.
+        if tw < fw {
+            r.status = C_NEEDS_CAST
+            r.note = "narrowing needs `as`, even inside `unsafe`"
+            return r
+        }
+        if inUnsafe {
+            r.status = C_OK
+            r.usedUnsafe = true
+            return r
+        }
+        r.status = C_SIGNEDNESS
+        return r
+    }
+
+    if f.kind == T_INT && g.kind == T_FLOAT {
+        if f.isSigned != 0 {
+            r.status = C_WARN // W0601
+            return r
+        }
+        // Floats count as signed: `u -> f` is E0601; `unsafe` accepts it (W0601 still applies).
+        if inUnsafe {
+            r.status = C_WARN
+            r.usedUnsafe = true
+            return r
+        }
+        r.status = C_SIGNEDNESS
+        return r
+    }
+
+    if f.kind == T_FLOAT && g.kind == T_FLOAT {
+        r.status = tw >= fw ? C_OK : C_NEEDS_CAST
+        return r
+    }
+
+    r.status = C_NEEDS_CAST // float -> int
+    return r
+}
+
+/// Result type of an arithmetic/comparison operation on `a` and `b`. Mixed signedness is E0601
+/// even inside `unsafe`: one side needs `as`.
+export fn commonBinaryType(t: *Types, a: i32, b: i32, pointerBits: u32) -> CommonTypeResult {
+    local r: CommonTypeResult
+    r.status = C_INVALID
+    r.ty = -1
+    r.warn = false
+    local x = t.get(a)
+    local y = t.get(b)
+    local aNum = x.kind == T_INT || x.kind == T_FLOAT
+    local bNum = y.kind == T_INT || y.kind == T_FLOAT
+    if !aNum || !bNum {
+        if sameShape(t, a, b) {
+            r.status = C_OK
+            r.ty = a
+        }
+        return r
+    }
+    if x.kind == T_INT && y.kind == T_INT {
+        if x.isSigned != y.isSigned {
+            r.status = C_SIGNEDNESS
+            return r
+        }
+        r.status = C_OK
+        r.ty = widthOf(t, a, pointerBits) >= widthOf(t, b, pointerBits) ? a : b
+        return r
+    }
+    if x.kind == T_FLOAT && y.kind == T_FLOAT {
+        r.status = C_OK
+        r.ty = x.bits >= y.bits ? a : b
+        return r
+    }
+    // Integer with float: the integer converts to the float type.
+    local integer = x.kind == T_INT ? a : b
+    if t.get(integer).isSigned == 0 {
+        r.status = C_SIGNEDNESS
+        return r
+    }
+    r.status = C_OK
+    r.ty = x.kind == T_FLOAT ? a : b
+    r.warn = true
+    return r
+}

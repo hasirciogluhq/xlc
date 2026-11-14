@@ -1,0 +1,194 @@
+// The layout records of the semantic analysis: the size, alignment and field offsets of an
+// aggregate, the text form `xl.layout` stores, and the project history file. The computation
+// itself lives with the checks; this file is the data and its persistence. The records own their
+// names and field lists, so they are classes.
+from "std" import String, Vec, format
+from "std/str" import fromParts, trim
+from "std/io/fs" import fsWrite, fsReadAll
+from "./types" import Types
+
+/// One field of a layout: its name, type, offset, size and alignment; `inherited` marks a field
+/// that came from a base class.
+export class FieldLayout {
+    name: String
+    ty: i32
+    offset: u64
+    size: u64
+    align: u64
+    inherited: bool
+
+    fn init(self, name: str) {
+        self.name = String(name)
+        self.ty = -1
+        self.align = 1
+    }
+}
+
+/// Size, alignment and field offsets of a struct/class (or the shape of a primitive).
+export class TypeLayout {
+    size: u64
+    align: u64
+    dataSize: u64 ///< end of the last field, without tail padding (Itanium `dsize`)
+    fields: Vec<*FieldLayout>
+    hasVptr: bool
+    reprC: bool
+    packed: bool
+    /// A union (the compiler-made `E$Data` of a payload enum): every field sits at offset 0.
+    isUnion: bool
+    shuffled: bool
+    seed: u64
+    scheme: String ///< "v1"
+    source: String ///< computed | record | assumed-c
+
+    fn init(self) {
+        self.fields = Vec<*FieldLayout>()
+        self.align = 1
+        self.scheme = String("v1")
+        self.source = String("computed")
+    }
+}
+
+/// One record of `xl.layout`: the type name and its layout.
+export class LayoutRecord {
+    name: String
+    layout: *TypeLayout
+
+    fn init(self, name: str, layout: *TypeLayout) {
+        self.name = String(name)
+        self.layout = layout
+    }
+}
+
+/// The text form `load` and `save` use:
+///
+///   type Vec3 size=12 align=4 scheme=v1 repr=xl shuffled=0 seed=0
+///     field x offset=0 size=4 align=4
+export fn formatLayoutRecord(record: *LayoutRecord) -> String {
+    local l = record.layout
+    local out = format("type {} size={} align={} scheme={} repr={} vptr={} union={} shuffled={} seed={}\n",
+        &record.name, l.size, l.align, l.scheme.asStr(), l.reprC ? "c" : "xl",
+        l.hasVptr ? 1 : 0, l.isUnion ? 1 : 0, l.shuffled ? 1 : 0, l.seed)
+    for i in 0..l.fields.length() {
+        local f = l.fields.get(i)
+        out.append(format("  field {} offset={} size={} align={}\n", &(*f).name,
+            (*f).offset, (*f).size, (*f).align))
+    }
+    return out
+}
+
+/// The value of `key=value` in a word list, or "".
+fn valueOf(words: *Vec<String>, key: str) -> String {
+    local prefix = format("{}=", key)
+    for i in 0..(*words).length() {
+        local w = (*words).get(i)
+        if (*w).startsWith(prefix.asStr()) {
+            return (*w).slice(prefix.len, (*w).length() - prefix.len)
+        }
+    }
+    return String()
+}
+
+/// Parses an unsigned decimal; 0 for anything else (the writer never emits malformed numbers).
+fn parseU64(text: str) -> u64 {
+    local v: u64 = 0
+    for i in 0..text.len as usize {
+        local c = text[i]
+        if c < b'0' || c > b'9' { return 0 }
+        v = v * 10 + (c - b'0') as u64
+    }
+    return v
+}
+
+/// `xl.layout` project history: text, one record per type.
+export class LayoutHistory {
+    records: Vec<*LayoutRecord>
+
+    fn init(self) {
+        self.records = Vec<*LayoutRecord>()
+    }
+
+    /// Inserts or replaces the record of the same name.
+    fn put(self, name: str, layout: *TypeLayout) {
+        for i in 0..self.records.length() {
+            local r = self.records.get(i)
+            if (*r).name.equals(name) {
+                (*r).layout = layout
+                return
+            }
+        }
+        self.records.push(new LayoutRecord(name, layout))
+    }
+
+    /// The layout of the type called `name`, or nil.
+    fn find(self, name: str) -> *TypeLayout {
+        for i in 0..self.records.length() {
+            local r = self.records.get(i)
+            if (*r).name.equals(name) { return (*r).layout }
+        }
+        return nil
+    }
+
+    /// Writes every record to `path`, truncating it. False when the file cannot be written.
+    fn save(self, path: *String) -> bool {
+        local out = String()
+        for i in 0..self.records.length() {
+            out.append(formatLayoutRecord(*self.records.get(i)))
+        }
+        return fsWrite(path.cstr(), out.asStr())
+    }
+
+    /// Reads a history from `text`; `source` names the input in an error. An empty `String` on
+    /// success, else the message.
+    fn read(self, text: str, source: str) -> String {
+        local lines = String(text).lines()
+        local current: *LayoutRecord = nil
+        for i in 0..lines.length() {
+            local line = trim((*lines.get(i)).asStr())
+            if line.len == 0 { continue }
+            if line.startsWith("type ") {
+                if current != nil { self.records.push(current) }
+                local words = line.splitAsciiWhitespace()
+                local name = valueOf(&words, "type")
+                if name.length() == 0 {
+                    return format("{}: layout record without a type name", source)
+                }
+                local l = new TypeLayout()
+                l.size = parseU64(valueOf(&words, "size").asStr())
+                l.align = parseU64(valueOf(&words, "align").asStr())
+                if valueOf(&words, "scheme").length() > 0 { l.scheme = valueOf(&words, "scheme") }
+                l.reprC = valueOf(&words, "repr").asStr() == "c"
+                l.hasVptr = valueOf(&words, "vptr").asStr() == "1"
+                l.isUnion = valueOf(&words, "union").asStr() == "1"
+                l.shuffled = valueOf(&words, "shuffled").asStr() == "1"
+                l.seed = parseU64(valueOf(&words, "seed").asStr())
+                l.source = String("record")
+                current = new LayoutRecord(name.asStr(), l)
+            } else if line.startsWith("field ") {
+                if current == nil {
+                    return format("{}: field line before any type line", source)
+                }
+                local words = line.splitAsciiWhitespace()
+                local f = new FieldLayout(valueOf(&words, "field").asStr())
+                f.offset = parseU64(valueOf(&words, "offset").asStr())
+                f.size = parseU64(valueOf(&words, "size").asStr())
+                f.align = parseU64(valueOf(&words, "align").asStr())
+                (*current).layout.fields.push(f)
+            } else {
+                return format("{}: not a layout record line: {}", source, &line)
+            }
+        }
+        if current != nil { self.records.push(current) }
+        return String()
+    }
+
+    /// Reads the history at `path`; a missing file is an empty history. An empty `String` on
+    /// success, else the message.
+    fn load(self, path: *String) -> String {
+        local cap: usize = 1 << 16
+        local buf = Vec<u8>()
+        buf.reserve(cap)
+        local n = fsReadAll(path.cstr(), buf.data, cap)
+        if n < 0 { return String() } // missing file = empty history
+        return self.read(fromParts(buf.data, n as usize), path.asStr())
+    }
+}

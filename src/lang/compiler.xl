@@ -10,6 +10,10 @@ from "frontend/frontend" import xlcFrontendParse
 from "../hir/dump" import xlcHirDump, xlcHirDumpFree
 from "../hir/prune" import xlcHirPrune, xlcHirPruneFree
 from "parser/parser" import xlcParse
+from "../sema/flat" import Flat
+from "../sema/types" import Types
+from "../sema/conversion" import implicitConversion, commonBinaryType
+from "../sema/layout" import LayoutHistory, formatLayoutRecord
 from "../util/source" import xlcUtilSourcesNew, xlcUtilAddFile, xlcUtilSourcesFree
 from "../util/diagnostics" import xlcDiagNew, xlcDiagConfigure, xlcDiagAddAllowScope,
     xlcDiagReport, xlcDiagBeginQuiet, xlcDiagEndQuiet, xlcDiagFlush, xlcDiagExplain,

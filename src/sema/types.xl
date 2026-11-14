@@ -1,0 +1,436 @@
+// The types of the semantic analysis: one arena of flat type records (`XType`, the same shape the
+// parser emits) plus the byte table their names point into. A type is an index into the arena;
+// resolving a `Named` reference rewrites its record in place, the way the C++ `Sema::resolve`
+// filled the shared `Type` tree in.
+//
+// The `length` expression of an array type stays an index into the module's flat AST, which lives
+// longer than this store; instances the analysis synthesizes copy declarations of the same module,
+// so the index is always valid.
+from "std" import String, Vec, format
+from "std/str" import fromParts
+from "../lang/ast/ast" import XType, XStr, XExpr
+from "./flat" import Flat
+
+// The order of `TypeKind` in include/xlang/lang/types.h; do not reorder.
+export const T_VOID: i32 = 0
+export const T_NEVER: i32 = 1
+export const T_BOOL: i32 = 2
+export const T_INT: i32 = 3
+export const T_FLOAT: i32 = 4
+export const T_POINTER: i32 = 5
+export const T_FN_PTR: i32 = 6
+export const T_ARRAY: i32 = 7
+export const T_ENUM: i32 = 8
+export const T_STRUCT: i32 = 9
+export const T_CLASS: i32 = 10
+export const T_INTERFACE: i32 = 11
+export const T_STR: i32 = 12
+export const T_SLICE: i32 = 13
+export const T_TUPLE: i32 = 14
+export const T_NAMED: i32 = 15
+
+/// The expression kinds the spelling of an array length names.
+export const XE_INT_LITERAL: i32 = 0
+export const XE_NAME: i32 = 5
+
+/// The type arena of one module. Everything it returns is an index; `-1` is no type.
+export class Types {
+    types: Vec<XType>
+    strs: Vec<XStr>
+    bytes: Vec<u8>
+    ast: *Flat ///< the module's parse result; array lengths read their expressions here
+
+    fn init(self, flat: *Flat) {
+        self.types = Vec<XType>()
+        self.strs = Vec<XStr>()
+        self.bytes = Vec<u8>()
+        self.ast = flat
+    }
+
+    /// interns `text` and returns its view into this store's byte table.
+    fn intern(self, text: str) -> XStr {
+        for i in 0..self.strs.length() {
+            local s = self.strs.get(i)
+            if (*s).len == text.len as u32 {
+                local p = (self.bytes.data as usize + (*s).off as usize) as *u8
+                if fromParts(p, (*s).len as usize) == text { return *s }
+            }
+        }
+        local off = self.bytes.length() as u32
+        for i in 0..text.len as usize {
+            self.bytes.push(text[i])
+        }
+        local s = XStr { off: off, len: text.len as u32 }
+        self.strs.push(s)
+        return s
+    }
+
+    /// interns a path of segments in order and ranges them in the string arena.
+    fn internPath(self, segs: Vec<String>) -> (u32, u32) {
+        local first = self.strs.length() as u32
+        for i in 0..segs.length() {
+            self.strs.push(self.intern(segs.get(i).asStr()))
+        }
+        return (first, (self.strs.length() as u32) - first)
+    }
+
+    /// pushes an empty record of `kind` and returns its index; index fields default to none.
+    fn push(self, kind: i32) -> i32 {
+        local t: XType
+        t.kind = kind
+        t.elem = -1
+        t.ret = -1
+        t.length = -1
+        self.types.push(t)
+        return (self.types.length() - 1) as i32
+    }
+
+    fn at(self, idx: i32) -> *XType {
+        return (self.types.data as usize + idx as usize * sizeOf(XType)) as *XType
+    }
+
+    /// The record as a value, for reading fields cheaply.
+    fn get(self, idx: i32) -> XType {
+        return *self.at(idx)
+    }
+
+    /// The path of a named, aggregate or enum type as one dotted string.
+    fn pathOf(self, t: XType) -> String {
+        local out = String()
+        for i in 0..t.pathCount as usize {
+            if i != 0 { out.append(".") }
+            local s = self.strs.get(t.pathFirst + i as u32)
+            local p = (self.bytes.data as usize + (*s).off as usize) as *u8
+            out.append(fromParts(p, (*s).len as usize))
+        }
+        return out
+    }
+
+    /// Rewrites the path of `idx` (resolution renames a `Named` to its qualified form).
+    fn setPath(self, idx: i32, segs: Vec<String>) {
+        local range = self.internPath(segs)
+        local t = self.at(idx)
+        (*t).pathFirst = range.0
+        (*t).pathCount = range.1
+    }
+
+    fn makeVoid(self) -> i32 { return self.push(T_VOID) }
+    fn makeNever(self) -> i32 { return self.push(T_NEVER) }
+    fn makeBool(self) -> i32 { return self.push(T_BOOL) }
+    fn makeStr(self) -> i32 { return self.push(T_STR) }
+
+    fn makeInt(self, bits: u32, isSigned: bool) -> i32 {
+        local idx = self.push(T_INT)
+        local t = self.at(idx)
+        (*t).bits = bits
+        (*t).isSigned = isSigned ? 1 : 0
+        return idx
+    }
+
+    fn makeFloat(self, bits: u32) -> i32 {
+        local idx = self.push(T_FLOAT)
+        local t = self.at(idx)
+        (*t).bits = bits
+        (*t).isSigned = 1 // floats count as signed (E0601 rules)
+        return idx
+    }
+
+    fn makePointer(self, elem: i32) -> i32 {
+        local idx = self.push(T_POINTER)
+        self.at(idx).elem = elem
+        return idx
+    }
+
+    fn makeSlice(self, elem: i32, isMutable: bool) -> i32 {
+        local idx = self.push(T_SLICE)
+        local t = self.at(idx)
+        (*t).elem = elem
+        (*t).isMutable = isMutable ? 1 : 0
+        return idx
+    }
+
+    fn makeFnPtr(self, params: Vec<i32>, ret: i32) -> i32 {
+        local idx = self.push(T_FN_PTR)
+        local t = self.at(idx)
+        (*t).paramsFirst = self.types.length() as u32
+        for i in 0..params.length() {
+            self.types.push(self.get(*params.get(i)))
+        }
+        (*t).paramsCount = (self.types.length() as u32) - (*t).paramsFirst
+        (*t).ret = ret
+        return idx
+    }
+
+    fn makeArray(self, elem: i32, length: i32) -> i32 {
+        local idx = self.push(T_ARRAY)
+        local t = self.at(idx)
+        (*t).elem = elem
+        (*t).length = length
+        return idx
+    }
+
+    fn makeTuple(self, args: Vec<i32>) -> i32 {
+        local idx = self.push(T_TUPLE)
+        local t = self.at(idx)
+        (*t).argsFirst = self.types.length() as u32
+        for i in 0..args.length() {
+            self.types.push(self.get(*args.get(i)))
+        }
+        (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
+        return idx
+    }
+
+    fn makeNamed(self, segs: Vec<String>) -> i32 {
+        local idx = self.push(T_NAMED)
+        local range = self.internPath(segs)
+        local t = self.at(idx)
+        (*t).pathFirst = range.0
+        (*t).pathCount = range.1
+        return idx
+    }
+
+    /// A resolved aggregate or enum: `kind` is Struct, Class, Interface or Enum, `path` the
+    /// qualified name, `args` the generic arguments.
+    fn makeAggregate(self, kind: i32, segs: Vec<String>, args: Vec<i32>) -> i32 {
+        local idx = self.push(kind)
+        local range = self.internPath(segs)
+        local t = self.at(idx)
+        (*t).pathFirst = range.0
+        (*t).pathCount = range.1
+        (*t).argsFirst = self.types.length() as u32
+        for i in 0..args.length() {
+            self.types.push(self.get(*args.get(i)))
+        }
+        (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
+        return idx
+    }
+
+    /// Copies a type record of the module's AST into the arena and returns its index. Children
+    /// come along recursively; the length expression stays an AST index.
+    fn internAst(self, idx: i32) -> i32 {
+        if idx < 0 { return -1 }
+        local src = self.ast.typeAt(idx)
+        local dst = self.push((*src).kind)
+        local t = self.at(dst)
+        (*t).bits = (*src).bits
+        (*t).isSigned = (*src).isSigned
+        (*t).isMutable = (*src).isMutable
+        (*t).length = (*src).length
+        // The path segments point into the AST bytes; copy them into this store's table.
+        local segs = Vec<String>()
+        for i in 0..(*src).pathCount as usize {
+            segs.push(self.ast.text(self.ast.pathSeg((*src).pathFirst + i as u32)))
+        }
+        local range = self.internPath(segs)
+        (*t).pathFirst = range.0
+        (*t).pathCount = range.1
+        (*t).elem = self.internAst((*src).elem)
+        (*t).ret = self.internAst((*src).ret)
+        if (*src).paramsCount != 0 {
+            (*t).paramsFirst = self.types.length() as u32
+            for i in 0..(*src).paramsCount as usize {
+                self.internAst(self.ast.ref(self.ast.r.typeRefs, (*src).paramsFirst + i as u32))
+            }
+            (*t).paramsCount = (self.types.length() as u32) - (*t).paramsFirst
+        }
+        if (*src).argsCount != 0 {
+            (*t).argsFirst = self.types.length() as u32
+            for i in 0..(*src).argsCount as usize {
+                self.internAst(self.ast.ref(self.ast.r.typeRefs, (*src).argsFirst + i as u32))
+            }
+            (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
+        }
+        return dst
+    }
+
+    /// `i32`, `u8`, `usize`, `f64`, `bool`, `void` -> the type; -1 for any other name.
+    fn primitiveFromName(self, name: str) -> i32 {
+        if name == "i8" { return self.makeInt(8, true) }
+        if name == "i16" { return self.makeInt(16, true) }
+        if name == "i32" { return self.makeInt(32, true) }
+        if name == "i64" { return self.makeInt(64, true) }
+        if name == "isize" { return self.makeInt(0, true) }
+        if name == "u8" { return self.makeInt(8, false) }
+        if name == "u16" { return self.makeInt(16, false) }
+        if name == "u32" { return self.makeInt(32, false) }
+        if name == "u64" { return self.makeInt(64, false) }
+        if name == "usize" { return self.makeInt(0, false) }
+        if name == "f32" { return self.makeFloat(32) }
+        if name == "f64" { return self.makeFloat(64) }
+        if name == "bool" { return self.makeBool() }
+        if name == "void" { return self.makeVoid() }
+        if name == "never" { return self.makeNever() }
+        if name == "str" { return self.makeStr() }
+        return -1
+    }
+
+    /// The source-like spelling: `*u8`, `[i32; 4]`, `fn(i32) -> i32`, `(i32, i64)`, `io.Writer`.
+    fn text(self, idx: i32) -> String {
+        if idx < 0 { return String("?") }
+        local t = self.get(idx)
+        switch {
+            case t.kind == T_VOID { return String("void") }
+            case t.kind == T_NEVER { return String("never") }
+            case t.kind == T_BOOL { return String("bool") }
+            case t.kind == T_STR { return String("str") }
+            case t.kind == T_SLICE {
+                local out = String("[]")
+                if t.isMutable != 0 { out.append("mut ") }
+                out.append(self.text(t.elem))
+                return out
+            }
+            case t.kind == T_INT {
+                if t.bits == 0 { return String(t.isSigned != 0 ? "isize" : "usize") }
+                return format("{}{}", t.isSigned != 0 ? "i" : "u", t.bits)
+            }
+            case t.kind == T_FLOAT { return format("f{}", t.bits) }
+            case t.kind == T_POINTER {
+                local out = String("*")
+                out.append(self.text(t.elem))
+                return out
+            }
+            case t.kind == T_FN_PTR {
+                local out = String("fn(")
+                for i in 0..t.paramsCount as usize {
+                    if i != 0 { out.append(", ") }
+                    out.append(self.text((t.paramsFirst + i as u32) as i32))
+                }
+                out.append(")")
+                if t.ret >= 0 && self.get(t.ret).kind != T_VOID {
+                    // `fn()` is `fn() -> void`; `-> never` is spelled
+                    out.append(" -> ")
+                    out.append(self.text(t.ret))
+                }
+                return out
+            }
+            case t.kind == T_ARRAY {
+                local out = String("[")
+                out.append(self.text(t.elem))
+                out.append("; ")
+                out.append(self.lengthText(t.length))
+                out.append("]")
+                return out
+            }
+            case t.kind == T_TUPLE {
+                // `()` is the empty tuple; a one-element tuple keeps its trailing comma so that it
+                // is not read as a parenthesized type.
+                local out = String("(")
+                for i in 0..t.argsCount as usize {
+                    if i != 0 { out.append(", ") }
+                    out.append(self.text((t.argsFirst + i as u32) as i32))
+                }
+                if t.argsCount == 1 { out.append(",") }
+                out.append(")")
+                return out
+            }
+            default { return self.pathOf(t) }
+        }
+    }
+
+    /// The spelling of an array length: the literal, the name, or the placeholder.
+    fn lengthText(self, exprIdx: i32) -> String {
+        if exprIdx < 0 { return String("?") }
+        local e = self.ast.exprAt(exprIdx)
+        if (*e).kind == XE_INT_LITERAL { return format("{}", (*e).intValue) }
+        if (*e).kind == XE_NAME { return self.ast.text((*e).text) }
+        return String("<const expr>")
+    }
+
+    /// True when the two types spell the same (the rule the C++ `sameType` uses).
+    fn same(self, a: i32, b: i32) -> bool {
+        if a == b { return true }
+        if a < 0 || b < 0 { return false }
+        return self.text(a) == self.text(b)
+    }
+
+    /// Symbol-safe spelling for link names: no spaces, `[`, `;`, `*`, `(`, `,` or `<`. `*T` is
+    /// `P<T>`, `[T; N]` is `A<N>_<T>`, `fn(A, B) -> R` is `F<A><B>R<R>E`, `(A, B)` is `T<A><B>E`
+    /// and `()` is `T E`, a named type is `N<len><name>`.
+    fn mangle(self, idx: i32) -> String {
+        if idx < 0 { return String("void") }
+        local t = self.get(idx)
+        switch {
+            case t.kind == T_VOID { return String("void") }
+            case t.kind == T_NEVER { return String("never") }
+            case t.kind == T_BOOL { return String("bool") }
+            case t.kind == T_STR { return String("str") }
+            case t.kind == T_SLICE {
+                // `[]T` is `S<T>`, `[]mut T` is `M<T>`: distinct link names, the same element
+                // mangling.
+                local out = String(t.isMutable != 0 ? "M" : "S")
+                out.append(t.elem >= 0 ? self.mangle(t.elem) : String("void"))
+                return out
+            }
+            case t.kind == T_INT {
+                if t.bits == 0 { return String(t.isSigned != 0 ? "isize" : "usize") }
+                return format("{}{}", t.isSigned != 0 ? "i" : "u", t.bits)
+            }
+            case t.kind == T_FLOAT { return format("f{}", t.bits) }
+            case t.kind == T_POINTER {
+                local out = String("P")
+                out.append(t.elem >= 0 ? self.mangle(t.elem) : String("void"))
+                return out
+            }
+            case t.kind == T_FN_PTR {
+                local out = String("F")
+                for i in 0..t.paramsCount as usize {
+                    out.append(self.mangle((t.paramsFirst + i as u32) as i32))
+                }
+                out.append("R")
+                out.append(t.ret >= 0 ? self.mangle(t.ret) : String("void"))
+                out.append("E")
+                return out
+            }
+            case t.kind == T_ARRAY {
+                local e = t.length >= 0 ? self.ast.exprAt(t.length) : nil
+                local len: u64 = e != nil && (*e).kind == XE_INT_LITERAL ? (*e).intValue : 0
+                local out = String("A")
+                out.append(format("{}_", len))
+                out.append(t.elem >= 0 ? self.mangle(t.elem) : String("void"))
+                return out
+            }
+            case t.kind == T_TUPLE {
+                local out = String("T")
+                for i in 0..t.argsCount as usize {
+                    out.append(self.mangle((t.argsFirst + i as u32) as i32))
+                }
+                out.append("E")
+                return out
+            }
+            default {
+                // A generic instance is named `Base<args>` in its path; its mangled name is the
+                // base name followed by `G<args>E`.
+                local name = self.pathOf(t)
+                local open = name.find("<")
+                if open >= 0 { name = name.slice(0, open as usize) }
+                // `::` and every other separator becomes `_`.
+                local clean = String()
+                local i: usize = 0
+                local n = name.length()
+                while i < n {
+                    local ch = name.at(i)
+                    if ch == b':' && i + 1 < n && name.at(i + 1) == b':' {
+                        i++
+                        clean.push(b'_')
+                    } else if ch == b':' || ch == b'.' || ch == b'/' {
+                        clean.push(b'_')
+                    } else {
+                        clean.push(ch)
+                    }
+                    i++
+                }
+                local out = String("N")
+                out.append(format("{}", clean.length()))
+                out.append(clean)
+                if t.argsCount != 0 {
+                    out.append("G")
+                    for i in 0..t.argsCount as usize {
+                        out.append(self.mangle((t.argsFirst + i as u32) as i32))
+                    }
+                    out.append("E")
+                }
+                return out
+            }
+        }
+    }
+}
