@@ -1,0 +1,142 @@
+// e2e: integer semantics for the native backend (`--backend=native`, arm64-apple-macos). Every
+// check states its expected value, so the program returns 0 when every operation has the width,
+// signedness and wrap-around of the language, and the LLVM build returns 0 as well (run.sh
+// compares both). It needs no stdlib.
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        return n
+    }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn narrow(x: i8, y: u16) -> i64 {
+    return (x as i64) * 1000 + (y as i64)
+}
+
+@entry fn main() -> i32 {
+    local fails: i32 = 0
+
+    // Wrap-around at each width.
+    local a: i8 = 127
+    a = a + 1
+    if a != -128 {
+        fails += 1
+    }
+    local b: u8 = 255
+    b = b + 1
+    if b != 0 {
+        fails += 1
+    }
+    local c: i16 = -32768
+    c = c - 1
+    if c != 32767 {
+        fails += 1
+    }
+    local d: u32 = 0
+    d = d - 1
+    if d != 4294967295 {
+        fails += 1
+    }
+    local e: u64 = 0
+    e = e - 1
+    if e != 18446744073709551615 {
+        fails += 1
+    }
+    local mn: i64 = -9223372036854775807 - 1
+    if mn - 1 != 9223372036854775807 {
+        fails += 1
+    }
+
+    // Division and remainder: signed truncates toward zero, unsigned on the full width.
+    local s: i32 = -7
+    if s / 2 != -3 || s % 3 != -1 {
+        fails += 1
+    }
+    local f: u32 = 4000000000
+    if f / 3 != 1333333333 || f % 7 != 3 {
+        fails += 1
+    }
+    local sb: i8 = -128
+    if sb / -1 != -128 {
+        fails += 1
+    }
+
+    // Shifts: a count at or above the width gives 0, `>>` of a negative value keeps the sign.
+    local one: i32 = 1
+    if (one << 40) != 0 || (one << 31) >= 0 {
+        fails += 1
+    }
+    local neg: i32 = -16
+    if (neg >> 2) != -4 {
+        fails += 1
+    }
+    local top: u32 = 2147483648
+    if (top >> 31) != 1 {
+        fails += 1
+    }
+    local big: i64 = -1
+    if (big >> 100) != -1 {
+        fails += 1
+    }
+    local one64: i64 = 1
+    if (one64 << 64) != 0 {
+        fails += 1
+    }
+
+    // Casts: truncation, sign and zero extension, bool conversion.
+    local m: i32 = -1
+    if (m as u8) != 255 || (m as u64) != 18446744073709551615 {
+        fails += 1
+    }
+    local w: u8 = 255
+    if (w as i8) != -1 || (300 as u8) != 44 {
+        fails += 1
+    }
+    local big32: u32 = 4294967295
+    if (big32 as i32) != -1 || (big32 as i64) != 4294967295 {
+        fails += 1
+    }
+    if narrow(-3, 65535) != 62535 {
+        fails += 1
+    }
+    local five: i32 = 5
+    if (five as bool) != true || (five > 3) as i32 != 1 {
+        fails += 1
+    }
+
+    // Comparisons: signed and unsigned on the same bits.
+    local hi: u32 = 4294967295
+    local lo: u32 = 1
+    if !(hi > lo) || (m < 1) != true {
+        fails += 1
+    }
+
+    // Bool logic and bitwise operators.
+    local t: bool = true
+    local z: bool = false
+    if !(t && !z) || (z || z) {
+        fails += 1
+    }
+    local mask: u8 = 0xf0
+    if (mask & 0x3c) != 0x30 || (mask | 0x0f) != 0xff || (mask ^ 0xff) != 0x0f {
+        fails += 1
+    }
+    if (~mask) != 0x0f {
+        fails += 1
+    }
+
+    // Control flow and recursion.
+    if fib(20) != 6765 {
+        fails += 1
+    }
+    local i: i32 = 0
+    local acc: i64 = 0
+    while i < 10 {
+        acc += i as i64
+        i += 1
+    }
+    if acc != 45 {
+        fails += 1
+    }
+    return fails
+}
