@@ -12,7 +12,7 @@
 #include "xlang/lang/frontend_c.h"
 #include "xlang/lang/lexer_c.h"
 #include "xlang/lang/macro_c.h"
-#include "parser/bridge.hpp"
+#include "parser_bridge.hpp"
 
 #include <cstdint>
 #include <map>

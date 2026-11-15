@@ -210,13 +210,14 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ```
 include/xlang/   public headers (lang, sema, hir, mir, analysis, codegen, util)
-src/lang/        lexer, preprocessor, macros, parser, AST, types, build configuration
+src/lang/        lexer, preprocessor, macros, parser, AST (all xlang); cpp/ holds the C++ AST,
+                 types, config and bridges that the C++ sema still reads, removed with it
 src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR
 src/hir/         HIR dump and reachability pruning
-src/mir/         HIR -> MIR (control-flow graph per function): builder/, dataflow/ solver, dump
+src/mir/         HIR -> MIR (control-flow graph per function), written in xlang: builder/,
+                 model.xl, dump.xl; xl_bridge.cpp/.hpp is the thin C bridge for C++ callers
 src/analysis/    static analyses over MIR, written in xlang (moves.xl, findings.xl): read only,
-                 findings sorted by position; xl_bridge.cpp/.hpp is the temporary C bridge that
-                 flattens mir::Body into the arenas of abi.xl
+                 findings sorted by position
 src/codegen/     HIR -> LLVM IR, optimization, object writers, C header
 src/driver/      linker driver (`link.xl`) and the in-process archiver (`archive.cpp`, LLVM's writer)
 src/util/        source files and diagnostics
