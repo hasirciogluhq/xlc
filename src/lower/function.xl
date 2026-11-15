@@ -3,7 +3,13 @@
 // grows as the lowering pass is ported.
 from "std" import String, Vec, format
 from "../hir/abi" import XlcHirLocal, XlcHirStr
-from "../lang/ast/ast" import XSpan
+from "../lang/ast/ast" import XSpan, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL, XE_STRING_LITERAL,
+    XE_BYTE_LITERAL, XE_NAME, XE_UNARY, XE_BINARY, XE_CALL, XE_INDEX, XE_SLICE, XE_FIELD,
+    XE_CAST, XE_ARRAY_LIST, XE_ARRAY_REPEAT, XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW,
+    XE_TERNARY, XE_TRY, XE_CLOSURE,
+    XS_LOCAL, XS_DELETE, XS_CONST, XS_ASSIGN, XS_RETURN, XS_EXPR, XS_IF, XS_WHILE, XS_DO_WHILE,
+    XS_FOR, XS_FOR_RANGE, XS_FOR_PACK, XS_FOR_EACH, XS_SWITCH, XS_DEFER, XS_TRY, XS_CONTINUE,
+    XS_BREAK, XS_UNSAFE, XS_BLOCK
 from "../sema/sema" import Sema
 from "../sema/item" import SDecl, SItem, SParam
 from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY
@@ -13,53 +19,7 @@ from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
 from "./builder" import FnBuild
 from "../sema/const_eval" import evalConst
 
-/// The expression kinds of the flat AST (the `XE_*` constants of ast.xl, mirrored).
-const XE_INT_LITERAL: i32 = 0
-const XE_FLOAT_LITERAL: i32 = 1
-const XE_STRING_LITERAL: i32 = 2
-const XE_BYTE_LITERAL: i32 = 3
-const XE_BOOL_LITERAL: i32 = 4
-const XE_NIL_LITERAL: i32 = 5
-const XE_NAME: i32 = 6
-const XE_BINARY: i32 = 7
-const XE_UNARY: i32 = 8
-const XE_CALL: i32 = 9
-const XE_INDEX: i32 = 10
-const XE_FIELD: i32 = 11
-const XE_METHOD: i32 = 12
-const XE_CAST: i32 = 13
-const XE_TUPLE: i32 = 14
-const XE_STRUCT_LIT: i32 = 15
-const XE_ARRAY_LIT: i32 = 16
-const XE_SLICE_LIT: i32 = 17
-const XE_ADDR_OF: i32 = 18
-const XE_DEREF: i32 = 19
-const XE_NEW: i32 = 20
-const XE_LAMBDA: i32 = 21
-const XE_SELECT: i32 = 22
-const XE_QUESTION: i32 = 23
-const XE_AWAIT: i32 = 24
-const XE_SYSCALL: i32 = 25
-const XE_SIZEOF: i32 = 26
-const XE_TYPE: i32 = 27
-const XE_MOVE: i32 = 28
-const XE_CLOSURE: i32 = 29
-
 /// The statement kinds of the flat AST (the `XS_*` constants of ast.xl, mirrored).
-const XS_LET: i32 = 0
-const XS_EXPR: i32 = 1
-const XS_RETURN: i32 = 2
-const XS_IF: i32 = 3
-const XS_WHILE: i32 = 4
-const XS_FOR: i32 = 5
-const XS_BREAK: i32 = 6
-const XS_CONTINUE: i32 = 7
-const XS_BLOCK: i32 = 8
-const XS_SWITCH: i32 = 9
-const XS_TRY: i32 = 10
-const XS_DEFER: i32 = 11
-const XS_ASSIGN: i32 = 12
-
 export fn lowerModuleTouch() { return }
 
 /// A module-level function: the declaration comes from the item.
@@ -202,7 +162,7 @@ export fn lowerBlockInto(l: *Lowerer, blockIdx: i32) -> Vec<i32> {
     /// Lowers one statement and returns its index, or -1 for nothing.
 export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
         local st = l.s.stmtAt(idx)
-        if (*st).kind == XS_LET {
+        if (*st).kind == XS_LOCAL {
             return lowerLet(l, idx)
         }
         if (*st).kind == XS_EXPR {
@@ -298,9 +258,6 @@ export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
         }
         if (*e).kind == XE_BYTE_LITERAL {
             return l.b.intConst((*e).intValue, l.exprTypeName(idx))
-        }
-        if (*e).kind == XE_NIL_LITERAL {
-            return l.b.nil(l.exprTypeName(idx))
         }
         if (*e).kind == XE_NAME {
             return lowerName(l, idx)
