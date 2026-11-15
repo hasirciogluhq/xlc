@@ -2,11 +2,9 @@
 #include "ir.h"
 #include "lowered.h"
 
-#include "xlang/hir/prune.h"
-
 // The C calling convention of `export(c)` and `declare` functions (src/codegen/llvm/c_abi/): the
-// LLVM signature each target's classifier picks, the diagnostics around it and the pruning of an
-// executable that links C objects.
+// LLVM signature each target's classifier picks and the diagnostics around it. The pruning of
+// `export(c)` functions is the xlang prune (src/hir/prune.xl), not covered here.
 
 namespace {
 
@@ -107,27 +105,6 @@ void testDeclareNeedsCTypes() {
     CHECK(!fine.diag->hasErrors());
 }
 
-// An executable keeps its `export(c)` functions only when it links prebuilt objects.
-void testExecutableKeepsCExportsForPrebuiltObjects() {
-    const std::string text = "export(c) fn forC() { }\nexport fn forXl() { }\n"
-                             "@entry fn main() -> i32 { return 0 }\n";
-    const auto names = [&](xlang::hir::KeepExports keep) {
-        Lowered r(text);
-        xlang::hir::pruneUnreachable(r.module, keep);
-        std::string out;
-        for (const auto& f : r.module.functions) {
-            out += f.name + " ";
-        }
-        return out;
-    };
-    const std::string none = names(xlang::hir::KeepExports::None);
-    const std::string c = names(xlang::hir::KeepExports::C);
-    const std::string all = names(xlang::hir::KeepExports::All);
-    CHECK(none.find("forC") == std::string::npos && none.find("forXl") == std::string::npos);
-    CHECK(c.find("forC") != std::string::npos && c.find("forXl") == std::string::npos);
-    CHECK(all.find("forC") != std::string::npos && all.find("forXl") != std::string::npos);
-}
-
 } // namespace
 
 void runCAbiTests() {
@@ -137,5 +114,4 @@ void runCAbiTests() {
     RUN(testNarrowIntegersAreWidened);
     RUN(testCFunctionWithStructIsNotAValue);
     RUN(testDeclareNeedsCTypes);
-    RUN(testExecutableKeepsCExportsForPrebuiltObjects);
 }
