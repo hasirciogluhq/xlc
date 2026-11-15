@@ -1,0 +1,16 @@
+// Lowering of generic instances and impls (placeholders pending the port of the C++ instance
+// and impl passes). The driver calls these; they currently perform no work beyond the parts
+// already covered.
+from "./state" import Lowerer
+
+export fn lowerInstancesTouch() { return }
+
+/// Placeholder: lowering of pending generic instances and lazy methods.
+export fn lowerPendingInstances(l: *Lowerer) -> bool {
+    return false
+}
+
+/// Placeholder: lowering of the module's impl declarations.
+export fn lowerImpls(l: *Lowerer) {
+    return
+}

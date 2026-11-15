@@ -18,6 +18,9 @@ from "../sema/subst" import TypeEnv, substituteType, instantiateFn, instantiateD
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOf, layoutOfName, aggregateLayout
 from "../sema/enums" import enumMember, checkEnum
+from "../lower/function" import lowerModuleTouch
+from "../lower/instances" import lowerInstancesTouch
+from "../lower/items" import lowerItemsTouch
 from "../lower/state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec
 from "../lower/builder" import HirBuilder, FnBuild, HirKeep
 from "../sema/checks" import analyze

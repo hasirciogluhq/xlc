@@ -536,11 +536,36 @@ export class Sema {
         return (self.items.length() - 1) as i32
     }
 
+    /// The statement index recorded at position `i` of the flat `stmtRefs` arena.
+    fn stmtIndexOf(self, i: u32) -> i32 {
+        return self.refAt("stmt", i as i32)
+    }
+
     /// The interned declaration of item `i`.
     fn declOf(self, i: i32) -> *SDecl {
         local d = self.items.get(i as usize).decl
         if d < 0 { return nil }
         return (self.decls.data as usize + (d as u64) as usize * sizeOf(SDecl)) as *SDecl
+    }
+
+    /// The declaration at an arena index (methods, synthesized declarations).
+    fn declAt(self, i: usize) -> *SDecl {
+        return (self.decls.data as usize + i * sizeOf(SDecl)) as *SDecl
+    }
+
+    /// The parameter at an arena index.
+    fn paramAt(self, i: usize) -> *SParam {
+        return (self.params.data as usize + i * sizeOf(SParam)) as *SParam
+    }
+
+    /// The field at an arena index.
+    fn fieldAt(self, i: usize) -> *SField {
+        return (self.fields.data as usize + i * sizeOf(SField)) as *SField
+    }
+
+    /// The enum member at an arena index.
+    fn memberAt(self, i: usize) -> *SEnumMember {
+        return (self.members.data as usize + i * sizeOf(SEnumMember)) as *SEnumMember
     }
 
     /// The SDecl index of item `i`.

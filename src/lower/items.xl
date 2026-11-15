@@ -1,0 +1,244 @@
+// Lowering of the module items: enums, aggregates, interfaces, globals and functions. The xlang
+// source of sema/lower/item/{driver,enum,aggregate,global}.cpp; the generic-instance and impl
+// passes follow in instances.xl and impls.xl.
+from "std" import String, Vec, format
+from "../hir/abi" import XlcHirLocal
+from "../sema/sema" import Sema, EntityRef
+from "../sema/flat" import Flat
+from "../sema/item" import SDecl, SItem, SParam, SField
+from "../sema/types" import T_NAMED, T_POINTER
+from "../sema/resolve" import resolve
+from "../sema/enums" import checkEnum
+from "../sema/layout_calc" import layoutOfName
+from "../sema/const_eval" import evalConst
+from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_GLOBAL, SE_CONSTANT, SE_TYPE
+from "./builder" import FnBuild, EnumRec, AggrRec, IfaceRec, XlcHirGlobalRec
+from "./helpers" import baseInitKey, overloadKey
+
+export fn lowerItemsTouch() { return }
+from "./function" import lowerFunction, lowerFunctionDecl, lowerConstInit
+from "./instances" import lowerPendingInstances, lowerImpls
+
+/// The declaration kinds of the flat AST (mirrored here for the dispatch).
+const XD_FN: i32 = 0
+const XD_GLOBAL: i32 = 1
+const XD_STRUCT: i32 = 2
+const XD_CLASS: i32 = 3
+const XD_INTERFACE: i32 = 4
+const XD_IMPL: i32 = 5
+const XD_ENUM: i32 = 6
+const XD_TYPE_ALIAS: i32 = 7
+const XD_DEFINE_CONST: i32 = 8
+
+    /// The resolved parameter types of a declaration, self excluded.
+export fn paramTypes(l: *Lowerer, d: *SDecl) -> Vec<String> {
+        local out = Vec<String>()
+        for i in 0..(*d).paramsCount as usize {
+            local p = l.s.paramAt((*d).paramsFirst as usize + i)
+            if (*p).isSelf != 0 { continue }
+            out.push(l.typeName(resolve(l.s, (*p).ty)))
+        }
+        return out
+    }
+
+export fn lowerItems(l: *Lowerer) {
+        lowerBatch(l)
+        lowerImpls(l)
+        lowerPendingInstances(l)
+    }
+
+    /// The first pass over every item of the module, then the class methods.
+export fn lowerBatch(l: *Lowerer) {
+        for i in 0..l.s.items.length() {
+            local item = i as i32
+            local declIdx = l.s.declOfItem(item)
+            if declIdx < 0 { continue }
+            local d = l.s.declOf(item)
+            local gp = l.s.genericParamsOf(item)
+            if gp.1 > 0 { continue } // a generic declaration is lowered per instance
+            if (*d).kind == XD_IMPL { continue } // the module's impls are in lowerImpls
+            if (*d).kind == XD_ENUM {
+                lowerEnum(l, item, declIdx)
+            } else if (*d).kind == XD_STRUCT || (*d).kind == XD_CLASS {
+                lowerAggregate(l, item, declIdx)
+            } else if (*d).kind == XD_INTERFACE {
+                lowerInterface(l, item, declIdx)
+            } else if (*d).kind == XD_GLOBAL {
+                lowerGlobal(l, item, declIdx)
+            } else if (*d).kind == XD_FN {
+                lowerTopFn(l, item, declIdx)
+            }
+        }
+        // Methods after all signatures and types exist.
+        for i in 0..l.s.items.length() {
+            local item = i as i32
+            local declIdx = l.s.declOfItem(item)
+            if declIdx < 0 { continue }
+            local d = l.s.declOf(item)
+            if (*d).kind != XD_CLASS { continue }
+            if l.s.genericParamsOf(item).1 > 0 { continue }
+            lowerMethods(l, item, declIdx)
+        }
+    }
+
+export fn lowerEnum(l: *Lowerer, item: i32, declIdx: i32) {
+        local d = l.s.declOf(item)
+        checkEnum(l.s, declIdx)
+        local rec = new EnumRec(l.s.text((*d).name), "")
+        if (*d).hasUnderlying != 0 {
+            (*rec).underlying = l.typeName((*d).underlying)
+        }
+        for i in 0..(*d).membersCount as usize {
+            local m = l.s.memberAt((*d).membersFirst as usize + i)
+            (*rec).memberNames.push(String(l.s.text((*m).name)))
+            // The member value: evaluated by the const folder when written, auto-numbered else.
+            local value = i as i64
+            if (*m).value >= 0 {
+                local cv = *l.s.consts.get(evalConst(l.s, (*m).value) as usize)
+                value = (*cv).intValue.lo as i64
+            }
+            (*rec).memberValues.push(value)
+            (*rec).memberTexts.push(String(""))
+        }
+        l.b.enums.push(rec)
+    }
+
+export fn lowerAggregate(l: *Lowerer, item: i32, declIdx: i32) {
+        local d = l.s.declOf(item)
+        local rec = new AggrRec(l.s.qualify(l.s.text((*d).name)).asStr())
+        (*rec).isClass = (*d).kind == XD_CLASS
+        (*rec).isUnion = (*d).isUnion != 0
+        (*rec).opaque = (*d).opaque != 0
+        if (*d).baseCount > 0 {
+            (*rec).base = String(l.s.text(l.s.flat.pathSeg((*d).baseFirst)))
+        }
+        for i in 0..(*d).fieldsCount as usize {
+            local f = l.s.fieldAt((*d).fieldsFirst as usize + i)
+            (*rec).fieldNames.push(String(l.s.text((*f).name)))
+            (*rec).fieldTypeNames.push(l.typeName(resolve(l.s, (*f).ty)))
+        }
+        // The layout is computed here so the codegen sees it without a second pass.
+        layoutOfName(l.s, l.s.text((*d).name), (*d).nameSpan)
+        l.b.aggregates.push(rec)
+    }
+
+export fn lowerInterface(l: *Lowerer, item: i32, declIdx: i32) {
+        local d = l.s.declOf(item)
+        local rec = new IfaceRec(l.s.qualify(l.s.text((*d).name)).asStr())
+        for i in 0..(*d).methodsCount as usize {
+            local m = l.s.declAt((*d).methodsFirst as usize + i)
+            (*rec).methodNames.push(String(l.s.text((*m).name)))
+            (*rec).methodRets.push(l.typeName(resolve(l.s, (*m).ret)))
+            local params = Vec<String>()
+            for j in 0..(*m).paramsCount as usize {
+                local p = l.s.paramAt((*m).paramsFirst as usize + j)
+                if (*p).isSelf != 0 { continue }
+                params.push(l.typeName(resolve(l.s, (*p).ty)))
+            }
+            (*rec).methodParams.push(params)
+        }
+        l.b.interfaces.push(rec)
+    }
+
+export fn lowerGlobal(l: *Lowerer, item: i32, declIdx: i32) {
+        local d = l.s.declOf(item)
+        local it = l.s.items.get(item as usize)
+        local rec = new XlcHirGlobalRec(l.s.qualify(l.s.text((*d).name)).asStr(),
+            l.typeName(resolve(l.s, (*d).ty)).asStr())
+        (*rec).constant = (*d).isConst != 0
+        (*rec).exported = (*it).exported != 0 || (*it).exportC != 0 || (*it).registered != 0
+        (*rec).exportC = (*it).exportC != 0
+        (*rec).registered = (*it).registered != 0
+        if (*d).init >= 0 {
+            (*rec).init = lowerConstInit(l, (*d).init, l.typeName(resolve(l.s, (*d).ty)).asStr())
+        }
+        l.b.globals.push(rec)
+    }
+
+export fn lowerTopFn(l: *Lowerer, item: i32, declIdx: i32) {
+        local d = l.s.declOf(item)
+        local it = l.s.items.get(item as usize)
+        local qname = l.s.qualify(l.s.text((*d).name))
+        local sym = l.s.find(l.s.text((*d).name))
+        local overloaded = false
+        if sym >= 0 {
+            local rec = l.s.symbols.get(sym as usize)
+            overloaded = (*rec).overloadsCount > 1
+        }
+        local params = paramTypes(l, d)
+        local key = overloaded ? overloadKey(qname.asStr(), params) : qname.clone()
+        if fnKeySeen(l, key.asStr()) {
+            l.err("E0401", (*d).nameSpan,
+                format("`{}` is defined twice", overloadKey(l.s.text((*d).name), params).asStr()).asStr(),
+                "give the overloads different parameter types")
+            return
+        }
+        l.fnKeys.push(key.clone())
+        lowerFunction(l, item, declIdx, key.asStr(), l.s.text((*d).name), "")
+    }
+
+    /// The methods of one class: keys, lazy methods and the `init` helper name.
+export fn lowerMethods(l: *Lowerer, item: i32, declIdx: i32) {
+        local d = l.s.declOf(item)
+        local cls = l.s.text((*d).name)
+        local cq = l.s.qualify(cls).asStr()
+        for i in 0..(*d).methodsCount as usize {
+            local mIdx = ((*d).methodsFirst as usize + i) as i32
+            local m = l.s.declAt(mIdx as usize)
+            local name = l.s.text((*m).name)
+            local overloaded = false
+            for j in 0..(*d).methodsCount as usize {
+                local o = l.s.declAt(((*d).methodsFirst as usize + j))
+                if j != i && l.s.text((*o).name) == name { overloaded = true }
+            }
+            if (*m).genericCount > 0 {
+                if (*m).isVirtual != 0 || (*m).isOverride != 0 {
+                    l.err("E0730", (*m).nameSpan,
+                        format("generic method `{}` cannot be virtual", name).asStr(),
+                        "remove `virtual`/`override`: a vtable slot has one fixed signature")
+                } else if overloaded {
+                    l.err("E0405", (*m).nameSpan,
+                        format("generic method `{}` cannot be overloaded", name).asStr(),
+                        "keep one declaration with this name")
+                }
+                continue
+            }
+            local key = format("{}.{}", cq, name)
+            if overloaded {
+                if (*m).isVirtual != 0 || (*m).isOverride != 0 {
+                    l.err("E0405", (*m).nameSpan,
+                        format("`{}` cannot be overloaded: virtual methods have one slot", name).asStr(),
+                        "keep one declaration with this name")
+                }
+                local params = paramTypes(l, m)
+                key = overloadKey(key.asStr(), params)
+            }
+            if fnKeySeen(l, key.asStr()) {
+                l.err("E0401", (*m).nameSpan,
+                    format("`{}.{}` is defined twice", cls, name).asStr(),
+                    "give the overloads different parameter types")
+                continue
+            }
+            l.fnKeys.push(key.clone())
+            if name == "init" {
+                // The base-class init helper is called by every constructor.
+            }
+            lowerFunctionDecl(l, item, mIdx, key.asStr(), format("{}.{}", cls, name).asStr(), cq)
+        }
+    }
+
+export fn fnKeySeen(l: *Lowerer, key: str) -> bool {
+        for i in 0..l.fnKeys.length() {
+            if (*l.fnKeys.get(i)).asStr() == key { return true }
+        }
+        return false
+    }
+
+export fn run(l: *Lowerer) {
+        l.buildModuleScope()
+        lowerItems(l)
+    }
+
+export fn finish(l: *Lowerer) {
+        l.scopes.pop()
+    }

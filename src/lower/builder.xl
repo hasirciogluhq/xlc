@@ -54,11 +54,11 @@ export class FnBuild {
 /// The arenas of one HIR module under construction.
 export class HirBuilder {
     fns: Vec<*FnBuild>
-    globals: Vec<XlcHirGlobalRec>
-    enums: Vec<EnumRec>
-    aggregates: Vec<AggrRec>
-    interfaces: Vec<IfaceRec>
-    impls: Vec<ImplRec>
+    globals: Vec<*XlcHirGlobalRec>
+    enums: Vec<*EnumRec>
+    aggregates: Vec<*AggrRec>
+    interfaces: Vec<*IfaceRec>
+    impls: Vec<*ImplRec>
     exprs: Vec<XlcHirExpr>
     stmts: Vec<XlcHirStmt>
     fieldInits: Vec<XlcHirFieldInit>
@@ -76,11 +76,11 @@ export class HirBuilder {
 
     fn init(self) {
         self.fns = Vec<*FnBuild>()
-        self.globals = Vec<XlcHirGlobalRec>()
-        self.enums = Vec<EnumRec>()
-        self.aggregates = Vec<AggrRec>()
-        self.interfaces = Vec<IfaceRec>()
-        self.impls = Vec<ImplRec>()
+        self.globals = Vec<*XlcHirGlobalRec>()
+        self.enums = Vec<*EnumRec>()
+        self.aggregates = Vec<*AggrRec>()
+        self.interfaces = Vec<*IfaceRec>()
+        self.impls = Vec<*ImplRec>()
         self.exprs = Vec<XlcHirExpr>()
         self.stmts = Vec<XlcHirStmt>()
         self.fieldInits = Vec<XlcHirFieldInit>()

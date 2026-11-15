@@ -145,7 +145,7 @@ export class Lowerer {
     fnName: String
     fnSymbol: String
     fnRet: String
-    fnLocals: Vec<XlcHirLocalRec>
+    fnLocals: Vec<*XlcHirLocalRec>
     fnParamCount: u32
     fnBody: Vec<i32>
     fnUnwind: Vec<i32>
@@ -157,6 +157,15 @@ export class Lowerer {
 
     // The pending statements a `?` or a compound assignment hoists before the expression.
     prelude: Vec<i32>
+
+    // The function keys already handed out (E0401 for a duplicate signature).
+    fnKeys: Vec<String>
+
+    // The current class when a method body is lowered ("" for a free function).
+    currentClass: String
+    selfLocal: u32
+    hasSelf: bool
+    loopDepth: i32 ///< current loop nesting depth for break/continue targeting
 
     fn init(self, s: *Sema, b: *HirBuilder, isLibrary: bool) {
         self.s = s
@@ -170,7 +179,7 @@ export class Lowerer {
         self.fnName = String("")
         self.fnSymbol = String("")
         self.fnRet = String("void")
-        self.fnLocals = Vec<XlcHirLocalRec>()
+        self.fnLocals = Vec<*XlcHirLocalRec>()
         self.fnParamCount = 0
         self.fnBody = Vec<i32>()
         self.fnUnwind = Vec<i32>()
@@ -178,12 +187,38 @@ export class Lowerer {
         self.needsDropCache = Vec<String>()
         self.needsDropValue = Vec<bool>()
         self.prelude = Vec<i32>()
+        self.fnKeys = Vec<String>()
+        self.currentClass = String("")
+        self.selfLocal = 0
+        self.hasSelf = false
+        self.loopDepth = 0
     }
 
     /// The spelling of a type for the HIR (the same text the C++ pass writes).
     fn typeName(self, idx: i32) -> String {
         if idx < 0 { return String("") }
         return self.s.types.text(idx)
+    }
+
+    /// The type name attached to an expression record. The flat AST carries a type index only on
+    /// a few forms; the lowering pass currently passes the declared type when available and an
+    /// empty string otherwise, pending per-expression type inference in the xl sema.
+    fn exprTypeName(self, idx: i32) -> str {
+        local e = self.s.exprAt(idx)
+        if (*e).typeIdx >= 0 {
+            return self.typeName((*e).typeIdx).asStr()
+        }
+        return ""
+    }
+
+    /// The ConstValue index of a `define` constant by name, or -1.
+    fn constOfName(self, name: str) -> i32 {
+        for i in 0..self.s.defineNames.length() {
+            if self.s.text(*self.s.defineNames.get(i)) == name {
+                return *self.s.defineValues.get(i)
+            }
+        }
+        return -1
     }
 
     /// Reports through the module's diagnostics.

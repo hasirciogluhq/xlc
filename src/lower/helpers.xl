@@ -1,0 +1,21 @@
+// Shared helpers of the lowering pass.
+from "std" import String, Vec, format
+from "../sema/sema" import Sema
+
+/// The qualified name of the base-class init helper of `cls`.
+export fn baseInitKey(s: *Sema, cls: str) -> String {
+    return format("{}.init$base", s.qualify(cls).asStr())
+}
+
+/// The key of an overload: the qualified name with the parameter types appended, the form the
+/// C++ pass writes (`name(type, type)`).
+export fn overloadKey(qname: str, params: Vec<String>) -> String {
+    local out = String(qname)
+    out.push(b'(')
+    for i in 0..params.length() {
+        if i > 0 { out.append(", ") }
+        out.append((*params.get(i)).asStr())
+    }
+    out.push(b')')
+    return out
+}

@@ -1,0 +1,412 @@
+// Lowering of function bodies: parameters, locals, statements and the expression walk. The
+// xlang source of sema/lower/item/function.cpp and the expr/ and stmt/ subtrees; this file
+// grows as the lowering pass is ported.
+from "std" import String, Vec, format
+from "../hir/abi" import XlcHirLocal, XlcHirStr
+from "../lang/ast/ast" import XSpan
+from "../sema/sema" import Sema
+from "../sema/item" import SDecl, SItem, SParam
+from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY
+from "../sema/resolve" import resolve
+from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
+    SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
+from "./builder" import FnBuild
+from "../sema/const_eval" import evalConst
+
+/// The expression kinds of the flat AST (the `XE_*` constants of ast.xl, mirrored).
+const XE_INT_LITERAL: i32 = 0
+const XE_FLOAT_LITERAL: i32 = 1
+const XE_STRING_LITERAL: i32 = 2
+const XE_BYTE_LITERAL: i32 = 3
+const XE_BOOL_LITERAL: i32 = 4
+const XE_NIL_LITERAL: i32 = 5
+const XE_NAME: i32 = 6
+const XE_BINARY: i32 = 7
+const XE_UNARY: i32 = 8
+const XE_CALL: i32 = 9
+const XE_INDEX: i32 = 10
+const XE_FIELD: i32 = 11
+const XE_METHOD: i32 = 12
+const XE_CAST: i32 = 13
+const XE_TUPLE: i32 = 14
+const XE_STRUCT_LIT: i32 = 15
+const XE_ARRAY_LIT: i32 = 16
+const XE_SLICE_LIT: i32 = 17
+const XE_ADDR_OF: i32 = 18
+const XE_DEREF: i32 = 19
+const XE_NEW: i32 = 20
+const XE_LAMBDA: i32 = 21
+const XE_SELECT: i32 = 22
+const XE_QUESTION: i32 = 23
+const XE_AWAIT: i32 = 24
+const XE_SYSCALL: i32 = 25
+const XE_SIZEOF: i32 = 26
+const XE_TYPE: i32 = 27
+const XE_MOVE: i32 = 28
+const XE_CLOSURE: i32 = 29
+
+/// The statement kinds of the flat AST (the `XS_*` constants of ast.xl, mirrored).
+const XS_LET: i32 = 0
+const XS_EXPR: i32 = 1
+const XS_RETURN: i32 = 2
+const XS_IF: i32 = 3
+const XS_WHILE: i32 = 4
+const XS_FOR: i32 = 5
+const XS_BREAK: i32 = 6
+const XS_CONTINUE: i32 = 7
+const XS_BLOCK: i32 = 8
+const XS_SWITCH: i32 = 9
+const XS_TRY: i32 = 10
+const XS_DEFER: i32 = 11
+const XS_ASSIGN: i32 = 12
+
+export fn lowerModuleTouch() { return }
+
+/// A module-level function: the declaration comes from the item.
+export fn lowerFunction(l: *Lowerer, item: i32, declIdx: i32, qname: str, localName: str,
+                        owner: str) {
+    runFunction(l, item, l.s.declOf(item), qname, localName, owner)
+}
+
+/// A class method: the declaration comes from the SDecl arena index.
+export fn lowerFunctionDecl(l: *Lowerer, item: i32, declIdx: i32, qname: str, localName: str,
+                            owner: str) {
+    runFunctionDecl(l, item, declIdx, qname, localName, owner)
+}
+
+/// The initializer of a global: a constant expression folded to a literal.
+export fn lowerConstInit(l: *Lowerer, exprIdx: i32, tyName: str) -> i32 {
+    return runConstInit(l, exprIdx, tyName)
+}
+
+    /// Opens the function under construction: the header fields, the scope and the parameters.
+export fn beginFunction(l: *Lowerer, qname: str, localName: str, owner: str, ret: str) {
+        l.fnName = String(qname)
+        l.fnSymbol = String("")
+        l.fnRet = String(ret)
+        l.fnLocals = Vec<*XlcHirLocalRec>()
+        l.fnParamCount = 0
+        l.fnBody = Vec<i32>()
+        l.fnUnwind = Vec<i32>()
+        l.prelude = Vec<i32>()
+        l.currentClass = String(owner)
+        l.hasSelf = false
+        l.scopes.push()
+    }
+
+    /// Closes the function: appends its record to the builder and pops the scope.
+export fn endFunction(l: *Lowerer, item: i32) {
+        local f = new FnBuild(l.fnName.asStr())
+        (*f).symbol = l.fnSymbol.clone()
+        (*f).ret = l.fnRet.clone()
+        for i in 0..l.fnLocals.length() {
+            local lr = l.fnLocals.get(i)
+            local rec: XlcHirLocal
+            rec.name = l.b.str((*lr).name.asStr())
+            rec.typeName = l.b.str((*lr).typeName.asStr())
+            (*f).locals.push(rec)
+        }
+        (*f).paramCount = l.fnParamCount
+        for i in 0..l.fnBody.length() {
+            (*f).body.push(*l.fnBody.get(i))
+        }
+        for i in 0..l.fnUnwind.length() {
+            (*f).unwind.push(*l.fnUnwind.get(i))
+        }
+        if item >= 0 {
+            local it = l.s.items.get(item as usize)
+            (*f).exported = (*it).exported != 0 || (*it).exportC != 0 || (*it).registered != 0
+            (*f).exportC = (*it).exportC != 0
+            (*f).registered = (*it).registered != 0
+            (*f).isEntry = l.s.text((*it).registerRole) == "entry"
+            (*f).isInit = l.s.text((*it).registerRole) == "init"
+            (*f).isFini = l.s.text((*it).registerRole) == "fini"
+            if (*f).isInit {
+                l.b.initFns.push(l.fnName.clone())
+            }
+            if (*f).isFini {
+                l.b.finiFns.push(l.fnName.clone())
+            }
+        }
+        l.b.addFn(f)
+        l.scopes.pop()
+    }
+
+    /// Adds a local to the function under construction and returns its id.
+export fn addLocal(l: *Lowerer, name: str, typeName: str) -> u32 {
+        local id = l.fnLocals.length() as u32
+        l.fnLocals.push(new XlcHirLocalRec(name, typeName))
+        return id
+    }
+
+    /// A function with a body: parameters, prologue, the body statements and the drops.
+export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: str, owner: str) {
+        local ret = l.typeName(resolve(l.s, (*d).ret))
+        if (*d).hasRet == 0 { ret = String("void") }
+        beginFunction(l, qname, localName, owner, ret.asStr())
+        // The parameters, in order; a `self` first when the owner is a class.
+        if owner.len > 0 {
+            local selfTy = format("*{}", owner)
+            local id = addLocal(l, "self", selfTy.asStr())
+            l.selfLocal = id
+            l.hasSelf = true
+            l.fnParamCount = l.fnParamCount + 1
+            local e = new ScopeEntry()
+            (*e).kind = SE_LOCAL
+            (*e).name = String("self")
+            (*e).ty = -1
+            (*e).localId = id
+            l.scopes.declare(e)
+        }
+        for i in 0..(*d).paramsCount as usize {
+            local p = l.s.paramAt((*d).paramsFirst as usize + i)
+            if (*p).isSelf != 0 { continue }
+            local ty = l.typeName(resolve(l.s, (*p).ty))
+            local id = addLocal(l, l.s.text((*p).name), ty.asStr())
+            l.fnParamCount = l.fnParamCount + 1
+            local e = new ScopeEntry()
+            (*e).kind = SE_LOCAL
+            (*e).name = String(l.s.text((*p).name))
+            (*e).ty = resolve(l.s, (*p).ty)
+            (*e).localId = id
+            l.scopes.declare(e)
+        }
+        // The body.
+        if (*d).hasBody != 0 && (*d).body >= 0 {
+            l.fnBody = lowerBlockInto(l, (*d).body)
+        }
+        endFunction(l, item)
+    }
+
+    /// A top-level function or a class method: dispatches on the declaration.
+export fn runFunctionDecl(l: *Lowerer, item: i32, declIdx: i32, qname: str, localName: str, owner: str) {
+        runFunction(l, item, l.s.declAt(declIdx as usize), qname, localName, owner)
+    }
+
+    /// The statements of block `blockIdx` lowered into a new list.
+export fn lowerBlockInto(l: *Lowerer, blockIdx: i32) -> Vec<i32> {
+        local out = Vec<i32>()
+        local blk = l.s.blockAt(blockIdx)
+        local count = (*blk).stmtsCount
+        local first = (*blk).stmtsFirst
+        l.scopes.push()
+        for i in 0..count as usize {
+            local idx = l.s.stmtIndexOf(first + i as u32)
+            local st = lowerStmt(l, idx)
+            if st >= 0 { out.push(st) }
+        }
+        l.scopes.pop()
+        return out
+    }
+
+    /// Lowers one statement and returns its index, or -1 for nothing.
+export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
+        local st = l.s.stmtAt(idx)
+        if (*st).kind == XS_LET {
+            return lowerLet(l, idx)
+        }
+        if (*st).kind == XS_EXPR {
+            local value = lowerExpr(l, (*st).expr)
+            if value < 0 { return -1 }
+            // An expression statement: the value is discarded.
+            return l.b.exprStmt(value)
+        }
+        if (*st).kind == XS_RETURN {
+            local value = -1
+            if (*st).expr >= 0 {
+                value = lowerExpr(l, (*st).expr)
+            }
+            return l.b.returnStmt(value)
+        }
+        if (*st).kind == XS_IF {
+            local cond = lowerExpr(l, (*st).expr)
+            local body = lowerBlockInto(l, (*st).body)
+            local elseBody = Vec<i32>()
+            if (*st).elseBody >= 0 {
+                elseBody = lowerBlockInto(l, (*st).elseBody)
+            }
+            return l.b.ifStmt(cond, body, elseBody)
+        }
+        if (*st).kind == XS_WHILE {
+            local cond = lowerExpr(l, (*st).expr)
+            l.loopDepth = l.loopDepth + 1
+            local body = lowerBlockInto(l, (*st).body)
+            l.loopDepth = l.loopDepth - 1
+            return l.b.whileStmt(cond, body, l.loopDepth as u32, false)
+        }
+        if (*st).kind == XS_BREAK {
+            return l.b.breakStmt(l.loopDepth as u32)
+        }
+        if (*st).kind == XS_CONTINUE {
+            return l.b.continueStmt(l.loopDepth as u32)
+        }
+        if (*st).kind == XS_BLOCK {
+            local body = lowerBlockInto(l, (*st).body)
+            return l.b.blockStmt(body)
+        }
+        if (*st).kind == XS_ASSIGN {
+            local target = lowerExpr(l, (*st).target)
+            local value = lowerExpr(l, (*st).expr)
+            return l.b.assign(target, value)
+        }
+        l.err("E0500", (*st).span, "this statement form is not lowered yet",
+            "the xlang lowering pass is still being ported")
+        return -1
+    }
+
+    /// A `let`: the local, its optional initializer and the binding.
+export fn lowerLet(l: *Lowerer, idx: i32) -> i32 {
+        local st = l.s.stmtAt(idx)
+        local name = l.s.stmtTextAt(idx)
+        local tyName = ""
+        if (*st).hasType != 0 && (*st).typeIdx >= 0 {
+            tyName = l.typeName(resolve(l.s, (*st).typeIdx)).asStr()
+        }
+        local value = -1
+        if (*st).expr >= 0 {
+            value = lowerExpr(l, (*st).expr)
+            if tyName.len == 0 {
+                tyName = l.exprTypeName((*st).expr)
+            }
+        }
+        if tyName.len == 0 { tyName = "void" }
+        local id = addLocal(l, name, tyName)
+        local e = new ScopeEntry()
+        (*e).kind = SE_LOCAL
+        (*e).name = String(name)
+        (*e).ty = (*st).typeIdx
+        (*e).localId = id
+        l.scopes.declare(e)
+        return l.b.localStmt(id, name, tyName, value)
+    }
+
+    /// Lowers one expression and returns its HIR index, or -1.
+export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
+        if idx < 0 { return -1 }
+        local e = l.s.exprAt(idx)
+        if (*e).kind == XE_INT_LITERAL {
+            return l.b.intConst((*e).intValue, l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_FLOAT_LITERAL {
+            return l.b.floatConst((*e).floatValue, l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_BOOL_LITERAL {
+            return l.b.boolConst((*e).boolValue != 0, l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_STRING_LITERAL {
+            return l.b.strConst(l.s.exprTextAt(idx), l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_BYTE_LITERAL {
+            return l.b.intConst((*e).intValue, l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_NIL_LITERAL {
+            return l.b.nil(l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_NAME {
+            return lowerName(l, idx)
+        }
+        if (*e).kind == XE_BINARY {
+            local lhs = lowerExpr(l, (*e).lhs)
+            local rhs = lowerExpr(l, (*e).rhs)
+            return l.b.binary(l.s.exprTextAt(idx), lhs, rhs, l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_UNARY {
+            local lhs = lowerExpr(l, (*e).lhs)
+            return l.b.unary(l.s.exprTextAt(idx), lhs, l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_CAST {
+            local value = lowerExpr(l, (*e).lhs)
+            return l.b.cast(value, l.exprTypeName(idx), false)
+        }
+        if (*e).kind == XE_FIELD {
+            local base = lowerExpr(l, (*e).lhs)
+            // Field offset index and pointer access are sema-derived; filled once the xl sema
+            // assigns per-expression types and member offsets.
+            return l.b.field(base, l.s.exprTextAt(idx), l.exprTypeName(idx), false, 0)
+        }
+        if (*e).kind == XE_INDEX {
+            local base = lowerExpr(l, (*e).lhs)
+            local sub = lowerExpr(l, (*e).rhs)
+            return l.b.index(base, sub, l.exprTypeName(idx))
+        }
+        if (*e).kind == XE_CALL {
+            return lowerCall(l, idx)
+        }
+        l.err("E0500", (*e).span, "this expression form is not lowered yet",
+            "the xlang lowering pass is still being ported")
+        return -1
+    }
+
+    /// A name: a local, a global, a function or a constant.
+export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
+        local name = l.s.exprTextAt(idx)
+        local entry = l.lookupName(name)
+        if entry == nil {
+            l.err("E0706", (*l.s.exprAt(idx)).span,
+                format("unknown name `{}`", name).asStr(), "not found in any scope")
+            return -1
+        }
+        local tyName = l.exprTypeName(idx)
+        if (*entry).kind == SE_LOCAL {
+            return l.b.localRef((*entry).localId, tyName)
+        }
+        if (*entry).kind == SE_GLOBAL {
+            return l.b.globalRef((*entry).qname.asStr(), tyName)
+        }
+        if (*entry).kind == SE_FUNCTION {
+            return l.b.funcRef((*entry).qname.asStr(), tyName)
+        }
+        if (*entry).kind == SE_CONSTANT {
+            // A define constant folds to its value.
+            local value = l.constOfName(name)
+            if value >= 0 {
+                local cv = *l.s.consts.get(value as usize)
+                return l.b.intConst((*cv).intValue.lo, tyName)
+            }
+        }
+        l.err("E0706", (*l.s.exprAt(idx)).span,
+            format("`{}` has no lowered form here", name).asStr(), "not a value")
+        return -1
+    }
+
+    /// A call: the callee name, the arguments in order.
+export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
+        local e = l.s.exprAt(idx)
+        local args = Vec<i32>()
+        local count = (*e).argsCount
+        for i in 0..count as usize {
+            local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
+            local v = lowerExpr(l, a)
+            if v < 0 { return -1 }
+            args.push(v)
+        }
+        local range = l.b.args(args)
+        local callee = l.s.exprTextAt((*e).lhs)
+        local entry = l.lookupName(callee)
+        if entry != nil && (*entry).kind == SE_FUNCTION {
+            return l.b.call((*entry).qname.asStr(), range.0, range.1, l.exprTypeName(idx))
+        }
+        return l.b.call(callee, range.0, range.1, l.exprTypeName(idx))
+    }
+
+    /// The initializer of a global: a constant expression folded to a literal.
+export fn runConstInit(l: *Lowerer, exprIdx: i32, tyName: str) -> i32 {
+        local value = evalConst(l.s, exprIdx)
+        if value >= 0 {
+            local cv = *l.s.consts.get(value as usize)
+            if (*cv).kind == 0 {
+                return l.b.intConst((*cv).intValue.lo, tyName)
+            }
+            if (*cv).kind == 1 {
+                return l.b.floatConst((*cv).floatValue, tyName)
+            }
+            if (*cv).kind == 2 {
+                return l.b.boolConst((*cv).boolValue, tyName)
+            }
+            if (*cv).kind == 3 {
+                return l.b.strConst((*cv).text.asStr(), tyName)
+            }
+        }
+        // Not constant: lowered as an expression; the codegen emits a dynamic initializer.
+        return lowerExpr(l, exprIdx)
+    }
