@@ -9,6 +9,7 @@ from "macro/expand" import xlcExpandMacros, xlcExpandMacrosFree
 from "frontend/frontend" import xlcFrontendParse
 from "../hir/dump" import xlcHirDump, xlcHirDumpFree
 from "../hir/prune" import xlcHirPrune, xlcHirPruneFree
+from "../mir/builder/module" import xlcMirBuild, xlcMirBuildSession, xlcMirDump, xlcMirDumpFree, xlcMirFree
 from "parser/parser" import xlcParse
 from "../sema/flat" import Flat
 from "../sema/types" import Types
@@ -31,7 +32,7 @@ from "../sema/sema" import Sema
 from "../sema/item" import SItem, SDecl, SParam, SField, SSumVariant, SEnumMember, SImportName
 from "../sema/conversion" import implicitConversion, commonBinaryType
 from "../sema/layout" import LayoutHistory, formatLayoutRecord
-from "../analysis/analysis" import xlcAnalysisNew, xlcAnalysisBody, xlcAnalysisFinish
+from "../analysis/analysis" import xlcAnalysisRun
 from "../util/source" import xlcUtilSourcesNew, xlcUtilAddFile, xlcUtilSourcesFree
 from "../util/diagnostics" import xlcDiagNew, xlcDiagConfigure, xlcDiagAddAllowScope,
     xlcDiagReport, xlcDiagBeginQuiet, xlcDiagEndQuiet, xlcDiagFlush, xlcDiagExplain,

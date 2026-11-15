@@ -16,9 +16,9 @@
 // stdlib release that exits such loops with `break`.
 from "std" import String, Vec, format
 from "../util/source" import Span
-from "abi" import XamBody, XamBlock, XamStmt, XamTerm, XamPlace, XamOperand, view,
-    LOCAL_PARAM, LOCAL_USER, PROJ_INDEX, OPERAND_MOVE, OPERAND_CONSTANT, RV_ADDRESS_OF, RV_SLICE,
-    TERM_BRANCH, TERM_CALL, TERM_DROP, TERM_RETURN, CALLEE_INDIRECT, CALLEE_INTERFACE
+from "../mir/model" import Body, BasicBlock, Statement, Terminator, Place, Operand, Rvalue,
+    LK_PARAM, LK_USER, PK_INDEX, OK_MOVE, OK_CONSTANT, RK_ADDRESS_OF, RK_SLICE, TK_BRANCH,
+    TK_RETURN, TK_CALL, TK_DROP, CL_INDIRECT, CL_INTERFACE
 from "findings" import Finding, Findings
 
 const OWNED: u8 = 0
@@ -95,84 +95,84 @@ fn sameSpan(a: *Span, b: *Span) -> bool {
 /// Applies the effect of statements and terminators to one row of a `Flow`; with `findings` set
 /// it also reports every read of a moved local.
 class Walker {
-    b: *XamBody
+    b: *Body
     flow: *Flow
     row: usize
     findings: *Findings
 
-    fn init(self, b: *XamBody, flow: *Flow, row: usize, findings: *Findings) {
+    fn init(self, b: *Body, flow: *Flow, row: usize, findings: *Findings) {
         self.b = b
         self.flow = flow
         self.row = row
         self.findings = findings
     }
 
-    fn block(self, blk: *XamBlock) {
-        for i in 0..blk.stmtCount as usize {
-            self.statement(&self.b.stmts[blk.stmtFirst as usize + i])
+    fn block(self, blk: *BasicBlock) {
+        for i in 0..blk.statements.length() {
+            self.statement(blk.statements.get(i))
         }
-        self.terminator(&blk.term)
+        self.terminator(&blk.terminator)
     }
 
-    fn statement(self, s: *XamStmt) {
-        for i in 0..s.opCount as usize {
-            self.operand(&self.b.operands[s.opFirst as usize + i], &s.span)
+    fn statement(self, s: *Statement) {
+        for i in 0..s.value.operands.length() {
+            self.operand(s.value.operands.get(i), &s.span)
         }
-        if s.rvKind == RV_ADDRESS_OF || s.rvKind == RV_SLICE {
-            self.read(&s.rvPlace, &s.span)
+        if s.value.kind == RK_ADDRESS_OF || s.value.kind == RK_SLICE {
+            self.read(&s.value.place, &s.span)
         }
         self.write(&s.place, &s.span)
     }
 
-    fn terminator(self, t: *XamTerm) {
+    fn terminator(self, t: *Terminator) {
         switch {
-            case t.kind == TERM_BRANCH || t.kind == TERM_RETURN {
+            case t.kind == TK_BRANCH || t.kind == TK_RETURN {
                 self.operand(&t.operand, &t.span)
             }
-            case t.kind == TERM_CALL {
-                if t.calleeKind == CALLEE_INDIRECT || t.calleeKind == CALLEE_INTERFACE {
-                    self.operand(&t.calleeValue, &t.span)
+            case t.kind == TK_CALL {
+                if t.callee.kind == CL_INDIRECT || t.callee.kind == CL_INTERFACE {
+                    self.operand(&t.callee.value, &t.span)
                 }
-                for i in 0..t.argCount as usize {
-                    self.operand(&self.b.operands[t.argFirst as usize + i], &t.span)
+                for i in 0..t.args.length() {
+                    self.operand(t.args.get(i), &t.span)
                 }
-                if t.hasDest != 0 {
-                    self.write(&t.dest, &t.span)
+                if t.hasDestination {
+                    self.write(&t.destination, &t.span)
                 }
             }
-            case t.kind == TERM_DROP {
-                if t.place.projCount == 0 {
-                    self.moved(t.place.id, &t.span)
+            case t.kind == TK_DROP {
+                if t.place.isLocal() {
+                    self.moved(t.place.localId, &t.span)
                 }
             }
             default {}
         }
     }
 
-    fn operand(self, o: *XamOperand, at: *Span) {
-        if o.kind == OPERAND_CONSTANT {
+    fn operand(self, o: *Operand, at: *Span) {
+        if o.kind == OK_CONSTANT {
             return
         }
         self.read(&o.place, at)
-        if o.kind == OPERAND_MOVE && o.place.projCount == 0 {
-            self.moved(o.place.id, at)
+        if o.kind == OK_MOVE && o.place.isLocal() {
+            self.moved(o.place.localId, at)
         }
     }
 
     /// A store owns a whole local again; a store into a part of one reads the rest of it.
-    fn write(self, p: *XamPlace, at: *Span) {
-        if p.projCount == 0 {
-            self.flow.status.set(self.row * self.flow.nl + p.id as usize, OWNED)
+    fn write(self, p: *Place, at: *Span) {
+        if p.isLocal() {
+            self.flow.status.set(self.row * self.flow.nl + p.localId as usize, OWNED)
             return
         }
         self.read(p, at)
     }
 
-    fn read(self, p: *XamPlace, at: *Span) {
-        self.check(p.id, at)
-        for i in 0..p.projCount as usize {
-            local pr = &self.b.projs[p.projFirst as usize + i]
-            if pr.kind == PROJ_INDEX {
+    fn read(self, p: *Place, at: *Span) {
+        self.check(p.localId, at)
+        for i in 0..p.projections.length() {
+            local pr = p.projections.get(i)
+            if pr.kind == PK_INDEX {
                 self.check(pr.index, at)
             }
         }
@@ -187,12 +187,12 @@ class Walker {
 
     fn check(self, id: u32, at: *Span) {
         local k = self.row * self.flow.nl + id as usize
-        local l = &self.b.locals[id as usize]
+        local l = self.b.locals.get(id as usize)
         if self.findings == nil || *self.flow.status.get(k) != MOVED ||
-            (l.kind != LOCAL_USER && l.kind != LOCAL_PARAM) {
+            (l.kind != LK_USER && l.kind != LK_PARAM) {
             return
         }
-        local name = view(l.name)
+        local name = l.name.asStr()
         local f = new Finding("E0780", format("use of a moved value `{}`", name))
         local origin = self.flow.at.get(k)
         local has = *self.flow.hasAt.get(k) != 0
@@ -214,12 +214,12 @@ class Walker {
 
 /// Solves the move states (FIFO worklist from block 0, so the result depends only on the body),
 /// then walks each reached block once more from its entry state to report.
-export fn checkMoves(b: *XamBody, findings: *Findings) {
-    local n = b.blockCount as usize
+export fn checkMoves(b: *Body, findings: *Findings) {
+    local n = b.blocks.length()
     if n == 0 {
         return
     }
-    local flow = Flow(n + 1, b.localCount as usize)
+    local flow = Flow(n + 1, b.locals.length())
     local work = Vec<u32>()
     local queued = Vec<u8>()
     for i in 0..n {
@@ -235,11 +235,10 @@ export fn checkMoves(b: *XamBody, findings: *Findings) {
         queued.set(id, 0)
         flow.copy(n, id)
         local w = Walker(b, &flow, n, nil)
-        w.block(&b.blocks[id])
-        local t = &b.blocks[id].term
-        local count = t.targetCount as usize + (t.hasUnwind != 0 ? 1 : 0)
-        for k in 0..count {
-            local next = (k < t.targetCount as usize ? b.targets[t.targetFirst as usize + k] : t.unwind) as usize
+        w.block(b.blocks.get(id))
+        local succ = b.blocks.get(id).terminator.successors()
+        for k in 0..succ.length() {
+            local next = *succ.get(k) as usize
             if flow.join(next, n) && *queued.get(next) == 0 {
                 queued.set(next, 1)
                 work.push(next as u32)
@@ -250,7 +249,7 @@ export fn checkMoves(b: *XamBody, findings: *Findings) {
         if *flow.reached.get(id) != 0 {
             flow.copy(n, id)
             local w = Walker(b, &flow, n, findings)
-            w.block(&b.blocks[id])
+            w.block(b.blocks.get(id))
         }
     }
 }

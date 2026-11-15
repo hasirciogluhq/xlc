@@ -401,7 +401,7 @@ int32_t XLC_BACKEND_CALL xlcSessionDumpMir(XlcSession* session) {
         s->ensureLowered();
         if (!s->diagnostics().hasErrors()) {
             s->diagnostics().flush();
-            mir::dumpModule(std::cout, s->mirModule());
+            std::cout << s->mirModule().dump();
             std::cout.flush();
         }
     });

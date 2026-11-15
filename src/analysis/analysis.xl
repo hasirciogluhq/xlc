@@ -1,31 +1,27 @@
-// The static analyses of a lowered program and their C ABI,
-// declared in src/analysis/xl_bridge.hpp. The analyses only read: the MIR passes check what needs
-// the control flow (moves, borrows, initialization). Neither changes the graph nor an earlier
-// phase.
+// The static analyses of a lowered program and their C ABI, declared in src/analysis/xl_bridge.hpp.
+// The analyses only read: the MIR passes check what needs the control flow (moves, borrows,
+// initialization). Neither changes the graph nor an earlier phase.
 //
-// A session collects the findings of every body, then `xlcAnalysisFinish` reports them sorted by
-// source position, never in the order the passes or functions ran. A new analysis is one file in
-// this folder and one line in `analyzeBody`; nothing else calls a pass.
-from "abi" import XamBody
+// A run collects the findings of every body, then reports them sorted by source position, never in
+// the order the passes or functions ran. A new analysis is one file in this folder and one line in
+// `analyzeBody`; nothing else calls a pass.
+from "../mir/model" import Module, Body
 from "findings" import Findings
 from "moves" import checkMoves
 from "../util/diagnostics" import DiagnosticEngine
 
 /// The passes that run on the MIR of one function, in order.
-fn analyzeBody(b: *XamBody, findings: *Findings) {
+fn analyzeBody(b: *Body, findings: *Findings) {
     checkMoves(b, findings)
 }
 
-export(c) fn xlcAnalysisNew() -> *Findings {
-    return new Findings()
-}
-
-export(c) fn xlcAnalysisBody(findings: *Findings, b: *XamBody) {
-    analyzeBody(b, findings)
-}
-
-/// Reports every finding to `engine` and frees the session.
-export(c) fn xlcAnalysisFinish(findings: *Findings, engine: *u8) {
+/// Runs every analysis over the MIR module `m` and reports the findings to `engine`, the C++
+/// `DiagnosticEngine`.
+export(c) fn xlcAnalysisRun(m: *Module, engine: *u8) {
+    local findings = new Findings()
+    for i in 0..m.bodies.length() {
+        analyzeBody(m.bodies.get(i), findings)
+    }
     findings.reportTo(engine as *DiagnosticEngine)
     delete findings
 }

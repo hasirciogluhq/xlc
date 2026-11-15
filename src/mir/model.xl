@@ -1,5 +1,5 @@
-// MIR: the control-flow graph of each function, built from the flat HIR (src/hir/abi.xl). The xlang
-// port of include/xlang/mir/mir.h.
+// MIR: the control-flow graph of each function, built from the flat HIR (src/hir/abi.xl) by
+// src/mir/builder.
 //
 // HIR is a typed tree: good for checks about types and names. MIR is what the flow analyses
 // (moves, borrows, initialization) and the optimizations work on:

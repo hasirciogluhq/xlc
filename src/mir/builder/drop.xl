@@ -1,0 +1,114 @@
+// MIR builder: the drop of a local. The xlang port of src/mir/builder/drop.cpp.
+//
+// Lowering writes the drop of a droppable local as a flag-guarded statement (`dropStmt` in
+// sema/lower/own/moves.cpp):
+//
+//   if $live { glue(&x); $live = false }
+//
+// The builder turns it into a `Drop` terminator behind the flag test, so the analyses see a drop
+// of the place `x`, not a call that borrows it:
+//
+//   branch copy $live -> drop, join
+//   drop:  drop x (glue) -> clear
+//   clear: $live = false; goto join
+from "std" import String
+from "../../hir/abi" import XlcHirStmt, XlcHirExpr, S_ASSIGN, S_EXPR, E_LOCAL_REF, E_CALL,
+    E_ADDR_OF, E_BOOL_CONST, owned
+from "../model" import Terminator, Constant, Operand, CK_BOOL, LK_DROP_FLAG, TK_DROP, placeOf,
+    useRvalue, constantOperand
+from "body" import BodyBuilder, ex, st, newBlock, enter, emit, terminate, fallTo, setUnwind,
+    branchTerm, copyOf, argOf
+
+/// Whether the expression is a local read.
+fn isLocalRef(e: *XlcHirExpr) -> bool {
+    return e.kind == E_LOCAL_REF
+}
+
+/// Lowers `s` as a drop and returns true, or returns false when `s` is not one.
+export fn lowerDrop(b: *BodyBuilder, s: *XlcHirStmt) -> bool {
+    local site = dropSite(b, s)
+    if !site.ok {
+        return false
+    }
+    local drop = newBlock(b)
+    local clear = newBlock(b)
+    local join = newBlock(b)
+    terminate(b, branchTerm(copyOf(placeOf(site.flag)), drop, join, s.span))
+    enter(b, drop)
+    local t = Terminator()
+    t.kind = TK_DROP
+    t.place = placeOf(site.varId)
+    t.glue = site.glue.clone()
+    t.targets.push(clear)
+    setUnwind(b, &t)
+    t.span = s.span
+    terminate(b, t)
+    enter(b, clear)
+    emit(b, placeOf(site.flag), useRvalue(boolOperand(false)), s.span)
+    fallTo(b, join, s.span)
+    enter(b, join)
+    return true
+}
+
+/// The `bool` constant `v` as an operand.
+fn boolOperand(v: bool) -> Operand {
+    local c = Constant()
+    c.kind = CK_BOOL
+    c.typeName = String("bool")
+    c.boolValue = v
+    return constantOperand(c)
+}
+
+/// The site of a statement that has exactly the shape `dropStmt` builds: a flag test, the call of
+/// the glue on the address of the local, and the flag cleared.
+class DropSiteResult {
+    ok: bool
+    varId: u32
+    flag: u32
+    glue: String
+
+    fn init(self) {
+        self.ok = false
+        self.varId = 0
+        self.flag = 0
+        self.glue = String()
+    }
+}
+
+fn dropSite(b: *BodyBuilder, s: *XlcHirStmt) -> DropSiteResult {
+    local none = DropSiteResult()
+    if s.elseCount != 0 || s.bodyCount != 2 || s.value < 0 {
+        return none
+    }
+    local value = ex(b, s.value)
+    if !isLocalRef(value) || b.out.locals.get(value.localId as usize).kind != LK_DROP_FLAG {
+        return none
+    }
+    local drop = st(b, s.bodyFirst)
+    local clear = st(b, s.bodyFirst + 1)
+    if drop.kind != S_EXPR || drop.value < 0 {
+        return none
+    }
+    local call = ex(b, drop.value)
+    if call.kind != E_CALL || call.argCount != 1 {
+        return none
+    }
+    local arg = argOf(b, call, 0)
+    if arg.kind != E_ADDR_OF || arg.lhs < 0 || !isLocalRef(ex(b, arg.lhs)) {
+        return none
+    }
+    local flag = value.localId
+    if clear.kind != S_ASSIGN || clear.target < 0 || !isLocalRef(ex(b, clear.target)) {
+        return none
+    }
+    if ex(b, clear.target).localId != flag || ex(b, clear.value).kind != E_BOOL_CONST ||
+       ex(b, clear.value).boolValue != 0 {
+        return none
+    }
+    local r = DropSiteResult()
+    r.ok = true
+    r.varId = ex(b, arg.lhs).localId
+    r.flag = flag
+    r.glue = owned(call.text)
+    return r
+}

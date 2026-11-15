@@ -160,7 +160,7 @@ src/sema/sema/const_eval.cpp:325:/// @grammar `sizeOf(T)`, `alignOf(T)` and `off
 
 ```
 include/xlang/analysis/analysis.h:14:/// @invariant findings are reported sorted by source position, never in the order the passes or functions ran.
-include/xlang/mir/mir.h:27:// @invariant MIR is built only from HIR and never refers back to it; a span on every statement and
+include/xlang/mir/build.h:13:/// @invariant the MIR never refers back to the HIR it was built from.
 src/sema/lower/call/builtins.cpp:70:/// @invariant the `__builtin_` set is closed: a name not listed here is not a builtin, and the compiler never learns a new one from the standard library.
 src/sema/lower/call/builtins.cpp:71:/// @invariant `__builtin_read` copies the value out of the pointer and drops nothing, so two reads of one pointer yield two owners of the same bytes and only the caller's discipline keeps that sound.
 src/sema/lower/call/builtins.cpp:72:/// @invariant `__builtin_write` is a statement, never a value, and moves the value through the pointer without running a destructor on the old bytes.
@@ -221,11 +221,5 @@ src/codegen/llvm/c_abi/sysv_x86_64.cpp:86:/// @spec https://gitlab.com/x86-psABI
 src/codegen/llvm/c_abi/win_x64.cpp:34:/// @spec https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention
 ```
 
-### @todo (1)
-
-```
-include/xlang/mir/mir.h:29:// @todo MIR does not yet carry what only code generation needs (the `asm` template and clobbers,
-```
-
-Total: 54 tag lines.
+Total: 53 tag lines.
 <!-- END COLLECTED TAGS -->

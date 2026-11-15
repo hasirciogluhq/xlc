@@ -1,0 +1,72 @@
+// MIR builder: the module entry points, the C ABI of the MIR. The xlang port of
+// src/mir/builder/module.cpp and of the C++ `mir::build` entry.
+//
+//   xlcMirBuild(hir)      the MIR of a flat HIR module (hir/abi.xl): one body per function that has
+//                         a body, in HIR order
+//   xlcMirBuildSession(p) the same for a C++ `hir::Module` at `p`, flattened by hir/flatten.xl
+//   xlcMirDump(m)         the text form (dump.xl), freed with xlcMirDumpFree
+//   xlcMirFree(m)         releases a module
+from "std" import String
+from "../../hir/abi" import XlcHirModule
+from "../../hir/flatten" import Flat, flattenModule
+from "../model" import Module
+from "../dump" import dumpModule
+from "body" import buildBody
+
+/// The text `xlcMirDump` produced: `len` bytes at `bytes`, owned by `block`.
+@repr(c)
+export struct XlcMirText {
+    bytes: *u8
+    len: u32
+    block: *u8
+}
+
+/// The heap block `xlcMirDump` returns: the text and the frozen `XlcMirText`. `result.block` hands
+/// the block back to `xlcMirDumpFree`, which drops exactly this.
+class DumpBlock {
+    text: String
+    result: XlcMirText
+}
+
+/// The MIR of a flat HIR module. The bodies copy every name and spelling, so the result does not
+/// refer to `hir`.
+export(c) fn xlcMirBuild(hir: *XlcHirModule) -> *Module {
+    local out = new Module()
+    for i in 0..hir.functionCount as usize {
+        local f = &hir.functions[i]
+        if f.hasBody != 0 {
+            out.bodies.push(buildBody(hir, f))
+        }
+    }
+    return out
+}
+
+/// The MIR of the C++ `hir::Module` at `raw`: flattens it, then builds.
+export(c) fn xlcMirBuildSession(raw: *void) -> *Module {
+    local f = Flat()
+    flattenModule(&f, raw)
+    return xlcMirBuild(&f.m)
+}
+
+/// The text form of `m`, as `--dump-mir` prints it.
+export(c) fn xlcMirDump(m: *Module) -> XlcMirText {
+    local block = new DumpBlock { text: dumpModule(m), result: XlcMirText { bytes: nil, len: 0, block: nil } }
+    local v = block.text.asStr()
+    block.result.bytes = v.ptr
+    block.result.len = v.len as u32
+    block.result.block = block as *u8
+    return block.result
+}
+
+/// Releases what `xlcMirDump` allocated.
+export(c) fn xlcMirDumpFree(t: XlcMirText) {
+    if t.block == nil {
+        return
+    }
+    delete (t.block as *DumpBlock)
+}
+
+/// Releases a module returned by `xlcMirBuild` or `xlcMirBuildSession`.
+export(c) fn xlcMirFree(m: *Module) {
+    delete m
+}

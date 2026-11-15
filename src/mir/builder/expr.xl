@@ -1,0 +1,253 @@
+// MIR builder: values. An expression becomes an operand (a constant or a temporary), an rvalue
+// (one MIR computation over operands), or a sequence of blocks that stores into a destination. The
+// xlang port of src/mir/builder/expr.cpp.
+from "std" import String, Vec, format
+from "../../hir/abi" import XlcHirExpr, XlcHirStr, E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST,
+    E_STR_CONST, E_NIL, E_FUNC_REF, E_BINARY, E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL,
+    E_CALL_ITABLE, E_CALL_EXTERNAL, E_SYSCALL, E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG,
+    E_ATOMIC_CAS, E_ATOMIC_ADD, E_FENCE, E_ASM, E_UNWIND_PADS, E_UNWIND_PAD_COUNT, E_SELECT,
+    E_NEW, E_CONSTRUCT, E_MOVE, E_UNARY, E_CAST, E_ADDR_OF, E_SLICE, E_ARRAY_LIST, E_TUPLE_LIT,
+    E_STRUCT_LIT, E_ARRAY_REPEAT, E_TO_INTERFACE, view, owned
+from "../model" import Place, Operand, Rvalue, Constant, placeOf, constantOperand, placeOperand,
+    useRvalue, RK_UNARY, RK_BINARY, RK_CAST, RK_ADDRESS_OF, RK_SLICE, RK_AGGREGATE, RK_REPEAT,
+    RK_TO_INTERFACE, CK_INT, CK_FLOAT, CK_BOOL, CK_STR, CK_NIL, CK_FUNCTION, CK_NONE, OK_COPY,
+    OK_MOVE
+from "../../util/source" import Span
+from "body" import BodyBuilder, ex, newBlock, enter, emit, terminate, fallTo, newTemp, branchTerm,
+    argOf, spellingIs, voidOperand, copyOf, moveOf
+from "place" import place
+from "call" import lowerCall, lowerNew, lowerConstruct, isCallKind
+
+/// The constant `e` is, when it is one: writes it to `out` and returns true.
+fn constantOf(e: *XlcHirExpr, out: *Constant) -> bool {
+    out.typeName = owned(e.typeName)
+    switch {
+        case e.kind == E_INT_CONST {
+            out.kind = CK_INT
+            out.intBits = e.intValue
+        }
+        case e.kind == E_FLOAT_CONST {
+            out.kind = CK_FLOAT
+            out.floatValue = e.floatValue
+        }
+        case e.kind == E_BOOL_CONST {
+            out.kind = CK_BOOL
+            out.boolValue = e.boolValue != 0
+        }
+        case e.kind == E_STR_CONST {
+            out.kind = CK_STR
+            out.text = owned(e.text)
+        }
+        case e.kind == E_NIL {
+            out.kind = CK_NIL
+        }
+        case e.kind == E_FUNC_REF {
+            out.kind = CK_FUNCTION
+            out.text = owned(e.text)
+        }
+        default { return false }
+    }
+    return true
+}
+
+/// `&&` and `||`.
+fn isShortCircuit(e: *XlcHirExpr) -> bool {
+    return e.kind == E_BINARY && (spellingIs(e.binaryOp, "&&") || spellingIs(e.binaryOp, "||"))
+}
+
+/// The HIR expressions that need control flow or a call, so they are lowered into a destination
+/// (`assignTo`) rather than into one rvalue.
+export fn needsControl(e: *XlcHirExpr) -> bool {
+    return isCallKind(e.kind) || isShortCircuit(e) || e.kind == E_SELECT || e.kind == E_NEW ||
+        e.kind == E_CONSTRUCT
+}
+
+/// A constant stays a constant; anything else is evaluated now into its own temporary, which the
+/// operand then moves out of.
+export fn operand(b: *BodyBuilder, e: *XlcHirExpr) -> Operand {
+    local c = Constant()
+    if constantOf(e, &c) {
+        return constantOperand(c)
+    }
+    local tmp = newTemp(b, owned(e.typeName), e.span)
+    assignTo(b, placeOf(tmp), e)
+    return moveOf(placeOf(tmp))
+}
+
+/// The operands of the argument list of `e`, in order.
+export fn operandsOf(b: *BodyBuilder, e: *XlcHirExpr) -> Vec<Operand> {
+    local out = Vec<Operand>()
+    for k in 0..e.argCount as usize {
+        out.push(operand(b, argOf(b, e, k as u32)))
+    }
+    return out
+}
+
+/// `e` as one rvalue. The statements its operands need are emitted first.
+export fn rvalue(b: *BodyBuilder, e: *XlcHirExpr) -> Rvalue {
+    local c = Constant()
+    if constantOf(e, &c) {
+        return useRvalue(constantOperand(c))
+    }
+    if needsControl(e) {
+        return useRvalue(operand(b, e))
+    }
+    local r = Rvalue()
+    r.typeName = owned(e.typeName)
+    switch {
+        case e.kind == E_MOVE {
+            // The flag is cleared first: nothing between the two statements reads it.
+            local cleared = Constant()
+            cleared.kind = CK_BOOL
+            cleared.typeName = String("bool")
+            cleared.boolValue = false
+            emit(b, placeOf(e.localId), useRvalue(constantOperand(cleared)), e.span)
+            return useRvalue(moveOf(place(b, ex(b, e.lhs))))
+        }
+        case e.kind == E_UNARY {
+            r.kind = RK_UNARY
+            r.op = owned(e.unaryOp)
+            r.operands.push(operand(b, ex(b, e.lhs)))
+        }
+        case e.kind == E_BINARY {
+            local lhs = operand(b, ex(b, e.lhs))
+            local rhs = operand(b, ex(b, e.rhs))
+            r.kind = RK_BINARY
+            r.op = owned(e.binaryOp)
+            r.operands.push(lhs)
+            r.operands.push(rhs)
+            r.checked = e.checked != 0
+        }
+        case e.kind == E_CAST {
+            r.kind = RK_CAST
+            r.operands.push(operand(b, ex(b, e.lhs)))
+        }
+        case e.kind == E_ADDR_OF {
+            r.kind = RK_ADDRESS_OF
+            r.place = place(b, ex(b, e.lhs))
+        }
+        case e.kind == E_SLICE {
+            local base = place(b, ex(b, e.lhs))
+            local lo = bound(b, e.argCount > 0 ? argOf(b, e, 0) : nil)
+            local hi = bound(b, e.rhs >= 0 ? ex(b, e.rhs) : nil)
+            r.kind = RK_SLICE
+            r.place = base
+            r.operands.push(lo)
+            r.operands.push(hi)
+            r.checked = e.checked != 0
+        }
+        case e.kind == E_ARRAY_LIST || e.kind == E_TUPLE_LIT {
+            r.kind = RK_AGGREGATE
+            r.operands = operandsOf(b, e)
+        }
+        case e.kind == E_STRUCT_LIT {
+            r.kind = RK_AGGREGATE
+            for k in 0..e.fieldCount as usize {
+                local fi = &b.m.fields[(e.fieldFirst + k as u32) as usize]
+                r.operands.push(operand(b, ex(b, fi.value)))
+                r.fields.push(fi.index)
+            }
+        }
+        case e.kind == E_ARRAY_REPEAT {
+            r.kind = RK_REPEAT
+            r.operands.push(operand(b, ex(b, e.lhs)))
+            r.count = e.intValue
+        }
+        case e.kind == E_TO_INTERFACE {
+            r.kind = RK_TO_INTERFACE
+            r.operands.push(operand(b, ex(b, e.lhs)))
+            r.name = owned(e.text)
+        }
+        default {
+            // A place read by value: a local, a field, an element, `*p`, `__builtin_read(p)`, a
+            // materialized temporary, a global.
+            return useRvalue(copyOf(place(b, e)))
+        }
+    }
+    return r
+}
+
+/// A slice bound: the operand of `e`, or the `None` constant when `e` is absent (nil).
+fn bound(b: *BodyBuilder, e: *XlcHirExpr) -> Operand {
+    if e == nil {
+        local c = Constant()
+        c.kind = CK_NONE
+        c.typeName = String("void")
+        return constantOperand(c)
+    }
+    return operand(b, e)
+}
+
+/// Stores the value of `e` into `dest`.
+export fn assignTo(b: *BodyBuilder, dest: Place, e: *XlcHirExpr) {
+    if isCallKind(e.kind) {
+        lowerCall(b, e, true, dest)
+    } else if isShortCircuit(e) {
+        lowerShortCircuit(b, e, dest)
+    } else if e.kind == E_SELECT {
+        lowerSelect(b, e, true, dest)
+    } else if e.kind == E_NEW {
+        lowerNew(b, e, dest)
+    } else if e.kind == E_CONSTRUCT {
+        lowerConstruct(b, e, dest)
+    } else {
+        local value = rvalue(b, e)
+        emit(b, dest, value, e.span)
+    }
+}
+
+/// `e` evaluated for its effects only (an expression statement).
+export fn effect(b: *BodyBuilder, e: *XlcHirExpr) {
+    local isVoid = spellingIs(e.typeName, "void") || spellingIs(e.typeName, "never")
+    if isVoid && isCallKind(e.kind) {
+        lowerCall(b, e, false, placeOf(0))
+    } else if isVoid && e.kind == E_SELECT {
+        lowerSelect(b, e, false, placeOf(0))
+    } else {
+        assignTo(b, placeOf(newTemp(b, owned(e.typeName), e.span)), e)
+    }
+}
+
+/// `c ? a : b`: only the chosen arm runs. Without a destination the arms run for their effects.
+export fn lowerSelect(b: *BodyBuilder, e: *XlcHirExpr, hasDest: bool, dest: Place) {
+    local cond = operand(b, ex(b, e.lhs))
+    local yes = newBlock(b)
+    local no = newBlock(b)
+    local join = newBlock(b)
+    terminate(b, branchTerm(cond, yes, no, e.span))
+    selectArm(b, yes, ex(b, e.rhs), join, hasDest, dest.clone(), e.span)
+    selectArm(b, no, argOf(b, e, 0), join, hasDest, dest.clone(), e.span)
+    enter(b, join)
+}
+
+fn selectArm(b: *BodyBuilder, block: u32, value: *XlcHirExpr, join: u32, hasDest: bool,
+             dest: Place, at: Span) {
+    enter(b, block)
+    if hasDest {
+        assignTo(b, dest, value)
+    } else {
+        effect(b, value)
+    }
+    fallTo(b, join, at)
+}
+
+/// `a && b` and `a || b`: `b` runs only when `a` does not decide the result.
+fn lowerShortCircuit(b: *BodyBuilder, e: *XlcHirExpr, dest: Place) {
+    local isAnd = spellingIs(e.binaryOp, "&&")
+    local lhs = operand(b, ex(b, e.lhs))
+    local rhs = newBlock(b)
+    local decided = newBlock(b)
+    local join = newBlock(b)
+    terminate(b, isAnd ? branchTerm(lhs, rhs, decided, e.span) : branchTerm(lhs, decided, rhs, e.span))
+    enter(b, decided)
+    local c = Constant()
+    c.kind = CK_BOOL
+    c.typeName = String("bool")
+    c.boolValue = !isAnd
+    emit(b, dest.clone(), useRvalue(constantOperand(c)), e.span)
+    fallTo(b, join, e.span)
+    enter(b, rhs)
+    assignTo(b, dest, ex(b, e.rhs))
+    fallTo(b, join, e.span)
+    enter(b, join)
+}

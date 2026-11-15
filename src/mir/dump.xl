@@ -1,5 +1,5 @@
-// The MIR text form (`--dump-mir`), the xlang port of src/mir/dump.cpp. The unit tests match this
-// text, so every line keeps the C++ spelling exactly:
+// The MIR text form (`--dump-mir`). The unit tests match this text, so every line keeps the
+// spelling of the MIR dump exactly:
 //
 //   fn name -> R
 //     let _0: T  (param a)

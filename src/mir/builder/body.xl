@@ -1,0 +1,223 @@
+// MIR builder: the frame of one function, its blocks and the cursor the statements are appended
+// to. The xlang port of src/mir/builder/body.cpp.
+//
+// The HIR locals keep their ids (a MIR local `n` is HIR local `n`); temporaries come after them.
+// Blocks are appended in the order the builder opens them, so the same HIR always gives the same
+// block numbers.
+//
+// Evaluation order is the HIR's: every operand that is not a constant is first stored in its own
+// temporary, so a later operand (a call, an assignment) cannot change a value already read.
+//
+// The functions of the builder take the state as their first argument (`b: *BodyBuilder`): stmt.xl
+// lowers statements, drop.xl drops, expr.xl values, place.xl places, call.xl calls and builtins.
+from "std" import String, Vec, format
+from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, XlcHirLocal,
+    XlcHirStr, view, owned
+from "../../util/source" import Span
+from "../model" import Body, BasicBlock, Local, Place, Operand, Rvalue, Statement, Terminator,
+    Constant, LK_PARAM, LK_USER, LK_DROP_FLAG, LK_TEMP, OK_COPY, OK_MOVE, CK_NONE,
+    TK_GOTO, TK_BRANCH, TK_RETURN, TK_UNREACHABLE, placeOf, constantOperand, placeOperand
+from "stmt" import lowerStmts
+
+/// Where `continue` and `break` of an enclosing loop jump to.
+export class LoopTarget {
+    next: u32
+    exit: u32
+
+    fn init(self, next: u32, exit: u32) {
+        self.next = next
+        self.exit = exit
+    }
+}
+
+/// The state of the builder for one function. `out` is the body under construction, owned by the
+/// caller; `m` is the flat HIR module the function's expressions and statements live in.
+export class BodyBuilder {
+    m: *XlcHirModule
+    decl: *XlcHirFunction
+    out: *Body
+    current: u32   ///< the block statements go to while `open`
+    open: bool     ///< `current` still takes statements (no terminator yet)
+    loops: Vec<LoopTarget>
+    catches: Vec<u32> ///< the `catch` blocks of the enclosing `try`s, innermost last
+
+    fn init(self, m: *XlcHirModule, decl: *XlcHirFunction, out: *Body) {
+        self.m = m
+        self.decl = decl
+        self.out = out
+        self.current = 0
+        self.open = false
+        self.loops = Vec<LoopTarget>()
+        self.catches = Vec<u32>()
+    }
+}
+
+/// The MIR body of one HIR function: the frame, then the statements and the implicit end.
+export fn buildBody(m: *XlcHirModule, decl: *XlcHirFunction) -> Body {
+    local body = Body()
+    body.name = owned(decl.name)
+    body.paramCount = decl.paramCount
+    body.ret = owned(decl.ret)
+    body.span = decl.span
+    local b = BodyBuilder(m, decl, &body)
+    declareLocals(&b)
+    enter(&b, newBlock(&b))
+    lowerBody(&b)
+    return body
+}
+
+/// The HIR expression at `i` (an index of the flat module, never -1 here).
+export fn ex(b: *BodyBuilder, i: i32) -> *XlcHirExpr {
+    return &b.m.exprs[i as usize]
+}
+
+/// The HIR statement at `i` of the flat module's statement arena.
+export fn st(b: *BodyBuilder, i: u32) -> *XlcHirStmt {
+    return &b.m.stmts[i as usize]
+}
+
+/// The `k`-th argument of `e`.
+export fn argOf(b: *BodyBuilder, e: *XlcHirExpr, k: u32) -> *XlcHirExpr {
+    return ex(b, b.m.refs[(e.argFirst + k) as usize] as i32)
+}
+
+/// Whether a boundary spelling is the given type or operator text.
+export fn spellingIs(s: XlcHirStr, t: str) -> bool {
+    return view(s) == t
+}
+
+/// What a HIR local is, from how lowering made it: parameters first, then the hidden `$...`
+/// locals (drop flags are `$live...`), then the user's own.
+fn kindOf(l: *XlcHirLocal, index: u32, paramCount: u32) -> u8 {
+    if index < paramCount {
+        return LK_PARAM
+    }
+    local name = owned(l.name)
+    if name.startsWith("$live") {
+        return LK_DROP_FLAG
+    }
+    return name.startsWith("$") ? LK_TEMP : LK_USER
+}
+
+fn declareLocals(b: *BodyBuilder) {
+    for i in 0..b.decl.localCount as usize {
+        local l = &b.decl.locals[i]
+        local entry = Local()
+        entry.kind = kindOf(l, i as u32, b.decl.paramCount)
+        entry.name = owned(l.name)
+        entry.typeName = owned(l.typeName)
+        entry.span = l.span
+        b.out.locals.push(entry)
+    }
+}
+
+/// The statements, then the implicit end: a `void` function returns, any other end is unreachable
+/// (sema rejects a value function that can fall off its end).
+fn lowerBody(b: *BodyBuilder) {
+    lowerStmts(b, b.decl.bodyFirst, b.decl.bodyCount)
+    if !b.open {
+        return
+    }
+    local end = Terminator()
+    end.kind = TK_UNREACHABLE
+    end.span = b.decl.span
+    if spellingIs(b.decl.ret, "void") {
+        end.kind = TK_RETURN
+        end.operand = voidOperand(b)
+    }
+    terminate(b, end)
+}
+
+/// The `None` constant of the function's return type: the operand of a `void` return.
+export fn voidOperand(b: *BodyBuilder) -> Operand {
+    local c = Constant()
+    c.kind = CK_NONE
+    c.typeName = owned(b.decl.ret)
+    return constantOperand(c)
+}
+
+export fn newTemp(b: *BodyBuilder, typeName: String, at: Span) -> u32 {
+    local l = Local()
+    l.kind = LK_TEMP
+    l.typeName = typeName
+    l.span = at
+    b.out.locals.push(l)
+    return (b.out.locals.length() - 1) as u32
+}
+
+export fn newBlock(b: *BodyBuilder) -> u32 {
+    b.out.blocks.push(BasicBlock())
+    return (b.out.blocks.length() - 1) as u32
+}
+
+export fn enter(b: *BodyBuilder, block: u32) {
+    b.current = block
+    b.open = true
+}
+
+/// The block statements go to. After a terminator (`return`, `break`, a call that never returns)
+/// the code that follows is dead: it gets a fresh block no edge reaches.
+export fn cursor(b: *BodyBuilder) -> *BasicBlock {
+    if !b.open {
+        enter(b, newBlock(b))
+    }
+    return b.out.blocks.get(b.current as usize)
+}
+
+export fn emit(b: *BodyBuilder, dest: Place, value: Rvalue, at: Span) {
+    local s = Statement()
+    s.place = dest
+    s.value = value
+    s.span = at
+    cursor(b).statements.push(s)
+}
+
+export fn terminate(b: *BodyBuilder, t: Terminator) {
+    cursor(b).terminator = t
+    b.open = false
+}
+
+/// Ends the current block with a jump to `target`, unless it already ended (a `return` in it).
+export fn fallTo(b: *BodyBuilder, target: u32, at: Span) {
+    if b.open {
+        terminate(b, gotoTerm(target, at))
+    }
+}
+
+/// A `goto target` terminator.
+export fn gotoTerm(target: u32, at: Span) -> Terminator {
+    local t = Terminator()
+    t.kind = TK_GOTO
+    t.targets.push(target)
+    t.span = at
+    return t
+}
+
+/// A `branch cond -> first, second` terminator.
+export fn branchTerm(cond: Operand, first: u32, second: u32, at: Span) -> Terminator {
+    local t = Terminator()
+    t.kind = TK_BRANCH
+    t.operand = cond
+    t.targets.push(first)
+    t.targets.push(second)
+    t.span = at
+    return t
+}
+
+/// Whether a call or drop made now has an unwind edge: the innermost `catch`, if any.
+export fn setUnwind(b: *BodyBuilder, t: *Terminator) {
+    if b.catches.length() > 0 {
+        t.hasUnwind = true
+        t.unwind = *b.catches.get(b.catches.length() - 1)
+    }
+}
+
+/// A `Place` read as a copy operand.
+export fn copyOf(p: Place) -> Operand {
+    return placeOperand(OK_COPY, p)
+}
+
+/// A `Place` moved out as an operand.
+export fn moveOf(p: Place) -> Operand {
+    return placeOperand(OK_MOVE, p)
+}

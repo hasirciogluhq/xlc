@@ -1,0 +1,238 @@
+// MIR builder: calls of every kind, the compiler's builtins, `new` and class constructors. Each call
+// ends its block, so a panic inside it has an edge to the enclosing `catch`. The xlang port of
+// src/mir/builder/call.cpp.
+from "std" import String, Vec, format
+from "../../hir/abi" import XlcHirExpr, XlcHirAsmOperand, E_CALL, E_CALL_EXTERNAL,
+    E_CALL_INDIRECT, E_CALL_VIRTUAL, E_CALL_ITABLE, E_SYSCALL, E_ATOMIC_LOAD, E_ATOMIC_STORE,
+    E_ATOMIC_XCHG, E_ATOMIC_CAS, E_ATOMIC_ADD, E_FENCE, E_ASM, E_UNWIND_PADS, E_UNWIND_PAD_COUNT,
+    view, owned
+from "../../util/source" import Span
+from "../model" import Place, Operand, Callee, Terminator, Rvalue, Constant, placeOf, constantOperand,
+    placeOperand, useRvalue, CL_DIRECT, CL_INDIRECT, CL_VIRTUAL, CL_INTERFACE, CL_SYSCALL,
+    CL_BUILTIN, BI_ALLOC, BI_ATOMIC_LOAD, BI_ATOMIC_STORE, BI_ATOMIC_XCHG, BI_ATOMIC_CAS,
+    BI_ATOMIC_ADD, BI_FENCE, BI_ASM, BI_UNWIND_PADS, BI_UNWIND_PAD_COUNT, TK_CALL, TK_BRANCH,
+    RK_ZERO, RK_BINARY, CK_NIL
+from "body" import BodyBuilder, ex, newBlock, enter, emit, terminate, newTemp, setUnwind, fallTo,
+    argOf, spellingIs, copyOf, moveOf
+from "expr" import operand, operandsOf, assignTo
+from "place" import place, addressOf, fieldOf, derefOf
+
+/// Whether the HIR expression kind is a call or a builtin that is one (atomics, `asm`, unwind).
+export fn isCallKind(kind: i32) -> bool {
+    return kind == E_CALL || kind == E_CALL_INDIRECT || kind == E_CALL_VIRTUAL ||
+        kind == E_CALL_ITABLE || kind == E_CALL_EXTERNAL || kind == E_SYSCALL ||
+        kind == E_ATOMIC_LOAD || kind == E_ATOMIC_STORE || kind == E_ATOMIC_XCHG ||
+        kind == E_ATOMIC_CAS || kind == E_ATOMIC_ADD || kind == E_FENCE || kind == E_ASM ||
+        kind == E_UNWIND_PADS || kind == E_UNWIND_PAD_COUNT
+}
+
+/// A callee of the given kind with no operands set yet.
+fn calleeOf(kind: u8) -> Callee {
+    local c = Callee()
+    c.kind = kind
+    return c
+}
+
+/// A call to `callee`; with `returns` false (`-> never`) nothing follows it. A call that returns
+/// ends its block and continues in a fresh one.
+export fn call(b: *BodyBuilder, callee: Callee, args: Vec<Operand>, hasDest: bool, dest: Place,
+               returns: bool, at: Span) {
+    local t = Terminator()
+    t.kind = TK_CALL
+    t.callee = callee
+    t.args = args
+    t.hasDestination = hasDest
+    t.destination = dest
+    t.span = at
+    setUnwind(b, &t)
+    if !returns {
+        terminate(b, t)
+        return
+    }
+    local next = newBlock(b)
+    t.targets.push(next)
+    terminate(b, t)
+    enter(b, next)
+}
+
+/// `returns` of a call expression: `-> never` and `asm` with `noreturn` never come back.
+fn returnsOf(e: *XlcHirExpr) -> bool {
+    return !spellingIs(e.typeName, "never") && !(e.kind == E_ASM && e.noreturn != 0)
+}
+
+/// A call expression. `hasDest` and `dest` say where the result goes; a `void` call has none.
+export fn lowerCall(b: *BodyBuilder, e: *XlcHirExpr, hasDest: bool, dest: Place) {
+    local hasValue = !spellingIs(e.typeName, "void") && !spellingIs(e.typeName, "never")
+    local toDest = hasDest && hasValue
+    local callee = Callee()
+    switch {
+        case e.kind == E_CALL {
+            callee = calleeOf(CL_DIRECT)
+            callee.name = owned(e.text)
+        }
+        case e.kind == E_CALL_EXTERNAL {
+            callee = calleeOf(CL_DIRECT)
+            callee.name = format("{}.{}", view(e.text), view(e.member))
+        }
+        case e.kind == E_CALL_INDIRECT {
+            callee = calleeOf(CL_INDIRECT)
+            callee.value = operand(b, ex(b, e.lhs))
+        }
+        case e.kind == E_CALL_VIRTUAL {
+            callee = calleeOf(CL_VIRTUAL)
+            callee.name = owned(e.text)
+            callee.index = e.index
+        }
+        case e.kind == E_CALL_ITABLE {
+            callee = calleeOf(CL_INTERFACE)
+            callee.name = owned(e.text)
+            callee.index = e.index
+            callee.value = operand(b, ex(b, e.lhs))
+        }
+        case e.kind == E_SYSCALL { callee = calleeOf(CL_SYSCALL) }
+        default {
+            lowerBuiltin(b, e, toDest, dest)
+            return
+        }
+    }
+    local args = operandsOf(b, e)
+    call(b, callee, args, toDest, dest, returnsOf(e), e.span)
+}
+
+/// Atomics, fences, `asm` and the unwind table: the operands in the order the HIR gives them.
+fn lowerBuiltin(b: *BodyBuilder, e: *XlcHirExpr, hasDest: bool, dest: Place) {
+    local callee = calleeOf(CL_BUILTIN)
+    callee.index = e.index
+    local args = Vec<Operand>()
+    switch {
+        case e.kind == E_ATOMIC_LOAD { callee.builtin = BI_ATOMIC_LOAD }
+        case e.kind == E_ATOMIC_STORE { callee.builtin = BI_ATOMIC_STORE }
+        case e.kind == E_ATOMIC_XCHG { callee.builtin = BI_ATOMIC_XCHG }
+        case e.kind == E_ATOMIC_CAS { callee.builtin = BI_ATOMIC_CAS }
+        case e.kind == E_ATOMIC_ADD { callee.builtin = BI_ATOMIC_ADD }
+        case e.kind == E_FENCE { callee.builtin = BI_FENCE }
+        case e.kind == E_UNWIND_PADS { callee.builtin = BI_UNWIND_PADS }
+        case e.kind == E_UNWIND_PAD_COUNT { callee.builtin = BI_UNWIND_PAD_COUNT }
+        case e.kind == E_ASM {
+            callee.builtin = BI_ASM
+            callee.name = owned(e.text)
+            // An input is read; an output (and an in-out) is written through its address.
+            for k in 0..e.operandCount as usize {
+                local op = &b.m.operands[(e.operandFirst + k as u32) as usize]
+                if op.kind == 0 {
+                    args.push(operand(b, ex(b, op.value)))
+                } else {
+                    local value = ex(b, op.value)
+                    args.push(addressOf(b, place(b, value), owned(value.typeName), value.span))
+                }
+            }
+        }
+        default { }
+    }
+    if e.kind != E_ASM {
+        if e.lhs >= 0 {
+            args.push(operand(b, ex(b, e.lhs)))
+        }
+        if e.rhs >= 0 {
+            args.push(operand(b, ex(b, e.rhs)))
+        }
+        for k in 0..e.argCount as usize {
+            args.push(operand(b, argOf(b, e, k as u32)))
+        }
+    }
+    call(b, callee, args, hasDest, dest, returnsOf(e), e.span)
+}
+
+/// `new T { fields }` and `new T(args)`, placed (`new(p) T`) or from the `register(alloc)`
+/// function. A nil pointer (a failed allocation) is the result as is: nothing is written.
+///
+///   dest = alloc(T) | p
+///   branch dest != nil -> init, end
+///   init: *dest = zeroed T; T.init(dest, args); (*dest).f = v ...; goto end
+export fn lowerNew(b: *BodyBuilder, e: *XlcHirExpr, dest: Place) {
+    if e.lhs >= 0 {
+        assignTo(b, dest.clone(), ex(b, e.lhs))
+    } else {
+        local alloc = calleeOf(CL_BUILTIN)
+        alloc.builtin = BI_ALLOC
+        alloc.typeName = owned(e.targetName)
+        call(b, alloc, Vec<Operand>(), true, dest.clone(), true, e.span)
+    }
+    local ok = newTemp(b, String("bool"), e.span)
+    local test = Rvalue()
+    test.kind = RK_BINARY
+    test.typeName = String("bool")
+    test.op = String("!=")
+    test.operands.push(copyOf(dest.clone()))
+    test.operands.push(nilOperand(e))
+    emit(b, placeOf(ok), test, e.span)
+    local init = newBlock(b)
+    local end = newBlock(b)
+    terminate(b, branchOn(ok, init, end, e.span))
+    enter(b, init)
+    local object = derefOf(dest.clone())
+    local zero = Rvalue()
+    zero.kind = RK_ZERO
+    zero.typeName = owned(e.targetName)
+    emit(b, object.clone(), zero, e.span)
+    if e.text.len > 0 {
+        local args = Vec<Operand>()
+        args.push(copyOf(dest.clone()))
+        pushAll(&args, operandsOf(b, e))
+        call(b, directCallee(owned(e.text)), args, false, placeOf(0), true, e.span)
+    }
+    for k in 0..e.fieldCount as usize {
+        local fi = &b.m.fields[(e.fieldFirst + k as u32) as usize]
+        assignTo(b, fieldOf(object.clone(), fi.index), ex(b, fi.value))
+    }
+    fallTo(b, end, e.span)
+    enter(b, end)
+}
+
+/// `T(args)` of a class: a zeroed object with its vptr, then its `init` on it.
+export fn lowerConstruct(b: *BodyBuilder, e: *XlcHirExpr, dest: Place) {
+    local zero = Rvalue()
+    zero.kind = RK_ZERO
+    zero.typeName = owned(e.targetName)
+    emit(b, dest.clone(), zero, e.span)
+    if e.text.len == 0 {
+        return
+    }
+    local args = Vec<Operand>()
+    args.push(addressOf(b, dest.clone(), owned(e.targetName), e.span))
+    pushAll(&args, operandsOf(b, e))
+    call(b, directCallee(owned(e.text)), args, false, placeOf(0), true, e.span)
+}
+
+/// The `nil` of a `new`'s pointer type, as an operand.
+fn nilOperand(e: *XlcHirExpr) -> Operand {
+    local c = Constant()
+    c.kind = CK_NIL
+    c.typeName = owned(e.typeName)
+    return constantOperand(c)
+}
+
+/// `branch ok -> yes, no`.
+fn branchOn(ok: u32, yes: u32, no: u32, at: Span) -> Terminator {
+    local t = Terminator()
+    t.kind = TK_BRANCH
+    t.operand = moveOf(placeOf(ok))
+    t.targets.push(yes)
+    t.targets.push(no)
+    t.span = at
+    return t
+}
+
+/// A direct callee of the function `name`.
+fn directCallee(name: String) -> Callee {
+    local c = calleeOf(CL_DIRECT)
+    c.name = name
+    return c
+}
+
+/// Appends a deep copy of every operand of `src` to `dst`, in order.
+fn pushAll(dst: *Vec<Operand>, src: Vec<Operand>) {
+    for k in 0..src.length() {
+        dst.push(src.get(k).clone())
+    }
+}

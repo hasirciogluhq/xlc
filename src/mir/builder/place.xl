@@ -1,0 +1,106 @@
+// MIR builder: places. A HIR lvalue becomes a local with projections; any other value used where a
+// place is needed (`f().x`, `&g()`) is first stored in a temporary. The xlang port of
+// src/mir/builder/place.cpp.
+from "std" import String, format
+from "../../hir/abi" import XlcHirExpr, E_LOCAL_REF, E_GLOBAL_REF, E_EXTERNAL, E_FIELD, E_INDEX,
+    E_DEREF, E_RAW_READ, E_MATERIALIZE, view, owned
+from "../../util/source" import Span
+from "../model" import Place, Projection, Rvalue, Operand, Constant, placeOf, useRvalue,
+    constantOperand, placeOperand, PK_FIELD, PK_DEREF, PK_INDEX, CK_BOOL, CK_GLOBAL,
+    RK_ADDRESS_OF, OK_MOVE
+from "body" import BodyBuilder, ex, newTemp, emit, spellingIs
+from "expr" import assignTo, operand
+
+/// Whether the expression is a place (a local, a global, a field, an element or a deref).
+fn isPlace(e: *XlcHirExpr) -> bool {
+    return e.kind == E_LOCAL_REF || e.kind == E_GLOBAL_REF || e.kind == E_EXTERNAL ||
+        e.kind == E_FIELD || e.kind == E_INDEX || e.kind == E_DEREF || e.kind == E_RAW_READ ||
+        e.kind == E_MATERIALIZE
+}
+
+/// `base` with one field projection appended.
+export fn fieldOf(base: Place, index: u32) -> Place {
+    local p = Projection()
+    p.kind = PK_FIELD
+    p.field = index
+    return base.project(p)
+}
+
+/// `base` with one dereference appended.
+export fn derefOf(base: Place) -> Place {
+    local p = Projection()
+    p.kind = PK_DEREF
+    return base.project(p)
+}
+
+/// The place of the HIR lvalue `e`.
+export fn place(b: *BodyBuilder, e: *XlcHirExpr) -> Place {
+    switch {
+        case e.kind == E_LOCAL_REF { return placeOf(e.localId) }
+        case e.kind == E_FIELD {
+            local base = e.throughPointer != 0 ? pointee(b, ex(b, e.lhs)) : place(b, ex(b, e.lhs))
+            return fieldOf(base, e.index)
+        }
+        case e.kind == E_INDEX {
+            local base = place(b, ex(b, e.lhs))
+            local rhs = ex(b, e.rhs)
+            local index = newTemp(b, owned(rhs.typeName), rhs.span)
+            assignTo(b, placeOf(index), rhs)
+            local p = Projection()
+            p.kind = PK_INDEX
+            p.index = index
+            p.checked = e.checked != 0
+            return base.project(p)
+        }
+        case e.kind == E_DEREF || e.kind == E_RAW_READ { return pointee(b, ex(b, e.lhs)) }
+        case e.kind == E_MATERIALIZE {
+            // The temporary is stored and its drop flag set; the place is the temporary itself.
+            assignTo(b, placeOf(e.localId), ex(b, e.lhs))
+            local set = Constant()
+            set.kind = CK_BOOL
+            set.typeName = String("bool")
+            set.boolValue = true
+            emit(b, placeOf(e.index), useRvalue(constantOperand(set)), e.span)
+            return placeOf(e.localId)
+        }
+        case e.kind == E_GLOBAL_REF || e.kind == E_EXTERNAL {
+            // A global is the place behind its address: `*(&g)`.
+            local name = e.kind == E_GLOBAL_REF ? owned(e.text) : format("{}.{}", view(e.text), view(e.member))
+            local ptr = format("*{}", view(e.typeName))
+            local addr = newTemp(b, ptr.clone(), e.span)
+            local c = Constant()
+            c.kind = CK_GLOBAL
+            c.typeName = ptr.clone()
+            c.text = name
+            emit(b, placeOf(addr), useRvalue(constantOperand(c)), e.span)
+            return derefOf(placeOf(addr))
+        }
+        default { return spill(b, e) }
+    }
+    return placeOf(0)
+}
+
+/// The place `pointer` points at: `*p` of a pointer place, or of a temporary holding the value.
+export fn pointee(b: *BodyBuilder, pointer: *XlcHirExpr) -> Place {
+    local base = isPlace(pointer) ? place(b, pointer) : spill(b, pointer)
+    return derefOf(base)
+}
+
+/// `e` stored in a fresh temporary; the place is the temporary.
+export fn spill(b: *BodyBuilder, e: *XlcHirExpr) -> Place {
+    local tmp = newTemp(b, owned(e.typeName), e.span)
+    assignTo(b, placeOf(tmp), e)
+    return placeOf(tmp)
+}
+
+/// `&p` in a temporary, as an operand. `pointee` is the spelling of the pointed-to type.
+export fn addressOf(b: *BodyBuilder, p: Place, pointee: String, at: Span) -> Operand {
+    local ptr = format("*{}", &pointee)
+    local tmp = newTemp(b, ptr.clone(), at)
+    local r = Rvalue()
+    r.kind = RK_ADDRESS_OF
+    r.typeName = ptr
+    r.place = p
+    emit(b, placeOf(tmp), r, at)
+    return placeOperand(OK_MOVE, placeOf(tmp))
+}

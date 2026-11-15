@@ -1,7 +1,7 @@
 #pragma once
 
 #include "xlang/hir/hir.h"
-#include "xlang/mir/mir.h"
+#include "xlang/mir/build.h"
 #include "xlang/util/diagnostics.h"
 
 namespace xlang::analysis {

@@ -1,0 +1,146 @@
+// MIR builder: statements and the control flow between them. The xlang port of
+// src/mir/builder/stmt.cpp.
+from "std" import String, Vec, format
+from "../../hir/abi" import XlcHirStmt, XlcHirExpr, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF,
+    S_WHILE, S_CONTINUE, S_BREAK, S_BLOCK, S_TRY, E_LOCAL_REF
+from "../model" import Place, Operand, Rvalue, Terminator, placeOf, useRvalue, RK_ZERO,
+    TK_GOTO, TK_TRY, TK_RETURN, TK_CALL, Constant, CK_NONE
+from "body" import BodyBuilder, LoopTarget, ex, st, newBlock, enter, emit, terminate, fallTo,
+    cursor, gotoTerm, branchTerm, setUnwind, voidOperand
+from "expr" import operand, rvalue, assignTo, effect
+from "place" import place
+from "drop" import lowerDrop
+
+/// The statements of the list `first .. first + count` of the statement arena.
+export fn lowerStmts(b: *BodyBuilder, first: u32, count: u32) {
+    for i in 0..count as usize {
+        lowerStmt(b, st(b, first + i as u32))
+    }
+}
+
+export fn lowerStmt(b: *BodyBuilder, s: *XlcHirStmt) {
+    switch {
+        case s.kind == S_LOCAL { lowerLocal(b, s) }
+        case s.kind == S_ASSIGN { lowerAssign(b, s) }
+        case s.kind == S_RETURN { lowerReturn(b, s) }
+        case s.kind == S_EXPR { effect(b, ex(b, s.value)) }
+        case s.kind == S_IF { lowerIf(b, s) }
+        case s.kind == S_WHILE { lowerWhile(b, s) }
+        case s.kind == S_CONTINUE || s.kind == S_BREAK { lowerJump(b, s) }
+        case s.kind == S_BLOCK { lowerStmts(b, s.bodyFirst, s.bodyCount) }
+        case s.kind == S_TRY { lowerTry(b, s) }
+        default { }
+    }
+}
+
+/// `local x = v` stores `v`; `local x` without a value is zeroed (a class also gets its vptr).
+fn lowerLocal(b: *BodyBuilder, s: *XlcHirStmt) {
+    if s.value >= 0 {
+        assignTo(b, placeOf(s.localId), ex(b, s.value))
+        return
+    }
+    local zero = Rvalue()
+    zero.kind = RK_ZERO
+    zero.typeName = b.out.locals.get(s.localId as usize).typeName.clone()
+    emit(b, placeOf(s.localId), zero, s.span)
+}
+
+/// The value is evaluated before the target, as code generation does.
+fn lowerAssign(b: *BodyBuilder, s: *XlcHirStmt) {
+    local value = rvalue(b, ex(b, s.value))
+    emit(b, place(b, ex(b, s.target)), value, s.span)
+}
+
+fn lowerIf(b: *BodyBuilder, s: *XlcHirStmt) {
+    if lowerDrop(b, s) {
+        return
+    }
+    local cond = operand(b, ex(b, s.value))
+    local thenBlock = newBlock(b)
+    local elseBlock = newBlock(b)
+    local join = newBlock(b)
+    terminate(b, branchTerm(cond, thenBlock, elseBlock, s.span))
+    enter(b, thenBlock)
+    lowerStmts(b, s.bodyFirst, s.bodyCount)
+    fallTo(b, join, s.span)
+    enter(b, elseBlock)
+    lowerStmts(b, s.elseFirst, s.elseCount)
+    fallTo(b, join, s.span)
+    enter(b, join)
+}
+
+/// `while c { body }`, `do { body } while c` and `for` (the `step` runs after the body and after
+/// every `continue`):
+///
+///   test:  branch c -> body, exit        (a `do` loop enters at `body`)
+///   body:  ...; goto step
+///   step:  ...; goto test                 (no step: `continue` goes to `test`)
+fn lowerWhile(b: *BodyBuilder, s: *XlcHirStmt) {
+    local hasStep = s.stepCount > 0
+    local test = newBlock(b)
+    local body = newBlock(b)
+    local step = hasStep ? newBlock(b) : test
+    local exit = newBlock(b)
+    fallTo(b, s.postTest != 0 ? body : test, s.span)
+
+    enter(b, test)
+    local cond = operand(b, ex(b, s.value))
+    terminate(b, branchTerm(cond, body, exit, s.span))
+
+    enter(b, body)
+    b.loops.push(LoopTarget(step, exit))
+    lowerStmts(b, s.bodyFirst, s.bodyCount)
+    b.loops.pop()
+    fallTo(b, step, s.span)
+
+    // The step is part of the loop: a `?` hoisted into it (a `do` loop's condition) ends it with
+    // `break`.
+    if step != test {
+        enter(b, step)
+        b.loops.push(LoopTarget(test, exit))
+        lowerStmts(b, s.stepFirst, s.stepCount)
+        b.loops.pop()
+        fallTo(b, test, s.span)
+    }
+    enter(b, exit)
+}
+
+fn lowerJump(b: *BodyBuilder, s: *XlcHirStmt) {
+    local loop = b.loops.get(b.loops.length() - 1 - s.depth as usize)
+    local target = s.kind == S_BREAK ? loop.exit : loop.next
+    terminate(b, gotoTerm(target, s.span))
+}
+
+fn lowerReturn(b: *BodyBuilder, s: *XlcHirStmt) {
+    local value = s.value >= 0 ? operand(b, ex(b, s.value)) : voidOperand(b)
+    local t = Terminator()
+    t.kind = TK_RETURN
+    t.operand = value
+    t.span = s.span
+    terminate(b, t)
+}
+
+/// `try { body } catch { handler }`: the `Try` terminator enters the body; every call and drop in
+/// the body unwinds to the handler, so the handler sees the state of any point a panic left from.
+fn lowerTry(b: *BodyBuilder, s: *XlcHirStmt) {
+    local body = newBlock(b)
+    local handler = newBlock(b)
+    local end = newBlock(b)
+    local t = Terminator()
+    t.kind = TK_TRY
+    t.place = placeOf(s.localId)
+    t.message = s.msgLocal
+    t.targets.push(body)
+    t.targets.push(handler)
+    t.span = s.span
+    terminate(b, t)
+    enter(b, body)
+    b.catches.push(handler)
+    lowerStmts(b, s.bodyFirst, s.bodyCount)
+    b.catches.pop()
+    fallTo(b, end, s.span)
+    enter(b, handler)
+    lowerStmts(b, s.elseFirst, s.elseCount)
+    fallTo(b, end, s.span)
+    enter(b, end)
+}

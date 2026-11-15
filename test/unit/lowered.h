@@ -42,9 +42,7 @@ struct Lowered {
             std::ostringstream h;
             xlang::hir::dumpModule(h, module);
             hir_text = h.str();
-            std::ostringstream m;
-            xlang::mir::dumpModule(m, mir);
-            mir_text = m.str();
+            mir_text = mir.dump();
         }
         diag->flush();
     }
