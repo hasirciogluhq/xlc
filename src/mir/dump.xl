@@ -20,10 +20,10 @@ from "model" import Place, Projection, Constant, Operand, Rvalue, Callee, Termin
 
 /// The `Local` kind word of the `let` line.
 fn kindName(kind: u8) -> str {
-    switch kind {
-        case LK_PARAM { return "param" }
-        case LK_USER { return "user" }
-        case LK_DROP_FLAG { return "flag" }
+    switch {
+        case kind == LK_PARAM { return "param" }
+        case kind == LK_USER { return "user" }
+        case kind == LK_DROP_FLAG { return "flag" }
         default { return "temp" }
     }
 }
@@ -46,21 +46,21 @@ fn placeText(p: *Place) -> String {
 
 /// A constant. Floats print as C++ `std::format("{}", double)` does: a whole value carries no `.0`.
 fn constantText(c: *Constant) -> String {
-    switch c.kind {
-        case CK_NONE { return String("()") }
-        case CK_INT { return format("{}", c.intBits) }
-        case CK_FLOAT {
+    switch {
+        case c.kind == CK_NONE { return String("()") }
+        case c.kind == CK_INT { return format("{}", c.intBits) }
+        case c.kind == CK_FLOAT {
             local t = toString(c.floatValue)
             if t.findLast("e") < 0 && t.length() >= 2 && t.at(t.length() - 2) == b'.' && t.at(t.length() - 1) == b'0' {
                 return t.slice(0, t.length() - 2)
             }
             return t
         }
-        case CK_BOOL { return String(c.boolValue ? "true" : "false") }
-        case CK_STR { return format("\"{}\"", &c.text) }
-        case CK_NIL { return String("nil") }
-        case CK_FUNCTION { return format("fn {}", &c.text) }
-        case CK_GLOBAL { return format("&{}", &c.text) }
+        case c.kind == CK_BOOL { return String(c.boolValue ? "true" : "false") }
+        case c.kind == CK_STR { return format("\"{}\"", &c.text) }
+        case c.kind == CK_NIL { return String("nil") }
+        case c.kind == CK_FUNCTION { return format("fn {}", &c.text) }
+        case c.kind == CK_GLOBAL { return format("&{}", &c.text) }
         default { return String("?") }
     }
 }
@@ -106,23 +106,23 @@ fn aggregateText(r: *Rvalue) -> String {
 /// The right side of an assignment.
 fn rvalueText(r: *Rvalue) -> String {
     local checked = r.checked ? " checked" : ""
-    switch r.kind {
-        case RK_USE { return operandsText(&r.operands) }
-        case RK_ADDRESS_OF { return format("&{}", &placeText(&r.place)) }
-        case RK_UNARY { return format("{}{}", &r.op, &operandsText(&r.operands)) }
-        case RK_BINARY {
+    switch {
+        case r.kind == RK_USE { return operandsText(&r.operands) }
+        case r.kind == RK_ADDRESS_OF { return format("&{}", &placeText(&r.place)) }
+        case r.kind == RK_UNARY { return format("{}{}", &r.op, &operandsText(&r.operands)) }
+        case r.kind == RK_BINARY {
             return format("{} {} {}{}", &operandText(r.operands.get(0)), &r.op,
                 &operandText(r.operands.get(1)), checked)
         }
-        case RK_CAST { return format("{} as {}", &operandsText(&r.operands), &r.typeName) }
-        case RK_AGGREGATE { return aggregateText(r) }
-        case RK_REPEAT { return format("[{}; {}]", &operandsText(&r.operands), r.count) }
-        case RK_ZERO { return format("zeroed {}", &r.typeName) }
-        case RK_SLICE {
+        case r.kind == RK_CAST { return format("{} as {}", &operandsText(&r.operands), &r.typeName) }
+        case r.kind == RK_AGGREGATE { return aggregateText(r) }
+        case r.kind == RK_REPEAT { return format("[{}; {}]", &operandsText(&r.operands), r.count) }
+        case r.kind == RK_ZERO { return format("zeroed {}", &r.typeName) }
+        case r.kind == RK_SLICE {
             return format("{}[{}..{}]{}", &placeText(&r.place), &operandText(r.operands.get(0)),
                 &operandText(r.operands.get(1)), checked)
         }
-        case RK_TO_INTERFACE {
+        case r.kind == RK_TO_INTERFACE {
             return format("{} as {} by {}", &operandsText(&r.operands), &r.typeName, &r.name)
         }
         default { return String("?") }
@@ -131,17 +131,17 @@ fn rvalueText(r: *Rvalue) -> String {
 
 /// The spelling of a builtin callee.
 fn builtinName(b: u8) -> str {
-    switch b {
-        case BI_ALLOC { return "alloc" }
-        case BI_ATOMIC_LOAD { return "atomic.load" }
-        case BI_ATOMIC_STORE { return "atomic.store" }
-        case BI_ATOMIC_XCHG { return "atomic.xchg" }
-        case BI_ATOMIC_CAS { return "atomic.cas" }
-        case BI_ATOMIC_ADD { return "atomic.add" }
-        case BI_FENCE { return "fence" }
-        case BI_ASM { return "asm" }
-        case BI_UNWIND_PADS { return "unwindPads" }
-        case BI_UNWIND_PAD_COUNT { return "unwindPadCount" }
+    switch {
+        case b == BI_ALLOC { return "alloc" }
+        case b == BI_ATOMIC_LOAD { return "atomic.load" }
+        case b == BI_ATOMIC_STORE { return "atomic.store" }
+        case b == BI_ATOMIC_XCHG { return "atomic.xchg" }
+        case b == BI_ATOMIC_CAS { return "atomic.cas" }
+        case b == BI_ATOMIC_ADD { return "atomic.add" }
+        case b == BI_FENCE { return "fence" }
+        case b == BI_ASM { return "asm" }
+        case b == BI_UNWIND_PADS { return "unwindPads" }
+        case b == BI_UNWIND_PAD_COUNT { return "unwindPadCount" }
         default { return "?" }
     }
 }
@@ -149,13 +149,13 @@ fn builtinName(b: u8) -> str {
 /// The callee of a call: a name, `(fn-pointer)`, `virtual[slot] f`, `(iface).m[slot]`, `syscall`
 /// or a builtin.
 fn calleeText(c: *Callee) -> String {
-    switch c.kind {
-        case CL_DIRECT { return String(c.name.asStr()) }
-        case CL_INDIRECT { return format("({})", &operandText(&c.value)) }
-        case CL_VIRTUAL { return format("virtual[{}] {}", c.index, &c.name) }
-        case CL_INTERFACE { return format("({}).{}[{}]", &operandText(&c.value), &c.name, c.index) }
-        case CL_SYSCALL { return String("syscall") }
-        case CL_BUILTIN {
+    switch {
+        case c.kind == CL_DIRECT { return String(c.name.asStr()) }
+        case c.kind == CL_INDIRECT { return format("({})", &operandText(&c.value)) }
+        case c.kind == CL_VIRTUAL { return format("virtual[{}] {}", c.index, &c.name) }
+        case c.kind == CL_INTERFACE { return format("({}).{}[{}]", &operandText(&c.value), &c.name, c.index) }
+        case c.kind == CL_SYSCALL { return String("syscall") }
+        case c.kind == CL_BUILTIN {
             return c.builtin == BI_ALLOC ? format("alloc<{}>", &c.typeName) : String(builtinName(c.builtin))
         }
         default { return String("?") }
@@ -176,25 +176,25 @@ fn targetsText(t: *Terminator) -> String {
 
 /// The terminator of a block.
 fn terminatorText(t: *Terminator) -> String {
-    switch t.kind {
-        case TK_GOTO { return format("goto {}", &targetsText(t)) }
-        case TK_BRANCH {
+    switch {
+        case t.kind == TK_GOTO { return format("goto {}", &targetsText(t)) }
+        case t.kind == TK_BRANCH {
             return format("branch {} -> {}", &operandText(&t.operand), &targetsText(t))
         }
-        case TK_CALL {
+        case t.kind == TK_CALL {
             local result = t.hasDestination ? format("{} = ", &placeText(&t.destination)) : String()
             local next = t.targets.length() == 0 && !t.hasUnwind ? String("never") : targetsText(t)
             return format("{}call {}({}) -> {}", &result, &calleeText(&t.callee),
                 &operandsText(&t.args), &next)
         }
-        case TK_DROP {
+        case t.kind == TK_DROP {
             return format("drop {} by {} -> {}", &placeText(&t.place), &t.glue, &targetsText(t))
         }
-        case TK_TRY {
+        case t.kind == TK_TRY {
             return format("try {}, _{} -> {}", &placeText(&t.place), t.message, &targetsText(t))
         }
-        case TK_RETURN { return format("return {}", &operandText(&t.operand)) }
-        case TK_UNREACHABLE { return String("unreachable") }
+        case t.kind == TK_RETURN { return format("return {}", &operandText(&t.operand)) }
+        case t.kind == TK_UNREACHABLE { return String("unreachable") }
         default { return String("?") }
     }
 }
