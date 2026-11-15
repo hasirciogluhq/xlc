@@ -19,6 +19,7 @@ from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
 from "./builder" import FnBuild
 from "../sema/const_eval" import evalConst
+from "../sema/layout_calc" import layoutOfName
 
 /// The statement kinds of the flat AST (the `XS_*` constants of ast.xl, mirrored).
 export fn lowerModuleTouch() { return }
@@ -404,6 +405,11 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
     /// A call: the callee name, the arguments in order.
 export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         local e = l.s.exprAt(idx)
+        // The layout queries fold to constants here: the HIR has no sizeof form.
+        local calleeText = l.s.exprTextAt((*e).lhs)
+        if calleeText == "sizeOf" || calleeText == "alignOf" || calleeText == "offsetOf" {
+            return lowerLayoutQuery(l, idx, e, calleeText)
+        }
         local args = Vec<i32>()
         local count = (*e).argsCount
         for i in 0..count as usize {
@@ -412,14 +418,95 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
             if v < 0 { return -1 }
             args.push(v)
         }
-        local range = l.b.args(args)
-        local callee = l.s.exprTextAt((*e).lhs)
-        local entry = l.lookupName(callee)
-        if entry != nil && (*entry).kind == SE_FUNCTION {
-            return l.b.call((*entry).qname.asStr(), range.0, range.1, l.exprTypeName(idx))
+        local range = l.b.args(args.clone())
+        local lhs = l.s.exprAt((*e).lhs)
+        if (*lhs).kind == XE_NAME {
+            local callee = l.s.exprTextAt((*e).lhs)
+            local entry = l.lookupName(callee)
+            if entry != nil && (*entry).kind == SE_FUNCTION {
+                return l.b.call((*entry).qname.asStr(), range.0, range.1, l.exprTypeName(idx))
+            }
+            return l.b.call(callee, range.0, range.1, l.exprTypeName(idx))
         }
-        return l.b.call(callee, range.0, range.1, l.exprTypeName(idx))
+        if (*lhs).kind == XE_FIELD {
+            // A method call: the receiver becomes the first argument; the qualified name is
+            // filled in when the xl sema assigns per-expression types.
+            local receiver = lowerExpr(l, (*lhs).lhs)
+            if receiver < 0 { return -1 }
+            local method = l.s.exprTextAt((*e).lhs)
+            local withSelf = Vec<i32>()
+            withSelf.push(receiver)
+            for i in 0..args.length() {
+                withSelf.push(*args.get(i))
+            }
+            local full = l.b.args(withSelf)
+            return l.b.call(method, full.0, full.1, l.exprTypeName(idx))
+        }
+        // A call through a value (a function pointer): the callee expression is the operand.
+        local fnValue = lowerExpr(l, (*e).lhs)
+        if fnValue < 0 { return -1 }
+        return l.b.callIndirect(fnValue, range.0, range.1, l.exprTypeName(idx))
     }
+
+/// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)`: folded to an integer constant from the
+/// computed layout. Primitives use the fixed table; aggregates go through `layoutOfName`.
+export fn lowerLayoutQuery(l: *Lowerer, idx: i32, e: *XExpr, which: str) -> i32 {
+    if (*e).argsCount == 0 {
+        l.err("E0709", (*e).span, format("`{}` needs a type", which).asStr(), "missing argument")
+        return -1
+    }
+    local tyArg = l.s.refAt("expr", (*e).argsFirst as i32)
+    local tyName = l.s.exprTextAt(tyArg)
+    local value: u64 = 0
+    if which == "offsetOf" {
+        if (*e).argsCount < 2 {
+            l.err("E0709", (*e).span, "`offsetOf` needs a type and a field", "missing argument")
+            return -1
+        }
+        local fieldArg = l.s.refAt("expr", ((*e).argsFirst + 1 as u32) as i32)
+        local fieldName = l.s.exprTextAt(fieldArg)
+        local li = layoutOfName(l.s, tyName, (*e).span)
+        if li < 0 {
+            l.err("E0709", (*e).span, format("no layout for `{}`", tyName).asStr(),
+                "unknown type")
+            return -1
+        }
+        local lay = *l.s.layoutCache.get(li as usize)
+        for i in 0..(*lay).fields.length() {
+            local f = (*lay).fields.get(i)
+            if (*f).name.asStr() == fieldName {
+                value = (*f).offset
+            }
+        }
+    } else {
+        value = primLayout(tyName, which)
+        if value == 0 {
+            local li = layoutOfName(l.s, tyName, (*e).span)
+            if li < 0 {
+                l.err("E0709", (*e).span, format("no layout for `{}`", tyName).asStr(),
+                    "unknown type")
+                return -1
+            }
+            local lay = *l.s.layoutCache.get(li as usize)
+            value = which == "sizeOf" ? (*lay).size : (*lay).align
+        }
+    }
+    return l.b.intConst(value, "u64")
+}
+
+/// The size or alignment of a primitive type by name; 0 when `tyName` is not one.
+fn primLayout(tyName: str, which: str) -> u64 {
+    local size: u64 = 0
+    if tyName == "i8" || tyName == "u8" || tyName == "bool" { size = 1 }
+    else if tyName == "i16" || tyName == "u16" { size = 2 }
+    else if tyName == "f32" { size = 4 }
+    else if tyName == "i32" || tyName == "u32" || tyName == "f32" { size = 4 }
+    else if tyName == "i64" || tyName == "u64" || tyName == "f64" || tyName == "usize" ||
+            tyName == "isize" || tyName == "u128" || tyName == "i128" { size = 8 }
+    else if tyName == "str" { size = 16 }
+    if size == 0 { return 0 }
+    return which == "sizeOf" ? size : size
+}
 
     /// The initializer of a global: a constant expression folded to a literal.
 export fn runConstInit(l: *Lowerer, exprIdx: i32, tyName: str) -> i32 {
