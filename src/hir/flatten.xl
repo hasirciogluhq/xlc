@@ -19,6 +19,7 @@
 // expression go through the `refs` arena, collected first and appended after, so nested calls
 // cannot interleave another expression's argument range.
 from "std" import String, Vec, format
+from "../util/source" import Span, spanNone
 from "abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirEnum, XlcHirEnumMember,
     XlcHirAggregate, XlcHirField, XlcHirVtableSlot, XlcHirInterface, XlcHirIfaceMethod, XlcHirImpl,
     XlcHirExpr, XlcHirStmt, XlcHirLocal, XlcHirFieldInit, XlcHirAsmOperand, XlcHirStr, view,
@@ -35,6 +36,7 @@ from "abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirEnum, XlcHir
 
 const XE_KIND: usize = 0
 const XE_TYPE: usize = 8
+const XE_SPAN: usize = 168
 const XE_INT_VALUE: usize = 192
 const XE_FLOAT_VALUE: usize = 200
 const XE_BOOL_VALUE: usize = 208
@@ -61,6 +63,7 @@ const XE_NORETURN: usize = 561
 // ---- offsets: hir::Stmt (sizeof 128) -----------------------------------------------------------
 
 const XS_KIND: usize = 0
+const XS_SPAN: usize = 4
 const XS_LOCAL: usize = 24
 const XS_MSG_LOCAL: usize = 28
 const XS_TARGET: usize = 32
@@ -87,6 +90,7 @@ const XF_REGISTERED: usize = 368
 const XF_IS_INIT: usize = 400
 const XF_IS_FINI: usize = 401
 const XF_IS_ENTRY: usize = 402
+const XF_SPAN: usize = 408
 
 // ---- offsets: hir::Global (sizeof 296), Local (208), FieldInit (40), AsmOperand (40) -----------
 
@@ -100,6 +104,7 @@ const XG_REGISTERED: usize = 244
 
 const XL_NAME: usize = 0
 const XL_TYPE: usize = 24
+const XL_SPAN: usize = 188
 
 const XFI_NAME: usize = 0
 const XFI_INDEX: usize = 24
@@ -268,6 +273,17 @@ fn rdU64(p: *void, off: usize) -> u64 {
 
 fn rdI64(p: *void, off: usize) -> i64 {
     return __builtin_read((p as usize + off) as *i64)
+}
+
+/// The `Span` (five u32 words: file, line, column, end line, end column) at `off`.
+fn rdSpan(p: *void, off: usize) -> Span {
+    local s = spanNone()
+    s.file = rdU32(p, off)
+    s.line = rdU32(p, off + 4)
+    s.column = rdU32(p, off + 8)
+    s.endLine = rdU32(p, off + 12)
+    s.endColumn = rdU32(p, off + 16)
+    return s
 }
 
 fn rdF64(p: *void, off: usize) -> f64 {
@@ -534,6 +550,7 @@ fn exprNode(f: *Flat, raw: *void) -> i32 {
         local v = rdPtr(fi as *void, XFI_VALUE)
         local entry: XlcHirFieldInit
         entry.name = cxxStr(fi as *void)
+        entry.index = rdU32(fi as *void, XFI_INDEX)
         entry.value = v != 0 ? exprNode(f, v as *void) : -1
         f.fields.push(entry)
     }
@@ -559,6 +576,10 @@ fn exprNode(f: *Flat, raw: *void) -> i32 {
     // The node itself, kind by kind.
     local at = exprSlot(f, kind, typeName)
     local e = f.exprs.get(at as usize)
+    e.span = rdSpan(raw, XE_SPAN)
+    if kind == E_NEW || kind == E_CONSTRUCT {
+        e.targetName = typeSpelling(f, (raw as usize + XE_TARGET) as *void)
+    }
     switch {
         case kind == E_INT_CONST || kind == E_ARRAY_REPEAT { e.intValue = rdU64(raw, XE_INT_VALUE) }
         case kind == E_FLOAT_CONST { e.floatValue = rdF64(raw, XE_FLOAT_VALUE) }
@@ -566,15 +587,19 @@ fn exprNode(f: *Flat, raw: *void) -> i32 {
         case kind == E_STR_CONST || kind == E_GLOBAL_REF || kind == E_FUNC_REF || kind == E_CALL || kind == E_CALL_VIRTUAL {
             e.text = cxxStr((raw as usize + XE_TEXT) as *void)
         }
-        case kind == E_CALL_ITABLE || kind == E_FIELD || kind == E_TO_INTERFACE || kind == E_ASM || kind == E_CONSTRUCT {
+        case kind == E_CALL_ITABLE || kind == E_FIELD || kind == E_TO_INTERFACE || kind == E_ASM || kind == E_CONSTRUCT || kind == E_NEW {
             e.text = cxxStr((raw as usize + XE_TEXT) as *void)
         }
         case kind == E_EXTERNAL || kind == E_CALL_EXTERNAL {
             e.text = cxxStr((raw as usize + XE_TEXT) as *void)
             e.member = cxxStr((raw as usize + XE_MEMBER) as *void)
         }
-        case kind == E_LOCAL_REF || kind == E_MOVE || kind == E_MATERIALIZE {
+        case kind == E_LOCAL_REF || kind == E_MOVE {
             e.localId = rdU32(raw, XE_LOCAL)
+        }
+        case kind == E_MATERIALIZE {
+            e.localId = rdU32(raw, XE_LOCAL)
+            e.index = rdU32(raw, XE_INDEX)
         }
         case kind == E_UNARY { e.unaryOp = unaryOpName(rdU32(raw, XE_UNARY_OP)) }
         case kind == E_BINARY { e.binaryOp = binaryOpName(rdU32(raw, XE_BINARY_OP)) }
@@ -583,7 +608,7 @@ fn exprNode(f: *Flat, raw: *void) -> i32 {
             e.index = rdU32(raw, XE_INDEX)
         }
         case kind == E_CAST { e.implicit = rdU8(raw, XE_IMPLICIT) != 0 ? 1 : 0 }
-        case kind == E_INDEX || kind == E_SLICE { e.checked = rdU8(raw, XE_CHECKED) != 0 ? 1 : 0 }
+        case kind == E_INDEX || kind == E_SLICE || kind == E_BINARY { e.checked = rdU8(raw, XE_CHECKED) != 0 ? 1 : 0 }
         case kind == E_FIELD { e.throughPointer = rdU8(raw, XE_THROUGH_POINTER) != 0 ? 1 : 0 }
         case kind == E_NEW { e.registered = rdU8(raw, XE_REGISTERED) != 0 ? 1 : 0 }
         case kind == E_ASM {
@@ -633,6 +658,7 @@ fn stmtNode(f: *Flat, raw: *void, pending: *Vec<Pending>) -> i32 {
     s.msgLocal = rdU32(raw, XS_MSG_LOCAL)
     s.target = target
     s.value = value
+    s.span = rdSpan(raw, XS_SPAN)
     s.postTest = rdU8(raw, XS_POST_TEST) != 0 ? 1 : 0
     s.depth = rdU32(raw, XS_DEPTH)
     f.stmts.push(s)
@@ -681,6 +707,7 @@ fn functionLocals(f: *Flat, raw: *void) -> (u32, u32) {
         local entry: XlcHirLocal
         entry.name = cxxStr(l as *void)
         entry.typeName = typeSpelling(f, (l + XL_TYPE) as *void)
+        entry.span = rdSpan(l as *void, XL_SPAN)
         f.locals.push(entry)
     }
     return (localsFirst, localCount)
@@ -710,6 +737,7 @@ fn functionNode(f: *Flat, raw: *void, locals: (u32, u32)) {
     fu.isEntry = rdU8(raw, XF_IS_ENTRY) != 0 ? 1 : 0
     fu.isInit = rdU8(raw, XF_IS_INIT) != 0 ? 1 : 0
     fu.isFini = rdU8(raw, XF_IS_FINI) != 0 ? 1 : 0
+    fu.span = rdSpan(raw, XF_SPAN)
     f.fns.push(fu)
 }
 

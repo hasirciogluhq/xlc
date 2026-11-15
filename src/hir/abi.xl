@@ -9,6 +9,7 @@
 // because all three are keywords of the language.
 from "std" import String
 from "std/str" import fromParts
+from "../util/source" import Span
 
 /// One string across the boundary: the bytes are not NUL-terminated. Empty = `len` 0.
 @repr(c)
@@ -22,13 +23,16 @@ export struct XlcHirStr {
 export struct XlcHirLocal {
     name: XlcHirStr
     typeName: XlcHirStr
+    span: Span
 }
 
-/// One `name = value` of a struct literal; `value` is an expression node, -1 = none.
+/// One `name = value` of a struct literal; `value` is an expression node, -1 = none. `index` is
+/// the field's position in its aggregate.
 @repr(c)
 export struct XlcHirFieldInit {
     name: XlcHirStr
     value: i32
+    index: u32
 }
 
 /// One `in(reg) x` / `out("rax") y` / `inout(reg) z` of `__builtin_asm`; `kind` is 0, 1, 2 in that
@@ -91,6 +95,8 @@ export const E_UNWIND_PAD_COUNT: i32 = 42  ///< `__builtin_unwindPadCount()`
 export struct XlcHirExpr {
     kind: i32
     typeName: XlcHirStr
+    targetName: XlcHirStr ///< New, Construct: the allocated type; empty otherwise
+    span: Span
     text: XlcHirStr
     member: XlcHirStr
     unaryOp: XlcHirStr   ///< the spelling of the operator, empty = not a `Unary`
@@ -134,6 +140,7 @@ export const S_TRY: i32 = 9
 @repr(c)
 export struct XlcHirStmt {
     kind: i32
+    span: Span
     localId: u32
     msgLocal: u32
     target: i32
@@ -167,6 +174,7 @@ export struct XlcHirFunction {
     isEntry: i32
     isInit: i32
     isFini: i32
+    span: Span
 }
 
 @repr(c)
