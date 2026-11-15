@@ -103,13 +103,7 @@ export fn endFunction(l: *Lowerer, item: i32) {
             (*f).isEntry = l.s.text((*it).registerRole) == "entry"
             (*f).isInit = l.s.text((*it).registerRole) == "init"
             (*f).isFini = l.s.text((*it).registerRole) == "fini"
-            // The module's role functions (C++ roles.cpp; the structural checks are not ported yet).
-            local role = l.s.text((*it).registerRole)
-            if role == "panic" { l.b.panicFunction = l.fnName.clone() }
-            if role == "alloc" { l.b.allocFunction = l.fnName.clone() }
-            if role == "free" { l.b.freeFunction = l.fnName.clone() }
-            if role == "args" { l.b.argsFunction = l.fnName.clone() }
-            if role == "unwind" { l.b.unwindFunction = l.fnName.clone() }
+            // The role functions are set by the role pass before the bodies (roles.xl).
             if (*f).isInit {
                 l.b.initFns.push(l.fnName.clone())
             }
@@ -594,6 +588,8 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
         local name = l.s.exprTextAt(idx)
         local entry = l.lookupName(name)
         if entry == nil {
+            // `nil` with no binding of that name is the null pointer, typed `*void` (C++ nameExpr).
+            if name == "nil" { return l.b.nil("*void") }
             l.err("E0706", (*l.s.exprAt(idx)).span,
                 format("unknown name `{}`", name).asStr(), "not found in any scope")
             return -1

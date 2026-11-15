@@ -1,0 +1,136 @@
+// The role registrations of a module (C++ item/roles.cpp, checkRegistrations): every
+// `register(role) fn` must have the signature its role needs (E0503), and a role is registered
+// once per module (E0502). The pass runs before any body is lowered, so every function already
+// knows the unwinder when it builds its landing pads. Across modules the registrations meet in the
+// session of the driver; this pass sees the one module it is given.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XD_FN
+from "../sema/sema" import Sema
+from "../sema/item" import SDecl
+from "../sema/types" import Types, T_VOID, T_NEVER, T_INT, T_POINTER
+from "../util/source" import Span
+from "../util/diagnostics" import Diagnostic, Label, SEV_ERROR
+from "./state" import Lowerer
+from "./overload" import declParamTypes, declRetType
+
+/// The kind of a type index, -1 for an unknown one.
+fn kindAt(t: *Types, idx: i32) -> i32 {
+    return idx < 0 ? -1 : t.get(idx).kind
+}
+
+/// True when `idx` is an integer of `bits` bits (0 is `usize`) with the signedness `signed`.
+fn intAt(t: *Types, idx: i32, bits: u32, signed: bool) -> bool {
+    if kindAt(t, idx) != T_INT { return false }
+    return t.get(idx).bits == bits && (t.get(idx).isSigned != 0) == signed
+}
+
+/// The pointee of the pointer type `idx`, -1 when it is not a pointer.
+fn pointee(t: *Types, idx: i32) -> i32 {
+    return kindAt(t, idx) == T_POINTER ? t.get(idx).elem : -1
+}
+
+/// True when `idx` is `*void`.
+fn isVoidPointer(t: *Types, idx: i32) -> bool {
+    return kindAt(t, pointee(t, idx)) == T_VOID
+}
+
+/// Whether the function `d` has the signature the role `role` needs (C++ checkRegistrations). A
+/// role that is not one of the five is never a fit.
+fn roleFits(s: *Sema, role: str, d: *SDecl) -> bool {
+    if (*d).kind != XD_FN { return false }
+    local t = s.types
+    local params = declParamTypes(s, d)
+    local ret = declRetType(s, d)
+    local n = params.length()
+    if role == "panic" {
+        // fn(msg: *u8) -> never
+        return n == 1 && kindAt(t, ret) == T_NEVER && intAt(t, pointee(t, *params.get(0)), 8, false)
+    }
+    if role == "alloc" {
+        // fn(size: usize, align: usize) -> *void
+        return n == 2 && isVoidPointer(t, ret) && intAt(t, *params.get(0), 0, false) &&
+            intAt(t, *params.get(1), 0, false)
+    }
+    if role == "free" {
+        // fn(p: *void) with no return type
+        return n == 1 && kindAt(t, ret) == T_VOID && isVoidPointer(t, *params.get(0))
+    }
+    if role == "unwind" {
+        // fn(op: i32, snapshot: *usize, message: *u8) with no return type
+        return n == 3 && kindAt(t, ret) == T_VOID && intAt(t, *params.get(0), 32, true) &&
+            intAt(t, pointee(t, *params.get(1)), 0, false) &&
+            intAt(t, pointee(t, *params.get(2)), 8, false)
+    }
+    if role == "args" {
+        // fn(argc: *i32) -> **u8
+        return n == 1 && intAt(t, pointee(t, *params.get(0)), 32, true) &&
+            intAt(t, pointee(t, pointee(t, ret)), 8, false)
+    }
+    return false
+}
+
+/// The text that says what a role needs, for E0503 (the C++ `why`).
+fn roleNeeds(role: str) -> String {
+    if role == "panic" { return String("`register(panic)` needs `fn(msg: *u8) -> never`") }
+    if role == "alloc" { return String("`register(alloc)` needs `fn(size: usize, align: usize) -> *void`") }
+    if role == "free" { return String("`register(free)` needs `fn(p: *void)` with no return type") }
+    if role == "unwind" {
+        return String("`register(unwind)` needs `fn(op: i32, snapshot: *usize, message: *u8)` with no return type")
+    }
+    if role == "args" { return String("`register(args)` needs `fn(argc: *i32) -> **u8`") }
+    return format("unknown role `{}`; known roles: panic, alloc, free, unwind, args", role)
+}
+
+/// E0502 with both registrations marked: the second one is reported, the first one is kept.
+fn reportTwice(l: *Lowerer, role: str, first: Span, second: Span) {
+    local diag = l.s.diag
+    local d: Diagnostic
+    d.code = diag.txt("E0502")
+    d.severity = SEV_ERROR
+    d.message = diag.txt(format("role `{}` is registered twice", role).asStr())
+    d.labelsFirst = diag.labels.length() as i32
+    diag.labels.push(Label { span: first, text: diag.txt("first registration") })
+    diag.labels.push(Label { span: second, text: diag.txt("second registration") })
+    d.labelsCount = 2
+    d.fix = diag.txt("keep one registration per role in your program; a library default is replaced by registering the role in your own code")
+    diag.report(d)
+}
+
+/// The role registrations of the module, in item order. A registration that does not fit its role
+/// is E0503; a second registration of a role is E0502 and does not replace the first. A fitting
+/// registration sets the module's function for the role (`panic`, `alloc`, `free`, `args`, `unwind`).
+export fn checkRegistrations(l: *Lowerer) {
+    local seenRoles = Vec<String>()
+    local seenSpans = Vec<Span>()
+    for i in 0..l.s.items.length() {
+        local item = i as i32
+        local it = l.s.items.get(i)
+        if (*it).registered == 0 { continue }
+        local role = l.s.text((*it).registerRole)
+        if role.len == 0 { continue }
+        local d = l.s.declOf(item)
+        local name = l.s.text((*d).name)
+        if !roleFits(l.s, role, d) {
+            l.s.diag.error("E0503", l.s.span((*d).nameSpan),
+                format("`{}` does not fit role `{}`", name, role).asStr(), roleNeeds(role).asStr())
+            continue
+        }
+        local at = l.s.span((*d).nameSpan)
+        local dup = -1
+        for k in 0..seenRoles.length() {
+            if (*seenRoles.get(k)).asStr() == role { dup = k as i32 }
+        }
+        if dup >= 0 {
+            reportTwice(l, role, *seenSpans.get(dup as usize), at)
+            continue
+        }
+        seenRoles.push(String(role))
+        seenSpans.push(at)
+        local qname = l.s.qualify(name)
+        if role == "panic" { l.b.panicFunction = qname.clone() }
+        if role == "alloc" { l.b.allocFunction = qname.clone() }
+        if role == "free" { l.b.freeFunction = qname.clone() }
+        if role == "args" { l.b.argsFunction = qname.clone() }
+        if role == "unwind" { l.b.unwindFunction = qname.clone() }
+    }
+}

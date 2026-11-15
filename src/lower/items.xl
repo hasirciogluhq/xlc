@@ -21,6 +21,7 @@ from "./queries" import enumMemberValue, isConstValue
 from "./typing" import exprType, exprTypeName
 from "./diagnose" import cCompatible
 from "./overload" import declParamTypes, declRetType
+from "./roles" import checkRegistrations
 from "./instances" import lowerPendingInstances, lowerImpls
 
 /// The declaration kinds of the flat AST (mirrored here for the dispatch).
@@ -302,6 +303,8 @@ export fn fnKeySeen(l: *Lowerer, key: str) -> bool {
 
 export fn run(l: *Lowerer) {
         l.buildModuleScope()
+        // The role registrations come first: the bodies need the unwinder (its pads) and the others.
+        checkRegistrations(l)
         lowerItems(l)
     }
 
