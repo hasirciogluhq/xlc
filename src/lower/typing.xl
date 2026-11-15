@@ -19,6 +19,9 @@ from "../sema/item" import SDecl
 from "../sema/const_eval" import evalConst
 from "../sema/const_value" import CV_INT, CV_FLOAT, CV_BOOL, CV_STRING
 from "./state" import Lowerer, ScopeEntry, SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT
+from "./overload" import ARG_EXPR, ARG_INT, ARG_FLOAT, ARG_STR, ARG_NIL, PICK_NONE, pickOverload,
+    declParamTypes, declRetType
+from "./methods" import findMethod, methodsNamed, classDeclIndex
 
 /// True for an unsuffixed numeric literal, or `-` of one: it takes the type of the other operand.
 export fn isLiteralExpr(l: *Lowerer, idx: i32) -> bool {
@@ -65,6 +68,7 @@ export fn exprType(l: *Lowerer, idx: i32) -> i32 {
         return -1
     }
     if k == XE_FIELD { return fieldType(l, idx) }
+    if k == XE_SLICE { return sliceType(l, idx) }
     if k == XE_CAST || k == XE_STRUCT_LITERAL { return resolve(l.s, l.s.types.internAst((*e).typeIdx)) }
     if k == XE_NEW {
         local inner = resolve(l.s, l.s.types.internAst((*e).typeIdx))
@@ -218,26 +222,104 @@ export fn isNumeric(l: *Lowerer, t: i32) -> bool {
     return k == T_INT || k == T_FLOAT
 }
 
-/// The result of a call: a plain function name with one declaration gives its declared return
-/// type; the layout queries and `syscall` have fixed types. Overloads and methods are not typed
-/// yet (-1).
+/// The argument kinds and expression types of a call: the input of the overload choice.
+export class ArgSpecs {
+    kinds: Vec<i32>
+    types: Vec<i32>
+
+    fn init(self) {
+        self.kinds = Vec<i32>()
+        self.types = Vec<i32>()
+    }
+}
+
+/// The argument specs of call `e`: a literal argument keeps its literal kind, any other one gets
+/// its type with no context (C++ `preLowerArgs`).
+export fn argSpecs(l: *Lowerer, e: *XExpr) -> *ArgSpecs {
+    local out = new ArgSpecs()
+    for i in 0..(*e).argsCount as usize {
+        local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
+        local ae = l.s.exprAt(a)
+        local k = ARG_EXPR
+        if (*ae).kind == XE_INT_LITERAL { k = ARG_INT }
+        if (*ae).kind == XE_FLOAT_LITERAL { k = ARG_FLOAT }
+        if (*ae).kind == XE_STRING_LITERAL { k = ARG_STR }
+        if (*ae).kind == XE_NAME && l.s.exprTextAt(a) == "nil" { k = ARG_NIL }
+        (*out).kinds.push(k)
+        (*out).types.push(k == ARG_EXPR ? exprType(l, a) : -1)
+    }
+    return out
+}
+
+/// The declarations a call to the function name `entry` may pick from, as SDecl indices. An
+/// overloaded name whose candidate is generic gives none: the xlang pass does not choose among
+/// generic candidates yet, so such a call is left to the caller's fallback.
+export fn functionDecls(l: *Lowerer, entry: *ScopeEntry) -> Vec<i32> {
+    local out = Vec<i32>()
+    for i in 0..(*entry).overloads.length() {
+        local d = l.s.declOfItem(*(*entry).overloads.get(i))
+        if d < 0 { return Vec<i32>() }
+        if (*entry).overloads.length() > 1 && (*l.s.declAt(d as usize)).genericCount > 0 {
+            return Vec<i32>()
+        }
+        out.push(d)
+    }
+    return out
+}
+
+/// The parameter types of each declaration in `decls`, in order: the candidates of the choice.
+export fn paramsOfDecls(l: *Lowerer, decls: *Vec<i32>) -> Vec<Vec<i32>> {
+    local out = Vec<Vec<i32>>()
+    for i in 0..(*decls).length() {
+        out.push(declParamTypes(l.s, l.s.declAt(*(*decls).get(i) as usize)))
+    }
+    return out
+}
+
+/// The index in `decls` that call `args` picks, or `PICK_NONE` / `PICK_AMBIGUOUS` (see
+/// overload.xl).
+export fn chooseDecl(l: *Lowerer, decls: *Vec<i32>, args: *ArgSpecs) -> i32 {
+    local cands = paramsOfDecls(l, decls)
+    return pickOverload(l.s, &cands, &((*args).kinds), &((*args).types))
+}
+
+/// The result type of a call that picks one of `decls`: the only declaration's, or the chosen
+/// overload's. -1 when there is none or the overloads do not decide.
+fn declaredResult(l: *Lowerer, decls: *Vec<i32>, e: *XExpr) -> i32 {
+    if (*decls).length() == 0 { return -1 }
+    local pick = 0
+    if (*decls).length() > 1 {
+        pick = chooseDecl(l, decls, argSpecs(l, e))
+        if pick < 0 { return -1 }
+    }
+    return declRetType(l.s, l.s.declAt(*(*decls).get(pick as usize) as usize))
+}
+
+/// The result of a call: a function name gives its declared return type (its chosen overload
+/// when it has several); a method gives the return type of the method it names, searched in the
+/// receiver's class; the layout queries and `syscall` have fixed types. -1 when unknown.
 fn callType(l: *Lowerer, e: *XExpr) -> i32 {
     local lhs = l.s.exprAt((*e).lhs)
-    if (*lhs).kind != XE_NAME { return -1 }
-    local callee = l.s.exprTextAt((*e).lhs)
-    if callee == "sizeOf" || callee == "alignOf" || callee == "offsetOf" {
-        return l.s.types.makeInt(0, false) // usize: the C++ pass folds them to a usize constant
+    if (*lhs).kind == XE_NAME {
+        local callee = l.s.exprTextAt((*e).lhs)
+        if callee == "sizeOf" || callee == "alignOf" || callee == "offsetOf" {
+            return l.s.types.makeInt(0, false) // usize: the C++ pass folds them to a usize constant
+        }
+        if callee == "syscall" { return l.s.types.makeInt(64, true) }
+        local entry = l.lookupName(callee)
+        if entry == nil || (*entry).kind != SE_FUNCTION { return -1 }
+        local decls = functionDecls(l, entry)
+        return declaredResult(l, &decls, e)
     }
-    if callee == "syscall" { return l.s.types.makeInt(64, true) }
-    local entry = l.lookupName(callee)
-    if entry == nil || (*entry).kind != SE_FUNCTION || (*entry).overloads.length() != 1 {
-        return -1
+    if (*lhs).kind == XE_FIELD {
+        local recvTy = exprType(l, (*lhs).lhs)
+        if recvTy < 0 { return -1 }
+        local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt((*e).lhs))
+        if !(*m).found { return -1 }
+        local decls = methodsNamed(l.s, (*m).cdecl, l.s.exprTextAt((*e).lhs))
+        return declaredResult(l, &decls, e)
     }
-    local d = l.s.declOfItem(*(*entry).overloads.get(0))
-    if d < 0 { return -1 }
-    local decl = l.s.declAt(d as usize)
-    if (*decl).hasRet == 0 { return l.s.types.makeVoid() }
-    return resolve(l.s, (*decl).ret)
+    return -1
 }
 
 /// The type of a field access `base.name` (`idx` is the access): `len` of a `str` or slice is
@@ -257,15 +339,38 @@ fn fieldType(l: *Lowerer, idx: i32) -> i32 {
     return fieldTypeOf(l, base, name)
 }
 
+/// True for an expression that names a place: a variable, a dereference, or a field or element of
+/// one. A slice of a place is writable when its element type allows it.
+fn isPlace(l: *Lowerer, idx: i32) -> bool {
+    local e = l.s.exprAt(idx)
+    if (*e).kind == XE_NAME || (*e).kind == XE_UNARY && (*e).unaryOp == XU_DEREF { return true }
+    if (*e).kind == XE_FIELD || (*e).kind == XE_INDEX { return isPlace(l, (*e).lhs) }
+    return false
+}
+
+/// The type of a slice `base[lo..hi]` (the C++ `indexExpr` rules): `str` for a `str` or an array
+/// of bytes; otherwise `[]T` over the element type of an array or slice, writable when the base is
+/// a place. -1 when the base type is not known.
+fn sliceType(l: *Lowerer, idx: i32) -> i32 {
+    local e = l.s.exprAt(idx)
+    local bt = exprType(l, (*e).lhs)
+    if bt < 0 { return -1 }
+    local b = l.s.types.get(bt)
+    if b.kind == T_STR { return l.s.types.makeStr() }
+    if b.kind == T_ARRAY {
+        local elem = l.s.types.get(b.elem)
+        if elem.kind == T_INT && elem.bits == 8 { return l.s.types.makeStr() }
+        return l.s.types.makeSlice(b.elem, isPlace(l, (*e).lhs))
+    }
+    if b.kind == T_SLICE {
+        return l.s.types.makeSlice(b.elem, b.isMutable != 0 && isPlace(l, (*e).lhs))
+    }
+    return -1
+}
+
 /// The declaration of the struct or class `ty` (a Types index), nil when it is none.
-fn aggregateDecl(l: *Lowerer, ty: i32) -> *SDecl {
-    if ty < 0 { return nil }
-    local rec = l.s.types.get(ty)
-    if rec.kind != T_STRUCT && rec.kind != T_CLASS { return nil }
-    local path = l.s.types.pathOf(rec)
-    local ref = lookupEntity(l.s, path.asStr())
-    if ref.sym < 0 { return nil }
-    local d = l.s.declOfItem(l.s.itemOf(ref.sym))
+export fn aggregateDecl(l: *Lowerer, ty: i32) -> *SDecl {
+    local d = classDeclIndex(l.s, ty)
     if d < 0 { return nil }
     return l.s.declAt(d as usize)
 }

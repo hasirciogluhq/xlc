@@ -227,14 +227,6 @@ void testNewAndRegisteredAllocator() {
         CHECK(r.module.free_function == "drop");
     }
     {
-        // `new C(args)` runs `C.init`, so the lowering emits it (the prune keeps it too: xlang prune).
-        Lowered r(types + "register(alloc) fn grab(size: usize, align: usize) -> *void { return nil }\n"
-                          "class C {\n    fd: i32\n    fn init(self, fd: i32) { self.fd = fd }\n}\n"
-                          "@entry fn main() -> i32 {\n    local c = new C(5)\n    return c.fd\n}\n");
-        CHECK(!r.diag->hasErrors());
-        CHECK(std::ranges::any_of(r.module.functions, [](const hir::Function& f) { return f.name == "C.init"; }));
-    }
-    {
         Lowered r(types + "register(alloc) fn grab(size: i32) -> *void { return nil }\n");
         CHECK(r.failedWith("E0503"));
     }

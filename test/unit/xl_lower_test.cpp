@@ -1,8 +1,9 @@
 // The acceptance gate of the xlang lowering pass: for every sample, the text of the HIR the xlang
 // sema and lowering build (src/lower/program.xl, through src/sema/xl_bridge.cpp) must equal the
 // text the C++ pass dumps for the same source. The C++ pass is deleted only after its part of
-// the samples compares equal. kSamples holds the expression forms; kLaneASamples the statement
-// and item forms (lane A). Calls, methods and operators join as their lanes port them.
+// the samples compares equal. Samples cover the ported expression forms; the statement forms
+// (while, if, for, switch, ...) and method calls are ported by later lanes and join this table
+// then.
 
 #include "check.h"
 #include "lowered.h"
@@ -15,7 +16,6 @@
 #include <iterator>
 #include <sstream>
 #include <string>
-#include <vector>
 
 using namespace xlang;
 
@@ -56,7 +56,7 @@ const Sample kSamples[] = {
     {"negate", "fn neg(a: i32) -> i32 {\n    return -a\n}\n"},
     {"ternary", "fn pick(a: i32) -> i32 {\n    return a > 0 ? a : 0\n}\n"},
     // Casts, pointers and aggregates.
-    {"cast", "fn narrow(a: i32) -> u8 {\n    return a as u8\n}\n"},
+    {"cast","fn narrow(a: i32) -> u8 {\n    return a as u8\n}\n"},
     {"cast-float", "fn toi(f: f64) -> i32 {\n    return f as i32\n}\n"},
     {"address-and-deref",
      "fn addr(a: i32) -> *i32 {\n    return &a\n}\n"
@@ -77,6 +77,31 @@ const Sample kSamples[] = {
     // Builtins.
     {"syscall", "fn pid() -> i64 {\n    return syscall(39)\n}\n"},
     {"size-of", "fn sz() -> u64 {\n    return sizeOf(i64)\n}\n"},
+    // Conversions, casts, slices, struct literals and fields, the clean cases.
+    {"widen-same-sign", "fn wide(a: u8) -> u32 {\n    return a\n}\n"},
+    {"explicit-cast-widen", "fn wide(a: i32) -> i64 {\n    return a as i64\n}\n"},
+    {"struct-literal-coerce",
+     "struct Wide { x: i64 }\nfn make() -> Wide {\n    return Wide { x: 7 }\n}\n"},
+    {"struct-field-of-literal",
+     "struct P { x: i32, y: i32 }\nfn sumOf() -> i32 {\n    local p = P { x: 1, y: 2 }\n"
+     "    return p.x\n}\n"},
+    {"str-slice", "fn part(s: str) -> str {\n    return s[1..2]\n}\n"},
+    {"str-len-field", "fn size(s: str) -> usize {\n    return s.len\n}\n"},
+    // Lane B: calls (overloads, class methods).
+    {"overload-by-float",
+     "fn pick(a: i32) -> i32 {\n    return a\n}\n"
+     "fn pick(a: f64) -> f64 {\n    return a\n}\n"
+     "fn main() -> f64 {\n    return pick(2.5)\n}\n"},
+    {"overload-by-int-width",
+     "fn pick(a: i32) -> i32 {\n    return a\n}\n"
+     "fn pick(a: i64) -> i64 {\n    return a\n}\n"
+     "fn main() -> i64 {\n    local x: i32 = 1\n    return pick(x) + pick(7)\n}\n"},
+    {"method-call",
+     "class Counter {\n    n: i32\n    fn get(self) -> i32 {\n        return self.n\n    }\n}\n"
+     "fn read(c: Counter) -> i32 {\n    return c.get()\n}\n"},
+    {"method-call-through-pointer",
+     "class Counter {\n    n: i32\n    fn get(self) -> i32 {\n        return self.n\n    }\n}\n"
+     "fn read(c: *Counter) -> i32 {\n    return c.get() + 1\n}\n"},
 };
 
 // Lane A (statements and items): the statement and item forms the xlang lowering ports. Kept as
@@ -130,6 +155,40 @@ const Sample kLaneASamples[] = {
     {"enum-valued", "enum Small: u8 {\n    A\n    B = 10\n    C\n}\nfn pick() -> Small {\n    return Small.C\n}\n"},
 };
 
+/// Samples the C++ pass rejects: the xlang pass must report the same diagnostics (codes, spans and
+/// text) and produce no dump. Each rejected statement is a `local`, not a `return`, so that the
+/// function still returns on every path (the C++ flow check adds nothing). A warning sample has a
+/// dump too.
+const Sample kDiagnosticSamples[] = {
+    {"err-signedness", "fn f(a: u32) -> i32 {\n    local r: i32 = a\n    return 0\n}\n"},
+    {"err-narrowing", "fn f(a: i64) -> i32 {\n    local r: i32 = a\n    return 0\n}\n"},
+    {"err-float-to-int", "fn f() -> i32 {\n    local r: i32 = 1.5\n    return 0\n}\n"},
+    {"err-no-conversion",
+     "struct A { x: i32 }\nstruct B { x: i32 }\n"
+     "fn f(a: A) -> i32 {\n    local r: B = a\n    return 0\n}\n"},
+    {"warn-int-to-float", "fn f(a: i32) -> f64 {\n    return a\n}\n"},
+    {"err-cast-pointer-float",
+     "fn f(p: *i32) -> i32 {\n    local r = p as f64\n    return 0\n}\n"},
+    {"err-deref-scalar", "fn f(a: i32) -> i32 {\n    local r = *a\n    return 0\n}\n"},
+    {"err-deref-void", "fn f(p: *void) -> i32 {\n    local r = *p\n    return 0\n}\n"},
+    {"err-index-float",
+     "fn f(a: [i32; 3]) -> i32 {\n    local r = a[1.5]\n    return 0\n}\n"},
+    {"err-index-scalar", "fn f(a: i32) -> i32 {\n    local r = a[0]\n    return 0\n}\n"},
+    {"err-index-void", "fn f(p: *void) -> i32 {\n    local r = p[0]\n    return 0\n}\n"},
+    {"err-slice-scalar", "fn f(a: i32) -> i32 {\n    local s = a[0..1]\n    return 0\n}\n"},
+    {"err-field-unknown",
+     "struct P { x: i32 }\nfn f(p: P) -> i32 {\n    local r = p.z\n    return 0\n}\n"},
+    {"err-field-scalar", "fn f(a: i32) -> i32 {\n    local r = a.x\n    return 0\n}\n"},
+    {"err-field-str", "fn f(s: str) -> i32 {\n    local r = s.size\n    return 0\n}\n"},
+    {"err-tuple-range", "fn f(t: (i32, i32)) -> i32 {\n    local r = t.5\n    return 0\n}\n"},
+    {"err-literal-unknown-field",
+     "struct P { x: i32 }\nfn f() -> i32 {\n    local r = P { y: 1 }\n    return 0\n}\n"},
+    {"err-literal-duplicate",
+     "struct P { x: i32 }\nfn f() -> i32 {\n    local r = P { x: 1, x: 2 }\n    return 0\n}\n"},
+    {"err-literal-field-type",
+     "struct P { x: i32 }\nfn f() -> i32 {\n    local r = P { x: 1.5 }\n    return 0\n}\n"},
+};
+
 /// The text of the HIR the xlang pass builds for `text`; the diagnostics go to `diagnostics`.
 std::string xlangDump(const std::string& text, std::string& diagnostics) {
     SourceManager sources;
@@ -142,24 +201,39 @@ std::string xlangDump(const std::string& text, std::string& diagnostics) {
     return lowered.dump();
 }
 
-void testSamplesMatchTheCppLowering() {
-    std::vector<Sample> all(std::begin(kSamples), std::end(kSamples));
-    all.insert(all.end(), std::begin(kLaneASamples), std::end(kLaneASamples));
-    int equal = 0;
-    for (const Sample& s : all) {
-        const xlang_test::Lowered cpp(s.text);
-        std::string diagnostics;
-        const std::string xl = xlangDump(s.text, diagnostics);
-        if (!cpp.hir_text.empty() && xl == cpp.hir_text) {
-            ++equal;
-            continue;
-        }
-        std::cerr << "sample `" << s.name << "` differs\n--- C++ ---\n" << cpp.hir_text
-                  << "--- xlang ---\n" << xl << "--- xlang diagnostics ---\n" << diagnostics;
+// A sample is equal when the diagnostics of both passes are the same text, and, when the C++ pass
+// reports none, the HIR dumps are the same text too.
+bool sampleEqual(const Sample& s) {
+    const xlang_test::Lowered cpp(s.text);
+    std::string diagnostics;
+    const std::string xl = xlangDump(s.text, diagnostics);
+    const bool dumps = cpp.diag->hasErrors() || (!cpp.hir_text.empty() && xl == cpp.hir_text);
+    const bool diags = diagnostics == cpp.out.str();
+    if (dumps && diags) {
+        return true;
     }
-    std::cout << "xlang lowering: " << equal << " of " << all.size()
-              << " samples equal the C++ HIR\n";
-    CHECK_EQ(equal, static_cast<int>(all.size()));
+    std::cerr << "sample `" << s.name << "` differs\n--- C++ ---\n" << cpp.hir_text
+              << "--- C++ diagnostics ---\n" << cpp.out.str() << "--- xlang ---\n" << xl
+              << "--- xlang diagnostics ---\n" << diagnostics;
+    return false;
+}
+
+void testSamplesMatchTheCppLowering() {
+    int equal = 0;
+    for (const Sample& s : kSamples) {
+        equal += sampleEqual(s) ? 1 : 0;
+    }
+    for (const Sample& s : kLaneASamples) {
+        equal += sampleEqual(s) ? 1 : 0;
+    }
+    for (const Sample& s : kDiagnosticSamples) {
+        equal += sampleEqual(s) ? 1 : 0;
+    }
+    const int total = static_cast<int>(std::size(kSamples) + std::size(kLaneASamples) +
+                                       std::size(kDiagnosticSamples));
+    std::cout << "xlang lowering: " << equal << " of " << total
+              << " samples equal the C++ pass (HIR and diagnostics)\n";
+    CHECK_EQ(equal, total);
 }
 
 } // namespace

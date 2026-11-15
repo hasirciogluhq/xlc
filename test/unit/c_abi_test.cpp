@@ -3,8 +3,7 @@
 #include "lowered.h"
 
 // The C calling convention of `export(c)` and `declare` functions (src/codegen/llvm/c_abi/): the
-// LLVM signature each target's classifier picks and the diagnostics around it. The pruning of
-// `export(c)` functions is the xlang prune (src/hir/prune.xl), not covered here.
+// LLVM signature each target's classifier picks and the diagnostics around it.
 
 namespace {
 

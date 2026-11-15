@@ -7,15 +7,14 @@ export fn baseInitKey(s: *Sema, cls: str) -> String {
     return format("{}.init$base", s.qualify(cls).asStr())
 }
 
-/// The key of an overload: the qualified name with the parameter types appended, the form the
-/// C++ pass writes (`name(type, type)`).
+/// The key of an overload: the qualified name with each parameter's mangled type appended after a
+/// `$`, the form the C++ pass writes (`name$i32$f64`). `params` holds the mangled types
+/// (`mangledParams` in overload.xl, `paramTypes` in items.xl).
 export fn overloadKey(qname: str, params: Vec<String>) -> String {
     local out = String(qname)
-    out.push(b'(')
     for i in 0..params.length() {
-        if i > 0 { out.append(", ") }
+        out.push(b'$')
         out.append((*params.get(i)).asStr())
     }
-    out.push(b')')
     return out
 }

@@ -1,0 +1,248 @@
+// Conversions, casts, dereferences, indexing, slicing and field access of the xlang lowering pass,
+// with the diagnostics the C++ expression lowering reports for them (src/sema/lower/expr/convert.cpp,
+// arith.cpp, index.cpp, field.cpp, literal.cpp), the same codes, spans and text.
+//
+// Each check reports at the span of the expression it judges and returns false when it reported,
+// so the caller leaves the expression out (the C++ returns nullptr). A check that needs a feature
+// the xlang pass does not have yet (an operator function, an interface value, an unsafe block, an
+// inherited field) returns true and reports nothing: those forms are not checked here.
+from "std" import String, format
+from "../lang/ast/ast" import XExpr, XSpan
+from "../sema/types" import Types, T_VOID, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ARRAY,
+    T_ENUM, T_STRUCT, T_CLASS, T_INTERFACE, T_STR, T_SLICE, T_TUPLE
+from "../sema/conversion" import implicitConversion, C_OK, C_WARN, C_SIGNEDNESS, C_NEEDS_CAST
+from "./state" import Lowerer
+from "./typing" import exprType, typeNameOf, fieldPos, aggregateDecl
+
+/// The spelling of a type, as the diagnostics quote it (the C++ `typeToString`).
+fn tname(l: *Lowerer, t: i32) -> String {
+    return l.s.types.text(t)
+}
+
+/// `castable` of the C++ `Lowerer::castable`: whether `src as to` is an explicit conversion. An
+/// enum converts as its underlying type; a scalar converts to a scalar, a pointer or function
+/// pointer to one of those, and an integer to or from an address. A negative type is unknown.
+export fn castable(t: *Types, src: i32, to: i32) -> bool {
+    if src < 0 || to < 0 || t.same(src, to) { return true }
+    local f = t.get(src)
+    local g = t.get(to)
+    if f.kind == T_ENUM && f.elem >= 0 { return castable(t, f.elem, to) }
+    if g.kind == T_ENUM && g.elem >= 0 { return castable(t, src, g.elem) }
+    local fs = f.kind == T_INT || f.kind == T_FLOAT || f.kind == T_BOOL
+    local gs = g.kind == T_INT || g.kind == T_FLOAT || g.kind == T_BOOL
+    local fa = f.kind == T_POINTER || f.kind == T_FN_PTR
+    local ga = g.kind == T_POINTER || g.kind == T_FN_PTR
+    if fs && gs { return true }
+    if fa && ga { return true }
+    return (fa && g.kind == T_INT) || (f.kind == T_INT && ga)
+}
+
+/// `src as to` at the cast expression `idx`: E0709 when no explicit conversion exists.
+export fn checkCast(l: *Lowerer, idx: i32, src: i32, to: i32) -> bool {
+    if castable(l.s.types, src, to) { return true }
+    local a = tname(l, src)
+    local b = tname(l, to)
+    local msg = format("cannot cast `{}` to `{}`", a.asStr(), b.asStr())
+    l.err("E0709", (*l.s.exprAt(idx)).span, msg.asStr(), "no explicit conversion exists")
+    return false
+}
+
+/// A `[]mut T` value used as `[]T` degrades with no code: the two have one layout, so the
+/// conversion is no conversion at all (the C++ `coerce` retypes the value).
+fn degradesSlice(t: *Types, src: i32, to: i32) -> bool {
+    local f = t.get(src)
+    local g = t.get(to)
+    return f.kind == T_SLICE && g.kind == T_SLICE && f.isMutable != 0 && g.isMutable == 0 &&
+        t.same(f.elem, g.elem)
+}
+
+/// The implicit conversion of `value`, lowered from the expression `idx` whose type is `src`, to
+/// the known type `want`: the rules of `implicitConversion`, with the diagnostics of the C++
+/// `coerce`. Returns the converted value, or -1 after an error. A signed integer to a float is
+/// W0601 and converts; a conversion that needs `as` is E0708, a signedness change E0601.
+/// `unsafe` is not tracked yet, so a signedness change is always an error here.
+export fn coerceChecked(l: *Lowerer, idx: i32, value: i32, src: i32, want: i32) -> i32 {
+    // Interface boxing is not ported: the value is left as it is.
+    if l.s.types.get(want).kind == T_INTERFACE || degradesSlice(l.s.types, src, want) {
+        return value
+    }
+    local r = implicitConversion(l.s.types, src, want, false, l.s.pointerBits)
+    local at = (*l.s.exprAt(idx)).span
+    local a = tname(l, src)
+    local b = tname(l, want)
+    switch {
+        case r.status == C_OK {
+            return l.b.cast(value, typeNameOf(l, want), true)
+        }
+        case r.status == C_WARN {
+            local msg = format("`{}` is implicitly converted to `{}`, precision may be lost",
+                a.asStr(), b.asStr())
+            l.s.diag.warning("W0601", l.s.span(at), msg.asStr(), "write `as` to silence")
+            return l.b.cast(value, typeNameOf(l, want), true)
+        }
+        case r.status == C_SIGNEDNESS {
+            local msg = format("implicit conversion from `{}` to `{}` changes signedness",
+                a.asStr(), b.asStr())
+            l.err("E0601", at, msg.asStr(), "write `as`, or use `unsafe { }`")
+            return -1
+        }
+        case r.status == C_NEEDS_CAST {
+            local msg = format("expected `{}`, found `{}`", b.asStr(), a.asStr())
+            if r.note.len > 0 {
+                l.err("E0708", at, msg.asStr(), r.note)
+            } else {
+                l.err("E0708", at, msg.asStr(), "an explicit `as` is required")
+            }
+            return -1
+        }
+        default {
+            local msg = format("expected `{}`, found `{}`", b.asStr(), a.asStr())
+            l.err("E0708", at, msg.asStr(), "no conversion exists")
+            return -1
+        }
+    }
+    return -1
+}
+
+/// The type `typeNameOf` names, for the checks below: -1 when the type is not known yet.
+fn kindOf(t: *Types, idx: i32) -> i32 {
+    return idx < 0 ? -1 : t.get(idx).kind
+}
+
+/// `base[index]` (the expression `e`, a plain index; `operator[]` is not checked here): an index
+/// is an integer (E0708), and only `str`, slices, arrays and pointers are indexed (E0709). An
+/// index through `*void` is refused. True when the access may be built.
+export fn checkIndex(l: *Lowerer, e: *XExpr) -> bool {
+    local bt = exprType(l, (*e).lhs)
+    local it = exprType(l, (*e).rhs)
+    local bk = kindOf(l.s.types, bt)
+    if bk < 0 || bk == T_STRUCT || bk == T_CLASS { return true }
+    if it >= 0 && l.s.types.get(it).kind != T_INT {
+        local a = tname(l, it)
+        local msg = format("index must be an integer, found `{}`", a.asStr())
+        l.err("E0708", (*l.s.exprAt((*e).rhs)).span, msg.asStr(), "integer expected")
+        return false
+    }
+    if bk == T_STR || bk == T_SLICE || bk == T_ARRAY { return true }
+    if bk != T_POINTER {
+        local a = tname(l, bt)
+        local msg = format("`{}` cannot be indexed", a.asStr())
+        l.err("E0709", (*e).span, msg.asStr(), "only arrays and pointers can be indexed")
+        return false
+    }
+    local elem = l.s.types.get(bt).elem
+    if elem >= 0 && kindOf(l.s.types, elem) == T_VOID {
+        l.err("E0709", (*e).span, "cannot index `*void`", "cast it to a typed pointer first")
+        return false
+    }
+    return true
+}
+
+/// `base[lo..hi]` (the expression `e`): the base is `str`, an array or a slice (E0709 otherwise).
+export fn checkSlice(l: *Lowerer, e: *XExpr) -> bool {
+    local bk = kindOf(l.s.types, exprType(l, (*e).lhs))
+    if bk < 0 || bk == T_STR || bk == T_ARRAY || bk == T_SLICE { return true }
+    local a = tname(l, exprType(l, (*e).lhs))
+    local msg = format("`{}` cannot be sliced", a.asStr())
+    l.err("E0709", (*e).span, msg.asStr(), "only `str`, arrays and slices can be sliced")
+    return false
+}
+
+/// `*p` (the unary expression `e`): the operand is a pointer (E0709 otherwise), and not `*void`.
+/// A struct or class operand is `operator*`, which is not checked here.
+export fn checkDeref(l: *Lowerer, e: *XExpr) -> bool {
+    local bt = exprType(l, (*e).lhs)
+    local bk = kindOf(l.s.types, bt)
+    if bk < 0 || bk == T_STRUCT || bk == T_CLASS { return true }
+    if bk != T_POINTER || l.s.types.get(bt).elem < 0 {
+        local a = tname(l, bt)
+        local msg = format("cannot dereference `{}`", a.asStr())
+        l.err("E0709", (*e).span, msg.asStr(), "not a pointer")
+        return false
+    }
+    if kindOf(l.s.types, l.s.types.get(bt).elem) == T_VOID {
+        l.err("E0709", (*e).span, "cannot dereference `*void`", "cast it to a typed pointer first")
+        return false
+    }
+    return true
+}
+
+/// `base.name` (the field expression `idx`, with `e` its node): a field of `str` or a slice is
+/// `ptr` or `len`; a field of a struct or class is declared by it; a tuple element index is below
+/// the element count. Anything else has no field (E0709). Pointers are read through. The length
+/// of an array is not checked here (its constant is not folded yet), and a class with a base
+/// class is not checked (its fields may be inherited).
+export fn checkField(l: *Lowerer, idx: i32, e: *XExpr) -> bool {
+    local bt = exprType(l, (*e).lhs)
+    local bk = kindOf(l.s.types, bt)
+    if bk < 0 { return true }
+    local agg = bt
+    if bk == T_POINTER {
+        agg = l.s.types.get(bt).elem
+        if agg < 0 { return true }
+    }
+    local ak = kindOf(l.s.types, agg)
+    local name = l.s.exprTextAt(idx)
+    if ak == T_STR || ak == T_SLICE {
+        if name == "ptr" || name == "len" { return true }
+        local a = tname(l, agg)
+        local msg = format("`{}` has no field `{}`", a.asStr(), name)
+        l.err("E0709", (*e).span, msg.asStr(), "the fields are `ptr` and `len`")
+        return false
+    }
+    if ak == T_ARRAY { return true }
+    if ak == T_TUPLE {
+        local count = l.s.types.get(agg).argsCount
+        if (*e).intValue < (count as u64) { return true }
+        local a = tname(l, agg)
+        local msg = format("`{}` has {} element(s), so `.{}` is out of range", a.asStr(), count,
+            (*e).intValue)
+        l.err("E0709", (*e).span, msg.asStr(), "write an element index below the element count")
+        return false
+    }
+    if ak != T_STRUCT && ak != T_CLASS {
+        local a = tname(l, bt)
+        local msg = format("`{}` has no field `{}`", a.asStr(), name)
+        l.err("E0709", (*e).span, msg.asStr(), "only structs, classes and tuples have fields")
+        return false
+    }
+    return knownField(l, agg, name, (*e).span)
+}
+
+/// `name` is a field of the struct or class `agg`, or cannot be checked (the declaration is not
+/// found, or a base class may supply it); otherwise E0709 "unknown field" at `at`.
+export fn knownField(l: *Lowerer, agg: i32, name: str, at: XSpan) -> bool {
+    local decl = aggregateDecl(l, agg)
+    if decl == nil || (*decl).baseHas != 0 || fieldPos(l, agg, name) >= 0 { return true }
+    local a = tname(l, agg)
+    local msg = format("`{}` has no field `{}`", a.asStr(), name)
+    l.err("E0709", at, msg.asStr(), "unknown field")
+    return false
+}
+
+/// The struct literal `e` of the aggregate `agg`: the type must be a struct or class (E0709).
+/// An unknown type is not checked.
+export fn checkStructLit(l: *Lowerer, e: *XExpr, agg: i32) -> bool {
+    local k = kindOf(l.s.types, agg)
+    if k < 0 || k == T_STRUCT || k == T_CLASS { return true }
+    local a = tname(l, agg)
+    local msg = format("`{}` is not a struct or class", a.asStr())
+    l.err("E0709", (*e).span, msg.asStr(), "cannot build it with `{ ... }`")
+    return false
+}
+
+/// The field initializer `i` of the literal `e` is not the second one of its name (E0709
+/// "initialized twice", reported at the initializer). True when it is the first.
+export fn checkDuplicateInit(l: *Lowerer, e: *XExpr, i: u32) -> bool {
+    local first = (*e).fieldsFirst
+    local name = l.s.flat.strOf((*l.s.flat.initAt((first + i) as i32)).name)
+    for j in 0..(i as usize) {
+        if l.s.flat.strOf((*l.s.flat.initAt((first + (j as u32)) as i32)).name) == name {
+            local f = l.s.flat.initAt((first + i) as i32)
+            local msg = format("field `{}` is initialized twice", name)
+            l.err("E0709", (*f).span, msg.asStr(), "duplicate field")
+            return false
+        }
+    }
+    return true
+}

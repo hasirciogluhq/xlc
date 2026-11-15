@@ -1,0 +1,92 @@
+// Methods of the xlang lowering pass: the declaration of a class or struct type, and the method a
+// call names, searched in the class and then its base classes (C++ `Lowerer::findMethod`). A
+// method is found in one class only; the overloads of that name in that class are its candidates
+// (C++ `methodCandidates`). Virtual methods are found too, so the caller can tell them apart.
+// Only the module's own declarations are searched; a base class of another module is a known gap.
+from "std" import String, Vec
+from "../sema/sema" import Sema
+from "../sema/module_scope" import lookupEntity
+from "../sema/item" import SDecl
+from "../sema/types" import T_CLASS, T_STRUCT
+
+/// The SDecl index of the class or struct `ty` (a Types index), -1 when it has none here.
+export fn classDeclIndex(s: *Sema, ty: i32) -> i32 {
+    if ty < 0 { return -1 }
+    local rec = s.types.get(ty)
+    if rec.kind != T_STRUCT && rec.kind != T_CLASS { return -1 }
+    local ref = lookupEntity(s, s.types.pathOf(rec).asStr())
+    if ref.sym < 0 { return -1 }
+    return s.declOfItem(s.itemOf(ref.sym))
+}
+
+/// The SDecl index of the base class of the declaration `d`, -1 when it has no base or the base
+/// is not declared here. The base is written as a path in the flat AST, as `lowerAggregate`
+/// reads it.
+export fn baseDeclIndex(s: *Sema, d: i32) -> i32 {
+    local decl = s.declAt(d as usize)
+    if (*decl).baseCount == 0 { return -1 }
+    local ref = lookupEntity(s, s.text(s.flat.pathSeg((*decl).baseFirst)))
+    if ref.sym < 0 { return -1 }
+    return s.declOfItem(s.itemOf(ref.sym))
+}
+
+/// The methods of the declaration `d` named `name`, as SDecl indices in declaration order.
+export fn methodsNamed(s: *Sema, d: i32, name: str) -> Vec<i32> {
+    local out = Vec<i32>()
+    local decl = s.declAt(d as usize)
+    for j in 0..(*decl).methodsCount as usize {
+        local mIdx = (*decl).methodsFirst as usize + j
+        if s.text((*s.declAt(mIdx)).name) == name { out.push(mIdx as i32) }
+    }
+    return out
+}
+
+/// A method a call names: `found` is false when no class of the chain declares it.
+/// `decl` is the SDecl index of the method, `cdecl` the SDecl index of the class that declares it,
+/// `cls` the qualified name of that class (the key prefix), `isVirtual` tells a vtable call from a
+/// direct one.
+export class MethodRef {
+    found: bool
+    decl: i32
+    cdecl: i32
+    cls: String
+    isVirtual: bool
+
+    fn init(self) {
+        self.found = false
+        self.decl = -1
+        self.cdecl = -1
+        self.cls = String("")
+        self.isVirtual = false
+    }
+}
+
+/// The method `name` of the class or struct `ty`, searched through its base classes.
+export fn findMethod(s: *Sema, ty: i32, name: str) -> *MethodRef {
+    local out = new MethodRef()
+    local d = classDeclIndex(s, ty)
+    local depth = 0
+    while d >= 0 && depth < 32 {
+        local found = methodsNamed(s, d, name)
+        if found.length() > 0 {
+            local m = *found.get(0)
+            local decl = s.declAt(m as usize)
+            (*out).found = true
+            (*out).decl = m
+            (*out).cdecl = d
+            (*out).cls = s.qualify(s.text((*s.declAt(d as usize)).name))
+            (*out).isVirtual = (*decl).isVirtual != 0 || (*decl).isOverride != 0
+            return out
+        }
+        d = baseDeclIndex(s, d)
+        depth = depth + 1
+    }
+    return out
+}
+
+/// The type of `self` in a method of the class `cls` (its qualified name): a pointer to the class.
+export fn classSelfType(s: *Sema, cls: str) -> i32 {
+    local segs = Vec<String>()
+    segs.push(String(cls))
+    return s.types.makePointer(s.types.makeAggregate(T_CLASS, segs, Vec<i32>()))
+}

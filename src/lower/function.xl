@@ -21,8 +21,13 @@ from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
 from "./builder" import FnBuild
+from "./call" import lowerCall
+from "./methods" import classSelfType
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
-    effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf
+    effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
+    fieldTypeOf
+from "./diagnose" import coerceChecked, checkCast, checkIndex, checkSlice, checkDeref, checkField,
+    checkStructLit, checkDuplicateInit, knownField
 from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOfName
@@ -142,7 +147,7 @@ export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: 
             local e = new ScopeEntry()
             (*e).kind = SE_LOCAL
             (*e).name = String("self")
-            (*e).ty = -1
+            (*e).ty = classSelfType(l.s, owner)
             (*e).localId = id
             l.scopes.declare(e)
         }
@@ -398,6 +403,7 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
             // A negative literal takes the context type; the other operators do not pass it on.
             local lhs = lowerExprWant(l, (*e).lhs, (*e).unaryOp == XU_NEG ? want : -1)
             if (*e).unaryOp == XU_DEREF {
+                if !checkDeref(l, e) { return -1 }
                 return l.b.deref(lhs, exprTypeName(l, idx))
             }
             if (*e).unaryOp == XU_ADDROF {
@@ -407,6 +413,8 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
         if (*e).kind == XE_CAST {
             local value = lowerExpr(l, (*e).lhs)
+            local to = resolve(l.s, l.s.types.internAst((*e).typeIdx))
+            if !checkCast(l, idx, exprType(l, (*e).lhs), to) { return -1 }
             return l.b.cast(value, exprTypeName(l, idx), false)
         }
         if (*e).kind == XE_FIELD {
@@ -423,6 +431,7 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
             local base = lowerExpr(l, (*e).lhs)
             // A field of a pointer is read through it (`field.ptr`); the index is the field's
             // position in its aggregate.
+            if !checkField(l, idx, e) { return -1 }
             local bt = exprType(l, (*e).lhs)
             local viaPointer = bt >= 0 && l.s.types.get(bt).kind == T_POINTER
             local owner = resolveBase(l, bt)
@@ -434,12 +443,17 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
         if (*e).kind == XE_SLICE {
             local base = lowerExpr(l, (*e).lhs)
+            if !checkSlice(l, e) { return -1 }
+            // The bounds are `usize`, as the C++ slice lowering converts them.
+            local bounds = l.s.types.makeInt(0, false)
             local lo = -1
             if (*e).argsCount > 0 {
-                lo = lowerExpr(l, l.s.refAt("expr", (*e).argsFirst as i32))
+                lo = lowerExprAs(l, l.s.refAt("expr", (*e).argsFirst as i32), bounds)
             }
-            local hi = lowerExpr(l, (*e).rhs)
-            return l.b.slice(base, lo, hi, "")
+            local hi = lowerExprAs(l, (*e).rhs, bounds)
+            local sl = l.b.slice(base, lo, hi, exprTypeName(l, idx))
+            if l.checkedSafety { (*l.b.exprAt(sl)).checked = 1 }
+            return sl
         }
         if (*e).kind == XE_ARRAY_LIST || (*e).kind == XE_TUPLE_LITERAL {
             local items = lowerArgList(l, e)
@@ -477,6 +491,7 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
 export fn lowerIndex(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
         local base = lowerExpr(l, (*e).lhs)
         local sub = lowerExpr(l, (*e).rhs)
+        if !checkIndex(l, e) { return -1 }
         local at = l.b.index(base, sub, exprTypeName(l, idx))
         local bt = exprType(l, (*e).lhs)
         local bk = bt < 0 ? -1 : l.s.types.get(bt).kind
@@ -493,11 +508,7 @@ export fn coerceTo(l: *Lowerer, idx: i32, value: i32, want: i32) -> i32 {
         if want < 0 || value < 0 { return value }
         local vt = effectiveType(l, idx, want)
         if vt < 0 || l.s.types.same(vt, want) { return value }
-        local r = implicitConversion(l.s.types, vt, want, false, l.s.pointerBits)
-        if r.status == C_OK || r.status == C_WARN {
-            return l.b.cast(value, typeNameOf(l, want), true)
-        }
-        return value
+        return coerceChecked(l, idx, value, vt, want)
     }
 
     /// A binary operation, as the C++ `binaryExpr`: a literal operand takes the type of the other
@@ -588,83 +599,6 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
         l.err("E0706", (*l.s.exprAt(idx)).span,
             format("`{}` has no lowered form here", name).asStr(), "not a value")
         return -1
-    }
-
-    /// A call: the callee name, the arguments in order.
-    /// The declared type of parameter `i` (self excluded) of the function `entry` names, when the
-    /// name has exactly one declaration; -1 otherwise.
-export fn calleeParamType(l: *Lowerer, entry: *ScopeEntry, i: u32) -> i32 {
-        if entry == nil || (*entry).kind != SE_FUNCTION || (*entry).overloads.length() != 1 {
-            return -1
-        }
-        local d = l.s.declOfItem(*(*entry).overloads.get(0))
-        if d < 0 { return -1 }
-        local decl = l.s.declAt(d as usize)
-        local k: u32 = 0
-        for j in 0..(*decl).paramsCount as usize {
-            local p = l.s.paramAt((*decl).paramsFirst as usize + j)
-            if (*p).isSelf != 0 { continue }
-            if k == i { return resolve(l.s, (*p).ty) }
-            k = k + 1
-        }
-        return -1
-    }
-
-export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
-        local e = l.s.exprAt(idx)
-        // The layout queries fold to constants here: the HIR has no sizeof form.
-        local calleeText = l.s.exprTextAt((*e).lhs)
-        if calleeText == "sizeOf" || calleeText == "alignOf" || calleeText == "offsetOf" {
-            return lowerLayoutQuery(l, idx, e, calleeText)
-        }
-        // `syscall(nr, args...)` is the HIR syscall form, not a call.
-        if calleeText == "syscall" {
-            local sysArgs = Vec<i32>()
-            for i in 0..(*e).argsCount as usize {
-                sysArgs.push(lowerExpr(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)))
-            }
-            local sysRange = l.b.args(sysArgs)
-            return l.b.syscallExpr(sysRange.0, sysRange.1, exprTypeName(l, idx))
-        }
-        // A plain function name with one declaration: each argument converts to its parameter.
-        local direct = l.s.exprAt((*e).lhs)
-        local callee = (*direct).kind == XE_NAME ? l.lookupName(l.s.exprTextAt((*e).lhs)) : nil
-        local args = Vec<i32>()
-        local count = (*e).argsCount
-        for i in 0..count as usize {
-            local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
-            local v = lowerExprAs(l, a, calleeParamType(l, callee, i as u32))
-            if v < 0 { return -1 }
-            args.push(v)
-        }
-        local range = l.b.args(args.clone())
-        local lhs = l.s.exprAt((*e).lhs)
-        if (*lhs).kind == XE_NAME {
-            local callee = l.s.exprTextAt((*e).lhs)
-            local entry = l.lookupName(callee)
-            if entry != nil && (*entry).kind == SE_FUNCTION {
-                return l.b.call((*entry).qname.asStr(), range.0, range.1, exprTypeName(l,idx))
-            }
-            return l.b.call(callee, range.0, range.1, exprTypeName(l,idx))
-        }
-        if (*lhs).kind == XE_FIELD {
-            // A method call: the receiver becomes the first argument; the qualified name is
-            // filled in when the xl sema assigns per-expression types.
-            local receiver = lowerExpr(l, (*lhs).lhs)
-            if receiver < 0 { return -1 }
-            local method = l.s.exprTextAt((*e).lhs)
-            local withSelf = Vec<i32>()
-            withSelf.push(receiver)
-            for i in 0..args.length() {
-                withSelf.push(*args.get(i))
-            }
-            local full = l.b.args(withSelf)
-            return l.b.call(method, full.0, full.1, exprTypeName(l,idx))
-        }
-        // A call through a value (a function pointer): the callee expression is the operand.
-        local fnValue = lowerExpr(l, (*e).lhs)
-        if fnValue < 0 { return -1 }
-        return l.b.callIndirect(fnValue, range.0, range.1, exprTypeName(l,idx))
     }
 
 /// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)`: folded to an integer constant from the
@@ -1086,25 +1020,45 @@ export fn lowerArgList(l: *Lowerer, e: *XExpr) -> Vec<i32> {
 
 /// A struct literal: the field initializers in source order.
 export fn lowerStructLit(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
-    local tyName = typeNameOf(l, aggregateTypeOf(l, e))
-    local inits = Vec<i32>()
+    local agg = aggregateTypeOf(l, e)
+    if !checkStructLit(l, e, agg) { return -1 }
+    local tyName = typeNameOf(l, agg)
     local first = l.b.fieldInits.length() as u32
-    for i in 0..(*e).fieldsCount as usize {
-        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
-        local v = lowerExpr(l, (*f).value)
-        if v < 0 { continue }
-        local rec: XlcHirFieldInit
-        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
-        rec.value = v
-        l.b.fieldInits.push(rec)
-        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, l.s.flat.strOf((*f).name),
-            fieldIndexOf(l, aggregateTypeOf(l, e), l.s.flat.strOf((*f).name)))
-    }
+    lowerFieldInits(l, e, agg)
     local at = l.b.expr(E_STRUCT_LIT, tyName)
     local p = l.b.exprAt(at)
     (*p).fieldFirst = first
     (*p).fieldCount = l.b.fieldInits.length() as u32 - first
     return at
+}
+
+/// The field initializers of a struct literal or `new T { ... }` of the aggregate `agg`, in source
+/// order (the C++ `lowerFields`): an unknown field is E0709 and its value is still lowered for its
+/// own errors; a repeated field is E0709 and dropped; every other value is converted to the
+/// declared type of its field.
+fn lowerFieldInits(l: *Lowerer, e: *XExpr, agg: i32) {
+    for i in 0..(*e).fieldsCount as usize {
+        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
+        local name = l.s.flat.strOf((*f).name)
+        if !knownField(l, agg, name, (*f).span) {
+            lowerExpr(l, (*f).value)
+            continue
+        }
+        if !checkDuplicateInit(l, e, i as u32) { continue }
+        local ft = fieldTypeOf(l, agg, name)
+        local v = -1
+        if ft >= 0 {
+            v = lowerExprAs(l, (*f).value, ft)
+        } else {
+            v = lowerExpr(l, (*f).value)
+        }
+        if v < 0 { continue }
+        local rec: XlcHirFieldInit
+        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
+        rec.value = v
+        l.b.fieldInits.push(rec)
+        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, name, fieldIndexOf(l, agg, name))
+    }
 }
 
 /// `new T` / `new T { fields }` / `new T(args)`: the allocation, the init call and the fields.
@@ -1123,17 +1077,7 @@ export fn lowerNew(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
     }
     // The field initializers.
     local first = l.b.fieldInits.length() as u32
-    for i in 0..(*e).fieldsCount as usize {
-        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
-        local v = lowerExpr(l, (*f).value)
-        if v < 0 { continue }
-        local rec: XlcHirFieldInit
-        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
-        rec.value = v
-        l.b.fieldInits.push(rec)
-        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, l.s.flat.strOf((*f).name),
-            fieldIndexOf(l, aggregateTypeOf(l, e), l.s.flat.strOf((*f).name)))
-    }
+    lowerFieldInits(l, e, aggregateTypeOf(l, e))
     (*p).fieldFirst = first
     (*p).fieldCount = l.b.fieldInits.length() as u32 - first
     return at
