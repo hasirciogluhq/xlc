@@ -83,3 +83,10 @@ export fn findMethod(s: *Sema, ty: i32, name: str) -> *MethodRef {
     }
     return out
 }
+
+/// The type of `self` in a method of the class `cls` (its qualified name): a pointer to the class.
+export fn classSelfType(s: *Sema, cls: str) -> i32 {
+    local segs = Vec<String>()
+    segs.push(String(cls))
+    return s.types.makePointer(s.types.makeAggregate(T_CLASS, segs, Vec<i32>()))
+}

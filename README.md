@@ -217,8 +217,11 @@ src/sema/        modules, name tables, constant evaluation, layout, lowering to 
                  xl_bridge.cpp/.hpp is the C++ side of the xlang lowering pass
 src/lower/       the xlang lowering pass (flat HIR, written in xlang): program.xl is its entry,
                  typing.xl the per-expression types, function.xl the expression walk,
-                 diagnose.xl the conversion, cast, index, slice, field and literal checks; the
-                 sema it runs is src/sema/*.xl
+                 diagnose.xl the conversion, cast, index, slice, field and literal checks;
+                 call.xl the calls (functions, overloads, methods, function values),
+                 overload.xl the overload keys and the choice among candidates, methods.xl the
+                 class declarations and the method lookup through base classes; the sema it runs
+                 is src/sema/*.xl
 src/hir/         the flat HIR (abi.xl), its reader of the C++ module (flatten.xl), the dump and the
                  reachability prune (prune.xl), all xlang
 src/mir/         HIR -> MIR (control-flow graph per function), written in xlang: builder/,

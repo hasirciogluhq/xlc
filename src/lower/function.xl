@@ -21,6 +21,7 @@ from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
 from "./builder" import FnBuild
 from "./call" import lowerCall
+from "./methods" import classSelfType
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
     fieldTypeOf
@@ -126,7 +127,7 @@ export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: 
             local e = new ScopeEntry()
             (*e).kind = SE_LOCAL
             (*e).name = String("self")
-            (*e).ty = -1
+            (*e).ty = classSelfType(l.s, owner)
             (*e).localId = id
             l.scopes.declare(e)
         }

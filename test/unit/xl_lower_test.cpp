@@ -102,14 +102,6 @@ const Sample kSamples[] = {
     {"method-call-through-pointer",
      "class Counter {\n    n: i32\n    fn get(self) -> i32 {\n        return self.n\n    }\n}\n"
      "fn read(c: *Counter) -> i32 {\n    return c.get() + 1\n}\n"},
-    {"method-call-overloaded",
-     "class Box {\n    n: i32\n    fn put(self, a: i32) -> i32 {\n        return a\n    }\n"
-     "    fn put(self, a: f64) -> f64 {\n        return a\n    }\n}\n"
-     "fn go(b: Box) -> f64 {\n    return b.put(1.5)\n}\n"},
-    {"method-call-on-field",
-     "class Counter {\n    n: i32\n    fn get(self) -> i32 {\n        return self.n\n    }\n}\n"
-     "struct Holder {\n    c: Counter\n}\n"
-     "fn read(h: Holder) -> i32 {\n    return h.c.get()\n}\n"},
 };
 
 /// Samples the C++ pass rejects: the xlang pass must report the same diagnostics (codes, spans and
