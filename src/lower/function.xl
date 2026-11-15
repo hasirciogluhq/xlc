@@ -17,6 +17,7 @@ from "../lang/ast/ast" import XStmt, XExpr, XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF,
     XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
 from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_STR, T_INT, T_BOOL, T_ENUM, T_TUPLE
 from "./stmt" import switchChain
+from "./flow" import checkReachesEnd
 from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
@@ -159,6 +160,7 @@ export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: 
         // The body.
         if (*d).hasBody != 0 && (*d).body >= 0 {
             local body = lowerBlockInto(l, (*d).body)
+            checkReachesEnd(l, d, &body)
             // The `defer` flags are declared before the first statement (C++ function.cpp).
             for i in 0..l.fnFlags.length() {
                 l.fnBody.push(l.b.localStmt(*l.fnFlags.get(i), "", "bool", l.b.boolConst(false, "bool")))

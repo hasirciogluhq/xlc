@@ -28,6 +28,8 @@ passes for each sample. A sample is equal when both agree. The gate count is in 
 - diagnose.xl: conversion, cast, index, slice, field, literal and struct literal checks, and the
   C ABI test `cCompatible`.
 - call.xl, overload.xl, methods.xl: calls, overloads and method lookup.
+- flow.xl: control flow of a body (`terminates`, `breaksOut` over the statement arena) and the
+  E0764 check that runs on it.
 - instances.xl: stubs for generic instances and impls (not ported).
 
 ## Ported and compared
@@ -65,6 +67,7 @@ Items:
   literal (E0715).
 - `export(c)` and `declare` functions and globals: the types must be C-expressible (E0302).
 - Reserved entry symbols `_start`, `mainCRTStartup`, `_xl_initAll` (E0726).
+- E0764: a function with a value, or `-> never`, that can reach the end of its body (flow.xl).
 - Role registrations: each role's signature (E0503) and a role registered twice in one module
   (E0502). The pass runs before the bodies, so the `unwind` function is known to every `try`.
 
@@ -91,7 +94,8 @@ Each item names the reason it is not in the xlang pass yet.
 - Operator functions (expr/operators.cpp): `operator[]`, `operator*`, `operator()`.
 - Packs (`for` over packs, pack calls).
 - `__builtin_` forms (call/builtins.cpp), the atomics, `__builtin_read` and `__builtin_write`.
-- `new` target checks, E0764 (a function that can reach its end), and the prelude form of the
+- E0765 (a `return` in a `-> never` function): the C++ pass reports it next to E0764; not ported.
+- `new` target checks, and the prelude form of the
   ternary (stmt/ternary.cpp: a branch that hoists `?` or `&temp()`; the plain form is ported).
 - E0778 (a `fn(...)` value of a function that passes a struct in the C convention) and E0705 for
   `@mangle` on a function (item/c_abi.cpp). The symbol duplicate check (E0401 on link names) is

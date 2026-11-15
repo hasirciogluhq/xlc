@@ -187,6 +187,14 @@ const Sample kRemainingSamples[] = {
      "fn second(t: (i32, f64)) -> f64 {\n    return t.1\n}\n"
      "fn first(t: (i32, f64)) -> i32 {\n    return t.0\n}\n"},
     {"tuple-field-through-pointer", "fn second(t: *(i32, f64)) -> f64 {\n    return t.1 * 2.0\n}\n"},
+    {"flow-while-true", "fn f() -> i32 {\n    while true {\n        return 1\n    }\n}\n"},
+    {"flow-if-else-returns",
+     "fn f(a: i32) -> i32 {\n    if a > 0 {\n        return 1\n    } else {\n        return 0\n    }\n}\n"},
+    {"flow-while-true-break",
+     "fn f(a: i32) -> i32 {\n    while true {\n        if a > 0 {\n            break\n        }\n"
+     "        return 1\n    }\n    return 2\n}\n"},
+    {"flow-never-call",
+     "fn stop() -> never {\n    while true {\n    }\n}\nfn f() -> i32 {\n    stop()\n}\n"},
     {"switch-values-three",
      "fn f(a: i32) -> i32 {\n    switch a {\n        case 1 {\n            return 10\n        }\n"
      "        case 2, 3 {\n            return 20\n        }\n        default {\n            return 0\n        }\n"
@@ -226,6 +234,10 @@ const Sample kRemainingDiagnostics[] = {
      "fn f(a: i32) -> i32 {\n    switch a {\n        case 1, 2 {\n            return 1\n        }\n"
      "        case 2 {\n            return 2\n        }\n        default {\n            return 0\n        }\n"
      "    }\n}\n"},
+    {"err-reaches-end",
+     "fn f(a: i32) -> i32 {\n    if a > 0 {\n        return 1\n    }\n}\n"},
+    {"err-reaches-end-never",
+     "fn f(a: i32) -> never {\n    if a > 0 {\n        local x = a\n    }\n}\n"},
     {"err-switch-two-defaults",
      "fn f(a: i32) -> i32 {\n    switch a {\n        case 1 {\n            return 1\n        }\n"
      "        default {\n            return 2\n        }\n        default {\n            return 0\n        }\n"

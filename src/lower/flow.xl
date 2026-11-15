@@ -1,0 +1,87 @@
+// Control flow of a lowered body: whether control can fall off its end (E0764). The xlang source
+// of `terminates` and `breaksOut` in sema/lower/lower.hpp, and of the check in
+// sema/lower/item/function.cpp. It reads the statement arena that the builder fills, so it runs
+// on the records of a body, never on the AST.
+from "std" import Vec, format
+from "std/str" import fromParts
+from "../sema/types" import T_VOID, T_NAMED, T_NEVER
+from "../sema/item" import SDecl
+from "../hir/abi" import S_RETURN, S_BLOCK, S_IF, S_TRY, S_WHILE, S_EXPR, S_BREAK, E_ASM, E_BOOL_CONST
+from "./builder" import HirBuilder
+from "./state" import Lowerer
+
+/// E0764: a function that returns a value, or is `-> never`, must not reach the end of its body.
+/// It runs on the lowered body list, before the defer flags and the prologue are added (C++ order).
+export fn checkReachesEnd(l: *Lowerer, d: *SDecl, body: *Vec<i32>) {
+    local kind = l.s.types.get(l.fnRetTy).kind
+    if kind == T_VOID || kind == T_NAMED || listTerminates(l.b, body) { return }
+    local name = l.s.text((*d).name)
+    if kind == T_NEVER {
+        l.err("E0764", (*d).nameSpan,
+            format("`{}` is `-> never` but can reach its end", name).asStr(),
+            "end every path with an endless loop or a `-> never` call")
+    } else {
+        l.err("E0764", (*d).nameSpan,
+            format("`{}` can reach the end without returning a value", name).asStr(),
+            "not every path returns")
+    }
+}
+
+/// True when control cannot fall off the end of the statement list `body` (C++ `terminates`).
+export fn listTerminates(b: *HirBuilder, body: *Vec<i32>) -> bool {
+    for i in 0..body.length() {
+        if stmtTerminates(b, *body.get(i)) { return true }
+    }
+    return false
+}
+
+/// True when the statements `first..first + count` of the arena cannot fall through.
+fn rangeTerminates(b: *HirBuilder, first: u32, count: u32) -> bool {
+    for i in 0..count as usize {
+        if stmtTerminates(b, (first + i as u32) as i32) { return true }
+    }
+    return false
+}
+
+/// One statement cannot fall through: a `return`; a block, `if` or `try` whose every branch cannot
+/// fall through (an `if` or `try` with no else or handler can); an endless `while true` with no
+/// `break` out of it; a `noreturn` asm or a call of type `never`.
+fn stmtTerminates(b: *HirBuilder, idx: i32) -> bool {
+    local st = b.stmtAt(idx)
+    if (*st).kind == S_RETURN { return true }
+    if (*st).kind == S_BLOCK { return rangeTerminates(b, (*st).bodyFirst, (*st).bodyCount) }
+    if (*st).kind == S_IF || (*st).kind == S_TRY {
+        if (*st).elseCount == 0 { return false }
+        return rangeTerminates(b, (*st).bodyFirst, (*st).bodyCount) &&
+            rangeTerminates(b, (*st).elseFirst, (*st).elseCount)
+    }
+    if (*st).kind == S_WHILE {
+        local cond = b.exprAt((*st).value)
+        if (*cond).kind != E_BOOL_CONST || (*cond).boolValue == 0 { return false }
+        return !breaksOut(b, (*st).bodyFirst, (*st).bodyCount, 0)
+    }
+    if (*st).kind == S_EXPR {
+        local v = b.exprAt((*st).value)
+        if (*v).kind == E_ASM && (*v).noreturn != 0 { return true }
+        return fromParts((*v).typeName.bytes, (*v).typeName.len as usize) == "never"
+    }
+    return false
+}
+
+/// True when the statements `first..first + count` hold a `break` that leaves the loop at nesting
+/// `level` (C++ `breaksOut`). A nested `while` raises the level: its own `break`s stay inside it.
+fn breaksOut(b: *HirBuilder, first: u32, count: u32, level: u32) -> bool {
+    for i in 0..count as usize {
+        local st = b.stmtAt((first + i as u32) as i32)
+        if (*st).kind == S_BREAK && (*st).depth == level { return true }
+        if (*st).kind == S_IF || (*st).kind == S_TRY {
+            if breaksOut(b, (*st).bodyFirst, (*st).bodyCount, level) ||
+                breaksOut(b, (*st).elseFirst, (*st).elseCount, level) { return true }
+        } else if (*st).kind == S_BLOCK {
+            if breaksOut(b, (*st).bodyFirst, (*st).bodyCount, level) { return true }
+        } else if (*st).kind == S_WHILE {
+            if breaksOut(b, (*st).bodyFirst, (*st).bodyCount, level + 1) { return true }
+        }
+    }
+    return false
+}
