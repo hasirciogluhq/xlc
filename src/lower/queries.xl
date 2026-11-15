@@ -9,6 +9,21 @@ from "../sema/item" import SDecl
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOfName
 from "./state" import Lowerer
+from "./typing" import arrayLength, hasSideEffects
+
+/// `base.len` of an array of type `arr` (C++ fieldExpr): the constant length as `usize`. The array
+/// is not evaluated, so a base that calls or allocates is E0709. An array whose length is not a
+/// constant gives -1 here, with nothing reported.
+export fn lowerArrayLen(l: *Lowerer, e: *XExpr, arr: i32) -> i32 {
+    local n = arrayLength(l, arr)
+    if n < 0 { return -1 }
+    if hasSideEffects(l, (*e).lhs) {
+        local label = format("the length is the constant {}; bind the array to a local first, or write the constant", n)
+        l.err("E0709", (*e).span, "`.len` of an array does not evaluate the array", label.asStr())
+        return -1
+    }
+    return l.b.intConst(n as u64, "usize")
+}
 
 /// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)`: folded to an integer constant from the
 /// computed layout. Primitives use the fixed table; aggregates go through `layoutOfName`.

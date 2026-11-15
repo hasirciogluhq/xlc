@@ -170,8 +170,8 @@ export fn checkDeref(l: *Lowerer, e: *XExpr) -> bool {
 /// `base.name` (the field expression `idx`, with `e` its node): a field of `str` or a slice is
 /// `ptr` or `len`; a field of a struct or class is declared by it; a tuple element index is below
 /// the element count. Anything else has no field (E0709). Pointers are read through. The length
-/// of an array is not checked here (its constant is not folded yet), and a class with a base
-/// class is not checked (its fields may be inherited).
+/// of an array is `len` (folded to a constant in queries.xl); any other name is E0709. A class with
+/// a base class is not checked (its fields may be inherited).
 export fn checkField(l: *Lowerer, idx: i32, e: *XExpr) -> bool {
     local bt = exprType(l, (*e).lhs)
     local bk = kindOf(l.s.types, bt)
@@ -190,7 +190,13 @@ export fn checkField(l: *Lowerer, idx: i32, e: *XExpr) -> bool {
         l.err("E0709", (*e).span, msg.asStr(), "the fields are `ptr` and `len`")
         return false
     }
-    if ak == T_ARRAY { return true }
+    if ak == T_ARRAY {
+        if name == "len" { return true }
+        local a = tname(l, bt)
+        local msg = format("`{}` has no field `{}`", a.asStr(), name)
+        l.err("E0709", (*e).span, msg.asStr(), "only structs, classes and tuples have fields")
+        return false
+    }
     if ak == T_TUPLE {
         local count = l.s.types.get(agg).argsCount
         if (*e).intValue < (count as u64) { return true }

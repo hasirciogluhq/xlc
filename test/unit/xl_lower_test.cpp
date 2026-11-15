@@ -155,6 +155,30 @@ const Sample kLaneASamples[] = {
     {"enum-valued", "enum Small: u8 {\n    A\n    B = 10\n    C\n}\nfn pick() -> Small {\n    return Small.C\n}\n"},
 };
 
+// Remaining forms: the array `.len`, the `switch` checks on values and defaults.
+const Sample kRemainingSamples[] = {
+    {"array-len", "fn f(a: [i32; 3]) -> usize {\n    return a.len\n}\n"},
+    {"array-len-through-pointer", "fn f(p: *[i32; 3]) -> usize {\n    return p.len\n}\n"},
+    {"switch-values-three",
+     "fn f(a: i32) -> i32 {\n    switch a {\n        case 1 {\n            return 10\n        }\n"
+     "        case 2, 3 {\n            return 20\n        }\n        default {\n            return 0\n        }\n"
+     "    }\n}\n"},
+};
+
+const Sample kRemainingDiagnostics[] = {
+    {"err-array-len-side-effect",
+     "fn make(a: [i32; 3]) -> [i32; 3] {\n    return a\n}\n"
+     "fn f(a: [i32; 3]) -> i32 {\n    local r = make(a).len\n    return 0\n}\n"},
+    {"err-case-duplicate",
+     "fn f(a: i32) -> i32 {\n    switch a {\n        case 1, 2 {\n            return 1\n        }\n"
+     "        case 2 {\n            return 2\n        }\n        default {\n            return 0\n        }\n"
+     "    }\n}\n"},
+    {"err-switch-two-defaults",
+     "fn f(a: i32) -> i32 {\n    switch a {\n        case 1 {\n            return 1\n        }\n"
+     "        default {\n            return 2\n        }\n        default {\n            return 0\n        }\n"
+     "    }\n}\n"},
+};
+
 /// Samples the C++ pass rejects: the xlang pass must report the same diagnostics (codes, spans and
 /// text) and produce no dump. Each rejected statement is a `local`, not a `return`, so that the
 /// function still returns on every path (the C++ flow check adds nothing). A warning sample has a
@@ -229,8 +253,16 @@ void testSamplesMatchTheCppLowering() {
     for (const Sample& s : kDiagnosticSamples) {
         equal += sampleEqual(s) ? 1 : 0;
     }
+    for (const Sample& s : kRemainingSamples) {
+        equal += sampleEqual(s) ? 1 : 0;
+    }
+    for (const Sample& s : kRemainingDiagnostics) {
+        equal += sampleEqual(s) ? 1 : 0;
+    }
     const int total = static_cast<int>(std::size(kSamples) + std::size(kLaneASamples) +
-                                       std::size(kDiagnosticSamples));
+                                       std::size(kDiagnosticSamples) +
+                                       std::size(kRemainingSamples) +
+                                       std::size(kRemainingDiagnostics));
     std::cout << "xlang lowering: " << equal << " of " << total
               << " samples equal the C++ pass (HIR and diagnostics)\n";
     CHECK_EQ(equal, total);

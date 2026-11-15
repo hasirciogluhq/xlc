@@ -8,6 +8,7 @@ from "std" import String, Vec, format
 from "../lang/ast/ast" import XExpr, XType, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL,
     XE_STRING_LITERAL, XE_BYTE_LITERAL, XE_NAME, XE_UNARY, XE_BINARY, XE_CALL, XE_INDEX, XE_SLICE,
     XE_FIELD, XE_CAST, XE_ARRAY_LIST, XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW, XE_TERNARY,
+    XE_MACRO_CALL,
     XU_NOT, XU_DEREF, XU_ADDROF, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE, XB_AND, XB_OR,
     XB_SHL, XB_SHR
 from "../sema/types" import Types, T_VOID, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ARRAY,
@@ -336,6 +337,8 @@ fn fieldType(l: *Lowerer, idx: i32) -> i32 {
         if name == "ptr" { return l.s.types.makePointer(rec.kind == T_STR ? l.s.types.makeInt(8, false) : rec.elem) }
         return -1
     }
+    // `[T; N].len` is the constant length as `usize` (C++ fieldExpr).
+    if rec.kind == T_ARRAY && name == "len" { return l.s.types.makeInt(0, false) }
     return fieldTypeOf(l, base, name)
 }
 
@@ -397,4 +400,34 @@ export fn fieldTypeOf(l: *Lowerer, ty: i32, name: str) -> i32 {
     if i < 0 { return -1 }
     local decl = aggregateDecl(l, ty)
     return resolve(l.s, (*l.s.fieldAt((*decl).fieldsFirst as usize + i as usize)).ty)
+}
+
+/// The constant length of the array type `t` (C++ `Lowerer::arrayLength`), or -1 when its length
+/// is not a constant or no source expression spells it (a literal's type), or it is negative.
+export fn arrayLength(l: *Lowerer, t: i32) -> i64 {
+    local len = l.s.types.get(t).length
+    if len < 0 { return -1 }
+    local v = evalConst(l.s, len)
+    if v < 0 { return -1 }
+    local cv = l.s.consts.get(v as usize)
+    if (*cv).kind != CV_INT || (*cv).intValue.hi != 0 { return -1 }
+    return (*cv).intValue.lo as i64
+}
+
+/// True when the expression `idx` calls a function, expands a macro or allocates with `new` in any
+/// of its parts (C++ `lower::astHasSideEffects`). A `.len` of an array is refused for such a base.
+export fn hasSideEffects(l: *Lowerer, idx: i32) -> bool {
+    if idx < 0 { return false }
+    local e = l.s.exprAt(idx)
+    local k = (*e).kind
+    if k == XE_CALL || k == XE_MACRO_CALL || k == XE_NEW { return true }
+    if hasSideEffects(l, (*e).lhs) || hasSideEffects(l, (*e).rhs) { return true }
+    for i in 0..(*e).argsCount as usize {
+        if hasSideEffects(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)) { return true }
+    }
+    for i in 0..(*e).fieldsCount as usize {
+        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
+        if hasSideEffects(l, (*f).value) { return true }
+    }
+    return false
 }

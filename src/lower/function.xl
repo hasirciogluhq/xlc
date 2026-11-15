@@ -21,7 +21,7 @@ from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
 from "./builder" import FnBuild
-from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName
+from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName, lowerArrayLen
 from "./call" import lowerCall
 from "./methods" import classSelfType
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
@@ -31,6 +31,7 @@ from "./diagnose" import coerceChecked, checkCast, checkIndex, checkSlice, check
     checkStructLit, checkDuplicateInit, knownField
 from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
 from "../sema/const_eval" import evalConst
+from "../sema/const_value" import CV_INT
 from "../sema/layout_calc" import layoutOfName
 
 /// The statement kinds of the flat AST (the `XS_*` constants of ast.xl, mirrored).
@@ -437,6 +438,9 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
             local viaPointer = bt >= 0 && l.s.types.get(bt).kind == T_POINTER
             local owner = resolveBase(l, bt)
             local fieldName = l.s.exprTextAt(idx)
+            if fieldName == "len" && owner >= 0 && l.s.types.get(owner).kind == T_ARRAY {
+                return lowerArrayLen(l, e, owner)
+            }
             return l.b.field(base, fieldName, exprTypeName(l, idx), viaPointer, fieldIndexOf(l, owner, fieldName))
         }
         if (*e).kind == XE_INDEX {
@@ -760,6 +764,22 @@ export fn lowerForRange(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
         return l.b.blockStmt(inner)
     }
 
+/// A `case` value `v` that is a constant an earlier `case` of the same switch already handles is
+/// E0709 at the value (C++ stmt/switch.cpp). `seen` holds the low 64 bits of the constants so far.
+fn checkCaseValue(l: *Lowerer, v: i32, seen: *Vec<u64>) {
+    local cv = evalConst(l.s, v)
+    if cv < 0 || (*l.s.consts.get(cv as usize)).kind != CV_INT { return }
+    local key = (*l.s.consts.get(cv as usize)).intValue.lo
+    for i in 0..(*seen).length() {
+        if *(*seen).get(i) == key {
+            l.err("E0709", (*l.s.exprAt(v)).span, "duplicate `case` value",
+                "this value is already handled by an earlier `case`")
+            return
+        }
+    }
+    (*seen).push(key)
+}
+
 /// A `switch`: an if/else chain over the case values; the default case is the last `else`.
 export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
     if (*st).expr < 0 {
@@ -783,11 +803,23 @@ export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
     local conds = Vec<i32>()
     local bodies = Vec<Vec<i32>>()
     local defaultBody = Vec<i32>()
+    local seen = Vec<u64>()
+    local hasDefault = false
     for i in 0..(*st).casesCount as usize {
         local c = l.s.flat.caseAt(((*st).casesFirst + i as u32) as i32)
         if (*c).isDefault != 0 {
+            if hasDefault {
+                l.err("E0709", (*c).span, "a `switch` has more than one `default`", "remove the duplicate")
+            }
+            hasDefault = true
             defaultBody = lowerBlockInto(l, (*c).body)
             continue
+        }
+        if (*c).valuesCount == 0 {
+            l.err("E0709", (*c).span, "`case` needs at least one value", "write `case 1, 2 { ... }`")
+        }
+        for j in 0..(*c).valuesCount as usize {
+            checkCaseValue(l, l.s.refAt("expr", ((*c).valuesFirst + j as u32) as i32), &seen)
         }
         local cond = -1
         for j in 0..(*c).valuesCount as usize {
@@ -795,8 +827,11 @@ export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
             local eq = l.b.binary("==", l.b.localRef(subject, tyName), lowerExprWant(l, v, t), "bool")
             cond = cond < 0 ? eq : l.b.binary("||", cond, eq, "bool")
         }
+        local body = lowerBlockInto(l, (*c).body)
+        // A case with no value was reported above; its body is checked and its arm is dropped.
+        if cond < 0 { continue }
         conds.push(cond)
-        bodies.push(lowerBlockInto(l, (*c).body))
+        bodies.push(body)
     }
     local chain = switchChain(l, conds, bodies, defaultBody)
     for i in 0..chain.length() {
