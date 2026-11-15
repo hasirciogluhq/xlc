@@ -18,6 +18,7 @@ from "../sema/subst" import TypeEnv, substituteType, instantiateFn, instantiateD
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOf, layoutOfName, aggregateLayout
 from "../sema/enums" import enumMember, checkEnum
+from "../sema/checks" import analyze
 from "../sema/module_scope" import lookupEntity, lookupQualified, entityByQName, entityOfExpr, exprToType
 from "../sema/int128" import I128, i128Of, i128Text
 from "../sema/const_value" import ConstValue, constInt, constText

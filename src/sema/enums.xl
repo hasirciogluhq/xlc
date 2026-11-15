@@ -13,7 +13,7 @@ from "./resolve" import resolve
 from "./const_eval" import evalConst
 
 /// The enum declaration whose parameters decide for a part name (`Result$Ok`): the enum itself.
-fn genericEnumOf(s: *Sema, name: str) -> i32 {
+export fn genericEnumOf(s: *Sema, name: str) -> i32 {
     local cut = -1
     for i in 0..name.len {
         if name[i] == b'$' {

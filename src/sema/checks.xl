@@ -1,0 +1,316 @@
+// Whole-module checks and the `analyze` entry point: aliases, enums, array lengths in every
+// type, `staticAssert`, layouts of every aggregate, and the bodies of non-generic functions.
+// The xlang source of sema/checks.cpp; the functions take the owning `Sema` explicitly.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XSpan, XExpr, XD_FN, XD_GLOBAL, XD_STRUCT, XD_CLASS,
+    XD_INTERFACE, XD_IMPL, XD_ENUM, XD_TYPE_ALIAS, XD_DEFINE_CONST, XD_TOP_LEVEL_CALL,
+    XE_CAST, XE_NEW, XE_STRUCT_LITERAL, XE_NAME, XE_STRING_LITERAL, XFieldInit, XClosure, XParam
+from "./sema" import Sema, SY_STRUCT, SY_CLASS, SY_FN
+from "./item" import SDecl, SParam, SField
+from "./types" import T_ARRAY, T_POINTER, T_FN_PTR, T_TUPLE, T_INT, T_FLOAT, T_BOOL
+from "./resolve" import resolve
+from "./const_eval" import evalConst
+from "./const_value" import CV_INT, CV_BOOL, CV_STRING
+from "./enums" import checkEnum, genericEnumOf
+from "./layout_calc" import layoutOfName
+
+/// The array lengths anywhere in the type tree must be constants.
+fn checkType(s: *Sema, tyIdx: i32) {
+    if tyIdx < 0 { return }
+    local resolved = resolve(s, tyIdx)
+    if resolved < 0 { return }
+    walkType(s, resolved)
+}
+
+fn walkType(s: *Sema, idx: i32) {
+    local t = s.types.get(idx)
+    if t.kind == T_ARRAY {
+        if t.length >= 0 {
+            local v = evalConst(s, t.length)
+            if v >= 0 {
+                local cv = *s.consts.get(v as usize)
+                if (*cv).kind != CV_INT || ((*cv).intValue.hi != 0) {
+                    s.error("E0707", (*s.exprAt(t.length)).span,
+                            "array length must be a non-negative integer constant",
+                            "invalid length")
+                }
+            }
+        }
+        if t.elem >= 0 { walkType(s, t.elem) }
+    } else if t.kind == T_POINTER {
+        if t.elem >= 0 { walkType(s, t.elem) }
+    } else if t.kind == T_FN_PTR {
+        for i in 0..t.paramsCount as usize {
+            walkType(s, (t.paramsFirst + i) as i32)
+        }
+        if t.ret >= 0 { walkType(s, t.ret) }
+    } else if t.kind == T_TUPLE {
+        for i in 0..t.argsCount as usize {
+            walkType(s, (t.argsFirst + i) as i32)
+        }
+    }
+}
+
+/// The type annotations anywhere in an expression must resolve and hold constant array lengths.
+fn checkExpr(s: *Sema, exprIdx: i32) {
+    if exprIdx < 0 { return }
+    local e = s.exprAt(exprIdx)
+    if (*e).kind == XE_CAST || (*e).kind == XE_NEW || (*e).kind == XE_STRUCT_LITERAL {
+        checkType(s, (*e).typeIdx)
+    }
+    if (*e).lhs >= 0 { checkExpr(s, (*e).lhs) }
+    if (*e).rhs >= 0 { checkExpr(s, (*e).rhs) }
+    for i in 0..(*e).argsCount as usize {
+        checkExpr(s, s.refAt("expr", ((*e).argsFirst + i) as i32))
+    }
+    for i in 0..(*e).fieldsCount as usize {
+        local f = (s.flat.r.fieldInits as usize + ((*e).fieldsFirst + i as u32) as usize *
+            sizeOf(XFieldInit)) as *XFieldInit
+        if (*f).value >= 0 { checkExpr(s, (*f).value) }
+    }
+    if (*e).closure >= 0 {
+        checkClosure(s, (*e).closure)
+    }
+}
+
+/// The closure of an expression: its parameter types, return type and body statements.
+fn checkClosure(s: *Sema, closureIdx: i32) {
+    local c = (s.flat.r.closures as usize + closureIdx as usize * sizeOf(XClosure)) as *XClosure
+    for i in 0..(*c).paramsCount as usize {
+        local p = (s.flat.r.params as usize + ((*c).paramsFirst + i as u32) as usize *
+            sizeOf(XParam)) as *XParam
+        if (*p).hasType != 0 {
+            checkType(s, (*p).typeIdx)
+        }
+    }
+    if (*c).hasRet != 0 {
+        checkType(s, (*c).ret)
+    }
+    checkStatements(s, (*c).body)
+}
+
+/// The type annotations anywhere in a statement must resolve and hold constant array lengths.
+fn checkStatements(s: *Sema, blockIdx: i32) {
+    if blockIdx < 0 { return }
+    local b = s.blockAt(blockIdx)
+    for i in 0..(*b).stmtsCount as usize {
+        local stmtIdx = s.refAt("stmt", ((*b).stmtsFirst + i as u32) as i32)
+        local st = s.stmtAt(stmtIdx)
+        if (*st).hasType != 0 {
+            checkType(s, (*st).typeIdx)
+        }
+        if (*st).target >= 0 { checkExpr(s, (*st).target) }
+        if (*st).expr >= 0 { checkExpr(s, (*st).expr) }
+        if (*st).body >= 0 { checkStatements(s, (*st).body) }
+        if (*st).elseBody >= 0 { checkStatements(s, (*st).elseBody) }
+    }
+}
+
+/// `staticAssert(cond, message?)`.
+fn checkStaticAssert(s: *Sema, declIdx: i32) {
+    local d = s.declOf(declIdx)
+    if (*d).call < 0 { return }
+    checkStaticAssertCall(s, (*d).call)
+}
+
+fn checkStaticAssertCall(s: *Sema, callIdx: i32) {
+    local c = s.exprAt(callIdx)
+    local lhs = s.exprAt((*c).lhs)
+    if (*lhs).kind != XE_NAME || s.exprTextAt((*c).lhs) != "staticAssert" {
+        return
+    }
+    if (*c).argsCount == 0 || (*c).argsCount > 2 {
+        s.error("E0702", (*c).span,
+                "`staticAssert` takes a condition and an optional message", "wrong arguments")
+        return
+    }
+    local value = evalConst(s, s.refAt("expr", (*c).argsFirst as i32))
+    if value < 0 { return }
+    local cv = *s.consts.get(value as usize)
+    if (*cv).kind != CV_BOOL {
+        s.error("E0702", (*s.exprAt(s.refAt("expr", (*c).argsFirst as i32))).span,
+                "`staticAssert` condition must be a bool constant", "not a bool")
+        return
+    }
+    if !(*cv).boolValue {
+        local message = String("static assertion failed")
+        if (*c).argsCount == 2 {
+            local second = s.refAt("expr", ((*c).argsFirst + 1) as i32)
+            if (*s.exprAt(second)).kind == XE_STRING_LITERAL {
+                message.append(": ")
+                message.append(s.exprTextAt(second))
+            }
+        }
+        s.error("E0702", (*c).span, message.asStr(), "this condition is false")
+    }
+}
+
+/// The layout of one aggregate is computed (and its diagnostics reported) here.
+fn checkAggregate(s: *Sema, declIdx: i32) {
+    local d = s.declOf(declIdx)
+    layoutOfName(s, s.text((*d).name), (*d).nameSpan)
+}
+
+/// True when the `fn` declaration takes a parameter pack.
+fn isPackFn(s: *Sema, declIdx: i32) -> bool {
+    local d = s.declOf(declIdx)
+    if (*d).kind != XD_FN { return false }
+    for i in 0..(*d).paramsCount as usize {
+        local p = s.params.get(((*d).paramsFirst + i as u32) as usize)
+        if (*p).isPack != 0 { return true }
+    }
+    return false
+}
+
+/// A pack function is checked here for its declaration and its uses of the pack; its body is
+/// checked per element count, when a call instantiates it.
+fn checkPackFn(s: *Sema, declIdx: i32) {
+    local d = s.declOf(declIdx)
+    local packSeen = false
+    for i in 0..(*d).paramsCount as usize {
+        local p = s.params.get(((*d).paramsFirst + i as u32) as usize)
+        if (*p).isPack == 0 {
+            if (*p).isSelf == 0 {
+                checkType(s, (*p).ty)
+            }
+            continue
+        }
+        if packSeen {
+            s.error("E0734", (*p).span, "a function can have only one parameter pack",
+                    "remove the second `..` parameter")
+        } else if (i + 1) as u32 != (*d).paramsCount {
+            s.error("E0734", (*p).span, "a parameter pack must be the last parameter",
+                    "move `..` to the end of the parameter list")
+        }
+        if !packSeen {
+            packSeen = true
+        }
+    }
+    checkType(s, (*d).ret)
+    if (*d).hasBody == 0 || (*d).isVirtual != 0 || (*d).isOverride != 0 ||
+            (*d).genericCount != 0 {
+        s.error("E0736", (*d).nameSpan,
+                format("`{}` cannot take a parameter pack here", s.text((*d).name)).asStr(),
+                "a pack function needs a body and no `declare`, `export(c)`, `virtual`, `override` or type parameters")
+    }
+}
+
+/// Parameter packs are supported on free functions only.
+fn checkNoPackMethod(s: *Sema, declIdx: i32) {
+    local d = s.declOf(declIdx)
+    for i in 0..(*d).paramsCount as usize {
+        local p = s.params.get(((*d).paramsFirst + i as u32) as usize)
+        if (*p).isPack != 0 {
+            s.error("E0736", (*d).nameSpan,
+                    format("method `{}` cannot take a parameter pack", s.text((*d).name)).asStr(),
+                    "parameter packs are supported on free functions only")
+            return
+        }
+    }
+}
+
+/// The whole-module analysis: every top-level declaration gets the checks of its kind.
+export fn analyze(s: *Sema) {
+    for i in 0..s.items.length() {
+        local declIdx = s.declOfItem(i as i32)
+        if declIdx < 0 { continue }
+        local d = s.declOf(declIdx)
+        if (*d).kind == XD_ENUM {
+            // A generic enum is checked per instance, when it is instantiated.
+            if (*d).genericCount == 0 {
+                checkEnum(s, declIdx)
+            }
+        } else if (*d).kind == XD_TYPE_ALIAS {
+            // A generic alias has no concrete target until it is used; each use resolves it.
+            if (*d).genericCount == 0 {
+                resolve(s, (*d).ty)
+                checkType(s, (*d).ty)
+                // Cyclic aliases resolve through the alias's own name.
+                local selfPath = Vec<String>()
+                selfPath.push(String(s.text((*d).name)))
+                local selfType = s.types.makeNamed(selfPath)
+                resolve(s, selfType)
+            }
+        } else if (*d).kind == XD_DEFINE_CONST {
+            if fromConfigHas(s, s.text((*d).name)) { continue }
+            // A define is evaluated once here, which fills the cache and reports E0707.
+            local item = s.itemOf(s.find(s.text((*d).name)))
+            if item >= 0 && (*s.declOf(declIdx)).init >= 0 {
+                evalConst(s, (*s.declOf(declIdx)).init)
+            }
+        } else if (*d).kind == XD_GLOBAL {
+            if (*d).hasType != 0 {
+                checkType(s, (*d).ty)
+            }
+            if (*d).init >= 0 {
+                checkExpr(s, (*d).init)
+            }
+        } else if isPackFn(s, declIdx) {
+            checkPackFn(s, declIdx)
+        } else if (*d).kind == XD_FN && (*d).genericCount == 0 {
+            // Generic declarations are checked per instance, when they are instantiated.
+            for p in 0..(*d).paramsCount as usize {
+                local param = s.params.get(((*d).paramsFirst + p as u32) as usize)
+                if (*param).isSelf == 0 {
+                    checkType(s, (*param).ty)
+                }
+            }
+            checkType(s, (*d).ret)
+            if (*d).hasBody != 0 {
+                checkStatements(s, (*d).body)
+            }
+        } else if ((*d).kind == XD_STRUCT || (*d).kind == XD_CLASS) &&
+                  (*d).genericCount == 0 {
+            // A payload struct of a generic enum (`Result$Ok<T, E>`) has the enum's parameters in
+            // its fields but none of its own; it is checked with the enum's instance.
+            if (*d).kind == XD_STRUCT && (*d).isPayload != 0 {
+                local enumItem = genericEnumOf(s, s.text((*d).name))
+                if enumItem >= 0 {
+                    local ed = s.declOfItem(enumItem)
+                    if ed >= 0 && (*s.declOf(ed)).genericCount != 0 { continue }
+                }
+            }
+            for f in 0..(*d).fieldsCount as usize {
+                local field = s.fields.get(((*d).fieldsFirst + f as u32) as usize)
+                checkType(s, (*field).ty)
+            }
+            if (*d).kind == XD_CLASS {
+                for m in 0..(*d).methodsCount as usize {
+                    local md = ((*d).methodsFirst + m as u32) as i32
+                    checkNoPackMethod(s, md)
+                    local mdecl = s.declOf(md)
+                    // A generic method has no body to check until an instance is made.
+                    if (*mdecl).hasBody != 0 && (*mdecl).genericCount == 0 {
+                        checkStatements(s, (*mdecl).body)
+                    }
+                }
+            }
+            if (*d).opaque == 0 {
+                checkAggregate(s, declIdx)
+            }
+        } else if (*d).kind == XD_IMPL {
+            for m in 0..(*d).methodsCount as usize {
+                local md = ((*d).methodsFirst + m as u32) as i32
+                checkNoPackMethod(s, md)
+                local mdecl = s.declOf(md)
+                if (*mdecl).hasBody != 0 {
+                    checkStatements(s, (*mdecl).body)
+                }
+            }
+        } else if (*d).kind == XD_INTERFACE {
+            for m in 0..(*d).methodsCount as usize {
+                checkNoPackMethod(s, ((*d).methodsFirst + m as u32) as i32)
+            }
+        } else if (*d).kind == XD_TOP_LEVEL_CALL {
+            checkStaticAssert(s, declIdx)
+        }
+    }
+}
+
+/// True when the `-D` table already carries `name` (the CLI wins over `define`).
+fn fromConfigHas(s: *Sema, name: str) -> bool {
+    for i in 0..s.cfgNames.length() {
+        if s.text(*s.cfgNames.get(i)) == name { return true }
+    }
+    return false
+}
