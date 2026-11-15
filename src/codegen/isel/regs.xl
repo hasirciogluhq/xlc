@@ -1,0 +1,150 @@
+// Register assignment for the native backend: decides, per function, which locals live in
+// callee-saved registers and which in stack slots.
+//
+// Method: a use-count heuristic in place of liveness-based linear scan (Poletto and Sarkar, "Linear
+// Scan Register Allocation", TOPLAS 1999). Every local of a function is live in all of it (its
+// register is its home for the whole body), so the allocation reduces to picking the hottest
+// locals: each reference counts 1, multiplied by 8 for every enclosing loop (capped at 8^4). The
+// ten callee-saved registers `x19`..`x28` go to the heaviest scalar locals whose address is never
+// taken; the rest keep a slot. A register-resident local costs no load or store at a use, and the
+// caller-saved temporaries `x9`..`x15` stay free for expression values, so a loop counter and an
+// accumulator never touch memory. The price is one save and one restore per register used, paid
+// once per call of the function (Apple arm64: AAPCS64 with `x18` reserved, `x29` the frame pointer).
+// @spec https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+from "std" import Vec
+from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, view,
+    E_LOCAL_REF, E_ADDR_OF, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE, S_BLOCK
+from "types" import Scalar, KIND_OTHER, KIND_FLOAT, scalarOf
+
+/// The first and last callee-saved register handed to locals.
+export const FIRST_SAVED: u32 = 19
+export const LAST_SAVED: u32 = 28
+
+/// Where every local of one function lives.
+export class Frame {
+    home: Vec<i32>       // per local: the register number, or -1 for a stack slot
+    slot: Vec<u32>       // per local: the byte offset from `sp` of its slot (when home is -1)
+    saved: Vec<u32>      // the callee-saved registers the function uses, in order
+    slotBytes: u32       // bytes of local slots, at the bottom of the frame
+    total: u32           // the whole frame below the frame record: slots, saved registers, padding
+
+    fn init(self) {
+        self.home = Vec<i32>()
+        self.slot = Vec<u32>()
+        self.saved = Vec<u32>()
+        self.slotBytes = 0
+        self.total = 0
+    }
+
+    /// The byte offset from `sp` where the k-th saved register is kept.
+    fn savedOffset(self, k: usize) -> u32 {
+        return self.slotBytes + (k as u32) * 8
+    }
+}
+
+class Walker {
+    m: *XlcHirModule
+    weight: Vec<u64>
+    taken: Vec<bool>
+
+    fn init(self, m: *XlcHirModule, localCount: u32) {
+        self.m = m
+        self.weight = Vec<u64>()
+        self.taken = Vec<bool>()
+        for i in 0..localCount as usize {
+            self.weight.push(1)
+            self.taken.push(false)
+        }
+    }
+
+    fn bump(self, id: u32, by: u64) {
+        if id < self.weight.length() as u32 {
+            self.weight.set(id as usize, *self.weight.get(id as usize) + by)
+        }
+    }
+
+    fn expr(self, index: i32, mult: u64) {
+        if index < 0 {
+            return
+        }
+        local e: *XlcHirExpr = &self.m.exprs[index as usize]
+        if e.kind == E_LOCAL_REF {
+            self.bump(e.localId, mult)
+        } else if e.kind == E_ADDR_OF && e.lhs >= 0 && self.m.exprs[e.lhs as usize].kind == E_LOCAL_REF {
+            self.taken.set(self.m.exprs[e.lhs as usize].localId as usize, true)
+        }
+        self.expr(e.lhs, mult)
+        self.expr(e.rhs, mult)
+        for i in 0..e.argCount as usize {
+            self.expr(self.m.refs[e.argFirst as usize + i] as i32, mult)
+        }
+    }
+
+    fn stmts(self, first: u32, count: u32, mult: u64) {
+        for i in 0..count as usize {
+            local s: *XlcHirStmt = &self.m.stmts[first as usize + i]
+            if s.kind == S_LOCAL {
+                if s.value >= 0 {
+                    self.bump(s.localId, mult)
+                }
+                self.expr(s.value, mult)
+            } else if s.kind == S_ASSIGN {
+                self.expr(s.target, mult)
+                self.expr(s.value, mult)
+            } else if s.kind == S_RETURN || s.kind == S_EXPR {
+                self.expr(s.value, mult)
+            } else if s.kind == S_IF {
+                self.expr(s.value, mult)
+                self.stmts(s.bodyFirst, s.bodyCount, mult)
+                self.stmts(s.elseFirst, s.elseCount, mult)
+            } else if s.kind == S_WHILE {
+                local inner: u64 = mult < 4096 ? mult * 8 : mult
+                self.expr(s.value, inner)
+                self.stmts(s.bodyFirst, s.bodyCount, inner)
+                self.stmts(s.stepFirst, s.stepCount, inner)
+            } else if s.kind == S_BLOCK {
+                self.stmts(s.bodyFirst, s.bodyCount, mult)
+            }
+        }
+    }
+}
+
+/// Assigns a home to every local of `f`.
+export fn assignFrame(m: *XlcHirModule, f: *XlcHirFunction) -> Frame {
+    local w: Walker = Walker(m, f.localCount)
+    w.stmts(f.bodyFirst, f.bodyCount, 1)
+    local fr: Frame = Frame()
+    for i in 0..f.localCount as usize {
+        fr.home.push(-1)
+        fr.slot.push(0)
+    }
+    // Heaviest first: repeated selection over at most ten rounds.
+    local next: u32 = FIRST_SAVED
+    while next <= LAST_SAVED {
+        local best: i32 = -1
+        local bestWeight: u64 = 1
+        for i in 0..f.localCount as usize {
+            local s: Scalar = scalarOf(m, view(f.locals[i].typeName))
+            local eligible = s.kind != KIND_OTHER && s.kind != KIND_FLOAT && !*w.taken.get(i) && *fr.home.get(i) < 0
+            if eligible && *w.weight.get(i) > bestWeight {
+                best = i as i32
+                bestWeight = *w.weight.get(i)
+            }
+        }
+        if best < 0 {
+            break
+        }
+        fr.home.set(best as usize, next as i32)
+        fr.saved.push(next)
+        next += 1
+    }
+    for i in 0..f.localCount as usize {
+        if *fr.home.get(i) < 0 {
+            fr.slot.set(i, fr.slotBytes)
+            fr.slotBytes += 8
+        }
+    }
+    local bytes: u32 = fr.slotBytes + (fr.saved.length() as u32) * 8
+    fr.total = (bytes + 15) / 16 * 16
+    return fr
+}

@@ -1,0 +1,131 @@
+// Memory layout for the native backend: the size and alignment of a type spelling, and the byte
+// offset of a field. The flat HIR (hir/abi.xl) carries types as spellings only, so the selector
+// computes layouts itself from the aggregate table.
+//
+// @todo Only `@repr(c)` structs are laid out: their order and padding are the C rules (natural
+// alignment, declaration order), which is all a spelling can reproduce. The default scheme may
+// reorder fields (sema/layout_calc.xl, "scheme v1"), classes carry a vptr and a base, and the flat
+// HIR has no offsets. Any other aggregate is reported as unsupported until the flat form carries
+// the layout the semantic pass already computed (recorded in xlang-docs/known-limitations.md).
+from "std/str" import fromParts
+from "../../hir/abi" import XlcHirModule, XlcHirAggregate, view
+from "types" import Scalar, KIND_OTHER, KIND_BOOL, KIND_FLOAT, scalarOf
+
+/// Size and alignment in bytes; `ok` is false for a type the selector cannot lay out.
+export struct Layout {
+    size: u64
+    align: u64
+    ok: bool
+}
+
+fn alignUp(v: u64, a: u64) -> u64 {
+    return (v + a - 1) & ~(a - 1)
+}
+
+/// The aggregate named `name`, or nil.
+export fn findAggregate(m: *XlcHirModule, name: str) -> *XlcHirAggregate {
+    for i in 0..m.aggregateCount as usize {
+        local a: *XlcHirAggregate = &m.aggregates[i]
+        if view(a.name) == name {
+            return a
+        }
+    }
+    return nil
+}
+
+/// Parses `[T; N]` into the element spelling and the length; false when `s` is not an array.
+/// The element ends at the last `;`, so a nested array element is kept whole.
+fn parseArray(s: str, elem: *str, n: *u64) -> bool {
+    if s.len < 5 || s.ptr[0] != b'[' || s.ptr[s.len - 1] != b']' {
+        return false
+    }
+    local semi: usize = 0
+    local found = false
+    for k in 1..s.len - 1 {
+        if s.ptr[k] == b';' {
+            semi = k
+            found = true
+        }
+    }
+    if !found {
+        return false
+    }
+    local count: u64 = 0
+    for k in semi + 1..s.len - 1 {
+        local c: u8 = s.ptr[k]
+        if c >= b'0' && c <= b'9' {
+            count = count * 10 + (c - b'0') as u64
+        } else if c != b' ' {
+            return false
+        }
+    }
+    *elem = fromParts(&s.ptr[1], semi - 1)
+    *n = count
+    return true
+}
+
+/// The layout of the type spelled `spelling`.
+export fn layoutOf(m: *XlcHirModule, spelling: str) -> Layout {
+    local bad = Layout { size: 0, align: 1, ok: false }
+    local s: Scalar = scalarOf(m, spelling)
+    if s.kind != KIND_OTHER {
+        local bytes: u64 = s.kind == KIND_BOOL ? 1 : (s.bits / 8) as u64
+        return Layout { size: bytes, align: bytes, ok: true }
+    }
+    local elem: str = ""
+    local n: u64 = 0
+    if parseArray(spelling, &elem, &n) {
+        local e: Layout = layoutOf(m, elem)
+        if !e.ok {
+            return bad
+        }
+        return Layout { size: e.size * n, align: e.align, ok: true }
+    }
+    local a: *XlcHirAggregate = findAggregate(m, spelling)
+    if a == nil || a.reprC == 0 || a.isClass != 0 || a.opaque != 0 {
+        return bad
+    }
+    local cursor: u64 = 0
+    local align: u64 = 1
+    for i in 0..a.fieldCount as usize {
+        local f: Layout = layoutOf(m, view(a.fields[i].typeName))
+        if !f.ok {
+            return bad
+        }
+        if a.isUnion != 0 {
+            if f.size > cursor {
+                cursor = f.size
+            }
+        } else {
+            cursor = alignUp(cursor, f.align) + f.size
+        }
+        if f.align > align {
+            align = f.align
+        }
+    }
+    return Layout { size: alignUp(cursor, align), align: align, ok: true }
+}
+
+/// The byte offset of field `index` of the aggregate `name`, or -1 when it cannot be computed.
+export fn fieldOffset(m: *XlcHirModule, name: str, index: u32) -> i64 {
+    local a: *XlcHirAggregate = findAggregate(m, name)
+    if a == nil || a.reprC == 0 || a.isClass != 0 || index >= a.fieldCount {
+        return -1
+    }
+    if a.isUnion != 0 {
+        return 0
+    }
+    local cursor: u64 = 0
+    for i in 0..index as usize + 1 {
+        local f: Layout = layoutOf(m, view(a.fields[i].typeName))
+        if !f.ok {
+            return -1
+        }
+        cursor = alignUp(cursor, f.align)
+        if i == index as usize {
+            return cursor as i64
+        }
+        cursor += f.size
+    }
+    return -1
+}

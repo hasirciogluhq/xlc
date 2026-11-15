@@ -1,0 +1,100 @@
+// arm64 scalar floating-point encoders (A64 "Data processing -- scalar floating-point and
+// Advanced SIMD", DDI 0487J). A scalar lives in the low 32 bits (`Sn`, `f32`) or 64 bits (`Dn`,
+// `f64`) of vector register `Vn`; the `ftype` field (bits 23..22) picks the width: 00 single, 01
+// double. Every function takes `dbl`: true for `f64`. Condition codes after `fcmp` (DDI 0487
+// "Condition flags"): less-than is `MI`, less-or-equal `LS`, greater `GT`, greater-or-equal `GE`,
+// equal `EQ`; unordered (NaN) sets C and V, so those four are false for NaN and `NE` is true.
+from "std" import Vec
+
+/// The `ftype` bit of a width: 0 for single, 1 for double, placed at bit 22.
+fn ft(dbl: bool) -> u32 {
+    return dbl ? (1 as u32) << 22 : 0
+}
+
+/// `fadd Rd, Rn, Rm`: `0 0 0 11110 ftype 1 Rm 0010 10 Rn Rd`.
+export fn fadd(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32, rm: u32) {
+    out.push(0x1e202800 | ft(dbl) | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `fsub Rd, Rn, Rm`: opcode `0011 10`.
+export fn fsub(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32, rm: u32) {
+    out.push(0x1e203800 | ft(dbl) | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `fmul Rd, Rn, Rm`: opcode `0000 10`.
+export fn fmul(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32, rm: u32) {
+    out.push(0x1e200800 | ft(dbl) | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `fdiv Rd, Rn, Rm`: opcode `0001 10`; division by zero gives an infinity or NaN, as in IEEE 754.
+export fn fdiv(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32, rm: u32) {
+    out.push(0x1e201800 | ft(dbl) | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `fneg Rd, Rn`: `0 0 0 11110 ftype 1 0000 10 10000 Rn Rd`.
+export fn fneg(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push(0x1e214000 | ft(dbl) | (rn << 5) | rd)
+}
+
+/// `fmov Rd, Rn` between two vector registers.
+export fn fmovReg(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push(0x1e204000 | ft(dbl) | (rn << 5) | rd)
+}
+
+/// `fcmp Rn, Rm`: sets NZCV, `0 0 0 11110 ftype 1 Rm 00 1000 Rn 00000`.
+export fn fcmp(out: *Vec<u32>, dbl: bool, rn: u32, rm: u32) {
+    out.push(0x1e202000 | ft(dbl) | (rm << 16) | (rn << 5))
+}
+
+/// `fmov Dd, Xn` or `fmov Sd, Wn`: the bits of a general register into a vector register.
+export fn fmovFromGp(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push((dbl ? 0x9e670000 : 0x1e270000) | (rn << 5) | rd)
+}
+
+/// `fmov Xd, Dn` or `fmov Wd, Sn`: the bits of a vector register into a general register.
+export fn fmovToGp(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push((dbl ? 0x9e660000 : 0x1e260000) | (rn << 5) | rd)
+}
+
+/// `scvtf Dd, Xn` / `scvtf Sd, Xn`: signed 64-bit integer to float, rounded to nearest even.
+export fn scvtf(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push((dbl ? 0x9e620000 : 0x9e220000) | (rn << 5) | rd)
+}
+
+/// `ucvtf`: unsigned 64-bit integer to float.
+export fn ucvtf(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push((dbl ? 0x9e630000 : 0x9e230000) | (rn << 5) | rd)
+}
+
+/// `fcvtzs Xd, Dn` / `fcvtzs Xd, Sn`: float to signed 64-bit, rounding toward zero; the result
+/// saturates and NaN gives 0 (the hardware never traps).
+export fn fcvtzs(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push((dbl ? 0x9e780000 : 0x9e380000) | (rn << 5) | rd)
+}
+
+/// `fcvtzu`: float to unsigned 64-bit, rounding toward zero, saturating.
+export fn fcvtzu(out: *Vec<u32>, dbl: bool, rd: u32, rn: u32) {
+    out.push((dbl ? 0x9e790000 : 0x9e390000) | (rn << 5) | rd)
+}
+
+/// `fcvt Dd, Sn`: single to double (exact).
+export fn fcvtToDouble(out: *Vec<u32>, rd: u32, rn: u32) {
+    out.push(0x1e22c000 | (rn << 5) | rd)
+}
+
+/// `fcvt Sd, Dn`: double to single (rounded to nearest even).
+export fn fcvtToSingle(out: *Vec<u32>, rd: u32, rn: u32) {
+    out.push(0x1e624000 | (rn << 5) | rd)
+}
+
+/// `ldr Dt, [Xn, #off]` (`dbl`, imm12 in units of 8) or `ldr St, [Xn, #off]` (units of 4).
+export fn ldrFloat(out: *Vec<u32>, dbl: bool, rt: u32, rn: u32, byteOff: u32) {
+    out.push(dbl ? (0xfd400000 | ((byteOff / 8) << 10) | (rn << 5) | rt)
+                 : (0xbd400000 | ((byteOff / 4) << 10) | (rn << 5) | rt))
+}
+
+/// `str Dt, [Xn, #off]` or `str St, [Xn, #off]`.
+export fn strFloat(out: *Vec<u32>, dbl: bool, rt: u32, rn: u32, byteOff: u32) {
+    out.push(dbl ? (0xfd000000 | ((byteOff / 8) << 10) | (rn << 5) | rt)
+                 : (0xbd000000 | ((byteOff / 4) << 10) | (rn << 5) | rt))
+}

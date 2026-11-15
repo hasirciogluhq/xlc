@@ -1,0 +1,84 @@
+// Native backend encoder check: prints the instruction words of the encoders added for the
+// optimizing selector, one per line, in the order of encode.s. run.sh assembles encode.s with the
+// system assembler and diffs the two listings, so a wrong field is a test failure.
+from "std" import Vec, format
+from "std/io" import fprint
+from "../../src/codegen/arm64" import and64Imm, orr64Imm, eor64Imm, logicalImm64, lsl64Imm,
+    lsr64Imm, asr64Imm, madd64, add32Reg, sub32Reg, mul32, ldrhImm, strhImm, ldrsbImm, ldrshImm
+from "../../src/codegen/arm64/float" import fadd, fsub, fmul, fdiv, fneg, fmovReg, fcmp,
+    fmovFromGp, fmovToGp, scvtf, ucvtf, fcvtzs, fcvtzu, fcvtToDouble, fcvtToSingle, ldrFloat, strFloat
+from "../../src/codegen/arm64/atomic" import ldar, stlr, swpal, ldaddal, casal, dmbIsh
+
+fn logical(out: *Vec<u32>, which: u32, v: u64) {
+    local enc: i32 = logicalImm64(v)
+    if enc < 0 {
+        out.push(0xdeadbeef)
+    } else if which == 0 {
+        and64Imm(out, 0, 1, enc as u32)
+    } else if which == 1 {
+        orr64Imm(out, 0, 1, enc as u32)
+    } else {
+        eor64Imm(out, 0, 1, enc as u32)
+    }
+}
+
+@entry fn main() -> i32 {
+    local o: Vec<u32> = Vec<u32>()
+    logical(&o, 0, 0xff)
+    logical(&o, 0, 0xff00ff00ff00ff00)
+    logical(&o, 1, 0x8000000000000000)
+    logical(&o, 2, 0xf0f0f0f0f0f0f0f0)
+    logical(&o, 0, 0xf00000000000000f)
+    logical(&o, 0, 0x5555555555555555)
+    logical(&o, 0, 0x7fffffff)
+    logical(&o, 0, 0xfffffffffffffffe)
+    lsl64Imm(&o, 0, 1, 5)
+    lsr64Imm(&o, 0, 1, 7)
+    asr64Imm(&o, 0, 1, 63)
+    madd64(&o, 0, 1, 2, 3)
+    add32Reg(&o, 0, 1, 2)
+    sub32Reg(&o, 0, 1, 2)
+    mul32(&o, 0, 1, 2)
+    ldrhImm(&o, 0, 1, 6)
+    strhImm(&o, 0, 1, 6)
+    ldrsbImm(&o, 0, 1, 3)
+    ldrshImm(&o, 0, 1, 6)
+    fadd(&o, true, 0, 1, 2)
+    fsub(&o, false, 0, 1, 2)
+    fmul(&o, true, 0, 1, 2)
+    fdiv(&o, false, 0, 1, 2)
+    fneg(&o, true, 0, 1)
+    fmovReg(&o, true, 0, 1)
+    fcmp(&o, true, 1, 2)
+    fmovFromGp(&o, true, 0, 1)
+    fmovFromGp(&o, false, 0, 1)
+    fmovToGp(&o, true, 0, 1)
+    fmovToGp(&o, false, 0, 1)
+    scvtf(&o, true, 0, 1)
+    scvtf(&o, false, 0, 1)
+    ucvtf(&o, true, 0, 1)
+    ucvtf(&o, false, 0, 1)
+    fcvtzs(&o, true, 0, 1)
+    fcvtzs(&o, false, 0, 1)
+    fcvtzu(&o, true, 0, 1)
+    fcvtzu(&o, false, 0, 1)
+    fcvtToDouble(&o, 0, 1)
+    fcvtToSingle(&o, 0, 1)
+    ldrFloat(&o, true, 0, 1, 16)
+    ldrFloat(&o, false, 0, 1, 8)
+    strFloat(&o, true, 0, 1, 16)
+    strFloat(&o, false, 0, 1, 8)
+    ldar(&o, 3, 0, 1)
+    ldar(&o, 2, 0, 1)
+    ldar(&o, 0, 0, 1)
+    stlr(&o, 3, 0, 1)
+    stlr(&o, 1, 0, 1)
+    swpal(&o, 3, 2, 3, 1)
+    ldaddal(&o, 2, 2, 3, 1)
+    casal(&o, 3, 2, 3, 1)
+    dmbIsh(&o)
+    for i in 0..o.length() {
+        fprint(1, format("{:08x}\n", *o.get(i)).asStr())
+    }
+    return 0
+}

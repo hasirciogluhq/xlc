@@ -1,0 +1,39 @@
+// arm64 atomic and barrier encoders. Apple silicon implements ARMv8.5 including the Large System
+// Extensions (LSE, ARMv8.1), so a read-modify-write is one instruction (`casal`, `ldaddal`,
+// `swpal`) instead of an `ldaxr`/`stlxr` retry loop. Every form here is acquire+release
+// sequentially consistent; a weaker `MemoryOrder` is not distinguished (it is only slower).
+// `size` is log2 of the access in bytes: 0 byte, 1 halfword, 2 word, 3 doubleword.
+// @spec https://developer.arm.com/documentation/ddi0487/latest (C6.2 CAS, LDADD, SWP, LDAR, STLR, DMB)
+from "std" import Vec
+
+/// `ldar Wt/Xt, [Xn]`: load-acquire, `size 001000 1 1 0 11111 1 11111 Rn Rt`. A byte or halfword
+/// load zero-extends into the register.
+export fn ldar(out: *Vec<u32>, size: u32, rt: u32, rn: u32) {
+    out.push(0x08dffc00 | (size << 30) | (rn << 5) | rt)
+}
+
+/// `stlr Wt/Xt, [Xn]`: store-release, `size 001000 1 0 0 11111 1 11111 Rn Rt`.
+export fn stlr(out: *Vec<u32>, size: u32, rt: u32, rn: u32) {
+    out.push(0x089ffc00 | (size << 30) | (rn << 5) | rt)
+}
+
+/// `swpal Ws, Wt, [Xn]`: `[Xn]` gets `Ws`, `Wt` gets the old value.
+export fn swpal(out: *Vec<u32>, size: u32, rs: u32, rt: u32, rn: u32) {
+    out.push(0x38e08000 | (size << 30) | (rs << 16) | (rn << 5) | rt)
+}
+
+/// `ldaddal Ws, Wt, [Xn]`: `[Xn] += Ws`, `Wt` gets the old value.
+export fn ldaddal(out: *Vec<u32>, size: u32, rs: u32, rt: u32, rn: u32) {
+    out.push(0x38e00000 | (size << 30) | (rs << 16) | (rn << 5) | rt)
+}
+
+/// `casal Ws, Wt, [Xn]`: compare `[Xn]` with `Ws`; when equal store `Wt`. `Ws` always receives the
+/// old memory value, so the swap succeeded exactly when it equals the expected value.
+export fn casal(out: *Vec<u32>, size: u32, rs: u32, rt: u32, rn: u32) {
+    out.push(0x08e0fc00 | (size << 30) | (rs << 16) | (rn << 5) | rt)
+}
+
+/// `dmb ish`: a full barrier in the inner shareable domain (`fence`).
+export fn dmbIsh(out: *Vec<u32>) {
+    out.push(0xd5033bbf)
+}

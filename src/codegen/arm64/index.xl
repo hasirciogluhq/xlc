@@ -400,3 +400,153 @@ export fn svc(out: *Vec<u32>, imm16: u32) {
 export fn brk(out: *Vec<u32>, imm16: u32) {
     out.push(0xd4200000 | (imm16 << 5))
 }
+
+// ---------------------------------------------------------------------------------------------
+// Immediate forms, fused multiply-add, 32-bit register forms and the remaining access widths.
+// These are what lets the selector avoid a constant register and a canonicalizing extension.
+
+/// True when `x` is a run of ones from bit 0 (`0b0111`), and not zero.
+fn isMask(x: u64) -> bool {
+    return x != 0 && ((x + 1) & x) == 0
+}
+
+/// True when `x` is one contiguous run of ones anywhere in the word, and not zero.
+fn isShiftedMask(x: u64) -> bool {
+    return x != 0 && isMask((x - 1) | x)
+}
+
+/// Index of the lowest set bit of `x` (`x != 0`).
+fn ctz64(x: u64) -> u32 {
+    local n: u32 = 0
+    local v: u64 = x
+    while (v & 1) == 0 {
+        v >>= 1
+        n += 1
+    }
+    return n
+}
+
+/// Number of zero bits above the highest set bit of `x` (`x != 0`).
+fn clz64(x: u64) -> u32 {
+    local n: u32 = 0
+    local v: u64 = x
+    while (v >> 63) == 0 {
+        v <<= 1
+        n += 1
+    }
+    return n
+}
+
+/// The `N:immr:imms` field of a 64-bit bitmask immediate, or -1 when `imm` is not one.
+/// A bitmask immediate is a run of ones, rotated, replicated across the word in elements of
+/// 2, 4, 8, 16, 32 or 64 bits. 0 and all ones are never encodable. The algorithm is LLVM's
+/// `processLogicalImmediate` (AArch64AddressingModes.h); the field layout is DDI 0487
+/// "DecodeBitMasks".
+/// @spec https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AArch64/MCTargetDesc/AArch64AddressingModes.h
+export fn logicalImm64(imm: u64) -> i32 {
+    local ones: u64 = ~(0 as u64)
+    if imm == 0 || imm == ones {
+        return -1
+    }
+    // The smallest element that replicates to the whole word.
+    local size: u32 = 64
+    while size > 2 {
+        local half: u64 = (size / 2) as u64
+        local m: u64 = ((1 as u64) << half) - 1
+        if (imm & m) != ((imm >> half) & m) {
+            break
+        }
+        size = size / 2
+    }
+    local mask: u64 = size == 64 ? ones : (((1 as u64) << (size as u64)) - 1)
+    local v: u64 = imm & mask
+    local i: u32 = 0
+    local cto: u32 = 0
+    if isShiftedMask(v) {
+        i = ctz64(v)
+        cto = ctz64(~(v >> (i as u64)))
+    } else {
+        // The run wraps around the element: invert and look for the run of zeros instead.
+        v = v | ~mask
+        if !isShiftedMask(~v) {
+            return -1
+        }
+        local clo: u32 = clz64(~v)
+        i = 64 - clo
+        cto = clo + ctz64(~v) - (64 - size)
+    }
+    local immr: u32 = (size - i) & (size - 1)
+    local nimms: u32 = ((~(size - 1)) << 1) | (cto - 1)
+    local n: u32 = ((nimms >> 6) & 1) ^ 1
+    return ((n << 12) | (immr << 6) | (nimms & 0x3f)) as i32
+}
+
+/// `and Rd, Rn, #bitmask` — `sf=1 00 100100 N immr imms Rn Rd`; `enc` is `logicalImm64`'s result.
+export fn and64Imm(out: *Vec<u32>, rd: u32, rn: u32, enc: u32) {
+    out.push(0x92000000 | (enc << 10) | (rn << 5) | rd)
+}
+
+/// `orr Rd, Rn, #bitmask` — `sf=1 01 100100 ...`.
+export fn orr64Imm(out: *Vec<u32>, rd: u32, rn: u32, enc: u32) {
+    out.push(0xb2000000 | (enc << 10) | (rn << 5) | rd)
+}
+
+/// `eor Rd, Rn, #bitmask` — `sf=1 10 100100 ...`.
+export fn eor64Imm(out: *Vec<u32>, rd: u32, rn: u32, enc: u32) {
+    out.push(0xd2000000 | (enc << 10) | (rn << 5) | rd)
+}
+
+/// `lsl Rd, Rn, #sh` (`sh` < 64) — the alias `ubfm Rd, Rn, #(-sh mod 64), #(63-sh)`.
+export fn lsl64Imm(out: *Vec<u32>, rd: u32, rn: u32, sh: u32) {
+    ubfm64(out, rd, rn, (64 - sh) & 63, 63 - sh)
+}
+
+/// `lsr Rd, Rn, #sh` — the alias `ubfm Rd, Rn, #sh, #63`.
+export fn lsr64Imm(out: *Vec<u32>, rd: u32, rn: u32, sh: u32) {
+    ubfm64(out, rd, rn, sh, 63)
+}
+
+/// `asr Rd, Rn, #sh` — the alias `sbfm Rd, Rn, #sh, #63`.
+export fn asr64Imm(out: *Vec<u32>, rd: u32, rn: u32, sh: u32) {
+    sbfm64(out, rd, rn, sh, 63)
+}
+
+/// `madd Rd, Rn, Rm, Ra` — `Rd = Ra + Rn * Rm`: `sf 00 11011 000 Rm 0 Ra Rn Rd`.
+export fn madd64(out: *Vec<u32>, rd: u32, rn: u32, rm: u32, ra: u32) {
+    out.push(0x9b000000 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+}
+
+/// `add Wd, Wn, Wm` — the 32-bit form zeroes bits 63..32, which is the canonical form of a `u32`.
+export fn add32Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x0b000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `sub Wd, Wn, Wm`.
+export fn sub32Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x4b000000 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `mul Wd, Wn, Wm` — the alias of `madd Wd, Wn, Wm, wzr`.
+export fn mul32(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0x1b007c00 | (rm << 16) | (rn << 5) | rd)
+}
+
+/// `ldrh Wt, [Xn, #off]` — zero-extending halfword load, imm12 in units of 2.
+export fn ldrhImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0x79400000 | ((byteOff / 2) << 10) | (rn << 5) | rt)
+}
+
+/// `strh Wt, [Xn, #off]`.
+export fn strhImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0x79000000 | ((byteOff / 2) << 10) | (rn << 5) | rt)
+}
+
+/// `ldrsb Xt, [Xn, #off]` — byte load sign-extended to 64 bits (`opc=10`).
+export fn ldrsbImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0x39800000 | (byteOff << 10) | (rn << 5) | rt)
+}
+
+/// `ldrsh Xt, [Xn, #off]` — halfword load sign-extended to 64 bits.
+export fn ldrshImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
+    out.push(0x79800000 | ((byteOff / 2) << 10) | (rn << 5) | rt)
+}
