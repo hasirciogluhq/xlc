@@ -1,0 +1,362 @@
+// The lowering pass state: scope entries, the scope stack and the `Lowerer` fields. The xlang
+// source of sema/lower/lower.hpp and item/scope.cpp; the compilation-aware paths (import
+// bindings from the driver, registered names) follow the standalone paths and are filled in
+// when the compilation driver lands.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XSpan
+from "../util/source" import Span
+from "../hir/abi" import XlcHirModule, XlcHirStr
+from "../sema/sema" import Sema, EntityRef, SY_FN, SY_GLOBAL, SY_DEFINE, SY_FN_ALIAS
+from "../sema/item" import SDecl, SItem, SParam
+from "../sema/types" import Types, T_NAMED
+from "../sema/module_scope" import lookupEntity, lookupQualified
+from "../sema/subst" import TypeEnv
+from "./builder" import HirBuilder, FnBuild
+
+// The kinds of a scope entry.
+export const SE_LOCAL: i32 = 0
+export const SE_GLOBAL: i32 = 1
+export const SE_FUNCTION: i32 = 2
+export const SE_CONSTANT: i32 = 3
+export const SE_TYPE: i32 = 4
+export const SE_NAMESPACE: i32 = 5
+export const SE_EXTERNAL: i32 = 6
+
+/// A declaration a call or a name may bind to; `key` is the name of its HIR function.
+export class ScopeEntry {
+    kind: i32
+    name: String
+    ty: i32          ///< Types index of the value type (Local/Global), -1 = unknown
+    span: Span
+    localId: u32     ///< Local: index into the function's locals
+    item: i32        ///< SItem index of the declaration, -1 = none
+    owner: *Sema     ///< module that owns the declaration
+    qname: String
+    moduleName: String ///< Namespace: module key; External: module path as written
+    member: String   ///< External: name inside `moduleName`
+    readonly: bool   ///< Global: a `const`
+    overloads: Vec<i32> ///< Function: every overload's SItem index
+
+    fn init(self) {
+        self.kind = SE_LOCAL
+        self.name = String("")
+        self.ty = -1
+        self.item = -1
+        self.owner = nil
+        self.qname = String("")
+        self.moduleName = String("")
+        self.member = String("")
+        self.overloads = Vec<i32>()
+    }
+}
+
+/// One scope: the names bound in it, parallel arrays.
+export class Scope {
+    names: Vec<String>
+    entries: Vec<*ScopeEntry>
+
+    fn init(self) {
+        self.names = Vec<String>()
+        self.entries = Vec<*ScopeEntry>()
+    }
+}
+
+/// Lexical scopes: module -> function -> nested blocks. Lookup walks from the innermost scope
+/// outwards; a name can be bound once per scope, inner scopes shadow outer ones.
+export class ScopeStack {
+    scopes: Vec<*Scope>
+
+    fn init(self) {
+        self.scopes = Vec<*Scope>()
+    }
+
+    fn push(self) {
+        local s = new Scope()
+        self.scopes.push(s)
+    }
+
+    fn pop(self) {
+        self.scopes.pop()
+    }
+
+    fn depth(self) -> i32 {
+        return self.scopes.length() as i32
+    }
+
+    /// Binds `entry` in the innermost scope; false when the name is bound there already.
+    fn declare(self, entry: *ScopeEntry) -> bool {
+        local top = *self.scopes.get(self.scopes.length() - 1)
+        for i in 0..(*top).names.length() {
+            if (*(*top).names.get(i)).asStr() == (*entry).name.asStr() { return false }
+        }
+        (*top).names.push((*entry).name.clone())
+        (*top).entries.push(entry)
+        return true
+    }
+
+    fn lookup(self, name: str) -> *ScopeEntry {
+        for i in 0..self.scopes.length() {
+            local idx = self.scopes.length() - 1 - i
+            local sc = *self.scopes.get(idx)
+            for j in 0..(*sc).names.length() {
+                if (*(*sc).names.get(j)).asStr() == name {
+                    return *(*sc).entries.get(j)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Lookup restricted to the module scope (the outermost one).
+    fn lookupModule(self, name: str) -> *ScopeEntry {
+        if self.scopes.length() == 0 { return nil }
+        local sc = *self.scopes.get(0)
+        for j in 0..(*sc).names.length() {
+            if (*(*sc).names.get(j)).asStr() == name {
+                return *(*sc).entries.get(j)
+            }
+        }
+        return nil
+    }
+
+    /// A stack that holds only the module scope of this one (the outermost): the scope a
+    /// function lowered inside another function sees.
+    fn moduleOnly(self) -> *ScopeStack {
+        local out = new ScopeStack()
+        if self.scopes.length() > 0 {
+            out.scopes.push(*self.scopes.get(0))
+        }
+        return out
+    }
+}
+
+/// The lowering of one module: its Sema, the shared HIR module and the scopes.
+export class Lowerer {
+    s: *Sema
+    b: *HirBuilder
+    isLibrary: bool
+    scopes: *ScopeStack
+    registeredNames: Vec<String>
+    extraNames: Vec<String>
+    extraEntries: Vec<*ScopeEntry>
+    starImport: bool
+
+    // The function under construction.
+    fnName: String
+    fnSymbol: String
+    fnRet: String
+    fnLocals: Vec<XlcHirLocalRec>
+    fnParamCount: u32
+    fnBody: Vec<i32>
+    fnUnwind: Vec<i32>
+
+    // Drop bookkeeping (own/*).
+    dropFlags: Vec<i32>   ///< (local, flag) pairs flattened
+    needsDropCache: Vec<String>
+    needsDropValue: Vec<bool>
+
+    // The pending statements a `?` or a compound assignment hoists before the expression.
+    prelude: Vec<i32>
+
+    fn init(self, s: *Sema, b: *HirBuilder, isLibrary: bool) {
+        self.s = s
+        self.b = b
+        self.isLibrary = isLibrary
+        self.scopes = new ScopeStack()
+        self.registeredNames = Vec<String>()
+        self.extraNames = Vec<String>()
+        self.extraEntries = Vec<*ScopeEntry>()
+        self.starImport = false
+        self.fnName = String("")
+        self.fnSymbol = String("")
+        self.fnRet = String("void")
+        self.fnLocals = Vec<XlcHirLocalRec>()
+        self.fnParamCount = 0
+        self.fnBody = Vec<i32>()
+        self.fnUnwind = Vec<i32>()
+        self.dropFlags = Vec<i32>()
+        self.needsDropCache = Vec<String>()
+        self.needsDropValue = Vec<bool>()
+        self.prelude = Vec<i32>()
+    }
+
+    /// The spelling of a type for the HIR (the same text the C++ pass writes).
+    fn typeName(self, idx: i32) -> String {
+        if idx < 0 { return String("") }
+        return self.s.types.text(idx)
+    }
+
+    /// Reports through the module's diagnostics.
+    fn err(self, code: str, at: XSpan, message: str, label: str) {
+        self.s.error(code, at, message, label)
+    }
+
+    // ------------------------------------------------------------------ module scope
+
+    /// The scope entry of an entity found through the name table.
+    fn entryOf(self, ref: EntityRef, name: str, span: Span) -> *ScopeEntry {
+        local owner = ref.owner != nil ? ref.owner : self.s
+        local sym = owner.symbols.get(ref.sym as usize)
+        if (*sym).kind == SY_FN_ALIAS {
+            // An alias stands for its target: the same function, overloads and link name.
+            local item = owner.itemOf(ref.sym)
+            local d = owner.declOfItem(item)
+            if d >= 0 {
+                local target = owner.text((*owner.declOf(d)).name)
+                local tref = lookupEntity(owner, target)
+                if tref.sym >= 0 {
+                    return self.entryOf(tref, name, span)
+                }
+            }
+            local failed = new ScopeEntry()
+            (*failed).name = String(name)
+            (*failed).span = span
+            return failed
+        }
+        local e = new ScopeEntry()
+        (*e).name = String(name)
+        (*e).span = span
+        (*e).item = owner.itemOf(ref.sym)
+        (*e).owner = owner
+        (*e).qname = owner.qualify(owner.text(ref.name))
+        if (*sym).kind == SY_FN {
+            (*e).kind = SE_FUNCTION
+            for i in 0..(*sym).overloadsCount as usize {
+                (*e).overloads.push(*owner.overloadRefs.get(((*sym).overloadsFirst as usize + i)))
+            }
+        } else if (*sym).kind == SY_GLOBAL {
+            (*e).kind = SE_GLOBAL
+            (*e).ty = (*owner.declOf((*e).item)).ty
+            (*e).readonly = (*owner.declOf((*e).item)).isConst != 0
+        } else if (*sym).kind == SY_DEFINE {
+            (*e).kind = SE_CONSTANT
+        } else {
+            (*e).kind = SE_TYPE
+        }
+        return e
+    }
+
+    /// The module scope: imported and declared names.
+    fn buildModuleScope(self) {
+        self.scopes.push()
+        local mem = new ScopeEntry()
+        (*mem).kind = SE_TYPE
+        (*mem).name = String("MemoryOrder")
+        (*mem).item = -1
+        (*mem).owner = self.s
+        (*mem).qname = String("MemoryOrder")
+        self.scopes.declare(mem)
+        for i in 0..self.s.items.length() {
+            local item = i as i32
+            local declIdx = self.s.declOfItem(item)
+            if declIdx < 0 { continue }
+            local d = self.s.declOf(declIdx)
+            if (*d).kind == 10 { // import: handled through the bindings below
+                continue
+            }
+            local e = new ScopeEntry()
+            (*e).name = String(self.s.text((*d).name))
+            (*e).span = self.s.span((*d).nameSpan)
+            (*e).item = item
+            (*e).owner = self.s
+            (*e).qname = self.s.qualify(self.s.text((*d).name))
+            if (*d).kind == 0 { // fn
+                (*e).kind = SE_FUNCTION
+                local sym = self.s.find((*e).name.asStr())
+                if sym >= 0 {
+                    local rec = self.s.symbols.get(sym as usize)
+                    for j in 0..(*rec).overloadsCount as usize {
+                        (*e).overloads.push(*self.s.overloadRefs.get(((*rec).overloadsFirst as usize + j)))
+                    }
+                }
+            } else if (*d).kind == 1 { // global
+                (*e).kind = SE_GLOBAL
+                (*e).ty = (*d).ty
+                (*e).readonly = (*d).isConst != 0
+            } else if (*d).kind == 8 { // define const
+                (*e).kind = SE_CONSTANT
+            } else if (*d).kind == 2 || (*d).kind == 3 || (*d).kind == 4 || (*d).kind == 6 ||
+                       (*d).kind == 7 { // struct, class, interface, enum, type alias
+                (*e).kind = SE_TYPE
+            } else {
+                continue
+            }
+            // Duplicate definitions were already reported by `Sema::collect` (E0401).
+            self.scopes.declare(e)
+        }
+        // Import bindings from the compilation; a standalone module has none.
+        for i in 0..self.s.importBindingNames.length() {
+            local name = self.s.text(*self.s.importBindingNames.get(i))
+            if self.scopes.lookupModule(name) != nil { continue }
+            local bind = self.s.importBindings.get(i)
+            if (*bind).isNamespace {
+                local ns = new ScopeEntry()
+                (*ns).kind = SE_NAMESPACE
+                (*ns).name = String(name)
+                (*ns).moduleName = String(self.s.text((*bind).moduleKey))
+                (*ns).span = (*bind).span
+                self.scopes.declare(ns)
+            }
+        }
+    }
+
+    /// The entry a name binds to, or nil.
+    fn lookupName(self, name: str) -> *ScopeEntry {
+        local e = self.scopes.lookup(name)
+        if e != nil { return e }
+        for i in 0..self.extraNames.length() {
+            if (*self.extraNames.get(i)).asStr() == name {
+                return *self.extraEntries.get(i)
+            }
+        }
+        return nil
+    }
+
+    /// Records an extra entry (external names, namespace members) and returns it.
+    fn extraEntry(self, key: str, e: *ScopeEntry) -> *ScopeEntry {
+        self.extraNames.push(String(key))
+        self.extraEntries.push(e)
+        return e
+    }
+
+    /// The entry a name chain (`a`, `a.b`, `a.b.c`) names: the last step is looked up inside the
+    /// namespace the step before it named.
+    fn chainEntry(self, exprIdx: i32) -> *ScopeEntry {
+        local e = self.s.exprAt(exprIdx)
+        if (*e).kind == 5 { // name
+            return self.lookupName(self.s.exprTextAt(exprIdx))
+        }
+        if (*e).kind == 11 { // field
+            local base = self.chainEntry((*e).lhs)
+            if base != nil && (*base).kind == SE_NAMESPACE {
+                return self.namespaceMember(base, self.s.exprTextAt(exprIdx), self.s.span((*e).span), true)
+            }
+        }
+        return nil
+    }
+
+    /// The member `name` of namespace `ns`. A standalone namespace: members are external names.
+    fn namespaceMember(self, ns: *ScopeEntry, name: str, at: Span, report: bool) -> *ScopeEntry {
+        local key = format("ns:{}.{}", (*ns).moduleName.asStr(), name)
+        local cached = self.lookupName(key.asStr())
+        if cached != nil { return cached }
+        local e = new ScopeEntry()
+        (*e).kind = SE_EXTERNAL
+        (*e).name = String(name)
+        (*e).moduleName = (*ns).moduleName.clone()
+        (*e).member = String(name)
+        (*e).span = at
+        return self.extraEntry(key.asStr(), e)
+    }
+}
+
+/// One local of the function under construction.
+export class XlcHirLocalRec {
+    name: String
+    typeName: String
+
+    fn init(self, name: str, typeName: str) {
+        self.name = String(name)
+        self.typeName = String(typeName)
+    }
+}
