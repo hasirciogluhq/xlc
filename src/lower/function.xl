@@ -2,7 +2,7 @@
 // xlang source of sema/lower/item/function.cpp and the expr/ and stmt/ subtrees; this file
 // grows as the lowering pass is ported.
 from "std" import String, Vec, format
-from "../hir/abi" import XlcHirLocal, XlcHirStr
+from "../hir/abi" import XlcHirLocal, XlcHirStr, XlcHirFieldInit, E_STRUCT_LIT
 from "../lang/ast/ast" import XSpan, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL, XE_STRING_LITERAL,
     XE_BYTE_LITERAL, XE_NAME, XE_UNARY, XE_BINARY, XE_CALL, XE_INDEX, XE_SLICE, XE_FIELD,
     XE_CAST, XE_ARRAY_LIST, XE_ARRAY_REPEAT, XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW,
@@ -12,7 +12,7 @@ from "../lang/ast/ast" import XSpan, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_L
     XS_BREAK, XS_UNSAFE, XS_BLOCK
 from "../sema/sema" import Sema
 from "../sema/item" import SDecl, SItem, SParam
-from "../lang/ast/ast" import XStmt
+from "../lang/ast/ast" import XStmt, XExpr
 from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY
 from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
@@ -329,6 +329,38 @@ export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
             local sub = lowerExpr(l, (*e).rhs)
             return l.b.index(base, sub, l.exprTypeName(idx))
         }
+        if (*e).kind == XE_SLICE {
+            local base = lowerExpr(l, (*e).lhs)
+            local lo = -1
+            if (*e).argsCount > 0 {
+                lo = lowerExpr(l, l.s.refAt("expr", (*e).argsFirst as i32))
+            }
+            local hi = lowerExpr(l, (*e).rhs)
+            return l.b.slice(base, lo, hi, "")
+        }
+        if (*e).kind == XE_ARRAY_LIST || (*e).kind == XE_TUPLE_LITERAL {
+            local items = lowerArgList(l, e)
+            if (*e).kind == XE_ARRAY_LIST {
+                return l.b.arrayList(items, "")
+            }
+            return l.b.tupleLit(items, "")
+        }
+        if (*e).kind == XE_ARRAY_REPEAT {
+            local value = lowerExpr(l, (*e).lhs)
+            return l.b.arrayRepeat(value, (*e).intValue, "")
+        }
+        if (*e).kind == XE_STRUCT_LITERAL {
+            return lowerStructLit(l, idx, e)
+        }
+        if (*e).kind == XE_NEW {
+            return lowerNew(l, idx, e)
+        }
+        if (*e).kind == XE_TERNARY {
+            local cond = lowerExpr(l, (*e).lhs)
+            local thenValue = lowerExpr(l, (*e).rhs)
+            local elseValue = lowerExpr(l, l.s.refAt("expr", (*e).argsFirst as i32))
+            return l.b.select(cond, thenValue, elseValue, "")
+        }
         if (*e).kind == XE_CALL {
             return lowerCall(l, idx)
         }
@@ -526,4 +558,69 @@ export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
         out = acc
     }
     return l.b.blockStmt(out)
+}
+
+/// The lowered argument expressions of a record's `argsFirst/argsCount` range, in order.
+export fn lowerArgList(l: *Lowerer, e: *XExpr) -> Vec<i32> {
+    local out = Vec<i32>()
+    for i in 0..(*e).argsCount as usize {
+        local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
+        local v = lowerExpr(l, a)
+        if v < 0 { continue }
+        out.push(v)
+    }
+    return out
+}
+
+/// A struct literal: the field initializers in source order.
+export fn lowerStructLit(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
+    local tyName = l.typeName((*e).typeIdx).asStr()
+    local inits = Vec<i32>()
+    local first = l.b.fieldInits.length() as u32
+    for i in 0..(*e).fieldsCount as usize {
+        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
+        local v = lowerExpr(l, (*f).value)
+        if v < 0 { continue }
+        local rec: XlcHirFieldInit
+        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
+        rec.value = v
+        l.b.fieldInits.push(rec)
+        l.b.fieldName(first, l.b.fieldInits.length() as u32 - 1, l.s.text((*f).name))
+    }
+    local at = l.b.expr(E_STRUCT_LIT, tyName)
+    local p = l.b.exprAt(at)
+    (*p).fieldFirst = first
+    (*p).fieldCount = l.b.fieldInits.length() as u32 - first
+    return at
+}
+
+/// `new T` / `new T { fields }` / `new T(args)`: the allocation, the init call and the fields.
+export fn lowerNew(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
+    local tyName = l.typeName((*e).typeIdx).asStr()
+    local at = l.b.newExpr(format("*{}", tyName).asStr())
+    local p = l.b.exprAt(at)
+    // A class with an `init`: the call becomes the init function over the argument list.
+    if (*e).hasCallArgs != 0 {
+        local args = lowerArgList(l, e)
+        local range = l.b.args(args)
+        (*p).lhs = l.b.construct(format("{}.init", tyName).asStr(), Vec<i32>(), tyName)
+        (*p).argFirst = range.0
+        (*p).argCount = range.1
+        return at
+    }
+    // The field initializers.
+    local first = l.b.fieldInits.length() as u32
+    for i in 0..(*e).fieldsCount as usize {
+        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
+        local v = lowerExpr(l, (*f).value)
+        if v < 0 { continue }
+        local rec: XlcHirFieldInit
+        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
+        rec.value = v
+        l.b.fieldInits.push(rec)
+        l.b.fieldName(first, l.b.fieldInits.length() as u32 - 1, l.s.text((*f).name))
+    }
+    (*p).fieldFirst = first
+    (*p).fieldCount = l.b.fieldInits.length() as u32 - first
+    return at
 }
