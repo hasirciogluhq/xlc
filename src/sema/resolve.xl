@@ -211,7 +211,8 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
     }
     if symKind == SY_ENUM {
         local decl = owner.declOf(item)
-        local under = resolveDepth(owner, decl.underlying, depth)
+        // An enum without `: T` is an `i32` (the C++ default).
+        local under = decl.hasUnderlying == 0 ? s.types.makeInt(32, true) : resolveDepth(owner, decl.underlying, depth)
         if under < 0 { return -1 }
         local q = qualifyOf(owner, ref)
         local out = s.types.makeAggregate(T_ENUM, singlePath(q.asStr()), Vec<i32>())
