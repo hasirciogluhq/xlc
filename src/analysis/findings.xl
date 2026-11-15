@@ -1,0 +1,117 @@
+// The diagnostics of every analysis, held until all of them ran.
+//
+// `report` emits them sorted by the position of their first label, without duplicates, whatever
+// order the passes and functions ran in. A finding owns its strings; the wire record built for
+// the engine only borrows them for the duration of the report call.
+from "std" import String, Vec
+from "std/str" import compare
+from "../util/source" import Span, XbStr
+from "../util/diagnostics" import XbDiagnostic, XbLabel, XbNote, DiagnosticEngine, xlcDiagReport
+
+/// One diagnostic: `labels[0]` is the primary place, the others show the other side of a conflict.
+export class Finding {
+    code: String
+    message: String
+    spans: Vec<Span>
+    texts: Vec<String>
+    detail: String
+    reason: String
+    fix: String
+
+    fn init(self, code: str, message: String) {
+        self.code = String(code)
+        self.message = message
+        self.spans = Vec<Span>()
+        self.texts = Vec<String>()
+        self.detail = String("")
+        self.reason = String("")
+        self.fix = String("")
+    }
+
+    fn label(self, at: Span, text: str) {
+        self.spans.push(at)
+        self.texts.push(String(text))
+    }
+}
+
+/// The primary span of a finding; the zero span when it has no label.
+fn primary(f: *Finding) -> Span {
+    if f.spans.length() == 0 {
+        local s: Span
+        return s
+    }
+    return *f.spans.get(0)
+}
+
+fn cmpU32(a: u32, b: u32) -> i32 {
+    return a < b ? -1 : (a > b ? 1 : 0)
+}
+
+/// Order by (file, line, column, code, message): the key the dedup compares too.
+fn cmpFinding(a: **Finding, b: **Finding) -> i32 {
+    local x = *a
+    local y = *b
+    local sa = primary(x)
+    local sb = primary(y)
+    local c = cmpU32(sa.file, sb.file)
+    if c == 0 { c = cmpU32(sa.line, sb.line) }
+    if c == 0 { c = cmpU32(sa.column, sb.column) }
+    if c == 0 { c = compare(x.code.asStr(), y.code.asStr()) }
+    if c == 0 { c = compare(x.message.asStr(), y.message.asStr()) }
+    return c
+}
+
+fn xb(s: *String) -> XbStr {
+    return XbStr { ptr: s.ptr, len: s.len as u32 }
+}
+
+export class Findings {
+    items: Vec<*Finding>
+
+    fn init(self) {
+        self.items = Vec<*Finding>()
+    }
+
+    fn drop(self) {
+        for i in 0..self.items.length() {
+            delete *self.items.get(i)
+        }
+    }
+
+    fn add(self, f: *Finding) {
+        self.items.push(f)
+    }
+
+    /// Sorts, drops the duplicates and reports each finding to `engine`.
+    fn reportTo(self, engine: *DiagnosticEngine) {
+        self.items.sortBy(cmpFinding)
+        local prev: *Finding = nil
+        for i in 0..self.items.length() {
+            local f = *self.items.get(i)
+            if prev != nil {
+                local same = cmpFinding(&prev, &f) == 0
+                if same { continue }
+            }
+            prev = f
+            local labels = Vec<XbLabel>()
+            for k in 0..f.spans.length() {
+                local s = f.spans.get(k)
+                local t = f.texts.get(k)
+                labels.push(XbLabel { file: s.file, line: s.line, column: s.column,
+                    endLine: s.endLine, endColumn: s.endColumn, text: t.ptr, textLen: t.len as u32 })
+            }
+            local d: XbDiagnostic
+            d.code = xb(&f.code)
+            d.severity = 1
+            d.message = xb(&f.message)
+            d.labels = labels.data
+            d.labelCount = labels.length() as u32
+            d.notes = nil
+            d.noteCount = 0
+            d.detail = xb(&f.detail)
+            d.reason = xb(&f.reason)
+            d.fix = xb(&f.fix)
+            xlcDiagReport(engine, &d)
+        }
+    }
+}

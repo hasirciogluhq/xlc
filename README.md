@@ -214,7 +214,9 @@ src/lang/        lexer, preprocessor, macros, parser, AST, types, build configur
 src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR
 src/hir/         HIR dump and reachability pruning
 src/mir/         HIR -> MIR (control-flow graph per function): builder/, dataflow/ solver, dump
-src/analysis/    static analyses over HIR (hir/) and MIR (mir/): read only, findings sorted by position
+src/analysis/    static analyses over MIR, written in xlang (moves.xl, findings.xl): read only,
+                 findings sorted by position; xl_bridge.cpp/.hpp is the temporary C bridge that
+                 flattens mir::Body into the arenas of abi.xl
 src/codegen/     HIR -> LLVM IR, optimization, object writers, C header
 src/driver/      linker driver (`link.xl`) and the in-process archiver (`archive.cpp`, LLVM's writer)
 src/util/        source files and diagnostics

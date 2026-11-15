@@ -1,7 +1,7 @@
 #include "check.h"
 #include "lowered.h"
 
-// The move check (src/analysis/mir/moves.cpp): E0780 for a use of a value moved on every reaching
+// The move check (src/analysis/moves.xl, reached through src/analysis/xl_bridge.cpp): E0780 for a use of a value moved on every reaching
 // path, and no finding where the value was assigned again, borrowed, dropped, or moved on some
 // paths only.
 
@@ -26,7 +26,7 @@ void testUseAfterMove() {
 }
 
 // A move on one branch makes the value maybe-moved after the join. A maybe-moved local is tracked
-// but not reported (see the note in src/analysis/mir/moves.cpp): only a definite move is E0780,
+// but not reported (see the note in src/analysis/moves.xl): only a definite move is E0780,
 // so both shapes here compile until the stdlib exits such loops with `break`.
 void testMoveOnSomePaths() {
     CHECK(!body("    local r = Res { id: 1 }\n    if c { take(r) }\n    take(r)\n").diag->hasErrors());

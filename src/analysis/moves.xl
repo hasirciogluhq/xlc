@@ -1,0 +1,256 @@
+// E0780: use of a moved value (the forward dataflow and the check in one file).
+//
+// A forward dataflow over the MIR of one function. At every point each local is owned, moved, or
+// moved on some paths only. A `move` operand of a whole local moves it; an assignment to the whole
+// local owns it again; a `Drop` ends it without reading it (the drop flag guards it). Any other
+// read of a moved or maybe-moved local (a copy, a move, `&x`, a field, a write into a part of it)
+// is reported.
+//
+// Only the user's own locals and parameters are reported: a hidden local of lowering is moved
+// exactly where lowering decided, so a finding on one would be a compiler bug, not a user error.
+//
+// Only a definite move (moved on every reaching path) is reported. A maybe-moved local is tracked
+// but not reported: the released stdlib writes loops in the `done`-flag style, where the paths
+// that move a local also set the flag that exits the loop, so the merge at the loop header sees a
+// move that no continuing iteration can reach. Revisit maybe-moved reporting together with a
+// stdlib release that exits such loops with `break`.
+from "std" import String, Vec, format
+from "../util/source" import Span
+from "abi" import XamBody, XamBlock, XamStmt, XamTerm, XamPlace, XamOperand, view,
+    LOCAL_PARAM, LOCAL_USER, PROJ_INDEX, OPERAND_MOVE, OPERAND_CONSTANT, RV_ADDRESS_OF, RV_SLICE,
+    TERM_BRANCH, TERM_CALL, TERM_DROP, TERM_RETURN, CALLEE_INDIRECT, CALLEE_INTERFACE
+from "findings" import Finding, Findings
+
+const OWNED: u8 = 0
+const MOVED: u8 = 1
+const MAYBE: u8 = 2 ///< moved on some paths only
+
+/// The facts at every program point, as `slots` rows of `nl` locals: the status of each local and
+/// where it was last seen moved. Row `b` is the state on entry to block `b`; the last row is the
+/// working copy a block's effect is applied to. A row nothing reached yet is `bottom`.
+class Flow {
+    nl: usize
+    reached: Vec<u8>
+    status: Vec<u8>
+    hasAt: Vec<u8>
+    at: Vec<Span>
+
+    fn init(self, slots: usize, nl: usize) {
+        self.nl = nl
+        self.reached = Vec<u8>()
+        self.status = Vec<u8>()
+        self.hasAt = Vec<u8>()
+        self.at = Vec<Span>()
+        local none: Span
+        for s in 0..slots {
+            self.reached.push(0)
+        }
+        for i in 0..slots * nl {
+            self.status.push(OWNED)
+            self.hasAt.push(0)
+            self.at.push(none)
+        }
+    }
+
+    fn copy(self, dst: usize, src: usize) {
+        self.reached.set(dst, *self.reached.get(src))
+        for i in 0..self.nl {
+            self.status.set(dst * self.nl + i, *self.status.get(src * self.nl + i))
+            self.hasAt.set(dst * self.nl + i, *self.hasAt.get(src * self.nl + i))
+            self.at.set(dst * self.nl + i, *self.at.get(src * self.nl + i))
+        }
+    }
+
+    /// Merges an incoming edge: a local moved on one edge and owned on the other is maybe moved.
+    /// True when row `dst` changed.
+    fn join(self, dst: usize, src: usize) -> bool {
+        if *self.reached.get(src) == 0 {
+            return false
+        }
+        if *self.reached.get(dst) == 0 {
+            self.copy(dst, src)
+            return true
+        }
+        local changed = false
+        for i in 0..self.nl {
+            local d = dst * self.nl + i
+            local s = src * self.nl + i
+            if *self.status.get(d) != *self.status.get(s) && *self.status.get(d) != MAYBE {
+                self.status.set(d, MAYBE)
+                changed = true
+            }
+            if *self.hasAt.get(d) == 0 {
+                self.hasAt.set(d, *self.hasAt.get(s))
+                self.at.set(d, *self.at.get(s))
+            }
+        }
+        return changed
+    }
+}
+
+fn sameSpan(a: *Span, b: *Span) -> bool {
+    return a.file == b.file && a.line == b.line && a.column == b.column
+}
+
+/// Applies the effect of statements and terminators to one row of a `Flow`; with `findings` set
+/// it also reports every read of a moved local.
+class Walker {
+    b: *XamBody
+    flow: *Flow
+    row: usize
+    findings: *Findings
+
+    fn init(self, b: *XamBody, flow: *Flow, row: usize, findings: *Findings) {
+        self.b = b
+        self.flow = flow
+        self.row = row
+        self.findings = findings
+    }
+
+    fn block(self, blk: *XamBlock) {
+        for i in 0..blk.stmtCount as usize {
+            self.statement(&self.b.stmts[blk.stmtFirst as usize + i])
+        }
+        self.terminator(&blk.term)
+    }
+
+    fn statement(self, s: *XamStmt) {
+        for i in 0..s.opCount as usize {
+            self.operand(&self.b.operands[s.opFirst as usize + i], &s.span)
+        }
+        if s.rvKind == RV_ADDRESS_OF || s.rvKind == RV_SLICE {
+            self.read(&s.rvPlace, &s.span)
+        }
+        self.write(&s.place, &s.span)
+    }
+
+    fn terminator(self, t: *XamTerm) {
+        switch {
+            case t.kind == TERM_BRANCH || t.kind == TERM_RETURN {
+                self.operand(&t.operand, &t.span)
+            }
+            case t.kind == TERM_CALL {
+                if t.calleeKind == CALLEE_INDIRECT || t.calleeKind == CALLEE_INTERFACE {
+                    self.operand(&t.calleeValue, &t.span)
+                }
+                for i in 0..t.argCount as usize {
+                    self.operand(&self.b.operands[t.argFirst as usize + i], &t.span)
+                }
+                if t.hasDest != 0 {
+                    self.write(&t.dest, &t.span)
+                }
+            }
+            case t.kind == TERM_DROP {
+                if t.place.projCount == 0 {
+                    self.moved(t.place.id, &t.span)
+                }
+            }
+            default {}
+        }
+    }
+
+    fn operand(self, o: *XamOperand, at: *Span) {
+        if o.kind == OPERAND_CONSTANT {
+            return
+        }
+        self.read(&o.place, at)
+        if o.kind == OPERAND_MOVE && o.place.projCount == 0 {
+            self.moved(o.place.id, at)
+        }
+    }
+
+    /// A store owns a whole local again; a store into a part of one reads the rest of it.
+    fn write(self, p: *XamPlace, at: *Span) {
+        if p.projCount == 0 {
+            self.flow.status.set(self.row * self.flow.nl + p.id as usize, OWNED)
+            return
+        }
+        self.read(p, at)
+    }
+
+    fn read(self, p: *XamPlace, at: *Span) {
+        self.check(p.id, at)
+        for i in 0..p.projCount as usize {
+            local pr = &self.b.projs[p.projFirst as usize + i]
+            if pr.kind == PROJ_INDEX {
+                self.check(pr.index, at)
+            }
+        }
+    }
+
+    fn moved(self, id: u32, at: *Span) {
+        local k = self.row * self.flow.nl + id as usize
+        self.flow.status.set(k, MOVED)
+        self.flow.hasAt.set(k, 1)
+        self.flow.at.set(k, *at)
+    }
+
+    fn check(self, id: u32, at: *Span) {
+        local k = self.row * self.flow.nl + id as usize
+        local l = &self.b.locals[id as usize]
+        if self.findings == nil || *self.flow.status.get(k) != MOVED ||
+            (l.kind != LOCAL_USER && l.kind != LOCAL_PARAM) {
+            return
+        }
+        local name = view(l.name)
+        local f = new Finding("E0780", format("use of a moved value `{}`", name))
+        local origin = self.flow.at.get(k)
+        local has = *self.flow.hasAt.get(k) != 0
+        if has && sameSpan(origin, at) {
+            f.label(*at, "moved here in an earlier iteration of the loop")
+        } else {
+            f.label(*at, "used here after the move")
+            if has {
+                f.label(*origin, "moved here")
+            }
+        }
+        f.detail = format("`{}` was moved and not assigned again", name)
+        f.reason = String("a moved value belongs to its new owner, which may already have dropped it")
+        f.fix = format("pass `&{}` to borrow it, move a copy (`{}.clone()`), or assign `{}` a new value before this use",
+            name, name, name)
+        self.findings.add(f)
+    }
+}
+
+/// Solves the move states (FIFO worklist from block 0, so the result depends only on the body),
+/// then walks each reached block once more from its entry state to report.
+export fn checkMoves(b: *XamBody, findings: *Findings) {
+    local n = b.blockCount as usize
+    if n == 0 {
+        return
+    }
+    local flow = Flow(n + 1, b.localCount as usize)
+    local work = Vec<u32>()
+    local queued = Vec<u8>()
+    for i in 0..n {
+        queued.push(0)
+    }
+    flow.reached.set(0, 1)
+    work.push(0)
+    queued.set(0, 1)
+    local head: usize = 0
+    while head < work.length() {
+        local id = *work.get(head) as usize
+        head++
+        queued.set(id, 0)
+        flow.copy(n, id)
+        local w = Walker(b, &flow, n, nil)
+        w.block(&b.blocks[id])
+        local t = &b.blocks[id].term
+        local count = t.targetCount as usize + (t.hasUnwind != 0 ? 1 : 0)
+        for k in 0..count {
+            local next = (k < t.targetCount as usize ? b.targets[t.targetFirst as usize + k] : t.unwind) as usize
+            if flow.join(next, n) && *queued.get(next) == 0 {
+                queued.set(next, 1)
+                work.push(next as u32)
+            }
+        }
+    }
+    for id in 0..n {
+        if *flow.reached.get(id) != 0 {
+            flow.copy(n, id)
+            local w = Walker(b, &flow, n, findings)
+            w.block(&b.blocks[id])
+        }
+    }
+}

@@ -156,13 +156,11 @@ src/sema/lower/item/roles.cpp:129:/// @grammar `@init fn`, `@fini fn`, `@entry f
 src/sema/sema/const_eval.cpp:325:/// @grammar `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)` are the only calls that are compile-time constants; every other call in a constant position is E0707.
 ```
 
-### @invariant (19)
+### @invariant (17)
 
 ```
 include/xlang/analysis/analysis.h:14:/// @invariant findings are reported sorted by source position, never in the order the passes or functions ran.
 include/xlang/mir/mir.h:27:// @invariant MIR is built only from HIR and never refers back to it; a span on every statement and
-src/analysis/findings.hpp:10:/// @invariant `reportTo` emits them sorted by the position of their first label, without duplicates, whatever order the passes and functions ran in.
-src/mir/dataflow/forward.hpp:24:/// @invariant the worklist is FIFO from block 0, so the result and the step count depend only on the body, never on hashing or addresses.
 src/sema/lower/call/builtins.cpp:70:/// @invariant the `__builtin_` set is closed: a name not listed here is not a builtin, and the compiler never learns a new one from the standard library.
 src/sema/lower/call/builtins.cpp:71:/// @invariant `__builtin_read` copies the value out of the pointer and drops nothing, so two reads of one pointer yield two owners of the same bytes and only the caller's discipline keeps that sound.
 src/sema/lower/call/builtins.cpp:72:/// @invariant `__builtin_write` is a statement, never a value, and moves the value through the pointer without running a destructor on the old bytes.
@@ -229,11 +227,5 @@ src/codegen/llvm/c_abi/win_x64.cpp:34:/// @spec https://learn.microsoft.com/en-u
 include/xlang/mir/mir.h:29:// @todo MIR does not yet carry what only code generation needs (the `asm` template and clobbers,
 ```
 
-### @cost (1)
-
-```
-src/mir/dataflow/forward.hpp:25:/// @cost each block is processed once per change of its entry fact: at most (lattice height) times.
-```
-
-Total: 57 tag lines.
+Total: 54 tag lines.
 <!-- END COLLECTED TAGS -->

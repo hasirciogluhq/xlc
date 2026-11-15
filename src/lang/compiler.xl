@@ -31,6 +31,7 @@ from "../sema/sema" import Sema
 from "../sema/item" import SItem, SDecl, SParam, SField, SSumVariant, SEnumMember, SImportName
 from "../sema/conversion" import implicitConversion, commonBinaryType
 from "../sema/layout" import LayoutHistory, formatLayoutRecord
+from "../analysis/analysis" import xlcAnalysisNew, xlcAnalysisBody, xlcAnalysisFinish
 from "../util/source" import xlcUtilSourcesNew, xlcUtilAddFile, xlcUtilSourcesFree
 from "../util/diagnostics" import xlcDiagNew, xlcDiagConfigure, xlcDiagAddAllowScope,
     xlcDiagReport, xlcDiagBeginQuiet, xlcDiagEndQuiet, xlcDiagFlush, xlcDiagExplain,
