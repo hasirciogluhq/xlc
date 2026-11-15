@@ -120,6 +120,12 @@ export class MachoObject {
         s.code.push(((w >> 24) & 0xff) as u8)
     }
 
+    /// Appends one raw byte to a section: the bytes of a string literal in `__cstring`.
+    fn addByte(self, section: u32, b: u8) {
+        local s: *MachoSection = self.sections.get(section)
+        s.code.push(b)
+    }
+
     /// Adds a defined global symbol at `offset` inside `section` (0-based) and returns its
     /// symbol-table index. The stored value is the offset; `writeObject` turns it into the
     /// virtual address by adding the section's address.

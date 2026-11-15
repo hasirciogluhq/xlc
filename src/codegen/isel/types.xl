@@ -1,0 +1,112 @@
+// The scalar types of the native backend. The flat HIR carries every type as its source spelling
+// (`i32`, `u8`, `bool`, `*Node`, an enum name); this file turns a spelling into the width,
+// signedness and class the instruction selector needs, and defines the register form every scalar
+// value takes.
+//
+// Canonical register form: an integer of `bits` bits lives in a 64-bit register, sign-extended when
+// it is signed and zero-extended otherwise; a `bool` is 0 or 1; a pointer is zero-extended. Every
+// operation whose result can leave the width re-normalizes it (`normalize` in index.xl), so a
+// comparison, a shift or a call argument can always use the full 64-bit register. A callee does
+// not trust its incoming registers either: the Apple arm64 ABI only extends narrow arguments to 32
+// bits, so each parameter is normalized again in the prolog.
+from "std" import String
+from "../../hir/abi" import XlcHirModule, view
+
+/// No scalar: an aggregate, a float or an unknown spelling. The selector rejects these in the
+/// scalar paths.
+export const KIND_OTHER: u32 = 0
+export const KIND_INT: u32 = 1
+export const KIND_BOOL: u32 = 2
+export const KIND_PTR: u32 = 3     // `*T` and `fn(...)`: 64 bits, unsigned
+export const KIND_FLOAT: u32 = 4   // `f32`, `f64`: not lowered yet
+
+/// The class, width and signedness of one scalar type.
+export struct Scalar {
+    kind: u32
+    bits: u32
+    signed: bool
+}
+
+/// Parses a fixed-width integer spelling: `i8`..`i64`, `u8`..`u64`, `isize`, `usize`. A spelling
+/// that is not one of those (`i128`, `str`, `Point`) gives `KIND_OTHER`.
+fn intOf(s: str) -> Scalar {
+    local other = Scalar { kind: KIND_OTHER, bits: 0, signed: false }
+    if s.len < 2 {
+        return other
+    }
+    local c0: u8 = s.ptr[0]
+    if c0 != b'i' && c0 != b'u' {
+        return other
+    }
+    local signed = c0 == b'i'
+    if s == "isize" || s == "usize" {
+        return Scalar { kind: KIND_INT, bits: 64, signed: signed }
+    }
+    local bits: u32 = 0
+    for k in 1..s.len {
+        local c: u8 = s.ptr[k]
+        if c < b'0' || c > b'9' {
+            return other
+        }
+        bits = bits * 10 + (c - b'0') as u32
+    }
+    if bits != 8 && bits != 16 && bits != 32 && bits != 64 {
+        return other
+    }
+    return Scalar { kind: KIND_INT, bits: bits, signed: signed }
+}
+
+/// The scalar of a type spelling. An enum resolves to its underlying integer type, the way
+/// `castScalar` and `genBinary` of the LLVM path do (`Type::elem`).
+export fn scalarOf(m: *XlcHirModule, spelling: str) -> Scalar {
+    if spelling == "bool" {
+        return Scalar { kind: KIND_BOOL, bits: 1, signed: false }
+    }
+    if spelling == "f32" || spelling == "f64" {
+        return Scalar { kind: KIND_FLOAT, bits: spelling == "f32" ? 32 : 64, signed: true }
+    }
+    // `*T` and `fn(...)` spellings start with `*` or `fn(`.
+    if spelling.len > 0 && spelling.ptr[0] == b'*' {
+        return Scalar { kind: KIND_PTR, bits: 64, signed: false }
+    }
+    if spelling.len >= 3 && spelling.ptr[0] == b'f' && spelling.ptr[1] == b'n' && spelling.ptr[2] == b'(' {
+        return Scalar { kind: KIND_PTR, bits: 64, signed: false }
+    }
+    local direct = intOf(spelling)
+    if direct.kind != KIND_OTHER {
+        return direct
+    }
+    for i in 0..m.enumCount as usize {
+        local e = &m.enums[i]
+        if spelling == view(e.name) {
+            return scalarOf(m, view(e.underlying))
+        }
+    }
+    return Scalar { kind: KIND_OTHER, bits: 0, signed: false }
+}
+
+/// The value `v` takes in the canonical register form of `s`: truncated to the width, then
+/// sign- or zero-extended. `bool` keeps only truth: any nonzero value is 1.
+export fn canonical(v: u64, s: Scalar) -> u64 {
+    if s.kind == KIND_BOOL {
+        return v != 0 ? 1 : 0
+    }
+    if s.kind != KIND_INT || s.bits >= 64 {
+        return v
+    }
+    local mask: u64 = ((1 as u64) << (s.bits as u64)) - 1
+    local x: u64 = v & mask
+    local top: u64 = (x >> ((s.bits - 1) as u64)) & 1
+    if s.signed && top != 0 {
+        x = x | ~mask
+    }
+    return x
+}
+
+/// The byte size of a scalar in memory: 1, 2, 4 or 8 for integers, 1 for `bool`, 8 for pointers.
+export fn sizeOfScalar(s: Scalar) -> u32 {
+    if s.kind == KIND_BOOL {
+        return 1
+    }
+    return s.bits / 8
+}

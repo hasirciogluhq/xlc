@@ -247,6 +247,34 @@ export fn asr64Reg(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
     out.push(0x9ac02800 | (rm << 16) | (rn << 5) | rd)
 }
 
+/// `msub Rd, Rn, Rm, Ra` — `Rd = Ra - Rn * Rm`: `sf 00 11011 000 Rm 1 Ra Rn Rd` (DDI 0487,
+/// Data-processing (3 source)). The remainder is `a - (a / b) * b`: `sdiv` then this.
+export fn msub64(out: *Vec<u32>, rd: u32, rn: u32, rm: u32, ra: u32) {
+    out.push(0x9b008000 | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+}
+
+/// `mvn Rd, Rm` — the alias of `orn Rd, xzr, Rm`: bitwise NOT (`sf 01 01010 shift 1 Rm imm6 Rn Rd`).
+export fn mvn64(out: *Vec<u32>, rd: u32, rm: u32) {
+    out.push(0xaa2003e0 | (rm << 16) | rd)
+}
+
+/// `csel Rd, Rn, Rm, cond` — `Rd = cond ? Rn : Rm`: `sf 00 11010100 Rm cond 00 Rn Rd`.
+export fn csel64(out: *Vec<u32>, rd: u32, rn: u32, rm: u32, cond: u32) {
+    out.push(0x9a800000 | (rm << 16) | (cond << 12) | (rn << 5) | rd)
+}
+
+/// `sbfm Rd, Rn, #immr, #imms` — the signed bitfield move, 64-bit: `1 00 100110 1 immr imms Rn Rd`.
+/// `sbfm Rd, Rn, #0, #(w-1)` sign-extends the low `w` bits (the `sxtb`/`sxth`/`sxtw` aliases).
+export fn sbfm64(out: *Vec<u32>, rd: u32, rn: u32, immr: u32, imms: u32) {
+    out.push(0x93400000 | (immr << 16) | (imms << 10) | (rn << 5) | rd)
+}
+
+/// `ubfm Rd, Rn, #immr, #imms` — the unsigned bitfield move, 64-bit: `1 10 100110 1 immr imms Rn Rd`.
+/// `ubfm Rd, Rn, #0, #(w-1)` zero-extends the low `w` bits (`uxtb`/`uxth`, `ubfx` for one bit).
+export fn ubfm64(out: *Vec<u32>, rd: u32, rn: u32, immr: u32, imms: u32) {
+    out.push(0xd3400000 | (immr << 16) | (imms << 10) | (rn << 5) | rd)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Loads and stores (unsigned-offset immediate forms; the offset is in bytes and must be a
 // multiple of the access size, which the imm12 field encodes in units of that size)
@@ -360,4 +388,15 @@ export fn br(out: *Vec<u32>, rn: u32) {
 /// `blr Rn` — indirect call, return address into `x30`.
 export fn blr(out: *Vec<u32>, rn: u32) {
     out.push(0xd63f0000 | (rn << 5))
+}
+
+/// `svc #imm16` — supervisor call; macOS takes `#0x80` with the number in `x16` (XNU
+/// `bsd/dev/arm/systemcalls.c`). `1101 0100 000 imm16 000 01`.
+export fn svc(out: *Vec<u32>, imm16: u32) {
+    out.push(0xd4000001 | (imm16 << 5))
+}
+
+/// `brk #imm16` — software breakpoint, the trap for a failed check the stdlib does not handle.
+export fn brk(out: *Vec<u32>, imm16: u32) {
+    out.push(0xd4200000 | (imm16 << 5))
 }
