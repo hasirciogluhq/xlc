@@ -1,0 +1,125 @@
+// Compile-time queries of the xlang lowering pass: the layout builtins (`sizeOf`, `alignOf`,
+// `offsetOf`), enum member values and the HIR spellings of the operators. None of them lowers an
+// expression, so they sit apart from the expression walk in function.xl (no cyclic imports).
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF, XU_BITNOT,
+    XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE,
+    XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
+from "../sema/item" import SDecl
+from "../sema/const_eval" import evalConst
+from "../sema/layout_calc" import layoutOfName
+from "./state" import Lowerer
+
+/// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)`: folded to an integer constant from the
+/// computed layout. Primitives use the fixed table; aggregates go through `layoutOfName`.
+export fn lowerLayoutQuery(l: *Lowerer, idx: i32, e: *XExpr, which: str) -> i32 {
+    if (*e).argsCount == 0 {
+        l.err("E0709", (*e).span, format("`{}` needs a type", which).asStr(), "missing argument")
+        return -1
+    }
+    local tyArg = l.s.refAt("expr", (*e).argsFirst as i32)
+    local tyName = l.s.exprTextAt(tyArg)
+    local value: u64 = 0
+    if which == "offsetOf" {
+        if (*e).argsCount < 2 {
+            l.err("E0709", (*e).span, "`offsetOf` needs a type and a field", "missing argument")
+            return -1
+        }
+        local fieldArg = l.s.refAt("expr", ((*e).argsFirst + 1 as u32) as i32)
+        local fieldName = l.s.exprTextAt(fieldArg)
+        local li = layoutOfName(l.s, tyName, (*e).span)
+        if li < 0 {
+            l.err("E0709", (*e).span, format("no layout for `{}`", tyName).asStr(),
+                "unknown type")
+            return -1
+        }
+        local lay = *l.s.layoutCache.get(li as usize)
+        for i in 0..(*lay).fields.length() {
+            local f = (*lay).fields.get(i)
+            if (*f).name.asStr() == fieldName {
+                value = (*f).offset
+            }
+        }
+    } else {
+        value = primLayout(tyName, which)
+        if value == 0 {
+            local li = layoutOfName(l.s, tyName, (*e).span)
+            if li < 0 {
+                l.err("E0709", (*e).span, format("no layout for `{}`", tyName).asStr(),
+                    "unknown type")
+                return -1
+            }
+            local lay = *l.s.layoutCache.get(li as usize)
+            value = which == "sizeOf" ? (*lay).size : (*lay).align
+        }
+    }
+    return l.b.intConst(value, "usize")
+}
+
+/// The size or alignment of a primitive type by name; 0 when `tyName` is not one.
+fn primLayout(tyName: str, which: str) -> u64 {
+    local size: u64 = 0
+    if tyName == "i8" || tyName == "u8" || tyName == "bool" { size = 1 }
+    else if tyName == "i16" || tyName == "u16" { size = 2 }
+    else if tyName == "f32" { size = 4 }
+    else if tyName == "i32" || tyName == "u32" || tyName == "f32" { size = 4 }
+    else if tyName == "i64" || tyName == "u64" || tyName == "f64" || tyName == "usize" ||
+            tyName == "isize" || tyName == "u128" || tyName == "i128" { size = 8 }
+    else if tyName == "str" { size = 16 }
+    if size == 0 { return 0 }
+    return which == "sizeOf" ? size : size
+}
+
+/// The value of the member `member` of the enum declared by `d`, numbered as the C++ enumMember
+/// does: a written value (a constant expression), else one more than the member before it.
+export fn enumMemberValue(l: *Lowerer, d: *SDecl, member: str) -> i64 {
+        local next: i64 = 0
+        for i in 0..(*d).membersCount as usize {
+            local m = l.s.memberAt((*d).membersFirst as usize + i)
+            local value = next
+            if (*m).value >= 0 {
+                local c = evalConst(l.s, (*m).value)
+                if c >= 0 { value = (*l.s.consts.get(c as usize)).intValue.lo as i64 }
+            }
+            if l.s.text((*m).name) == member { return value }
+            next = value + 1
+        }
+        return 0
+    }
+
+/// The spelling of a `UnaryOp` (Neg=0 Not=1 Deref=2 AddrOf=3 BitNot=4), the form the HIR keeps.
+export fn unaryOpName(op: i32) -> str {
+    switch {
+        case op == XU_NEG { return "-" }
+        case op == XU_NOT { return "!" }
+        case op == XU_DEREF { return "*" }
+        case op == XU_ADDROF { return "&" }
+        case op == XU_BITNOT { return "~" }
+    }
+    return "?"
+}
+
+/// The spelling of a `BinaryOp` (Add=0 .. Shr=17, declaration order).
+export fn binaryOpName(op: i32) -> str {
+    switch {
+        case op == XB_ADD { return "+" }
+        case op == XB_SUB { return "-" }
+        case op == XB_MUL { return "*" }
+        case op == XB_DIV { return "/" }
+        case op == XB_MOD { return "%" }
+        case op == XB_EQ { return "==" }
+        case op == XB_NE { return "!=" }
+        case op == XB_LT { return "<" }
+        case op == XB_LE { return "<=" }
+        case op == XB_GT { return ">" }
+        case op == XB_GE { return ">=" }
+        case op == XB_AND { return "&&" }
+        case op == XB_OR { return "||" }
+        case op == XB_BITAND { return "&" }
+        case op == XB_BITOR { return "|" }
+        case op == XB_BITXOR { return "^" }
+        case op == XB_SHL { return "<<" }
+        case op == XB_SHR { return ">>" }
+    }
+    return "?"
+}

@@ -16,7 +16,8 @@ from "./builder" import FnBuild, EnumRec, AggrRec, IfaceRec, XlcHirGlobalRec
 from "./helpers" import baseInitKey, overloadKey
 
 export fn lowerItemsTouch() { return }
-from "./function" import lowerFunction, lowerFunctionDecl, lowerConstInit, enumMemberValue
+from "./function" import lowerFunction, lowerFunctionDecl, lowerConstInit
+from "./queries" import enumMemberValue
 from "./instances" import lowerPendingInstances, lowerImpls
 
 /// The declaration kinds of the flat AST (mirrored here for the dispatch).

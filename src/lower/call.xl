@@ -14,7 +14,8 @@ from "std" import String, Vec, format
 from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
 from "../sema/types" import T_POINTER
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL
-from "./function" import lowerExpr, lowerExprAs, lowerLayoutQuery
+from "./function" import lowerExpr, lowerExprAs
+from "./queries" import lowerLayoutQuery
 from "./typing" import exprType, exprTypeName, typeNameOf, resolveBase, argSpecs, chooseDecl,
     functionDecls
 from "./methods" import findMethod, methodsNamed, MethodRef
