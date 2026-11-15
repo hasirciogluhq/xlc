@@ -1,0 +1,67 @@
+// The entry of the xlang lowering pass, as the C++ side calls it (src/sema/xl_bridge.cpp). One
+// session takes the frozen flat AST of one module, collects its names, lowers it into the flat
+// HIR of hir/abi.xl and keeps that module until the session is freed. The C++ pass
+// (src/sema/lower/program.cpp) is the reference: the two dumps must agree.
+from "std" import String, Vec
+from "../lang/parser/parser" import CParseResult
+from "../util/diagnostics" import DiagnosticEngine
+from "../hir/abi" import XlcHirModule, XlcHirText
+from "../hir/dump" import xlcHirDump, xlcHirDumpFree
+from "../sema/flat" import Flat
+from "../sema/types" import Types
+from "../sema/sema" import Sema
+from "./state" import Lowerer
+from "./builder" import HirBuilder, HirKeep
+from "./items" import run, finish
+
+/// One lowering session. Heap-allocated: the Types and the Sema keep pointers into the session
+/// (the flat AST and each other), so it must not move.
+export class LowerSession {
+    flat: Flat
+    types: Types
+    sema: Sema
+    builder: HirBuilder
+    keep: HirKeep
+    module: XlcHirModule
+
+    fn init(self, r: *CParseResult, diag: *DiagnosticEngine) {
+        self.flat = Flat(*r)
+        self.types = Types(&(self.flat))
+        self.sema = Sema(&(self.flat), &(self.types), diag)
+        // The configuration the gate runs with: a 64-bit target, no -D definitions, no
+        // compilation around the module, the default `xl` mangling.
+        self.sema.pointerBits = 64
+        self.sema.hasComp = false
+        self.sema.mangleNone = false
+        self.builder = HirBuilder()
+        self.keep = HirKeep()
+    }
+}
+
+/// `xlcLowerRun`: lowers the module behind `r` (the frozen parse of one file) with the xlang
+/// lowering pass. Diagnostics go to the engine `diag`. The result is freed with `xlcLowerFree`.
+export(c) fn xlcLowerRun(r: *CParseResult, diag: *DiagnosticEngine) -> *LowerSession {
+    local ses = new LowerSession(r, diag)
+    ses.sema.internProgram()
+    ses.sema.collect()
+    local l = new Lowerer(&(ses.sema), &(ses.builder), false)
+    run(l)
+    finish(l)
+    ses.module = ses.builder.materialize(&(ses.keep))
+    return ses
+}
+
+/// `xlcLowerDump`: the text of the lowered module, the same form `hir::dumpModule` writes.
+export(c) fn xlcLowerDump(ses: *LowerSession) -> XlcHirText {
+    return xlcHirDump(&(ses.module))
+}
+
+/// `xlcLowerDumpFree`: releases the text `xlcLowerDump` returned.
+export(c) fn xlcLowerDumpFree(t: XlcHirText) {
+    xlcHirDumpFree(t)
+}
+
+/// `xlcLowerFree`: releases a session; its module and the text dumped from it go with it.
+export(c) fn xlcLowerFree(ses: *LowerSession) {
+    delete ses
+}

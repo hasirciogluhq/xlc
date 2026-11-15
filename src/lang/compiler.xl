@@ -24,6 +24,7 @@ from "../lower/instances" import lowerInstancesTouch
 from "../lower/items" import lowerItemsTouch
 from "../lower/state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec
 from "../lower/builder" import HirBuilder, FnBuild, HirKeep
+from "../lower/program" import xlcLowerRun, xlcLowerDump, xlcLowerDumpFree, xlcLowerFree
 from "../sema/checks" import analyze
 from "../sema/module_scope" import lookupEntity, lookupQualified, entityByQName, entityOfExpr, exprToType
 from "../sema/int128" import I128, i128Of, i128Text

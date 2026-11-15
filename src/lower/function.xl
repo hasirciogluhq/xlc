@@ -15,11 +15,14 @@ from "../sema/item" import SDecl, SItem, SParam
 from "../lang/ast/ast" import XStmt, XExpr, XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF, XU_BITNOT,
     XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE,
     XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
-from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY
+from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_STR
 from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
 from "./builder" import FnBuild
+from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
+    effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf
+from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOfName
 
@@ -107,6 +110,7 @@ export fn addLocal(l: *Lowerer, name: str, typeName: str) -> u32 {
 export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: str, owner: str) {
         local ret = l.typeName(resolve(l.s, (*d).ret))
         if (*d).hasRet == 0 { ret = String("void") }
+        l.fnRetTy = (*d).hasRet == 0 ? l.s.types.makeVoid() : resolve(l.s, (*d).ret)
         beginFunction(l, qname, localName, owner, ret.asStr())
         // The parameters, in order; a `self` first when the owner is a class.
         if owner.len > 0 {
@@ -178,7 +182,7 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
         if (*st).kind == XS_RETURN {
             local value = -1
             if (*st).expr >= 0 {
-                value = lowerExpr(l, (*st).expr)
+                value = lowerExprAs(l, (*st).expr, l.fnRetTy)
             }
             return l.b.returnStmt(value)
         }
@@ -210,7 +214,7 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
         }
         if (*st).kind == XS_ASSIGN {
             local target = lowerExpr(l, (*st).target)
-            local value = lowerExpr(l, (*st).expr)
+            local value = lowerExprAs(l, (*st).expr, exprType(l, (*st).target))
             return l.b.assign(target, value)
         }
         if (*st).kind == XS_FOR {
@@ -264,23 +268,23 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
 export fn lowerLet(l: *Lowerer, idx: i32) -> i32 {
         local st = l.s.stmtAt(idx)
         local name = l.s.stmtTextAt(idx)
-        local tyName = ""
+        // The declared type, resolved; without one, the type of the initializer.
+        local declared = -1
         if (*st).hasType != 0 && (*st).typeIdx >= 0 {
-            tyName = l.typeName(resolve(l.s, (*st).typeIdx)).asStr()
+            declared = resolve(l.s, l.s.types.internAst((*st).typeIdx))
         }
         local value = -1
+        local vty = declared
         if (*st).expr >= 0 {
-            value = lowerExpr(l, (*st).expr)
-            if tyName.len == 0 {
-                tyName = l.exprTypeName((*st).expr)
-            }
+            value = lowerExprAs(l, (*st).expr, declared)
+            if vty < 0 { vty = effectiveType(l, (*st).expr, -1) }
         }
-        if tyName.len == 0 { tyName = "void" }
+        local tyName = vty < 0 ? "void" : l.keep(l.s.types.text(vty).asStr())
         local id = addLocal(l, name, tyName)
         local e = new ScopeEntry()
         (*e).kind = SE_LOCAL
         (*e).name = String(name)
-        (*e).ty = (*st).typeIdx
+        (*e).ty = vty
         (*e).localId = id
         l.scopes.declare(e)
         return l.b.localStmt(id, name, tyName, value)
@@ -288,49 +292,76 @@ export fn lowerLet(l: *Lowerer, idx: i32) -> i32 {
 
     /// Lowers one expression and returns its HIR index, or -1.
 export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
+        return lowerExprWant(l, idx, -1)
+    }
+
+    /// Lowers `idx` where the context expects type `want` (a Types index, -1 for none), then
+    /// converts the value to `want` the way the C++ `coerce` does.
+export fn lowerExprAs(l: *Lowerer, idx: i32, want: i32) -> i32 {
+        return coerceTo(l, idx, lowerExprWant(l, idx, want), want)
+    }
+
+    /// Lowers `idx` with the context type `want` (-1 for none). An unsuffixed literal takes the
+    /// type it is given: an integer one a float type too. The operators pass `want` on to the
+    /// operands that are literals (see `lowerBinary`).
+export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
         if idx < 0 { return -1 }
         local e = l.s.exprAt(idx)
         if (*e).kind == XE_INT_LITERAL {
-            return l.b.intConst((*e).intValue, l.exprTypeName(idx))
+            if want >= 0 && isFloatType(l, want) {
+                return l.b.floatConst((*e).intValue as f64, typeNameOf(l, want))
+            }
+            if want >= 0 && isIntType(l, want) {
+                return l.b.intConst((*e).intValue, typeNameOf(l, want))
+            }
+            return l.b.intConst((*e).intValue, exprTypeName(l, idx))
         }
         if (*e).kind == XE_FLOAT_LITERAL {
-            return l.b.floatConst((*e).floatValue, l.exprTypeName(idx))
+            local ft = want >= 0 && isFloatType(l, want) ? typeNameOf(l, want) : "f64"
+            return l.b.floatConst((*e).floatValue, ft)
         }
         if (*e).kind == XE_BOOL_LITERAL {
-            return l.b.boolConst((*e).boolValue != 0, l.exprTypeName(idx))
+            return l.b.boolConst((*e).boolValue != 0, exprTypeName(l,idx))
         }
         if (*e).kind == XE_STRING_LITERAL {
-            return l.b.strConst(l.s.exprTextAt(idx), l.exprTypeName(idx))
+            return l.b.strConst(l.s.exprTextAt(idx), exprTypeName(l,idx))
         }
         if (*e).kind == XE_BYTE_LITERAL {
-            return l.b.intConst((*e).intValue, l.exprTypeName(idx))
+            return l.b.intConst((*e).intValue, exprTypeName(l,idx))
         }
         if (*e).kind == XE_NAME {
             return lowerName(l, idx)
         }
         if (*e).kind == XE_BINARY {
-            local lhs = lowerExpr(l, (*e).lhs)
-            local rhs = lowerExpr(l, (*e).rhs)
-            return l.b.binary(binaryOpName((*e).binaryOp), lhs, rhs, l.exprTypeName(idx))
+            return lowerBinary(l, idx, e, want)
         }
         if (*e).kind == XE_UNARY {
-            local lhs = lowerExpr(l, (*e).lhs)
-            return l.b.unary(unaryOpName((*e).unaryOp), lhs, l.exprTypeName(idx))
+            // A negative literal takes the context type; the other operators do not pass it on.
+            local lhs = lowerExprWant(l, (*e).lhs, (*e).unaryOp == XU_NEG ? want : -1)
+            if (*e).unaryOp == XU_DEREF {
+                return l.b.deref(lhs, exprTypeName(l, idx))
+            }
+            if (*e).unaryOp == XU_ADDROF {
+                return l.b.addrOf(lhs, exprTypeName(l, idx))
+            }
+            return l.b.unary(unaryOpName((*e).unaryOp), lhs, typeNameOf(l, effectiveType(l, idx, want)))
         }
         if (*e).kind == XE_CAST {
             local value = lowerExpr(l, (*e).lhs)
-            return l.b.cast(value, l.exprTypeName(idx), false)
+            return l.b.cast(value, exprTypeName(l, idx), false)
         }
         if (*e).kind == XE_FIELD {
             local base = lowerExpr(l, (*e).lhs)
-            // Field offset index and pointer access are sema-derived; filled once the xl sema
-            // assigns per-expression types and member offsets.
-            return l.b.field(base, l.s.exprTextAt(idx), l.exprTypeName(idx), false, 0)
+            // A field of a pointer is read through it (`field.ptr`); the index is the field's
+            // position in its aggregate.
+            local bt = exprType(l, (*e).lhs)
+            local viaPointer = bt >= 0 && l.s.types.get(bt).kind == T_POINTER
+            local owner = resolveBase(l, bt)
+            local fieldName = l.s.exprTextAt(idx)
+            return l.b.field(base, fieldName, exprTypeName(l, idx), viaPointer, fieldIndexOf(l, owner, fieldName))
         }
         if (*e).kind == XE_INDEX {
-            local base = lowerExpr(l, (*e).lhs)
-            local sub = lowerExpr(l, (*e).rhs)
-            return l.b.index(base, sub, l.exprTypeName(idx))
+            return lowerIndex(l, idx, e)
         }
         if (*e).kind == XE_SLICE {
             local base = lowerExpr(l, (*e).lhs)
@@ -344,9 +375,9 @@ export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
         if (*e).kind == XE_ARRAY_LIST || (*e).kind == XE_TUPLE_LITERAL {
             local items = lowerArgList(l, e)
             if (*e).kind == XE_ARRAY_LIST {
-                return l.b.arrayList(items, "")
+                return l.b.arrayList(items, exprTypeName(l, idx))
             }
-            return l.b.tupleLit(items, "")
+            return l.b.tupleLit(items, exprTypeName(l, idx))
         }
         if (*e).kind == XE_ARRAY_REPEAT {
             local value = lowerExpr(l, (*e).lhs)
@@ -362,7 +393,7 @@ export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
             local cond = lowerExpr(l, (*e).lhs)
             local thenValue = lowerExpr(l, (*e).rhs)
             local elseValue = lowerExpr(l, l.s.refAt("expr", (*e).argsFirst as i32))
-            return l.b.select(cond, thenValue, elseValue, "")
+            return l.b.select(cond, thenValue, elseValue, exprTypeName(l, idx))
         }
         if (*e).kind == XE_CALL {
             return lowerCall(l, idx)
@@ -370,6 +401,86 @@ export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
         l.err("E0500", (*e).span, "this expression form is not lowered yet",
             "the xlang lowering pass is still being ported")
         return -1
+    }
+
+    /// `base[i]` (as the C++ `indexExpr`): a `str`, slice or array index is bounds checked under
+    /// `--safety=checked`; a pointer index is not.
+export fn lowerIndex(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
+        local base = lowerExpr(l, (*e).lhs)
+        local sub = lowerExpr(l, (*e).rhs)
+        local at = l.b.index(base, sub, exprTypeName(l, idx))
+        local bt = exprType(l, (*e).lhs)
+        local bk = bt < 0 ? -1 : l.s.types.get(bt).kind
+        if l.checkedSafety && (bk == T_STR || bk == T_SLICE || bk == T_ARRAY) {
+            (*l.b.exprAt(at)).checked = 1
+        }
+        return at
+    }
+
+    /// The value converted to type `want` (-1: no conversion). An implicit conversion is a cast
+    /// marked implicit; a conversion the language does not allow is left as it is (the sema
+    /// reports those, and the xlang sema does not report them yet).
+export fn coerceTo(l: *Lowerer, idx: i32, value: i32, want: i32) -> i32 {
+        if want < 0 || value < 0 { return value }
+        local vt = effectiveType(l, idx, want)
+        if vt < 0 || l.s.types.same(vt, want) { return value }
+        local r = implicitConversion(l.s.types, vt, want, false, l.s.pointerBits)
+        if r.status == C_OK || r.status == C_WARN {
+            return l.b.cast(value, typeNameOf(l, want), true)
+        }
+        return value
+    }
+
+    /// A binary operation, as the C++ `binaryExpr`: a literal operand takes the type of the other
+    /// one, the numeric operands are converted to their common type, and the result is that type
+    /// (`bool` for a comparison). `&&` and `||` take `bool` operands. A shift keeps the type of its
+    /// left operand, and its count is converted to it.
+export fn lowerBinary(l: *Lowerer, idx: i32, e: *XExpr, want: i32) -> i32 {
+        local op = (*e).binaryOp
+        local boolT = l.s.types.makeBool()
+        if op == XB_AND || op == XB_OR {
+            local andLhs = lowerExprAs(l, (*e).lhs, boolT)
+            local andRhs = lowerExprAs(l, (*e).rhs, boolT)
+            return l.b.binary(binaryOpName(op), andLhs, andRhs, "bool")
+        }
+        local isCmp = op >= XB_EQ && op <= XB_GE
+        local hint = isCmp ? -1 : want
+        local lhs = -1
+        local rhs = -1
+        local lt = -1
+        local rt = -1
+        // A literal on the left takes the type of a non-literal right operand; otherwise the right
+        // operand takes the type of a numeric left one.
+        if isLiteralExpr(l, (*e).lhs) && (!isLiteralExpr(l, (*e).rhs) || isFloatLiteralExpr(l, (*e).rhs)) {
+            rhs = lowerExprWant(l, (*e).rhs, hint)
+            rt = effectiveType(l, (*e).rhs, hint)
+            lhs = lowerExprWant(l, (*e).lhs, rt)
+            lt = effectiveType(l, (*e).lhs, rt)
+        } else {
+            lhs = lowerExprWant(l, (*e).lhs, hint)
+            lt = effectiveType(l, (*e).lhs, hint)
+            local rightHint = isNumeric(l, lt) ? lt : hint
+            rhs = lowerExprWant(l, (*e).rhs, rightHint)
+            rt = effectiveType(l, (*e).rhs, rightHint)
+        }
+        if op == XB_SHL || op == XB_SHR {
+            if !l.s.types.same(lt, rt) {
+                rhs = l.b.cast(rhs, typeNameOf(l, lt), false)
+            }
+            return l.b.binary(binaryOpName(op), lhs, rhs, typeNameOf(l, lt))
+        }
+        local common = -1
+        if isNumeric(l, lt) && isNumeric(l, rt) {
+            local c = commonBinaryType(l.s.types, lt, rt, l.s.pointerBits)
+            if c.status == C_OK {
+                common = c.ty
+                if !l.s.types.same(lt, common) { lhs = l.b.cast(lhs, typeNameOf(l, common), true) }
+                if !l.s.types.same(rt, common) { rhs = l.b.cast(rhs, typeNameOf(l, common), true) }
+            }
+        } else if isCmp {
+            common = lt
+        }
+        return l.b.binary(binaryOpName(op), lhs, rhs, typeNameOf(l, isCmp ? boolT : common))
     }
 
     /// A name: a local, a global, a function or a constant.
@@ -381,7 +492,7 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
                 format("unknown name `{}`", name).asStr(), "not found in any scope")
             return -1
         }
-        local tyName = l.exprTypeName(idx)
+        local tyName = exprTypeName(l,idx)
         if (*entry).kind == SE_LOCAL {
             return l.b.localRef((*entry).localId, tyName)
         }
@@ -405,6 +516,25 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
     }
 
     /// A call: the callee name, the arguments in order.
+    /// The declared type of parameter `i` (self excluded) of the function `entry` names, when the
+    /// name has exactly one declaration; -1 otherwise.
+export fn calleeParamType(l: *Lowerer, entry: *ScopeEntry, i: u32) -> i32 {
+        if entry == nil || (*entry).kind != SE_FUNCTION || (*entry).overloads.length() != 1 {
+            return -1
+        }
+        local d = l.s.declOfItem(*(*entry).overloads.get(0))
+        if d < 0 { return -1 }
+        local decl = l.s.declAt(d as usize)
+        local k: u32 = 0
+        for j in 0..(*decl).paramsCount as usize {
+            local p = l.s.paramAt((*decl).paramsFirst as usize + j)
+            if (*p).isSelf != 0 { continue }
+            if k == i { return resolve(l.s, (*p).ty) }
+            k = k + 1
+        }
+        return -1
+    }
+
 export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         local e = l.s.exprAt(idx)
         // The layout queries fold to constants here: the HIR has no sizeof form.
@@ -412,11 +542,23 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         if calleeText == "sizeOf" || calleeText == "alignOf" || calleeText == "offsetOf" {
             return lowerLayoutQuery(l, idx, e, calleeText)
         }
+        // `syscall(nr, args...)` is the HIR syscall form, not a call.
+        if calleeText == "syscall" {
+            local sysArgs = Vec<i32>()
+            for i in 0..(*e).argsCount as usize {
+                sysArgs.push(lowerExpr(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)))
+            }
+            local sysRange = l.b.args(sysArgs)
+            return l.b.syscallExpr(sysRange.0, sysRange.1, exprTypeName(l, idx))
+        }
+        // A plain function name with one declaration: each argument converts to its parameter.
+        local direct = l.s.exprAt((*e).lhs)
+        local callee = (*direct).kind == XE_NAME ? l.lookupName(l.s.exprTextAt((*e).lhs)) : nil
         local args = Vec<i32>()
         local count = (*e).argsCount
         for i in 0..count as usize {
             local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
-            local v = lowerExpr(l, a)
+            local v = lowerExprAs(l, a, calleeParamType(l, callee, i as u32))
             if v < 0 { return -1 }
             args.push(v)
         }
@@ -426,9 +568,9 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
             local callee = l.s.exprTextAt((*e).lhs)
             local entry = l.lookupName(callee)
             if entry != nil && (*entry).kind == SE_FUNCTION {
-                return l.b.call((*entry).qname.asStr(), range.0, range.1, l.exprTypeName(idx))
+                return l.b.call((*entry).qname.asStr(), range.0, range.1, exprTypeName(l,idx))
             }
-            return l.b.call(callee, range.0, range.1, l.exprTypeName(idx))
+            return l.b.call(callee, range.0, range.1, exprTypeName(l,idx))
         }
         if (*lhs).kind == XE_FIELD {
             // A method call: the receiver becomes the first argument; the qualified name is
@@ -442,12 +584,12 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
                 withSelf.push(*args.get(i))
             }
             local full = l.b.args(withSelf)
-            return l.b.call(method, full.0, full.1, l.exprTypeName(idx))
+            return l.b.call(method, full.0, full.1, exprTypeName(l,idx))
         }
         // A call through a value (a function pointer): the callee expression is the operand.
         local fnValue = lowerExpr(l, (*e).lhs)
         if fnValue < 0 { return -1 }
-        return l.b.callIndirect(fnValue, range.0, range.1, l.exprTypeName(idx))
+        return l.b.callIndirect(fnValue, range.0, range.1, exprTypeName(l,idx))
     }
 
 /// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)`: folded to an integer constant from the
@@ -493,7 +635,7 @@ export fn lowerLayoutQuery(l: *Lowerer, idx: i32, e: *XExpr, which: str) -> i32 
             value = which == "sizeOf" ? (*lay).size : (*lay).align
         }
     }
-    return l.b.intConst(value, "u64")
+    return l.b.intConst(value, "usize")
 }
 
 /// The size or alignment of a primitive type by name; 0 when `tyName` is not one.
@@ -663,7 +805,7 @@ export fn lowerArgList(l: *Lowerer, e: *XExpr) -> Vec<i32> {
 
 /// A struct literal: the field initializers in source order.
 export fn lowerStructLit(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
-    local tyName = l.typeName((*e).typeIdx).asStr()
+    local tyName = typeNameOf(l, aggregateTypeOf(l, e))
     local inits = Vec<i32>()
     local first = l.b.fieldInits.length() as u32
     for i in 0..(*e).fieldsCount as usize {
@@ -674,7 +816,8 @@ export fn lowerStructLit(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
         rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
         rec.value = v
         l.b.fieldInits.push(rec)
-        l.b.fieldName(first, l.b.fieldInits.length() as u32 - 1, l.s.text((*f).name))
+        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, l.s.flat.strOf((*f).name),
+            fieldIndexOf(l, aggregateTypeOf(l, e), l.s.flat.strOf((*f).name)))
     }
     local at = l.b.expr(E_STRUCT_LIT, tyName)
     local p = l.b.exprAt(at)
@@ -685,7 +828,7 @@ export fn lowerStructLit(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
 
 /// `new T` / `new T { fields }` / `new T(args)`: the allocation, the init call and the fields.
 export fn lowerNew(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
-    local tyName = l.typeName((*e).typeIdx).asStr()
+    local tyName = typeNameOf(l, aggregateTypeOf(l, e))
     local at = l.b.newExpr(format("*{}", tyName).asStr())
     local p = l.b.exprAt(at)
     // A class with an `init`: the call becomes the init function over the argument list.
@@ -707,7 +850,8 @@ export fn lowerNew(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
         rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
         rec.value = v
         l.b.fieldInits.push(rec)
-        l.b.fieldName(first, l.b.fieldInits.length() as u32 - 1, l.s.text((*f).name))
+        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, l.s.flat.strOf((*f).name),
+            fieldIndexOf(l, aggregateTypeOf(l, e), l.s.flat.strOf((*f).name)))
     }
     (*p).fieldFirst = first
     (*p).fieldCount = l.b.fieldInits.length() as u32 - first

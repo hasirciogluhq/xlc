@@ -739,6 +739,7 @@ void runCAbiTests();
 void runUtilBridgeTests();
 void runMirTests();
 void runMoveTests();
+void runXlLowerTests();
 
 int main() {
     RUN(runSemaTests);
@@ -753,6 +754,7 @@ int main() {
     RUN(runDropTests);
     RUN(runMirTests);
     RUN(runMoveTests);
+    RUN(runXlLowerTests);
     RUN(testWarningContextAndTwoSidedLabels);
     RUN(testErrorContextIsWiderAndGutterIsAligned);
     RUN(testDistantMarksAreSeparatedAndNearOnesMerged);

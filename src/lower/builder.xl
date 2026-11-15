@@ -64,7 +64,7 @@ export class HirBuilder {
     fieldInits: Vec<XlcHirFieldInit>
     operands: Vec<XlcHirAsmOperand>
     refs: Vec<u32>
-    bytes: Vec<u8>
+    owned: Vec<*String>  ///< the heap blocks the string views point into
     strs: Vec<XlcHirStr>
     panicFunction: String
     allocFunction: String
@@ -86,7 +86,7 @@ export class HirBuilder {
         self.fieldInits = Vec<XlcHirFieldInit>()
         self.operands = Vec<XlcHirAsmOperand>()
         self.refs = Vec<u32>()
-        self.bytes = Vec<u8>()
+        self.owned = Vec<*String>()
         self.strs = Vec<XlcHirStr>()
         self.panicFunction = String("")
         self.allocFunction = String("")
@@ -97,17 +97,15 @@ export class HirBuilder {
         self.finiFns = Vec<String>()
     }
 
-    /// Interns `text` and returns its view into the module's byte arena.
+    /// Interns `text` and returns its view. Each string is its own heap block, kept alive by the
+    /// builder, so a view never dangles when later strings are added.
     fn str(self, text: str) -> XlcHirStr {
-        local off = self.bytes.length() as u32
-        for i in 0..text.len {
-            self.bytes.push(text[i])
-        }
+        local owned = new String(text)
+        self.owned.push(owned)
+        local v = (*owned).asStr()
         local out: XlcHirStr
-        out.bytes = (self.bytes.data as usize + off as usize) as *u8
-        out.len = text.len as u32
-        // The view is recorded so the arena cannot be read around; the bytes stay put because the
-        // Vec only grows and the materialization copies it once, in order.
+        out.bytes = v.ptr
+        out.len = v.len as u32
         self.strs.push(out)
         return out
     }
@@ -327,10 +325,12 @@ export class HirBuilder {
     }
 
     /// Sets the name of the field-init record `first + i`.
-    fn fieldName(self, first: u32, i: u32, name: str) {
-        local rec = (self.fieldInits.data as usize + (first + i) as usize *
-            sizeOf(XlcHirFieldInit)) as *XlcHirFieldInit
+    /// Names the field initializer at absolute position `i` of `fieldInits`, and records the
+    /// position of that field in its aggregate.
+    fn fieldName(self, i: u32, name: str, index: u32) {
+        local rec = self.fieldInits.get(i as usize)
         (*rec).name = self.str(name)
+        (*rec).index = index
     }
 
     /// `new T`: the memory the init writes is `lhs`; the type name is the pointer type.
@@ -365,8 +365,13 @@ export class HirBuilder {
         return idx
     }
 
-    fn syscall(self, list: Vec<i32>, typeName: str) -> i32 {
-        return self.arrayList(list, typeName)
+    /// `syscall(nr, args...)`: the arguments are already in `refs` from `argFirst`.
+    fn syscallExpr(self, argFirst: u32, argCount: u32, typeName: str) -> i32 {
+        local idx = self.expr(E_SYSCALL, typeName)
+        local e = self.exprAt(idx)
+        (*e).argFirst = argFirst
+        (*e).argCount = argCount
+        return idx
     }
 
     // ------------------------------------------------------------------ statements
@@ -495,7 +500,11 @@ export class HirBuilder {
         // `strs` stay valid as long as the keep-alive holds the Vec.
         local m: XlcHirModule
         // Functions: locals and bodies flattened in order.
+        // A pointer into a Vec is taken only once the Vec is complete (a later push can move it):
+        // the `*First` lists remember where each entity's run starts, and the pointers are set
+        // after the loops.
         local locals = Vec<XlcHirLocal>()
+        local localFirst = Vec<usize>()
         local bodies = Vec<u32>()
         local unwinds = Vec<u32>()
         local fns = Vec<XlcHirFunction>()
@@ -505,7 +514,7 @@ export class HirBuilder {
             rec.name = self.str((*f).name.asStr())
             rec.symbol = self.str((*f).symbol.asStr())
             rec.ret = self.str((*f).ret.asStr())
-            rec.locals = (locals.data as usize + locals.length() as usize * sizeOf(XlcHirLocal)) as *XlcHirLocal
+            localFirst.push(locals.length())
             for j in 0..(*f).locals.length() {
                 locals.push(*(*f).locals.get(j))
             }
@@ -530,6 +539,9 @@ export class HirBuilder {
             rec.isFini = (*f).isFini ? 1 : 0
             fns.push(rec)
         }
+        for i in 0..fns.length() {
+            (*fns.get(i)).locals = (locals.data as usize + *localFirst.get(i) * sizeOf(XlcHirLocal)) as *XlcHirLocal
+        }
         m.functions = fns.data
         m.functionCount = fns.length() as u32
         // Globals, enums, aggregates, interfaces and impls.
@@ -550,13 +562,13 @@ export class HirBuilder {
         m.globalCount = globals.length() as u32
         local enums = Vec<XlcHirEnum>()
         local members = Vec<XlcHirEnumMember>()
+        local memberFirst = Vec<usize>()
         for i in 0..self.enums.length() {
             local en = self.enums.get(i)
             local rec: XlcHirEnum
             rec.name = self.str((*en).name.asStr())
             rec.underlying = self.str((*en).underlying.asStr())
-            rec.members = (members.data as usize + members.length() as usize *
-                sizeOf(XlcHirEnumMember)) as *XlcHirEnumMember
+            memberFirst.push(members.length())
             for j in 0..(*en).memberNames.length() {
                 local mem: XlcHirEnumMember
                 mem.name = self.str((*(*en).memberNames.get(j)).asStr())
@@ -567,18 +579,22 @@ export class HirBuilder {
             rec.memberCount = (*en).memberNames.length() as u32
             enums.push(rec)
         }
+        for i in 0..enums.length() {
+            (*enums.get(i)).members = (members.data as usize + *memberFirst.get(i) * sizeOf(XlcHirEnumMember)) as *XlcHirEnumMember
+        }
         m.enums = enums.data
         m.enumCount = enums.length() as u32
         local aggregates = Vec<XlcHirAggregate>()
         local aggrFields = Vec<XlcHirField>()
         local vtables = Vec<XlcHirVtableSlot>()
+        local aggrFieldFirst = Vec<usize>()
+        local vtableFirst = Vec<usize>()
         for i in 0..self.aggregates.length() {
             local ag = self.aggregates.get(i)
             local rec: XlcHirAggregate
             rec.name = self.str((*ag).name.asStr())
             rec.base = self.str((*ag).base.asStr())
-            rec.fields = (aggrFields.data as usize + aggrFields.length() as usize *
-                sizeOf(XlcHirField)) as *XlcHirField
+            aggrFieldFirst.push(aggrFields.length())
             for j in 0..(*ag).fieldNames.length() {
                 local fld: XlcHirField
                 fld.name = self.str((*(*ag).fieldNames.get(j)).asStr())
@@ -586,8 +602,7 @@ export class HirBuilder {
                 aggrFields.push(fld)
             }
             rec.fieldCount = (*ag).fieldNames.length() as u32
-            rec.vtable = (vtables.data as usize + vtables.length() as usize *
-                sizeOf(XlcHirVtableSlot)) as *XlcHirVtableSlot
+            vtableFirst.push(vtables.length())
             for j in 0..(*ag).vtableMethods.length() {
                 local slot: XlcHirVtableSlot
                 slot.method = self.str((*(*ag).vtableMethods.get(j)).asStr())
@@ -600,17 +615,21 @@ export class HirBuilder {
             rec.opaque = (*ag).opaque ? 1 : 0
             aggregates.push(rec)
         }
+        for i in 0..aggregates.length() {
+            (*aggregates.get(i)).fields = (aggrFields.data as usize + *aggrFieldFirst.get(i) * sizeOf(XlcHirField)) as *XlcHirField
+            (*aggregates.get(i)).vtable = (vtables.data as usize + *vtableFirst.get(i) * sizeOf(XlcHirVtableSlot)) as *XlcHirVtableSlot
+        }
         m.aggregates = aggregates.data
         m.aggregateCount = aggregates.length() as u32
         local interfaces = Vec<XlcHirInterface>()
         local ifaceMethods = Vec<XlcHirIfaceMethod>()
         local ifaceParams = Vec<XlcHirStr>()
+        local ifaceFirst = Vec<usize>()
         for i in 0..self.interfaces.length() {
             local ifc = self.interfaces.get(i)
             local rec: XlcHirInterface
             rec.name = self.str((*ifc).name.asStr())
-            rec.methods = (ifaceMethods.data as usize + ifaceMethods.length() as usize *
-                sizeOf(XlcHirIfaceMethod)) as *XlcHirIfaceMethod
+            ifaceFirst.push(ifaceMethods.length())
             for j in 0..(*ifc).methodNames.length() {
                 local im: XlcHirIfaceMethod
                 im.name = self.str((*(*ifc).methodNames.get(j)).asStr())
@@ -625,6 +644,9 @@ export class HirBuilder {
             }
             rec.methodCount = (*ifc).methodNames.length() as u32
             interfaces.push(rec)
+        }
+        for i in 0..interfaces.length() {
+            (*interfaces.get(i)).methods = (ifaceMethods.data as usize + *ifaceFirst.get(i) * sizeOf(XlcHirIfaceMethod)) as *XlcHirIfaceMethod
         }
         m.interfaces = interfaces.data
         m.interfaceCount = interfaces.length() as u32
@@ -653,8 +675,6 @@ export class HirBuilder {
         m.operandCount = self.operands.length() as u32
         m.refs = self.refs.data
         m.refCount = self.refs.length() as u32
-        m.strings = self.strs.data
-        m.stringCount = self.strs.length() as u32
         m.panicFunction = self.str(self.panicFunction.asStr())
         m.allocFunction = self.str(self.allocFunction.asStr())
         m.freeFunction = self.str(self.freeFunction.asStr())
@@ -672,10 +692,25 @@ export class HirBuilder {
         }
         m.finiFirst = finiFirst
         m.finiCount = self.finiFns.length() as u32
+        // The string table is read last: every `str` above may have added to it.
+        m.strings = self.strs.data
+        m.stringCount = self.strs.length() as u32
+        // Every array the module points into moves into the keep-alive: a local Vec would be freed
+        // when this function returns.
         keepAlive.fns = fns
         keepAlive.locals = locals
         keepAlive.bodies = bodies
         keepAlive.unwinds = unwinds
+        keepAlive.globals = globals
+        keepAlive.enums = enums
+        keepAlive.members = members
+        keepAlive.aggregates = aggregates
+        keepAlive.aggrFields = aggrFields
+        keepAlive.vtables = vtables
+        keepAlive.interfaces = interfaces
+        keepAlive.ifaceMethods = ifaceMethods
+        keepAlive.ifaceParams = ifaceParams
+        keepAlive.impls = impls
         keepAlive.builder = self
         return m
     }
@@ -687,11 +722,35 @@ export class HirKeep {
     locals: Vec<XlcHirLocal>
     bodies: Vec<u32>
     unwinds: Vec<u32>
+    globals: Vec<XlcHirGlobal>
+    enums: Vec<XlcHirEnum>
+    members: Vec<XlcHirEnumMember>
+    aggregates: Vec<XlcHirAggregate>
+    aggrFields: Vec<XlcHirField>
+    vtables: Vec<XlcHirVtableSlot>
+    interfaces: Vec<XlcHirInterface>
+    ifaceMethods: Vec<XlcHirIfaceMethod>
+    ifaceParams: Vec<XlcHirStr>
+    impls: Vec<XlcHirImpl>
     builder: *HirBuilder ///< the arenas live in the builder; keep it alive
     inits: Vec<XlcHirStr>
     finis: Vec<XlcHirStr>
 
     fn init(self) {
+        self.fns = Vec<XlcHirFunction>()
+        self.locals = Vec<XlcHirLocal>()
+        self.bodies = Vec<u32>()
+        self.unwinds = Vec<u32>()
+        self.globals = Vec<XlcHirGlobal>()
+        self.enums = Vec<XlcHirEnum>()
+        self.members = Vec<XlcHirEnumMember>()
+        self.aggregates = Vec<XlcHirAggregate>()
+        self.aggrFields = Vec<XlcHirField>()
+        self.vtables = Vec<XlcHirVtableSlot>()
+        self.interfaces = Vec<XlcHirInterface>()
+        self.ifaceMethods = Vec<XlcHirIfaceMethod>()
+        self.ifaceParams = Vec<XlcHirStr>()
+        self.impls = Vec<XlcHirImpl>()
         self.inits = Vec<XlcHirStr>()
         self.finis = Vec<XlcHirStr>()
     }
