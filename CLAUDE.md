@@ -47,6 +47,12 @@ is banned.
   tests of what changed while working, and each full suite once at the end.
 - A release is built only from a tree whose unit and e2e tests pass on the OS being built.
 
+- **A test that needs no C++ is written in xlang (hard rule).** Unit and e2e alike: when the test
+  does not have to call C++ code (a C++ class, a C++ test helper, the C++ side of a bridge), it is
+  an xlang program and runs with the `xl` binary (`xl test`). A C++ test is written only when the
+  code under test is C++ and cannot be reached through its C ABI. New tests default to xlang; a
+  ported part gets its tests in xlang.
+
 ## Git
 
 - Never add Co-Authored-By trailers or any "Generated with Claude Code" line to commits or pull
