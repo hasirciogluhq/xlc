@@ -216,8 +216,9 @@ src/lang/        lexer, preprocessor, macros, parser, AST (all xlang); cpp/ hold
 src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR (C++ reference);
                  xl_bridge.cpp/.hpp is the C++ side of the xlang lowering pass
 src/lower/       the xlang lowering pass (flat HIR, written in xlang): program.xl is its entry,
-                 typing.xl the per-expression types, function.xl the expression walk; the sema
-                 it runs is src/sema/*.xl
+                 typing.xl the per-expression types, function.xl the expression walk,
+                 diagnose.xl the conversion, cast, index, slice, field and literal checks; the
+                 sema it runs is src/sema/*.xl
 src/hir/         the flat HIR (abi.xl), its reader of the C++ module (flatten.xl), the dump and the
                  reachability prune (prune.xl), all xlang
 src/mir/         HIR -> MIR (control-flow graph per function), written in xlang: builder/,

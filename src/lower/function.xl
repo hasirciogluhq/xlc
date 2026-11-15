@@ -22,7 +22,10 @@ from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
 from "./builder" import FnBuild
 from "./call" import lowerCall
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
-    effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf
+    effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
+    fieldTypeOf
+from "./diagnose" import coerceChecked, checkCast, checkIndex, checkSlice, checkDeref, checkField,
+    checkStructLit, checkDuplicateInit, knownField
 from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOfName
@@ -340,6 +343,7 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
             // A negative literal takes the context type; the other operators do not pass it on.
             local lhs = lowerExprWant(l, (*e).lhs, (*e).unaryOp == XU_NEG ? want : -1)
             if (*e).unaryOp == XU_DEREF {
+                if !checkDeref(l, e) { return -1 }
                 return l.b.deref(lhs, exprTypeName(l, idx))
             }
             if (*e).unaryOp == XU_ADDROF {
@@ -349,12 +353,15 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
         if (*e).kind == XE_CAST {
             local value = lowerExpr(l, (*e).lhs)
+            local to = resolve(l.s, l.s.types.internAst((*e).typeIdx))
+            if !checkCast(l, idx, exprType(l, (*e).lhs), to) { return -1 }
             return l.b.cast(value, exprTypeName(l, idx), false)
         }
         if (*e).kind == XE_FIELD {
             local base = lowerExpr(l, (*e).lhs)
             // A field of a pointer is read through it (`field.ptr`); the index is the field's
             // position in its aggregate.
+            if !checkField(l, idx, e) { return -1 }
             local bt = exprType(l, (*e).lhs)
             local viaPointer = bt >= 0 && l.s.types.get(bt).kind == T_POINTER
             local owner = resolveBase(l, bt)
@@ -366,12 +373,17 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
         if (*e).kind == XE_SLICE {
             local base = lowerExpr(l, (*e).lhs)
+            if !checkSlice(l, e) { return -1 }
+            // The bounds are `usize`, as the C++ slice lowering converts them.
+            local bounds = l.s.types.makeInt(0, false)
             local lo = -1
             if (*e).argsCount > 0 {
-                lo = lowerExpr(l, l.s.refAt("expr", (*e).argsFirst as i32))
+                lo = lowerExprAs(l, l.s.refAt("expr", (*e).argsFirst as i32), bounds)
             }
-            local hi = lowerExpr(l, (*e).rhs)
-            return l.b.slice(base, lo, hi, "")
+            local hi = lowerExprAs(l, (*e).rhs, bounds)
+            local sl = l.b.slice(base, lo, hi, exprTypeName(l, idx))
+            if l.checkedSafety { (*l.b.exprAt(sl)).checked = 1 }
+            return sl
         }
         if (*e).kind == XE_ARRAY_LIST || (*e).kind == XE_TUPLE_LITERAL {
             local items = lowerArgList(l, e)
@@ -409,6 +421,7 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
 export fn lowerIndex(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
         local base = lowerExpr(l, (*e).lhs)
         local sub = lowerExpr(l, (*e).rhs)
+        if !checkIndex(l, e) { return -1 }
         local at = l.b.index(base, sub, exprTypeName(l, idx))
         local bt = exprType(l, (*e).lhs)
         local bk = bt < 0 ? -1 : l.s.types.get(bt).kind
@@ -425,11 +438,7 @@ export fn coerceTo(l: *Lowerer, idx: i32, value: i32, want: i32) -> i32 {
         if want < 0 || value < 0 { return value }
         local vt = effectiveType(l, idx, want)
         if vt < 0 || l.s.types.same(vt, want) { return value }
-        local r = implicitConversion(l.s.types, vt, want, false, l.s.pointerBits)
-        if r.status == C_OK || r.status == C_WARN {
-            return l.b.cast(value, typeNameOf(l, want), true)
-        }
-        return value
+        return coerceChecked(l, idx, value, vt, want)
     }
 
     /// A binary operation, as the C++ `binaryExpr`: a literal operand takes the type of the other
@@ -729,25 +738,45 @@ export fn lowerArgList(l: *Lowerer, e: *XExpr) -> Vec<i32> {
 
 /// A struct literal: the field initializers in source order.
 export fn lowerStructLit(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
-    local tyName = typeNameOf(l, aggregateTypeOf(l, e))
-    local inits = Vec<i32>()
+    local agg = aggregateTypeOf(l, e)
+    if !checkStructLit(l, e, agg) { return -1 }
+    local tyName = typeNameOf(l, agg)
     local first = l.b.fieldInits.length() as u32
-    for i in 0..(*e).fieldsCount as usize {
-        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
-        local v = lowerExpr(l, (*f).value)
-        if v < 0 { continue }
-        local rec: XlcHirFieldInit
-        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
-        rec.value = v
-        l.b.fieldInits.push(rec)
-        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, l.s.flat.strOf((*f).name),
-            fieldIndexOf(l, aggregateTypeOf(l, e), l.s.flat.strOf((*f).name)))
-    }
+    lowerFieldInits(l, e, agg)
     local at = l.b.expr(E_STRUCT_LIT, tyName)
     local p = l.b.exprAt(at)
     (*p).fieldFirst = first
     (*p).fieldCount = l.b.fieldInits.length() as u32 - first
     return at
+}
+
+/// The field initializers of a struct literal or `new T { ... }` of the aggregate `agg`, in source
+/// order (the C++ `lowerFields`): an unknown field is E0709 and its value is still lowered for its
+/// own errors; a repeated field is E0709 and dropped; every other value is converted to the
+/// declared type of its field.
+fn lowerFieldInits(l: *Lowerer, e: *XExpr, agg: i32) {
+    for i in 0..(*e).fieldsCount as usize {
+        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
+        local name = l.s.flat.strOf((*f).name)
+        if !knownField(l, agg, name, (*f).span) {
+            lowerExpr(l, (*f).value)
+            continue
+        }
+        if !checkDuplicateInit(l, e, i as u32) { continue }
+        local ft = fieldTypeOf(l, agg, name)
+        local v = -1
+        if ft >= 0 {
+            v = lowerExprAs(l, (*f).value, ft)
+        } else {
+            v = lowerExpr(l, (*f).value)
+        }
+        if v < 0 { continue }
+        local rec: XlcHirFieldInit
+        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
+        rec.value = v
+        l.b.fieldInits.push(rec)
+        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, name, fieldIndexOf(l, agg, name))
+    }
 }
 
 /// `new T` / `new T { fields }` / `new T(args)`: the allocation, the init call and the fields.
@@ -766,17 +795,7 @@ export fn lowerNew(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
     }
     // The field initializers.
     local first = l.b.fieldInits.length() as u32
-    for i in 0..(*e).fieldsCount as usize {
-        local f = l.s.flat.initAt(((*e).fieldsFirst + i as u32) as i32)
-        local v = lowerExpr(l, (*f).value)
-        if v < 0 { continue }
-        local rec: XlcHirFieldInit
-        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
-        rec.value = v
-        l.b.fieldInits.push(rec)
-        l.b.fieldName(l.b.fieldInits.length() as u32 - 1, l.s.flat.strOf((*f).name),
-            fieldIndexOf(l, aggregateTypeOf(l, e), l.s.flat.strOf((*f).name)))
-    }
+    lowerFieldInits(l, e, aggregateTypeOf(l, e))
     (*p).fieldFirst = first
     (*p).fieldCount = l.b.fieldInits.length() as u32 - first
     return at
