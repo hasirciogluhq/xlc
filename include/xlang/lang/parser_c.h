@@ -403,8 +403,9 @@ typedef struct XlcParseResult {
 /// recorded in the `errs` arena, not thrown across the boundary.
 XlcParseResult XLC_PARSE_CALL xlcParse(const void* toks, uint32_t count, uint32_t file);
 
-/// Releases a result returned by `xlcParse`. A default-constructed result is a no-op.
-void XLC_PARSE_CALL xlcParseFree(XlcParseResult result);
+/// Releases the `block` of a result returned by `xlcParse` (the result's `block` field). A null
+/// block is a no-op. It is a pointer, not the result struct: the xlang side takes it that way.
+void XLC_PARSE_CALL xlcParseFree(void* block);
 
 #ifdef __cplusplus
 }  // extern "C"

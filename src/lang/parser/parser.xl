@@ -4121,7 +4121,9 @@ export(c) fn xlcParse(toks: *CToken, count: u32, file: u32) -> CParseResult {
     return r
 }
 
-/// `xlcParseFree`: release the block `xlcParse` allocated.
-export(c) fn xlcParseFree(result: CParseResult) {
-    delete result.block
+/// `xlcParseFree`: release the block `xlcParse` allocated. It takes the block, not the result:
+/// a @repr(c) struct this large passed by value into an export(c) function crashes the released
+/// compiler (rc.12) on x86-64 (the struct itself is returned by value without trouble).
+export(c) fn xlcParseFree(block: *ParseBlock) {
+    delete block
 }

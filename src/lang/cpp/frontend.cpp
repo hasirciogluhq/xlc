@@ -136,7 +136,7 @@ Program parseSource(const SourceManager& sources, FileId file, const BuildConfig
                          static_cast<std::uint32_t>(defines.size()), defs.data(),
                          static_cast<std::uint32_t>(defs.size()), diagnostics.handle());
     Program program = readFlatProgram(result, file, diagnostics);
-    xlcParseFree(result);
+    xlcParseFree(result.block);
     return program;
 }
 
