@@ -51,3 +51,13 @@ swpal x2, x3, [x1]
 ldaddal w2, w3, [x1]
 casal x2, x3, [x1]
 dmb ish
+adr x9, 1f
+1:
+stp x19, x20, [sp, #16]
+ldp x19, x20, [sp, #16]
+stp d8, d9, [sp, #32]
+ldp d8, d9, [sp, #32]
+csinc x0, x1, x2, eq
+2:
+tbnz x3, #5, 2b
+tbz x3, #40, 2b

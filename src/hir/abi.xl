@@ -190,6 +190,7 @@ export struct XlcHirGlobal {
     constant: i32
     exported: i32
     exportC: i32
+    declared: i32  ///< `declare`d: defined elsewhere, never initialized here
     registered: i32
 }
 

@@ -105,6 +105,7 @@ const XG_INIT: usize = 232
 const XG_CONSTANT: usize = 240
 const XG_EXPORTED: usize = 241
 const XG_EXPORT_C: usize = 242
+const XG_DECLARED: usize = 243
 const XG_REGISTERED: usize = 244
 
 const XL_NAME: usize = 0
@@ -762,6 +763,7 @@ fn globalNode(f: *Flat, raw: *void) {
     g.constant = rdU8(raw, XG_CONSTANT) != 0 ? 1 : 0
     g.exported = rdU8(raw, XG_EXPORTED) != 0 ? 1 : 0
     g.exportC = rdU8(raw, XG_EXPORT_C) != 0 ? 1 : 0
+    g.declared = rdU8(raw, XG_DECLARED) != 0 ? 1 : 0
     g.registered = rdU8(raw, XG_REGISTERED) != 0 ? 1 : 0
     f.globals.push(g)
 }

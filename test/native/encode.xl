@@ -4,7 +4,8 @@
 from "std" import Vec, format
 from "std/io" import fprint
 from "../../src/codegen/arm64" import and64Imm, orr64Imm, eor64Imm, logicalImm64, lsl64Imm,
-    lsr64Imm, asr64Imm, madd64, add32Reg, sub32Reg, mul32, ldrhImm, strhImm, ldrsbImm, ldrshImm
+    lsr64Imm, asr64Imm, madd64, add32Reg, sub32Reg, mul32, ldrhImm, strhImm, ldrsbImm, ldrshImm,
+    adr, stpOff64, ldpOff64, stpOffD, ldpOffD, csinc64, tbnz, tbz
 from "../../src/codegen/arm64/float" import fadd, fsub, fmul, fdiv, fneg, fmovReg, fcmp,
     fmovFromGp, fmovToGp, scvtf, ucvtf, fcvtzs, fcvtzu, fcvtToDouble, fcvtToSingle, ldrFloat, strFloat
 from "../../src/codegen/arm64/atomic" import ldar, stlr, swpal, ldaddal, casal, dmbIsh
@@ -77,6 +78,14 @@ fn logical(out: *Vec<u32>, which: u32, v: u64) {
     ldaddal(&o, 2, 2, 3, 1)
     casal(&o, 3, 2, 3, 1)
     dmbIsh(&o)
+    adr(&o, 9, 1)
+    stpOff64(&o, 19, 20, 31, 16)
+    ldpOff64(&o, 19, 20, 31, 16)
+    stpOffD(&o, 8, 9, 31, 32)
+    ldpOffD(&o, 8, 9, 31, 32)
+    csinc64(&o, 0, 1, 2, 0)
+    tbnz(&o, 3, 5, 0)
+    tbz(&o, 3, 40, -1)
     for i in 0..o.length() {
         fprint(1, format("{:08x}\n", *o.get(i)).asStr())
     }

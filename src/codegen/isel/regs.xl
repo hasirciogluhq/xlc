@@ -1,48 +1,76 @@
-// Register assignment for the native backend: decides, per function, which locals live in
-// callee-saved registers and which in stack slots.
+// The frame of one function and the home of every local.
 //
-// Method: a use-count heuristic in place of liveness-based linear scan (Poletto and Sarkar, "Linear
-// Scan Register Allocation", TOPLAS 1999). Every local of a function is live in all of it (its
-// register is its home for the whole body), so the allocation reduces to picking the hottest
-// locals: each reference counts 1, multiplied by 8 for every enclosing loop (capped at 8^4). The
-// ten callee-saved registers `x19`..`x28` go to the heaviest scalar locals whose address is never
-// taken; the rest keep a slot. A register-resident local costs no load or store at a use, and the
-// caller-saved temporaries `x9`..`x15` stay free for expression values, so a loop counter and an
-// accumulator never touch memory. The price is one save and one restore per register used, paid
-// once per call of the function (Apple arm64: AAPCS64 with `x18` reserved, `x29` the frame pointer).
+// Frame layout (offsets from `sp`, which is constant in the body; `x29` points at the frame
+// record `[x29] = caller x29`, `[x29 + 8] = return address` just above the frame):
+//
+//   sp + 0                 the callee-saved registers the function uses (x19.., d8..)
+//   sp + savedBytes        the stack-resident locals
+//   sp + localsEnd         the spill area for live temporaries around calls (leaf: none)
+//   sp + spillEnd          the bump area for expression temporaries (aggregates, staged arguments)
+//   sp + total             = x29 (the frame record above)
+//
+// Method: use-count heuristic in place of liveness-based linear scan (Poletto and Sarkar, "Linear
+// Scan Register Allocation", TOPLAS 1999). Every local is live in the whole body, so the allocation
+// is the choice of the hottest locals: a reference counts 1, times 8 for each enclosing loop
+// (capped at 8^4). The callee-saved `x19`..`x28` go to the heaviest integer-class locals whose
+// address is never taken, `d8`..`d15` to the heaviest floats; the rest keep a stack slot. A
+// register-resident local costs nothing at a use. The caller-saved `x9`..`x15`, `x0`..`x7` and
+// `d16`..`d31` carry expression values.
+//
+// A function with a `try` or with cleanups (a landing pad) keeps every local in memory: the pad and
+// the catch block are entered by an unwinder that does not restore the callee-saved registers the
+// callees changed, so only memory is reliable there.
 // @spec https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+// @spec https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
 from "std" import Vec
 from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, view,
-    E_LOCAL_REF, E_ADDR_OF, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE, S_BLOCK
+    E_LOCAL_REF, E_ADDR_OF, E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL, E_CALL_ITABLE, E_CALL_EXTERNAL,
+    E_SYSCALL, E_ASM, E_NEW, E_CONSTRUCT, E_MATERIALIZE, E_MOVE, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE,
+    S_BLOCK, S_TRY
 from "types" import Scalar, KIND_OTHER, KIND_FLOAT, scalarOf
+from "layout" import Layouts, K_VOID, K_NEVER, K_INT, K_FLOAT
 
-/// The first and last callee-saved register handed to locals.
 export const FIRST_SAVED: u32 = 19
 export const LAST_SAVED: u32 = 28
 export const FIRST_SAVED_FLOAT: u32 = 8
 export const LAST_SAVED_FLOAT: u32 = 15
 
+/// Where a local lives.
+export const LK_REG: u32 = 0    // a callee-saved register
+export const LK_SLOT: u32 = 1   // a scalar in a stack slot, accessed with its own width
+export const LK_MEM: u32 = 2    // an aggregate stored in the frame
+
+/// Bytes of the temporaries spill area: 15 integer and 16 vector pool registers, 8 bytes each.
+export const SPILL_BYTES: u32 = 248
+
 /// Where every local of one function lives.
 export class Frame {
-    home: Vec<i32>       // per local: the register number, or -1 for a stack slot
-    slot: Vec<u32>       // per local: the byte offset from `sp` of its slot (when home is -1)
-    saved: Vec<u32>      // the callee-saved integer registers the function uses, in order
-    savedFloat: Vec<u32> // the callee-saved vector registers it uses; kept after the integer ones
-    slotBytes: u32       // bytes of local slots, at the bottom of the frame
-    total: u32           // the whole frame below the frame record: slots, saved registers, padding
+    kind: Vec<u32>
+    home: Vec<i32>       // LK_REG: the register number
+    off: Vec<u32>        // LK_SLOT, LK_MEM: the byte offset from `sp`
+    via: Vec<bool>       // an aggregate parameter: the local holds the address of the caller's copy
+    saved: Vec<u32>      // callee-saved integer registers in use
+    savedFloat: Vec<u32> // callee-saved vector registers in use, stored after the integer ones
+    savedBytes: u32
+    localsEnd: u32
+    spillBase: u32       // sp offset of the spill area, or 0 xFFFFFFFF when the function is a leaf
+    spillEnd: u32
+    hasCalls: bool
+    memOnly: bool
 
     fn init(self) {
+        self.kind = Vec<u32>()
         self.home = Vec<i32>()
-        self.slot = Vec<u32>()
+        self.off = Vec<u32>()
+        self.via = Vec<bool>()
         self.saved = Vec<u32>()
         self.savedFloat = Vec<u32>()
-        self.slotBytes = 0
-        self.total = 0
-    }
-
-    /// The byte offset from `sp` where the k-th saved register is kept.
-    fn savedOffset(self, k: usize) -> u32 {
-        return self.slotBytes + (k as u32) * 8
+        self.savedBytes = 0
+        self.localsEnd = 0
+        self.spillBase = 0
+        self.spillEnd = 0
+        self.hasCalls = false
+        self.memOnly = false
     }
 }
 
@@ -50,11 +78,15 @@ class Walker {
     m: *XlcHirModule
     weight: Vec<u64>
     taken: Vec<bool>
+    calls: bool
+    tries: bool
 
     fn init(self, m: *XlcHirModule, localCount: u32) {
         self.m = m
         self.weight = Vec<u64>()
         self.taken = Vec<bool>()
+        self.calls = false
+        self.tries = false
         for i in 0..localCount as usize {
             self.weight.push(1)
             self.taken.push(false)
@@ -67,6 +99,25 @@ class Walker {
         }
     }
 
+    /// An address-taking expression pins the local it names (or the local a field/index chain
+    /// starts at) in memory.
+    fn pin(self, index: i32) {
+        local i: i32 = index
+        while i >= 0 {
+            local e: *XlcHirExpr = &self.m.exprs[i as usize]
+            if e.kind == E_LOCAL_REF {
+                self.taken.set(e.localId as usize, true)
+                return
+            }
+            // Field, Index, Slice and Materialize walk to their base; anything else ends the chain.
+            if (e.kind == 19 && e.throughPointer == 0) || e.kind == 20 || e.kind == 21 || e.kind == E_MATERIALIZE || e.kind == E_MOVE {
+                i = e.lhs
+            } else {
+                return
+            }
+        }
+    }
+
     fn expr(self, index: i32, mult: u64) {
         if index < 0 {
             return
@@ -74,13 +125,27 @@ class Walker {
         local e: *XlcHirExpr = &self.m.exprs[index as usize]
         if e.kind == E_LOCAL_REF {
             self.bump(e.localId, mult)
-        } else if e.kind == E_ADDR_OF && e.lhs >= 0 && self.m.exprs[e.lhs as usize].kind == E_LOCAL_REF {
-            self.taken.set(self.m.exprs[e.lhs as usize].localId as usize, true)
+        } else if e.kind == E_ADDR_OF || e.kind == 21 || e.kind == 20 || e.kind == 19 {
+            // `&x`, a slice of a local array, or an index/field of one: the local is addressed.
+            self.pin(e.kind == E_ADDR_OF ? e.lhs : index)
         }
+        if e.kind == E_CALL || e.kind == E_CALL_INDIRECT || e.kind == E_CALL_VIRTUAL || e.kind == E_CALL_ITABLE ||
+                e.kind == E_CALL_EXTERNAL || e.kind == E_SYSCALL || e.kind == E_ASM || e.kind == E_NEW ||
+                e.kind == E_CONSTRUCT {
+            self.calls = true
+        }
+        // An atomic or a method call takes a pointer: nothing to pin. Operands of Materialize/Move
+        // are memory locals already.
         self.expr(e.lhs, mult)
         self.expr(e.rhs, mult)
         for i in 0..e.argCount as usize {
             self.expr(self.m.refs[e.argFirst as usize + i] as i32, mult)
+        }
+        for i in 0..e.fieldCount as usize {
+            self.expr(self.m.fields[e.fieldFirst as usize + i].value, mult)
+        }
+        for i in 0..e.operandCount as usize {
+            self.expr(self.m.operands[e.operandFirst as usize + i].value, mult)
         }
     }
 
@@ -108,57 +173,99 @@ class Walker {
                 self.stmts(s.stepFirst, s.stepCount, inner)
             } else if s.kind == S_BLOCK {
                 self.stmts(s.bodyFirst, s.bodyCount, mult)
+            } else if s.kind == S_TRY {
+                self.tries = true
+                self.calls = true
+                self.stmts(s.bodyFirst, s.bodyCount, mult)
+                self.stmts(s.elseFirst, s.elseCount, mult)
             }
         }
     }
 }
 
+fn alignUp(v: u32, a: u32) -> u32 {
+    return (v + a - 1) & ~(a - 1)
+}
+
 /// Assigns a home to every local of `f`.
-export fn assignFrame(m: *XlcHirModule, f: *XlcHirFunction) -> Frame {
+export fn assignFrame(m: *XlcHirModule, lay: *Layouts, f: *XlcHirFunction) -> Frame {
     local w: Walker = Walker(m, f.localCount)
     w.stmts(f.bodyFirst, f.bodyCount, 1)
+    w.stmts(f.unwindFirst, f.unwindCount, 1)
     local fr: Frame = Frame()
-    for i in 0..f.localCount as usize {
+    fr.hasCalls = w.calls
+    fr.memOnly = w.tries || f.unwindCount > 0
+    local n: usize = f.localCount as usize
+    local mem = Vec<bool>()
+    for i in 0..n {
+        local k: u32 = lay.kind(view(f.locals[i].typeName))
+        local isMem = lay.isMem(view(f.locals[i].typeName))
+        mem.push(isMem)
+        fr.kind.push(LK_SLOT)
         fr.home.push(-1)
-        fr.slot.push(0)
+        fr.off.push(0)
+        // An aggregate parameter arrives as an address and is held like a pointer scalar.
+        fr.via.push(isMem && i < f.paramCount as usize)
+        if isMem && i >= f.paramCount as usize {
+            fr.kind.set(i, LK_MEM)
+        }
     }
-    // Heaviest first: repeated selection, once per register class. Integers, booleans and pointers
-    // take `x19`..`x28`; floats take `d8`..`d15` (AAPCS64 keeps the low 64 bits of v8-v15 across
-    // calls, which holds an `f64` and an `f32` whole).
-    for pass in 0..2 {
-        local isFloat = pass == 1
-        local next: u32 = isFloat ? FIRST_SAVED_FLOAT : FIRST_SAVED
-        local last: u32 = isFloat ? LAST_SAVED_FLOAT : LAST_SAVED
-        while next <= last {
-            local best: i32 = -1
-            local bestWeight: u64 = 1
-            for i in 0..f.localCount as usize {
-                local s: Scalar = scalarOf(m, view(f.locals[i].typeName))
-                local classOk = isFloat ? s.kind == KIND_FLOAT : (s.kind != KIND_OTHER && s.kind != KIND_FLOAT)
-                if classOk && !*w.taken.get(i) && *fr.home.get(i) < 0 && *w.weight.get(i) > bestWeight {
-                    best = i as i32
-                    bestWeight = *w.weight.get(i)
+    // Heaviest first: repeated selection, once per register class.
+    if !fr.memOnly {
+        for pass in 0..2 {
+            local isFloat = pass == 1
+            local next: u32 = isFloat ? FIRST_SAVED_FLOAT : FIRST_SAVED
+            local last: u32 = isFloat ? LAST_SAVED_FLOAT : LAST_SAVED
+            while next <= last {
+                local best: i32 = -1
+                local bestWeight: u64 = 1
+                for i in 0..n {
+                    local k: u32 = lay.kind(view(f.locals[i].typeName))
+                    local classOk: bool = isFloat ? k == K_FLOAT : (k == K_INT || *fr.via.get(i))
+                    if classOk && !*w.taken.get(i) && *fr.kind.get(i) == LK_SLOT && *w.weight.get(i) > bestWeight {
+                        best = i as i32
+                        bestWeight = *w.weight.get(i)
+                    }
                 }
+                if best < 0 {
+                    break
+                }
+                fr.kind.set(best as usize, LK_REG)
+                fr.home.set(best as usize, next as i32)
+                if isFloat {
+                    fr.savedFloat.push(next)
+                } else {
+                    fr.saved.push(next)
+                }
+                next += 1
             }
-            if best < 0 {
-                break
-            }
-            fr.home.set(best as usize, next as i32)
-            if isFloat {
-                fr.savedFloat.push(next)
-            } else {
-                fr.saved.push(next)
-            }
-            next += 1
         }
     }
-    for i in 0..f.localCount as usize {
-        if *fr.home.get(i) < 0 {
-            fr.slot.set(i, fr.slotBytes)
-            fr.slotBytes += 8
+    fr.savedBytes = alignUp(((fr.saved.length() + fr.savedFloat.length()) as u32) * 8, 16)
+    local cursor: u32 = fr.savedBytes
+    for i in 0..n {
+        local spelling: str = view(f.locals[i].typeName)
+        if *fr.kind.get(i) == LK_REG {
+            continue
         }
+        local size: u64 = 8
+        local align: u64 = 8
+        if *fr.kind.get(i) == LK_MEM {
+            lay.sizeAlign(spelling, &size, &align)
+            if size == 0 {
+                size = 1
+            }
+            if align < 8 {
+                align = 8
+            }
+        }
+        cursor = alignUp(cursor, align as u32)
+        fr.off.set(i, cursor)
+        cursor += size as u32
     }
-    local bytes: u32 = fr.slotBytes + ((fr.saved.length() + fr.savedFloat.length()) as u32) * 8
-    fr.total = (bytes + 15) / 16 * 16
+    fr.localsEnd = alignUp(cursor, 16)
+    fr.spillBase = fr.localsEnd
+    fr.spillEnd = fr.hasCalls ? fr.localsEnd + SPILL_BYTES : fr.localsEnd
+    fr.spillEnd = alignUp(fr.spillEnd, 16)
     return fr
 }

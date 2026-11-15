@@ -1,0 +1,523 @@
+// The state of the native code generator and the helpers every part of it shares: symbols and
+// relocations, labels and branch fixups, the temporary register pools, the frame bump area and the
+// constant loaders. The generators are free functions over `*Gen` in expr.xl, call.xl, stmt.xl,
+// func.xl and data.xl.
+//
+// Registers (Apple arm64, AAPCS64 with `x18` reserved, `x29` the frame pointer):
+//   x0-x7, d0-d7      arguments and results; with x9-x15 the integer temporary pool
+//   x8                the address of an aggregate result (sret)
+//   x16, x17          scratch of the emit helpers, never allocated
+//   x19-x28, d8-d15   locals (regs.xl); saved and restored by the function that uses them
+//   d16-d31           the vector temporary pool
+// A temporary lives in the pool while an expression is evaluated; a call saves the live ones in the
+// frame's spill area and restores them afterwards (regs.xl), so a value held in a temporary
+// survives any callee.
+from "std" import String, Vec, format
+from "std/collections/hashmap" import HashMap
+from "std/io" import fprint
+from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirExpr, XlcHirStmt, view
+from "../arm64" import X0, X16, X17, SP, XZR, movReg64, add64Imm, sub64Imm, adrp, ldr64Imm, str64Imm, ldur64,
+    stur64, bl, b, brk
+from "../arm64/float" import fmovReg, ldrFloat, strFloat
+from "../macho" import MachoObject, TEXT_FLAGS, RELOC_BRANCH26, RELOC_PAGE21, RELOC_PAGEOFF12,
+    RELOC_GOT_PAGE21, RELOC_GOT_PAGEOFF12
+from "emit" import movConst, addOff, loadTyped, storeTyped, loadFloat, storeFloat
+from "layout" import Layouts, K_INT, K_FLOAT
+from "regs" import Frame, LK_REG, LK_SLOT, LK_MEM
+from "types" import Scalar, KIND_BOOL, KIND_FLOAT, KIND_INT, scalarOf
+
+/// Pool sizes: x9-x15 then x0-x7 (15 integer temporaries), d16-d31 (16 vector temporaries).
+export const POOL_INT: u32 = 15
+export const POOL_FLT: u32 = 16
+
+/// The register of integer pool slot `i`: x9..x15, then x0..x7.
+export fn poolInt(i: u32) -> u32 {
+    return i < 7 ? 9 + i : i - 7
+}
+
+/// The pool slot of integer register `r` (x9..x15 -> 0..6, x0..x7 -> 7..14).
+export fn poolIndex(r: u32) -> u32 {
+    return r >= 9 ? r - 9 : r + 7
+}
+
+/// A branch whose target is not known yet: patch the word at `at` to reach `label`.
+@repr(c)
+export struct Fixup {
+    at: u32
+    label: u32
+}
+
+/// A relocation in `__text`: `rtype` against symbol id `sym`, at byte `addr`.
+@repr(c)
+export struct Rel {
+    addr: u32
+    sym: u32
+    rtype: u32
+}
+
+/// A pointer relocation in a data section (`ARM64_RELOC_UNSIGNED`, 8 bytes).
+@repr(c)
+export struct DRel {
+    section: u32
+    addr: u32
+    sym: u32
+}
+
+/// A loop being generated: where `continue` and `break` go.
+@repr(c)
+export struct LoopRec {
+    cont: u32
+    brk: u32
+}
+
+/// An out-of-line panic block: the label the check branches to and the message it reports. Emitted
+/// after the function body so the good path falls through.
+export class Cold {
+    label: u32
+    message: String
+
+    fn init(self, label: u32, message: str) {
+        self.label = label
+        self.message = String(message)
+    }
+}
+
+/// One landing pad: function `fn` (index) enters label `pad`; 0 = no pad.
+@repr(c)
+export struct PadRec {
+    fnIndex: u32
+    pad: u32
+}
+
+/// The symbols of the object: interned by name, defined once.
+export class Syms {
+    names: Vec<String>
+    defined: Vec<bool>
+    section: Vec<u32>
+    offset: Vec<u64>
+    index: HashMap<String, u32>
+
+    fn init(self) {
+        self.names = Vec<String>()
+        self.defined = Vec<bool>()
+        self.section = Vec<u32>()
+        self.offset = Vec<u64>()
+        self.index = HashMap<String, u32>()
+    }
+
+    /// The id of symbol `name`, created on first use.
+    fn id(self, name: str) -> u32 {
+        local key = String(name)
+        local found = self.index.get(key.clone())
+        if found.isSome() {
+            return *found.unwrap()
+        }
+        local n: u32 = self.names.length() as u32
+        self.names.push(key.clone())
+        self.defined.push(false)
+        self.section.push(0)
+        self.offset.push(0)
+        self.index.put(key, n)
+        return n
+    }
+
+    /// Defines symbol `id` at `offset` of `section`.
+    fn define(self, id: u32, section: u32, offset: u64) {
+        self.defined.set(id as usize, true)
+        self.section.set(id as usize, section)
+        self.offset.set(id as usize, offset)
+    }
+}
+
+export class Gen {
+    m: *XlcHirModule
+    lay: Layouts
+    o: *MachoObject
+    hasOnly: bool
+    only: String
+    text: u32
+    cstr: u32
+    dconst: u32           // __DATA,__const: read-only data, vtables, tables
+    ddata: u32            // __DATA,__data: writable globals
+    code: Vec<u32>
+    fixups: Vec<Fixup>
+    labelPos: Vec<u32>
+    labels: u32
+    syms: Syms
+    rels: Vec<Rel>
+    drels: Vec<DRel>
+    lits: HashMap<String, u32>
+    cstrLen: u64
+    fnIdx: HashMap<String, u32>
+    globIdx: HashMap<String, u32>
+    pads: Vec<PadRec>
+    cold: Vec<Cold>
+    failed: bool
+
+    // The function being generated.
+    f: *XlcHirFunction
+    fi: u32
+    fr: Frame
+    liveI: u32
+    liveF: u32
+    tempTop: u32
+    tempMax: u32
+    loops: Vec<LoopRec>
+    epilog: u32
+    prologAt: u32         // the word index of the patched `sub sp` pair
+    sretOff: i32          // sp offset of the saved result address, or -1
+    padLabel: u32         // the landing pad label of this function, 0 = none
+    cabi: bool            // the function follows the C convention (export(c) or declare)
+    callHook: CallHook
+
+    fn init(self, m: *XlcHirModule, o: *MachoObject, hasOnly: bool, only: str) {
+        self.m = m
+        self.lay = Layouts(m)
+        self.o = o
+        self.hasOnly = hasOnly
+        self.only = String(only)
+        self.text = o.addSection("__text", TEXT_FLAGS, 2)
+        self.cstr = o.addSection("__cstring", 0x2, 0)
+        self.dconst = o.addSection("__const", 0, 3)
+        o.setSegment(self.dconst, "__DATA")
+        self.ddata = o.addSection("__data", 0, 4)
+        o.setSegment(self.ddata, "__DATA")
+        self.code = Vec<u32>()
+        self.fixups = Vec<Fixup>()
+        self.labelPos = Vec<u32>()
+        self.labels = m.functionCount
+        self.syms = Syms()
+        self.rels = Vec<Rel>()
+        self.drels = Vec<DRel>()
+        self.lits = HashMap<String, u32>()
+        self.cstrLen = 0
+        self.fnIdx = HashMap<String, u32>()
+        self.globIdx = HashMap<String, u32>()
+        self.pads = Vec<PadRec>()
+        self.cold = Vec<Cold>()
+        self.failed = false
+        self.loops = Vec<LoopRec>()
+        self.liveI = 0
+        self.liveF = 0
+        self.tempTop = 0
+        self.tempMax = 0
+        self.epilog = 0
+        self.sretOff = -1
+        self.padLabel = 0
+        self.cabi = false
+        self.callHook = nil
+        self.fi = 0
+        self.prologAt = 0
+        self.f = nil
+        for i in 0..m.functionCount as usize {
+            self.fnIdx.put(String(view(m.functions[i].name)), i as u32)
+        }
+        for i in 0..m.globalCount as usize {
+            self.globIdx.put(String(view(m.globals[i].name)), i as u32)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Errors
+
+    /// Reports a construct the generator cannot lower and marks the run failed.
+    fn fail(self, what: str) {
+        self.failed = true
+        local at: str = self.f == nil ? "" : view(self.f.name)
+        fprint(2, format("error[E0714]: native code generation: {} (in `{}`)\n", what, at).asStr())
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Symbols, labels and relocations
+
+    /// The link symbol of function `i`.
+    fn fnSymbol(self, i: u32) -> str {
+        local f: *XlcHirFunction = &self.m.functions[i as usize]
+        return view(f.symbol).len > 0 ? view(f.symbol) : view(f.name)
+    }
+
+    fn globSymbol(self, i: u32) -> str {
+        local g: *XlcHirGlobal = &self.m.globals[i as usize]
+        return view(g.symbol).len > 0 ? view(g.symbol) : view(g.name)
+    }
+
+    /// The index of the function named `name` (a HIR name), or -1.
+    fn findFunction(self, name: str) -> i32 {
+        local r = self.fnIdx.get(String(name))
+        return r.isSome() ? *r.unwrap() as i32 : -1
+    }
+
+    fn findGlobal(self, name: str) -> i32 {
+        local r = self.globIdx.get(String(name))
+        return r.isSome() ? *r.unwrap() as i32 : -1
+    }
+
+    /// True when the function or global of module `module` is defined in this object.
+    fn definedHere(self, module: str) -> bool {
+        return !self.hasOnly || self.only.equals(module)
+    }
+
+    fn newLabel(self) -> u32 {
+        local id: u32 = self.labels
+        self.labels += 1
+        return id
+    }
+
+    /// Binds `label` to the next word that will be appended.
+    fn bind(self, label: u32) {
+        while self.labelPos.length() <= label as usize {
+            self.labelPos.push(0)
+        }
+        self.labelPos.set(label as usize, self.code.length() as u32)
+    }
+
+    /// Marks the word just appended as a branch to `label`, to patch after emission.
+    fn fixup(self, label: u32) {
+        self.fixups.push(Fixup { at: (self.code.length() - 1) as u32, label: label })
+    }
+
+    /// The byte offset of the next word to be appended.
+    fn here(self) -> u32 {
+        return (self.code.length() as u32) * 4
+    }
+
+    /// A relocation against symbol `sym` at the word just appended.
+    fn relocHere(self, sym: u32, rtype: u32) {
+        self.rels.push(Rel { addr: ((self.code.length() - 1) as u32) * 4, sym: sym, rtype: rtype })
+    }
+
+    /// `bl sym`.
+    fn callSym(self, sym: u32) {
+        bl(&self.code, 0)
+        self.relocHere(sym, RELOC_BRANCH26)
+    }
+
+    /// `d = &sym`: `adrp` + `add` for a symbol of this image, `adrp` + `ldr` through the GOT for
+    /// an imported one (`got`).
+    fn symAddr(self, d: u32, sym: u32, got: bool) {
+        adrp(&self.code, d, 0)
+        self.relocHere(sym, got ? RELOC_GOT_PAGE21 : RELOC_PAGE21)
+        if got {
+            ldr64Imm(&self.code, d, d, 0)
+            self.relocHere(sym, RELOC_GOT_PAGEOFF12)
+        } else {
+            add64Imm(&self.code, d, d, 0, false)
+            self.relocHere(sym, RELOC_PAGEOFF12)
+        }
+    }
+
+    /// The symbol of the NUL-terminated literal `text` in `__cstring`, created on first use.
+    fn literal(self, text: str) -> u32 {
+        local key = String(text)
+        local found = self.lits.get(key.clone())
+        if found.isSome() {
+            return *found.unwrap()
+        }
+        local name = format("xl$str${}", self.lits.length())
+        local id: u32 = self.syms.id(name.asStr())
+        self.syms.define(id, self.cstr, self.cstrLen)
+        for k in 0..text.len {
+            self.o.addByte(self.cstr, text.ptr[k])
+        }
+        self.o.addByte(self.cstr, 0)
+        self.cstrLen += text.len as u64 + 1
+        self.lits.put(key, id)
+        return id
+    }
+
+    /// `d = &"text"`.
+    fn strAddr(self, d: u32, text: str) {
+        self.symAddr(d, self.literal(text), false)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Temporary registers
+
+    /// Takes a free integer temporary.
+    fn allocI(self) -> u32 {
+        for i in 0..POOL_INT {
+            if (self.liveI & ((1 as u32) << i)) == 0 {
+                self.liveI |= (1 as u32) << i
+                return poolInt(i)
+            }
+        }
+        self.fail("an expression needs more than 15 live integer temporaries")
+        return poolInt(0)
+    }
+
+    fn freeI(self, r: u32) {
+        self.liveI &= ~((1 as u32) << poolIndex(r))
+    }
+
+    /// Takes a free vector temporary (d16..d31).
+    fn allocF(self) -> u32 {
+        for i in 0..POOL_FLT {
+            if (self.liveF & ((1 as u32) << i)) == 0 {
+                self.liveF |= (1 as u32) << i
+                return 16 + i
+            }
+        }
+        self.fail("an expression needs more than 16 live float temporaries")
+        return 16
+    }
+
+    fn freeF(self, r: u32) {
+        self.liveF &= ~((1 as u32) << (r - 16))
+    }
+
+    /// Marks integer register `r` (a pool register) live without allocating it: a destination the
+    /// caller already owns.
+    fn holdI(self, r: u32) {
+        self.liveI |= (1 as u32) << poolIndex(r)
+    }
+
+    /// Saves every live temporary into the spill area before a call.
+    fn spillLive(self) {
+        for i in 0..POOL_INT {
+            if (self.liveI & ((1 as u32) << i)) != 0 {
+                str64Imm(&self.code, poolInt(i), SP, self.fr.spillBase + i * 8)
+            }
+        }
+        for i in 0..POOL_FLT {
+            if (self.liveF & ((1 as u32) << i)) != 0 {
+                strFloat(&self.code, true, 16 + i, SP, self.fr.spillBase + (POOL_INT + i) * 8)
+            }
+        }
+    }
+
+    /// Restores the temporaries `spillLive` saved, except integer register `skip` and vector
+    /// register `skipF` (the destination of the call's result; 255 = none).
+    fn reloadLive(self, skip: u32, skipF: u32) {
+        for i in 0..POOL_INT {
+            if (self.liveI & ((1 as u32) << i)) != 0 && poolInt(i) != skip {
+                ldr64Imm(&self.code, poolInt(i), SP, self.fr.spillBase + i * 8)
+            }
+        }
+        for i in 0..POOL_FLT {
+            if (self.liveF & ((1 as u32) << i)) != 0 && 16 + i != skipF {
+                ldrFloat(&self.code, true, 16 + i, SP, self.fr.spillBase + (POOL_INT + i) * 8)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The frame bump area
+
+    /// A temporary frame slot of `size` bytes: its offset from `sp`. Released by restoring
+    /// `tempTop` to an earlier value.
+    fn tempSlot(self, size: u64, align: u64) -> u32 {
+        local a: u32 = align < 8 ? 8 : align as u32
+        local at: u32 = (self.tempTop + a - 1) & ~(a - 1)
+        self.tempTop = at + (size == 0 ? 8 : size as u32)
+        if self.tempTop > self.tempMax {
+            self.tempMax = self.tempTop
+        }
+        return self.fr.spillEnd + at
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Locals
+
+    /// The scalar of local `i`'s type.
+    fn localScalar(self, i: u32) -> Scalar {
+        return scalarOf(self.m, view(self.f.locals[i as usize].typeName))
+    }
+
+    /// True when local `i` holds a float.
+    fn localIsFloat(self, i: u32) -> bool {
+        return self.localScalar(i).kind == KIND_FLOAT
+    }
+
+    /// Loads scalar local `i` into integer register `d`; for an aggregate parameter this is the
+    /// address of the caller's copy.
+    fn loadLocalI(self, d: u32, i: u32) {
+        local k: u32 = *self.fr.kind.get(i as usize)
+        if k == LK_REG {
+            movReg64(&self.code, d, *self.fr.home.get(i as usize) as u32)
+        } else if *self.fr.via.get(i as usize) {
+            ldr64Imm(&self.code, d, SP, *self.fr.off.get(i as usize))
+        } else {
+            loadTyped(&self.code, d, SP, *self.fr.off.get(i as usize) as i64, self.localScalar(i))
+        }
+    }
+
+    /// Loads float local `i` into vector register `d`.
+    fn loadLocalF(self, d: u32, i: u32) {
+        local dbl: bool = self.localScalar(i).bits == 64
+        if *self.fr.kind.get(i as usize) == LK_REG {
+            fmovReg(&self.code, dbl, d, *self.fr.home.get(i as usize) as u32)
+        } else {
+            loadFloat(&self.code, d, SP, *self.fr.off.get(i as usize) as i64, dbl)
+        }
+    }
+
+    /// Stores integer register `r` into scalar local `i`.
+    fn storeLocalI(self, r: u32, i: u32) {
+        local k: u32 = *self.fr.kind.get(i as usize)
+        if k == LK_REG {
+            movReg64(&self.code, *self.fr.home.get(i as usize) as u32, r)
+        } else if *self.fr.via.get(i as usize) {
+            str64Imm(&self.code, r, SP, *self.fr.off.get(i as usize))
+        } else {
+            storeTyped(&self.code, r, SP, *self.fr.off.get(i as usize) as i64, self.localScalar(i))
+        }
+    }
+
+    fn storeLocalF(self, r: u32, i: u32) {
+        local dbl: bool = self.localScalar(i).bits == 64
+        if *self.fr.kind.get(i as usize) == LK_REG {
+            fmovReg(&self.code, dbl, *self.fr.home.get(i as usize) as u32, r)
+        } else {
+            storeFloat(&self.code, r, SP, *self.fr.off.get(i as usize) as i64, dbl)
+        }
+    }
+
+    /// `d` = the address of local `i`'s storage (an aggregate, or a scalar whose address is taken).
+    fn localAddr(self, d: u32, i: u32) {
+        if *self.fr.via.get(i as usize) {
+            self.loadLocalI(d, i)
+        } else {
+            addOff(&self.code, d, SP, *self.fr.off.get(i as usize) as i64)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Checks
+
+    /// `panic(message)` through the registered role, or a trap when there is none. Never returns,
+    /// so no live temporary needs saving.
+    fn panicCall(self, message: str) {
+        if view(self.m.panicFunction).len > 0 {
+            local idx: i32 = self.findFunction(view(self.m.panicFunction))
+            if idx >= 0 {
+                self.strAddr(X0, message)
+                self.callSym(self.syms.id(self.fnSymbol(idx as u32)))
+            }
+        }
+        brk(&self.code, 1)
+    }
+
+    /// After a branch on a failed check: binds the failure block that panics and returns after the
+    /// good path. Emits `if (bad) panic(message)` given the label `fail` of the bad branch: the
+    /// caller emitted the conditional branch to it, this emits the code at `fail` out of line at
+    /// the end of the function (`coldCode`), so the hot path falls through.
+    fn coldPanic(self, message: str) -> u32 {
+        local l: u32 = self.newLabel()
+        self.cold.push(Cold(l, message))
+        return l
+    }
+}
+
+
+/// A memory destination or source: `off` bytes from the address in integer register `reg`
+/// (`sp` for a frame slot, or a pool temporary the owner keeps live).
+export struct Place {
+    reg: u32
+    off: i64
+}
+
+/// The function that generates a call-like expression (a call, `syscall`, `new`, an atomic, an
+/// `asm`): its result goes into integer register `d`, vector register `f` or the aggregate place
+/// `p`. Installed by call.xl, which imports expr.xl; expressions reach it through this field
+/// because xlang has no cyclic imports.
+export type CallHook = fn(*Gen, *XlcHirExpr, u32, u32, *Place)

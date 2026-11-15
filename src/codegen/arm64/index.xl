@@ -537,6 +537,52 @@ export fn add64Lsl(out: *Vec<u32>, rd: u32, rn: u32, rm: u32, sh: u32) {
     out.push(0x8b000000 | (rm << 16) | (sh << 10) | (rn << 5) | rd)
 }
 
+/// `adr Rd, label` — the address of a PC-relative target within +-1 MiB: `0 immlo(2) 10000 immhi(19)
+/// Rd`. `wordOff` is the distance to the target in instructions.
+export fn adr(out: *Vec<u32>, rd: u32, wordOff: i32) {
+    local imm: u32 = ((wordOff * 4) & 0x1fffff) as u32
+    out.push(0x10000000 | ((imm & 3) << 29) | ((imm >> 2) << 5) | rd)
+}
+
+/// `stp Xt1, Xt2, [Xn, #off]` — signed offset, no writeback: `10 101 0 010 0 imm7 Rt2 Rn Rt1`.
+export fn stpOff64(out: *Vec<u32>, rt1: u32, rt2: u32, rn: u32, byteOff: i32) {
+    local imm7: u32 = ((byteOff / 8) & 0x7f) as u32
+    out.push(0xa9000000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+/// `ldp Xt1, Xt2, [Xn, #off]` — signed offset, no writeback: `10 101 0 010 1 imm7 Rt2 Rn Rt1`.
+export fn ldpOff64(out: *Vec<u32>, rt1: u32, rt2: u32, rn: u32, byteOff: i32) {
+    local imm7: u32 = ((byteOff / 8) & 0x7f) as u32
+    out.push(0xa9400000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+/// `stp Dt1, Dt2, [Xn, #off]` — the SIMD&FP pair store: `01 101 1 010 0 imm7 Rt2 Rn Rt1`.
+export fn stpOffD(out: *Vec<u32>, rt1: u32, rt2: u32, rn: u32, byteOff: i32) {
+    local imm7: u32 = ((byteOff / 8) & 0x7f) as u32
+    out.push(0x6d000000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+/// `ldp Dt1, Dt2, [Xn, #off]`.
+export fn ldpOffD(out: *Vec<u32>, rt1: u32, rt2: u32, rn: u32, byteOff: i32) {
+    local imm7: u32 = ((byteOff / 8) & 0x7f) as u32
+    out.push(0x6d400000 | (imm7 << 15) | (rt2 << 10) | (rn << 5) | rt1)
+}
+
+/// `csinc Rd, Rn, Rm, cond` (64-bit): `Rd = cond ? Rn : Rm + 1`.
+export fn csinc64(out: *Vec<u32>, rd: u32, rn: u32, rm: u32, cond: u32) {
+    out.push(0x9a800400 | (rm << 16) | (cond << 12) | (rn << 5) | rd)
+}
+
+/// `tbnz Rt, #bit, label` — branch when bit `bit` of `Rt` is set (14-bit word distance).
+export fn tbnz(out: *Vec<u32>, rt: u32, bit: u32, wordOff: i32) {
+    out.push(0x37000000 | ((bit >> 5) << 31) | ((bit & 31) << 19) | (((wordOff & 0x3fff) as u32) << 5) | rt)
+}
+
+/// `tbz Rt, #bit, label` — branch when bit `bit` of `Rt` is clear.
+export fn tbz(out: *Vec<u32>, rt: u32, bit: u32, wordOff: i32) {
+    out.push(0x36000000 | ((bit >> 5) << 31) | ((bit & 31) << 19) | (((wordOff & 0x3fff) as u32) << 5) | rt)
+}
+
 /// `ldrh Wt, [Xn, #off]` — zero-extending halfword load, imm12 in units of 2.
 export fn ldrhImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
     out.push(0x79400000 | ((byteOff / 2) << 10) | (rn << 5) | rt)

@@ -313,6 +313,60 @@ export class Layouts {
         return self.cache.get(self.cache.length() - 1)
     }
 
+    /// The offset of field `index` of any aggregate spelling: `str` and slices are `{ptr, len}`, a
+    /// tuple is laid out in element order, a struct or class by `of`.
+    fn fieldOff(self, s: str, index: u32) -> u64 {
+        local k: u32 = self.kind(s)
+        if k == K_STR || k == K_SLICE || k == K_INTERFACE {
+            return (index as u64) * 8
+        }
+        if k == K_TUPLE {
+            local elems = self.tupleElems(s)
+            local cursor: u64 = 0
+            for i in 0..elems.length() {
+                local es: u64 = 0
+                local ea: u64 = 1
+                self.sizeAlign(elems.get(i).asStr(), &es, &ea)
+                cursor = alignUp(cursor, ea)
+                if i == index as usize {
+                    return cursor
+                }
+                cursor += es
+            }
+            return cursor
+        }
+        return self.offsetOf(s, index)
+    }
+
+    /// The element spelling of an array `[T; N]`, a slice `[]T`, a pointer `*T` or a `str` (`u8`).
+    fn elemOf(self, s: str) -> String {
+        local k: u32 = self.kind(s)
+        if k == K_ARRAY {
+            local elem = String()
+            local n: u64 = 0
+            self.arrayParts(s, &elem, &n)
+            return elem
+        }
+        if k == K_SLICE {
+            return self.sliceElem(s)
+        }
+        if k == K_STR {
+            return String("u8")
+        }
+        if s.len > 0 && s.ptr[0] == b'*' {
+            return trimmed(fromParts(&s.ptr[1], s.len - 1))
+        }
+        return String("void")
+    }
+
+    /// The length of an array spelling.
+    fn arrayLen(self, s: str) -> u64 {
+        local elem = String()
+        local n: u64 = 0
+        self.arrayParts(s, &elem, &n)
+        return n
+    }
+
     /// The offset of field `index` (layout order) of struct or class `name`; 0 when unknown.
     fn offsetOf(self, name: str, index: u32) -> u64 {
         local l: *AggLayout = self.of(name)

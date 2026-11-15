@@ -1,0 +1,146 @@
+// Aggregate memory operations: zeroing and copying a run of bytes between places. Both use 16-byte
+// `stp`/`ldp` pairs for the body and 8/4/2/1-byte accesses for the tail; a run over 128 bytes loops.
+// `x16` and `x17` carry the data of a copy, so a place never names them as its base.
+from "../arm64" import XZR, SP, add64Imm, sub64Imm, cbnz64, stpOff64, ldpOff64, movz64
+from "emit" import addOff, movConst, loadTyped, storeTyped
+from "gen" import Gen, Place
+from "types" import Scalar, KIND_INT
+
+fn unsigned(bits: u32) -> Scalar {
+    return Scalar { kind: KIND_INT, bits: bits, signed: false }
+}
+
+/// A base register and offset good for pair accesses (a multiple of 8 in +-504): the place itself
+/// when it fits, else its address built in the temporary `t`.
+fn pairBase(g: *Gen, p: Place, t: u32, outOff: *i64) -> u32 {
+    if p.off >= -504 && p.off <= 496 && p.off % 8 == 0 {
+        *outOff = p.off
+        return p.reg
+    }
+    addOff(&g.code, t, p.reg, p.off)
+    *outOff = 0
+    return t
+}
+
+/// Writes `size` zero bytes at `p`.
+export fn zeroMem(g: *Gen, p: Place, size: u64) {
+    if size == 0 {
+        return
+    }
+    if size > 128 {
+        // x16 walks the run, 16 bytes per turn; the tail is finished below.
+        local blocks: u64 = size / 16
+        addOff(&g.code, 16, p.reg, p.off)
+        movConst(&g.code, 17, blocks)
+        local top: u32 = g.newLabel()
+        g.bind(top)
+        stpOff64(&g.code, XZR, XZR, 16, 0)
+        add64Imm(&g.code, 16, 16, 16, false)
+        sub64Imm(&g.code, 17, 17, 1, false)
+        cbnz64(&g.code, 17, 0)
+        g.fixup(top)
+        local rest: u64 = size - blocks * 16
+        zeroMem(g, Place { reg: 16, off: 0 }, rest)
+        return
+    }
+    local base: u32 = p.reg
+    local pos: i64 = p.off
+    local left: u64 = size
+    // 16-byte pairs need the base in range of imm7; otherwise use x16 as the base.
+    if p.off % 8 != 0 || p.off < -504 || p.off + (size as i64) > 496 {
+        addOff(&g.code, 16, p.reg, p.off)
+        base = 16
+        pos = 0
+    }
+    while left >= 16 {
+        stpOff64(&g.code, XZR, XZR, base, pos as i32)
+        pos += 16
+        left -= 16
+    }
+    local chunk: u64 = 8
+    while chunk >= 1 {
+        while left >= chunk {
+            storeTyped(&g.code, XZR, base, pos, unsigned((chunk * 8) as u32))
+            pos += chunk as i64
+            left -= chunk
+        }
+        chunk /= 2
+    }
+}
+
+/// Copies `size` bytes from `src` to `dst`; the runs do not overlap.
+export fn copyMem(g: *Gen, dst: Place, src: Place, size: u64) {
+    if size == 0 {
+        return
+    }
+    if size > 128 {
+        // Three temporaries walk the runs: source, destination and the count of 16-byte blocks.
+        local s: u32 = g.allocI()
+        local d: u32 = g.allocI()
+        local c: u32 = g.allocI()
+        local blocks: u64 = size / 16
+        addOff(&g.code, s, src.reg, src.off)
+        addOff(&g.code, d, dst.reg, dst.off)
+        movConst(&g.code, c, blocks)
+        local top: u32 = g.newLabel()
+        g.bind(top)
+        ldpOff64(&g.code, 16, 17, s, 0)
+        stpOff64(&g.code, 16, 17, d, 0)
+        add64Imm(&g.code, s, s, 16, false)
+        add64Imm(&g.code, d, d, 16, false)
+        sub64Imm(&g.code, c, c, 1, false)
+        cbnz64(&g.code, c, 0)
+        g.fixup(top)
+        copyMem(g, Place { reg: d, off: 0 }, Place { reg: s, off: 0 }, size - blocks * 16)
+        g.freeI(c)
+        g.freeI(d)
+        g.freeI(s)
+        return
+    }
+    local sb: u32 = src.reg
+    local db: u32 = dst.reg
+    local spos: i64 = src.off
+    local dpos: i64 = dst.off
+    local left: u64 = size
+    local ts: u32 = 0
+    local td: u32 = 0
+    local needS = src.off % 8 != 0 || src.off < -504 || src.off + (size as i64) > 496
+    local needD = dst.off % 8 != 0 || dst.off < -504 || dst.off + (size as i64) > 496
+    if needS {
+        ts = g.allocI()
+        addOff(&g.code, ts, src.reg, src.off)
+        sb = ts
+        spos = 0
+    }
+    if needD {
+        td = g.allocI()
+        addOff(&g.code, td, dst.reg, dst.off)
+        db = td
+        dpos = 0
+    }
+    while left >= 16 {
+        ldpOff64(&g.code, 16, 17, sb, spos as i32)
+        stpOff64(&g.code, 16, 17, db, dpos as i32)
+        spos += 16
+        dpos += 16
+        left -= 16
+    }
+    local chunk: u64 = 8
+    while chunk >= 1 {
+        while left >= chunk {
+            local t: Scalar = unsigned((chunk * 8) as u32)
+            loadTyped(&g.code, 16, sb, spos, t)
+            storeTyped(&g.code, 16, db, dpos, t)
+            spos += chunk as i64
+            dpos += chunk as i64
+            left -= chunk
+        }
+        chunk /= 2
+    }
+    if needS {
+        g.freeI(ts)
+    }
+    if needD {
+        g.freeI(td)
+    }
+}

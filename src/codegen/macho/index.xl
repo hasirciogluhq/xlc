@@ -87,12 +87,9 @@ export class MachoSection {
 }
 
 /// The object under construction: sections and symbols, then `writeObject` serializes it.
-export /// The Mach-O spelling of a symbol name: every user symbol carries the `_` prefix in the object
-/// file. Idempotent, so a caller that already spelled `_name` stays as it is.
+/// The Mach-O spelling of a symbol name: every symbol carries one `_` prefix in the object file,
+/// whatever its own spelling (`_start` is `__start`), so two source names never collide.
 fn machoName(name: str) -> String {
-    if name.len > 0 && __builtin_read(name.ptr) == b'_' {
-        return String(name)
-    }
     local out = String("_")
     out.append(name)
     return out
@@ -147,6 +144,27 @@ export class MachoObject {
         return (self.syms.length() - 1) as u32
     }
 
+    /// The bytes in `section` so far.
+    fn size(self, section: u32) -> u64 {
+        return self.sections.get(section).code.length() as u64
+    }
+
+    /// Pads `section` with zero bytes up to a multiple of `align`.
+    fn padTo(self, section: u32, align: u64) {
+        local s: *MachoSection = self.sections.get(section)
+        while (s.code.length() as u64) % align != 0 {
+            s.code.push(0)
+        }
+    }
+
+    /// Overwrites the 8 bytes at `at` of a data section with `v`.
+    fn patchQuad(self, section: u32, at: u64, v: u64) {
+        local s: *MachoSection = self.sections.get(section)
+        for k in 0..8 as usize {
+            s.code.set((at as usize) + k, ((v >> ((k * 8) as u64)) & 0xff) as u8)
+        }
+    }
+
     /// Moves `section` into the segment `name` (`__DATA` for writable data).
     fn setSegment(self, section: u32, name: str) {
         self.sections.get(section).segname = String(name)
@@ -172,7 +190,7 @@ export class MachoObject {
         local s: *MachoSection = self.sections.get(section)
         // PC-relative: the branch distances and the `adrp` page distance. `PAGEOFF12` and the
         // absolute forms patch a plain offset.
-        s.relocs.push(MachoReloc { addr: addr, symIndex: symIndex, pcrel: rtype == RELOC_BRANCH26 || rtype == RELOC_PAGE21,
+        s.relocs.push(MachoReloc { addr: addr, symIndex: symIndex, pcrel: rtype == RELOC_BRANCH26 || rtype == RELOC_PAGE21 || rtype == RELOC_GOT_PAGE21,
             lengthLog2: 2, isExtern: true, rtype: rtype })
     }
 }

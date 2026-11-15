@@ -1,7 +1,7 @@
 // The boundary between the CLI written in xlang and the C++ backend: the flat structs of
 // include/xlang/backend_c.h mirrored field for field, the `declare fn` bindings of the session
 // (include/xlang/backend_c.h), and the helpers that turn strings into boundary strings and back.
-// The code generation bindings are in src/codegen/llvm.xl (include/xlang/codegen/codegen_c.h).
+// Code generation is not behind this boundary: it is xlang code (src/codegen/native).
 from "std" import String, Vec
 from "std/str" import fromParts
 
