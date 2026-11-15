@@ -68,6 +68,7 @@ Items:
 - `export(c)` and `declare` functions and globals: the types must be C-expressible (E0302).
 - Reserved entry symbols `_start`, `mainCRTStartup`, `_xl_initAll` (E0726).
 - E0764: a function with a value, or `-> never`, that can reach the end of its body (flow.xl).
+- E0765: a `return` in a `-> never` function (the value is still checked; the statement is dropped).
 - Role registrations: each role's signature (E0503) and a role registered twice in one module
   (E0502). The pass runs before the bodies, so the `unwind` function is known to every `try`.
 
@@ -94,7 +95,6 @@ Each item names the reason it is not in the xlang pass yet.
 - Operator functions (expr/operators.cpp): `operator[]`, `operator*`, `operator()`.
 - Packs (`for` over packs, pack calls).
 - `__builtin_` forms (call/builtins.cpp), the atomics, `__builtin_read` and `__builtin_write`.
-- E0765 (a `return` in a `-> never` function): the C++ pass reports it next to E0764; not ported.
 - `new` target checks, and the prelude form of the
   ternary (stmt/ternary.cpp: a branch that hoists `?` or `&temp()`; the plain form is ported).
 - E0778 (a `fn(...)` value of a function that passes a struct in the C convention) and E0705 for

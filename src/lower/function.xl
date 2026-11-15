@@ -15,7 +15,7 @@ from "../sema/item" import SDecl, SItem, SParam
 from "../lang/ast/ast" import XStmt, XExpr, XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF, XU_BITNOT,
     XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE,
     XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
-from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_STR, T_INT, T_BOOL, T_ENUM, T_TUPLE
+from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_STR, T_INT, T_BOOL, T_ENUM, T_TUPLE, T_NEVER
 from "./stmt" import switchChain
 from "./flow" import checkReachesEnd
 from "../sema/resolve" import resolve
@@ -238,6 +238,13 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             return l.b.exprStmt(value)
         }
         if (*st).kind == XS_RETURN {
+            // A `-> never` function cannot return: the value is still checked, the statement is dropped.
+            if l.s.types.get(l.fnRetTy).kind == T_NEVER {
+                l.err("E0765", (*st).span, "a `-> never` function cannot return",
+                    "end the path with an endless loop or a `-> never` call")
+                if (*st).expr >= 0 { lowerExpr(l, (*st).expr) }
+                return -1
+            }
             local value = -1
             if (*st).expr >= 0 {
                 value = lowerExprAs(l, (*st).expr, l.fnRetTy)

@@ -236,6 +236,8 @@ const Sample kRemainingDiagnostics[] = {
      "    }\n}\n"},
     {"err-reaches-end",
      "fn f(a: i32) -> i32 {\n    if a > 0 {\n        return 1\n    }\n}\n"},
+    {"err-never-returns", "fn f(a: i32) -> never {\n    return\n}\n"},
+    {"err-never-returns-value", "fn f(a: i32) -> never {\n    return a\n}\n"},
     {"err-reaches-end-never",
      "fn f(a: i32) -> never {\n    if a > 0 {\n        local x = a\n    }\n}\n"},
     {"err-switch-two-defaults",
