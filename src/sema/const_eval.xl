@@ -1,0 +1,416 @@
+// Compile-time evaluation (plan 3.6): literals, `-D` values, `define` constants, enum members,
+// operators, casts and the `sizeOf`/`alignOf`/`offsetOf` queries. The xlang source of
+// sema/const_eval.cpp; the functions take the owning `Sema` explicitly. Results live in the
+// Sema's `consts` arena and are returned as indices (-1: not constant).
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XSpan, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL,
+    XE_STRING_LITERAL, XE_BYTE_LITERAL, XE_NAME, XE_FIELD, XE_UNARY, XE_BINARY, XE_CAST, XE_CALL,
+    XU_NEG, XU_NOT, XU_BITNOT, XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE,
+    XB_GT, XB_GE, XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
+from "./sema" import Sema, SY_DEFINE, SY_ENUM
+from "./types" import T_INT, T_FLOAT, T_BOOL, T_ENUM, T_STRUCT, T_CLASS
+from "./module_scope" import lookupEntity, lookupQualified, entityOfExpr, exprToType
+from "./const_value" import ConstValue, CV_INT, CV_FLOAT, CV_BOOL, CV_STRING, constInt, constFloat,
+    constBool, constString
+from "./int128" import I128, i128Of, i128Negate, i128Not, i128Add, i128Sub, i128Mul, i128Div,
+    i128Mod, i128Eq, i128Lt, i128Le, i128And, i128Or, i128Xor, i128Shl, i128Shr, i128Wrap,
+    i128ToF64, i128FromF64, i128Cmp
+from "./resolve" import resolve
+from "./enums" import enumMember
+from "./layout_calc" import layoutOf
+
+/// The `-D` value of `name`, or -1. The driver fills `cfgNames`/`cfgValues` from the BuildConfig.
+fn fromConfig(s: *Sema, name: str) -> i32 {
+    for i in 0..s.cfgNames.length() {
+        if s.text(*s.cfgNames.get(i)) == name { return *s.cfgValues.get(i) }
+    }
+    return -1
+}
+
+/// The compile-time value of the expression at `exprIdx`, or -1 after reporting E0707.
+export fn evalConst(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    if (*e).kind == XE_INT_LITERAL || (*e).kind == XE_BYTE_LITERAL {
+        return pushInt(s, I128 { hi: ((((*e).intValue as i64) >> 63) as u64), lo: (*e).intValue })
+    }
+    if (*e).kind == XE_FLOAT_LITERAL {
+        return pushFloat(s, (*e).floatValue)
+    }
+    if (*e).kind == XE_BOOL_LITERAL {
+        return pushBool(s, (*e).boolValue != 0)
+    }
+    if (*e).kind == XE_STRING_LITERAL {
+        return pushString(s, s.exprTextAt(exprIdx))
+    }
+    if (*e).kind == XE_NAME {
+        return evalName(s, exprIdx)
+    }
+    if (*e).kind == XE_FIELD {
+        return evalField(s, exprIdx)
+    }
+    if (*e).kind == XE_UNARY {
+        return evalUnary(s, exprIdx)
+    }
+    if (*e).kind == XE_BINARY {
+        return evalBinary(s, exprIdx)
+    }
+    if (*e).kind == XE_CAST {
+        return evalCast(s, exprIdx)
+    }
+    if (*e).kind == XE_CALL {
+        return evalCall(s, exprIdx)
+    }
+    s.notConstant((*e).span, "this form cannot be evaluated at compile time")
+    return -1
+}
+
+fn pushInt(s: *Sema, v: I128) -> i32 {
+    local cv = new ConstValue()
+    cv.kind = CV_INT
+    cv.intValue = v
+    s.consts.push(cv)
+    return (s.consts.length() - 1) as i32
+}
+
+fn pushFloat(s: *Sema, v: f64) -> i32 {
+    local cv = new ConstValue()
+    cv.kind = CV_FLOAT
+    cv.floatValue = v
+    s.consts.push(cv)
+    return (s.consts.length() - 1) as i32
+}
+
+fn pushBool(s: *Sema, v: bool) -> i32 {
+    local cv = new ConstValue()
+    cv.kind = CV_BOOL
+    cv.boolValue = v
+    s.consts.push(cv)
+    return (s.consts.length() - 1) as i32
+}
+
+fn pushString(s: *Sema, v: str) -> i32 {
+    local cv = new ConstValue()
+    cv.kind = CV_STRING
+    cv.text = String(v)
+    s.consts.push(cv)
+    return (s.consts.length() - 1) as i32
+}
+
+/// A `Name`: `-D` values and builtins first (CLI wins over `define`), then `define` constants
+/// with a cache and a cycle guard.
+fn evalName(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    local name = s.exprTextAt(exprIdx)
+    local cfg = fromConfig(s, name)
+    if cfg >= 0 { return cfg }
+    local sym = s.find(name)
+    if sym < 0 {
+        local ref = lookupEntity(s, name)
+        if ref.sym >= 0 && ref.owner != nil && ref.owner != s &&
+                (*ref.owner.symbols.get(ref.sym as usize)).kind == SY_DEFINE {
+            // A define of another module: evaluate it there under its local name.
+            return evalConst(ref.owner, makeRemoteName(ref.owner, ref.owner.text(ref.foundAs),
+                (*e).span))
+        }
+    }
+    if sym < 0 || (*s.symbols.get(sym as usize)).kind != SY_DEFINE {
+        s.notConstant((*e).span, format("`{}` is not a `define` constant", name).asStr())
+        return -1
+    }
+    // The cache.
+    for i in 0..s.defineNames.length() {
+        if s.text(*s.defineNames.get(i)) == name { return *s.defineValues.get(i) }
+    }
+    for i in 0..s.defineInProgress.length() {
+        if s.text(*s.defineInProgress.get(i)) == name {
+            s.error("E0707", (*e).span, format("`define {}` depends on itself", name).asStr(),
+                    "cyclic constant")
+            return -1
+        }
+    }
+    s.defineInProgress.push(s.str(name))
+    local item = s.itemOf(sym)
+    local decl = s.declOfItem(item)
+    local value = -1
+    if decl >= 0 {
+        value = evalConst(s, (*s.declOf(decl)).init)
+    }
+    s.defineInProgressPop(s.str(name))
+    s.defineNames.push(s.str(name))
+    s.defineValues.push(value)
+    return value
+}
+
+/// A one-statement program naming `name`: the remote evaluation of an imported define.
+fn makeRemoteName(owner: *Sema, name: str, at: XSpan) -> i32 {
+    // The remote Sema evaluates the define's own initializer directly; a name expression is
+    // built only when the value must come from the name table, which `evalName` of the owner
+    // does with `find`. So hand the name back as an index into the owner's table instead.
+    local idx = owner.find(name)
+    if idx >= 0 { return -2 - idx } // unused; remote defines resolve through their own decl
+    return -1
+}
+
+/// `ns.name` or `Enum.member`.
+fn evalField(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    local lhs = s.exprAt((*e).lhs)
+    if (*lhs).kind == XE_NAME {
+        local ref = entityOfExpr(s, (*e).lhs)
+        if ref.sym >= 0 {
+            local owner = ref.owner != nil ? ref.owner : s
+            if (*owner.symbols.get(ref.sym as usize)).kind == SY_ENUM {
+                return enumMember(owner, owner.text(ref.foundAs), s.exprTextAt(exprIdx), (*e).span)
+            }
+        }
+        // `ns.name` naming a define of another module
+        local q = lookupQualified(s, s.exprTextAt((*e).lhs), s.exprTextAt(exprIdx))
+        if q.sym >= 0 && q.owner != nil &&
+                (*q.owner.symbols.get(q.sym as usize)).kind == SY_DEFINE {
+            return evalConst(q.owner, makeRemoteName(q.owner, q.owner.text(q.foundAs), (*e).span))
+        }
+    }
+    s.notConstant((*e).span, "only enum members can be read as constants")
+    return -1
+}
+
+fn evalUnary(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    local v = evalConst(s, (*e).lhs)
+    if v < 0 { return -1 }
+    local cv = *s.consts.get(v as usize)
+    if (*e).unaryOp == XU_NEG {
+        if (*cv).kind == CV_INT { return pushInt(s, i128Negate((*cv).intValue)) }
+        if (*cv).kind == CV_FLOAT { return pushFloat(s, -(*cv).floatValue) }
+    } else if (*e).unaryOp == XU_BITNOT && (*cv).kind == CV_INT {
+        return pushInt(s, i128Not((*cv).intValue))
+    } else if (*e).unaryOp == XU_NOT && (*cv).kind == CV_BOOL {
+        return pushBool(s, !(*cv).boolValue)
+    }
+    s.notConstant((*e).span, "operator does not apply to this constant")
+    return -1
+}
+
+/// The three-way result of a comparison operator: -1, 0 or 1 as the operator orders its sides.
+fn cmpResult(op: i32, c: i32) -> bool {
+    if op == XB_EQ { return c == 0 }
+    if op == XB_NE { return c != 0 }
+    if op == XB_LT { return c < 0 }
+    if op == XB_LE { return c <= 0 }
+    if op == XB_GT { return c > 0 }
+    return c >= 0
+}
+
+fn isCmp(op: i32) -> bool {
+    return op >= XB_EQ && op <= XB_GE
+}
+
+fn evalBinary(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    local l = evalConst(s, (*e).lhs)
+    if l < 0 { return -1 }
+    local le = s.exprAt((*e).lhs)
+    local re = s.exprAt((*e).rhs)
+    if (*e).binaryOp == XB_AND || (*e).binaryOp == XB_OR {
+        local lv = *s.consts.get(l as usize)
+        if (*lv).kind != CV_BOOL {
+            s.notConstant((*le).span, "`&&`/`||` need bool operands")
+            return -1
+        }
+        // Short-circuit: the unevaluated side may be non-constant.
+        if (*e).binaryOp == XB_AND && !(*lv).boolValue { return pushBool(s, false) }
+        if (*e).binaryOp == XB_OR && (*lv).boolValue { return pushBool(s, true) }
+        local r = evalConst(s, (*e).rhs)
+        if r < 0 { return -1 }
+        local rv = *s.consts.get(r as usize)
+        if (*rv).kind != CV_BOOL {
+            s.notConstant((*re).span, "`&&`/`||` need bool operands")
+            return -1
+        }
+        return pushBool(s, (*rv).boolValue)
+    }
+    local r = evalConst(s, (*e).rhs)
+    if r < 0 { return -1 }
+    local lv = *s.consts.get(l as usize)
+    local rv = *s.consts.get(r as usize)
+    local op = (*e).binaryOp
+    if (*lv).kind == CV_STRING || (*rv).kind == CV_STRING {
+        if (*lv).kind == (*rv).kind && isCmp(op) {
+            return pushBool(s, cmpResult(op, (*lv).text.compare((*rv).text.asStr())))
+        }
+        s.notConstant((*e).span, "strings only support comparison with another string")
+        return -1
+    }
+    if (*lv).kind == CV_BOOL && (*rv).kind == CV_BOOL && isCmp(op) {
+        local c = ((*lv).boolValue ? 1 : 0) - ((*rv).boolValue ? 1 : 0)
+        return pushBool(s, cmpResult(op, c))
+    }
+    if (*lv).kind == CV_BOOL || (*rv).kind == CV_BOOL {
+        s.notConstant((*e).span, "bool operands only support `==`, `!=`, `&&`, `||`")
+        return -1
+    }
+    if (*lv).kind == CV_INT && (*rv).kind == CV_INT {
+        local a = (*lv).intValue
+        local b = (*rv).intValue
+        if isCmp(op) {
+            local c = i128Cmp(a, b)
+            return pushBool(s, cmpResult(op, c))
+        }
+        if op == XB_ADD { return pushInt(s, i128Add(a, b)) }
+        if op == XB_SUB { return pushInt(s, i128Sub(a, b)) }
+        if op == XB_MUL { return pushInt(s, i128Mul(a, b)) }
+        if op == XB_DIV || op == XB_MOD {
+            if i128Eq(b, I128 { hi: 0, lo: 0 }) {
+                s.error("E0707", (*e).span, "division by zero in a constant expression",
+                        "divisor is 0")
+                return -1
+            }
+            return pushInt(s, op == XB_DIV ? i128Div(a, b) : i128Mod(a, b))
+        }
+        if op == XB_BITAND { return pushInt(s, i128And(a, b)) }
+        if op == XB_BITOR { return pushInt(s, i128Or(a, b)) }
+        if op == XB_BITXOR { return pushInt(s, i128Xor(a, b)) }
+        if op == XB_SHL || op == XB_SHR {
+            if i128Lt(b, I128 { hi: 0, lo: 0 }) || i128Lt(I128 { hi: 0, lo: 126 }, b) {
+                s.error("E0707", (*e).span,
+                        "shift count out of range in a constant expression",
+                        "the count must be between 0 and 126")
+                return -1
+            }
+            local n = b.lo as u32
+            return pushInt(s, op == XB_SHL ? i128Shl(a, n) : i128Shr(a, n))
+        }
+    }
+    // Floating point: an int operand converts.
+    local a = (*lv).kind == CV_INT ? i128ToF64((*lv).intValue) : (*lv).floatValue
+    local b = (*rv).kind == CV_INT ? i128ToF64((*rv).intValue) : (*rv).floatValue
+    if isCmp(op) {
+        local c = a < b ? -1 : (a > b ? 1 : 0)
+        return pushBool(s, cmpResult(op, c))
+    }
+    if op == XB_ADD { return pushFloat(s, a + b) }
+    if op == XB_SUB { return pushFloat(s, a - b) }
+    if op == XB_MUL { return pushFloat(s, a * b) }
+    if op == XB_DIV { return pushFloat(s, a / b) }
+    s.notConstant((*e).span, "`%` needs integer operands")
+    return -1
+}
+
+fn evalCast(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    local v = evalConst(s, (*e).lhs)
+    if v < 0 { return -1 }
+    local ty = resolve(s, (*e).typeIdx)
+    if ty < 0 { return -1 }
+    local t = s.types.get(ty)
+    local cv = *s.consts.get(v as usize)
+    if t.kind == T_ENUM {
+        return (*cv).kind == CV_INT ? v : -1
+    }
+    if t.kind == T_INT {
+        local raw = I128 { hi: 0, lo: 0 }
+        if (*cv).kind == CV_INT {
+            raw = (*cv).intValue
+        } else if (*cv).kind == CV_FLOAT {
+            raw = i128FromF64((*cv).floatValue)
+        } else if (*cv).kind == CV_BOOL {
+            raw = I128 { hi: 0, lo: (*cv).boolValue ? 1 : 0 }
+        } else {
+            s.notConstant((*e).span, "a string address is not a constant integer")
+            return -1
+        }
+        local bits = t.bits != 0 ? t.bits : s.pointerBits
+        return pushInt(s, i128Wrap(raw, bits, t.isSigned != 0))
+    }
+    if t.kind == T_FLOAT {
+        if (*cv).kind == CV_INT {
+            return pushFloat(s, i128ToF64((*cv).intValue))
+        }
+        if (*cv).kind == CV_FLOAT {
+            // `v == v` filters NaN; f32 narrows and widens back.
+            if (*cv).floatValue == (*cv).floatValue && t.bits == 32 {
+                return pushFloat(s, f32ToF64(f64ToF32((*cv).floatValue)))
+            }
+            return v
+        }
+    }
+    if t.kind == T_BOOL {
+        if (*cv).kind == CV_BOOL { return v }
+        if (*cv).kind == CV_INT { return pushBool(s, !i128Eq((*cv).intValue, I128 { hi: 0, lo: 0 })) }
+    }
+    s.notConstant((*e).span,
+        format("cast to `{}` is not a constant", s.types.text(ty).asStr()).asStr())
+    return -1
+}
+
+fn f64ToF32(v: f64) -> f32 {
+    return v as f32
+}
+
+fn f32ToF64(v: f32) -> f64 {
+    return v as f64
+}
+
+/// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)` are the only calls that are compile-time
+/// constants; every other call in a constant position is E0707.
+fn evalCall(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    local callee = s.exprTextAt((*e).lhs)
+    local lhs = s.exprAt((*e).lhs)
+    if (*lhs).kind != XE_NAME {
+        s.notConstant((*e).span, "only `sizeOf`, `alignOf` and `offsetOf` calls are constants")
+        return -1
+    }
+    if callee == "sizeOf" || callee == "alignOf" {
+        if (*e).argsCount != 1 {
+            s.error("E0707", (*e).span, format("`{}` takes one type argument", callee).asStr(),
+                    "wrong argument count")
+            return -1
+        }
+        local argIdx = s.refAt("expr", (*e).argsFirst as i32)
+        local ty = exprToType(s, argIdx)
+        if ty < 0 {
+            s.notConstant((*s.exprAt(argIdx)).span, "expected a type")
+            return -1
+        }
+        local lay = layoutOf(s, ty, (*s.exprAt(argIdx)).span)
+        if lay < 0 { return -1 }
+        local size = *s.layoutCache.get(lay as usize)
+        local n = (*size).size
+        if callee != "sizeOf" { n = (*size).align }
+        return pushInt(s, I128 { hi: 0, lo: n })
+    }
+    if callee == "offsetOf" {
+        if (*e).argsCount != 2 || (*s.exprAt(s.refAt("expr", ((*e).argsFirst + 1) as i32))).kind != XE_NAME {
+            s.error("E0707", (*e).span, "`offsetOf` takes a type and a field name",
+                    "wrong arguments")
+            return -1
+        }
+        local argIdx = s.refAt("expr", (*e).argsFirst as i32)
+        local ty = exprToType(s, argIdx)
+        local resolved = ty >= 0 ? resolve(s, ty) : -1
+        if resolved < 0 || ((*s.types.at(resolved)).kind != T_STRUCT &&
+                            (*s.types.at(resolved)).kind != T_CLASS) {
+            s.error("E0707", (*s.exprAt(argIdx)).span, "`offsetOf` needs a struct or class",
+                    "not an aggregate")
+            return -1
+        }
+        local lay = layoutOf(s, resolved, (*s.exprAt(argIdx)).span)
+        if lay < 0 { return -1 }
+        local size = *s.layoutCache.get(lay as usize)
+        local field = s.exprTextAt(s.refAt("expr", ((*e).argsFirst + 1) as i32))
+        for i in 0..(*size).fields.length() {
+            local f = *(*size).fields.get(i)
+            if (*f).name.asStr() == field {
+                return pushInt(s, I128 { hi: 0, lo: (*f).offset })
+            }
+        }
+        s.error("E0707", (*s.exprAt(s.refAt("expr", ((*e).argsFirst + 1) as i32))).span,
+            format("`{}` has no field `{}`", s.types.text(resolved).asStr(), field).asStr(),
+            "unknown field")
+        return -1
+    }
+    s.notConstant((*e).span,
+        format("call of `{}` cannot be evaluated at compile time", callee).asStr())
+    return -1
+}

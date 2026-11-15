@@ -1,0 +1,158 @@
+// Enums (plan 2.6): member values with auto-numbering, and the checks on the underlying type and
+// on duplicate or mistyped members (E0705). The xlang source of sema/enums.cpp; the functions
+// take the owning `Sema` explicitly.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XSpan, XD_ENUM, XD_STRUCT
+from "./sema" import Sema, SY_ENUM
+from "./item" import SDecl, SEnumMember
+from "./types" import T_INT, T_FLOAT, T_BOOL, T_POINTER, T_STR
+from "./const_value" import ConstValue, CV_INT, CV_FLOAT, CV_BOOL, CV_STRING, constInt, constFloat,
+    constBool
+from "./int128" import I128, i128Of, i128Add1
+from "./resolve" import resolve
+from "./const_eval" import evalConst
+
+/// The enum declaration whose parameters decide for a part name (`Result$Ok`): the enum itself.
+fn genericEnumOf(s: *Sema, name: str) -> i32 {
+    local cut = -1
+    for i in 0..name.len {
+        if name[i] == b'$' {
+            cut = i as i32
+            break
+        }
+    }
+    if cut >= 0 {
+        local whole = s.find(String(name).slice(0, cut as usize).asStr())
+        if whole >= 0 {
+            local item = s.itemOf(whole)
+            if item >= 0 {
+                local d = s.declOfItem(item)
+                if d >= 0 && (*s.declOf(d)).kind == XD_STRUCT { return item }
+            }
+        }
+    }
+    // Not a part: the declaration whose own parameters decide.
+    local own = s.find(name)
+    if own >= 0 { return s.itemOf(own) }
+    return -1
+}
+
+/// The value of `member` of enum `enumName`; auto-numbering fills the integer ones. Returns the
+/// ConstValue index in the Sema's `consts`, or -1.
+export fn enumMember(s: *Sema, enumName: str, member: str, at: XSpan) -> i32 {
+    local sym = s.find(enumName)
+    if sym < 0 || (*s.symbols.get(sym as usize)).kind != SY_ENUM {
+        s.error("E0706", at, format("unknown enum `{}`", enumName).asStr(), "not an enum")
+        return -1
+    }
+    local item = s.itemOf(sym)
+    local decl = s.declOfItem(item)
+    if decl < 0 { return -1 }
+    local d = s.declOf(decl)
+    // The cached values: found by name in `enumNames`.
+    local slot = -1
+    for i in 0..s.enumNames.length() {
+        if s.text(*s.enumNames.get(i)) == enumName { slot = i as i32 }
+    }
+    if slot < 0 && (*d).membersCount != 0 {
+        // Evaluate every member once, in declaration order.
+        slot = s.enumNames.length() as i32
+        s.enumNames.push(s.str(enumName))
+        local first = s.enumMemberValues.length() as i32
+        // A cycle answers "not constant" without reporting twice.
+        for i in 0..s.enumInProgress.length() {
+            if s.text(*s.enumInProgress.get(i)) == enumName { return -1 }
+        }
+        s.enumInProgress.push(s.str(enumName))
+        local under = resolve(s, (*d).underlying)
+        local integral = false
+        if under >= 0 && (*s.types.at(under)).kind == T_INT { integral = true }
+        local next = i128Of(0)
+        for m in 0..(*d).membersCount as usize {
+            local mem = s.members.get(((*d).membersFirst + m as u32) as usize)
+            local v = -1
+            if (*mem).value >= 0 {
+                v = evalConst(s, (*mem).value)
+                if v >= 0 && (*s.consts.get(v as usize)).kind == CV_INT {
+                    next = i128Add1((*s.consts.get(v as usize)).intValue)
+                }
+            } else if integral {
+                local cv = new ConstValue()
+                cv.kind = CV_INT
+                cv.intValue = next
+                s.consts.push(cv)
+                v = (s.consts.length() - 1) as i32
+                next = i128Add1(next)
+            }
+            s.enumMemberValues.push(v)
+        }
+        s.enumInProgressPop(s.str(enumName))
+        s.enumValues.push(first)
+        s.enumCounts.push((*d).membersCount as i32)
+    }
+    if slot >= 0 {
+        local first = *s.enumValues.get(slot as usize)
+        local count = *s.enumCounts.get(slot as usize)
+        for m in 0..(*d).membersCount as usize {
+            if m >= count as usize { break }
+            local mem = s.members.get(((*d).membersFirst + m as u32) as usize)
+            if s.text((*mem).name) == member {
+                return *s.enumMemberValues.get((first as usize) + m)
+            }
+        }
+    }
+    s.error("E0706", at, format("enum `{}` has no member `{}`", enumName, member).asStr(),
+            "unknown member")
+    return -1
+}
+
+/// The checks of one enum declaration: underlying type, duplicate members, mistyped values.
+export fn checkEnum(s: *Sema, declIdx: i32) {
+    local d = s.declOf(declIdx)
+    local under = resolve(s, (*d).underlying)
+    if under < 0 { return }
+    local ut = s.types.get(under)
+    local integral = ut.kind == T_INT
+    local constantCapable = integral || ut.kind == T_FLOAT || ut.kind == T_BOOL ||
+        (ut.kind == T_POINTER && ut.elem >= 0 && (*s.types.at(ut.elem)).kind == T_INT &&
+         (*s.types.at(ut.elem)).bits == 8 && (*s.types.at(ut.elem)).isSigned == 0)
+    if !constantCapable {
+        s.error("E0705", (*d).span,
+            format("`{}` cannot be the underlying type of an enum", s.types.text(under).asStr()).asStr(),
+            "must hold a constant: integer, float, bool or *u8")
+        return
+    }
+    for m in 0..(*d).membersCount as usize {
+        local mem = s.members.get(((*d).membersFirst + m as u32) as usize)
+        // Duplicate members.
+        for e in 0..m {
+            local other = s.members.get(((*d).membersFirst + e as u32) as usize)
+            if s.text((*other).name) == s.text((*mem).name) {
+                s.error("E0705", (*mem).span,
+                    format("enum member `{}` is defined twice", s.text((*mem).name)).asStr(),
+                    "duplicate member")
+            }
+        }
+        if (*mem).value < 0 && !integral {
+            s.error("E0705", (*mem).span,
+                format("member `{}` needs an explicit value", s.text((*mem).name)).asStr(),
+                "only integer enums are auto-numbered")
+            continue
+        }
+        local value = enumMember(s, s.text((*d).name), s.text((*mem).name), (*mem).span)
+        if value < 0 { continue }
+        if (*mem).value >= 0 {
+            local cv = *s.consts.get(value as usize)
+            local ok = (integral && (*cv).kind == CV_INT) ||
+                (ut.kind == T_FLOAT && (*cv).kind != CV_STRING && (*cv).kind != CV_BOOL) ||
+                (ut.kind == T_BOOL && (*cv).kind == CV_BOOL) ||
+                (ut.kind == T_POINTER && (*cv).kind == CV_STRING)
+            if !ok {
+                s.error("E0705", (*mem).span,
+                    format("value of `{}` does not match the underlying type `{}`",
+                           s.text((*mem).name), s.types.text(under).asStr()).asStr(),
+                    "wrong kind of constant")
+            }
+        }
+    }
+}

@@ -15,6 +15,9 @@ from "../sema/types" import Types
 from "../sema/resolve" import resolve
 from "../sema/instances" import instantiate, internInstance, instantiateMethod
 from "../sema/subst" import TypeEnv, substituteType, instantiateFn, instantiateDecl
+from "../sema/const_eval" import evalConst
+from "../sema/layout_calc" import layoutOf, layoutOfName, aggregateLayout
+from "../sema/enums" import enumMember, checkEnum
 from "../sema/module_scope" import lookupEntity, lookupQualified, entityByQName, entityOfExpr, exprToType
 from "../sema/int128" import I128, i128Of, i128Text
 from "../sema/const_value" import ConstValue, constInt, constText

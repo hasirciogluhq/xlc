@@ -47,6 +47,12 @@ export fn i128Negate(a: I128) -> I128 {
     return I128 { hi: ~a.hi + carry, lo: lo }
 }
 
+/// `a + 1`.
+export fn i128Add1(a: I128) -> I128 {
+    local one = I128 { hi: 0, lo: 1 }
+    return i128Add(a, one)
+}
+
 export fn i128Add(a: I128, b: I128) -> I128 {
     local lo = a.lo + b.lo
     local carry: u64 = lo < a.lo ? 1 : 0
@@ -62,6 +68,13 @@ export fn i128Eq(a: I128, b: I128) -> bool {
 }
 
 /// True when `a < b` as signed values.
+/// Three-way compare: -1, 0 or 1.
+export fn i128Cmp(a: I128, b: I128) -> i32 {
+    if i128Lt(a, b) { return -1 }
+    if i128Eq(a, b) { return 0 }
+    return 1
+}
+
 export fn i128Lt(a: I128, b: I128) -> bool {
     if a.hi != b.hi { return a.hi < b.hi }
     return a.lo < b.lo

@@ -130,9 +130,9 @@ export fn entityByQName(s: *Sema, qname: str) -> EntityRef {
     return none() // the compilation driver resolves this; not ported yet
 }
 
-/// The compile-time value of an expression, or -1. A placeholder until const_eval.xl lands; the
-/// array-length path only needs integer literals, which it answers directly.
-fn evalConstExpr(s: *Sema, exprIdx: i32) -> i32 {
+/// The compile-time length of an array-type repeat expression: integer literals only (the full
+/// evaluator lives in const_eval.xl and would make this module import it, a cycle).
+fn lengthConst(s: *Sema, exprIdx: i32) -> i32 {
     local e = s.exprAt(exprIdx)
     if (*e).kind == XE_INT_LITERAL {
         local cv = new ConstValue()
@@ -217,7 +217,7 @@ export fn exprToType(s: *Sema, exprIdx: i32) -> i32 {
     if (*e).kind == XE_ARRAY_REPEAT {
         local elem = exprToType(s, (*e).lhs)
         if elem < 0 { return -1 }
-        local v = evalConstExpr(s, (*e).rhs)
+        local v = lengthConst(s, (*e).rhs)
         if v < 0 { return -1 }
         local cv = *s.consts.get(v as usize)
         if (*cv).kind != CV_INT { return -1 }

@@ -17,6 +17,7 @@ from "./flat" import Flat, eqStr, eqText, bytesOf
 from "./types" import Types, T_INT, T_FLOAT, T_BOOL, T_POINTER, T_STRUCT, T_CLASS, T_INTERFACE,
     T_ENUM, T_NAMED
 from "./const_value" import ConstValue
+from "./layout" import TypeLayout
 from "./item" import SItem, SDecl, SParam, SField, SSumVariant, SEnumMember, SImportName
 
 /// The kind of a collected name (the order of `Sema::Symbol::Kind`).
@@ -142,12 +143,16 @@ export class Sema {
     layoutValues: Vec<i32>    ///< TypeLayout results (heap), -1 = known failed
     layoutNames: Vec<XStr>
     layoutInProgress: Vec<XStr>
-    enumValues: Vec<i32>      ///< per enum: range in `enumMemberValues`
+    enumValues: Vec<i32>      ///< per enum: the first index in `enumMemberValues`
+    enumCounts: Vec<i32>      ///< per enum: how many members its value run holds
     enumNames: Vec<XStr>
     enumMemberValues: Vec<i32> ///< ConstValue results, -1 = none (auto-numbered fills them)
     enumInProgress: Vec<XStr>
     reported: Vec<XStr>       ///< dedup keys of the diagnostics already reported
     consts: Vec<*ConstValue>  ///< the arena the ConstValue results index into
+    cfgNames: Vec<XStr>       ///< the `-D` names the driver loaded from the BuildConfig
+    cfgValues: Vec<i32>       ///< their ConstValue results, parallel to `cfgNames`
+    layoutCache: Vec<*TypeLayout> ///< the arena the layout results index into
 
     // Synthesized expression/statement/block arenas for cloned instance bodies. Indices below the
     // flat AST's counts read from the parse result; indices at or above read from these. Records
@@ -195,6 +200,10 @@ export class Sema {
         self.enumInProgress = Vec<XStr>()
         self.reported = Vec<XStr>()
         self.consts = Vec<*ConstValue>()
+        self.cfgNames = Vec<XStr>()
+        self.cfgValues = Vec<i32>()
+        self.layoutCache = Vec<*TypeLayout>()
+        self.enumCounts = Vec<i32>()
         self.methodInstDecls = Vec<i32>()
         self.methodInstKeys = Vec<XStr>()
         self.methodInstCls = Vec<XStr>()
@@ -573,6 +582,28 @@ export class Sema {
         }
         self.aliasInProgress.push(name)
         return true
+    }
+
+    /// Clears the in-progress mark of a named cache (`define`, `enum`, `layout`).
+    fn inProgressPop(self, list: *Vec<XStr>, name: XStr) {
+        for i in 0..(*list).length() {
+            if eqText(&(self.flat.r), *(*list).get(i), self.text(name)) {
+                (*list).remove(i)
+                return
+            }
+        }
+    }
+
+    fn defineInProgressPop(self, name: XStr) {
+        self.inProgressPop(&self.defineInProgress, name)
+    }
+
+    fn enumInProgressPop(self, name: XStr) {
+        self.inProgressPop(&self.enumInProgress, name)
+    }
+
+    fn layoutInProgressPop(self, name: XStr) {
+        self.inProgressPop(&self.layoutInProgress, name)
     }
 
     /// Clears the in-progress mark once an alias resolution finishes.

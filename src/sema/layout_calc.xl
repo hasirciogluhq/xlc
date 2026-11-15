@@ -1,0 +1,437 @@
+// Layouts (plan 3.3): primitive sizes, `str`, arrays, and the aggregate layout (scheme v1,
+// `@repr(c)`, `@packed`, `@align`, `@layout`, recorded layouts of `declare`d types). The xlang
+// source of sema/layout.cpp; the functions take the owning `Sema` explicitly. Results live in
+// the Sema's `layoutCache` arena and are returned as indices (-1: no layout).
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XSpan, XAttr, XAttrArg, XType, XD_STRUCT, XD_CLASS
+from "./sema" import Sema, SY_STRUCT, SY_CLASS
+from "./item" import SDecl, SField
+from "./types" import T_VOID, T_NEVER, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ENUM,
+    T_STRUCT, T_CLASS, T_INTERFACE, T_STR, T_SLICE, T_TUPLE, T_NAMED, T_ARRAY
+from "./resolve" import resolve
+from "./module_scope" import entityByQName
+from "./const_eval" import evalConst
+from "./const_value" import CV_INT
+from "./layout" import TypeLayout, FieldLayout
+
+/// `value` rounded up to `align` (a power of two).
+fn alignUp(value: u64, align: u64) -> u64 {
+    return (value + align - 1) & ~(align - 1)
+}
+
+/// The size of a primitive, or -1 with `align` written through `out`.
+fn primitiveSize(s: *Sema, t: *XType, out: *u64) -> i64 {
+    if (*t).kind == T_BOOL {
+        *out = 1
+        return 1
+    }
+    if (*t).kind == T_INT {
+        local bits = (*t).bits != 0 ? (*t).bits : s.pointerBits
+        *out = bits / 8
+        return bits as i64 / 8
+    }
+    if (*t).kind == T_FLOAT {
+        *out = (*t).bits / 8
+        return (*t).bits as i64 / 8
+    }
+    if (*t).kind == T_POINTER || (*t).kind == T_FN_PTR {
+        *out = s.pointerBits / 8
+        return (s.pointerBits / 8) as i64
+    }
+    if (*t).kind == T_INTERFACE {
+        // `interface` is a fat pointer: 2 * pointer width, aligned to the pointer width.
+        *out = s.pointerBits / 8
+        return 2 * (s.pointerBits / 8) as i64
+    }
+    return -1
+}
+
+/// The layout of the type at `tyIdx`, or -1 after reporting.
+export fn layoutOf(s: *Sema, tyIdx: i32, at: XSpan) -> i32 {
+    local resolved = resolve(s, tyIdx)
+    if resolved < 0 { return -1 }
+    local t = s.types.get(resolved)
+    local out = new TypeLayout()
+    if t.kind == T_VOID || t.kind == T_NEVER {
+        s.error("E0703", at, "`void` has no size", "sizeless type")
+        return -1
+    }
+    if t.kind == T_ENUM {
+        return layoutOf(s, t.elem, at)
+    }
+    if t.kind == T_ARRAY {
+        local value = -1
+        if t.length >= 0 { value = evalConst(s, t.length) }
+        if value < 0 || (*s.consts.get(value as usize)).kind != CV_INT {
+            if value >= 0 {
+                s.error("E0707", (*s.exprAt(t.length)).span,
+                        "array length must be a non-negative integer constant", "invalid length")
+            }
+            return -1
+        }
+        local n = (*s.consts.get(value as usize)).intValue
+        if n.hi != 0 && n.hi != 0xFFFFFFFFFFFFFFFF {
+            s.error("E0707", (*s.exprAt(t.length)).span,
+                    "array length must be a non-negative integer constant", "invalid length")
+            return -1
+        }
+        if n.hi == 0xFFFFFFFFFFFFFFFF && n.lo != 0 {
+            s.error("E0707", (*s.exprAt(t.length)).span,
+                    "array length must be a non-negative integer constant", "invalid length")
+            return -1
+        }
+        local elem = layoutOf(s, t.elem, at)
+        if elem < 0 { return -1 }
+        local el = *s.layoutCache.get(elem as usize)
+        (*out).align = (*el).align
+        (*out).size = (*el).size * n.lo
+        (*out).dataSize = (*out).size
+        return pushLayout(s, out)
+    }
+    if t.kind == T_STRUCT || t.kind == T_CLASS {
+        local ref = entityByQName(s, s.text(*s.types.strs.get(t.pathFirst)))
+        if ref.sym < 0 {
+            s.error("E0706", at,
+                    format("unknown type `{}`", s.text(*s.types.strs.get(t.pathFirst))).asStr(),
+                    "not a struct or class")
+            return -1
+        }
+        local owner = ref.owner != nil ? ref.owner : s
+        return layoutOfName(owner, owner.text(ref.foundAs), at)
+    }
+    if t.kind == T_TUPLE {
+        // A tuple is laid out like `@repr(c)` with the elements in order: no scheme reordering, so
+        // `(A, B)` and `(B, A)` differ and `.0` always names element 0. `()` has size 0.
+        local cursor: u64 = 0
+        local align: u64 = 1
+        for i in 0..t.argsCount as usize {
+            local element = layoutOf(s, (t.argsFirst + i) as i32, at)
+            if element < 0 { return -1 }
+            local el = *s.layoutCache.get(element as usize)
+            local off = alignUp(cursor, (*el).align)
+            local f = new FieldLayout(format("{}", i).asStr())
+            f.ty = (t.argsFirst + i) as i32
+            f.offset = off
+            f.size = (*el).size
+            f.align = (*el).align
+            (*out).fields.push(f)
+            cursor = off + (*el).size
+            if (*el).align > align { align = (*el).align }
+        }
+        (*out).align = align
+        (*out).dataSize = cursor
+        (*out).size = alignUp(cursor, align)
+        (*out).reprC = true
+        return pushLayout(s, out)
+    }
+    if t.kind == T_STR {
+        // `str` is `{ ptr, len }`; the fields are visible to `s.ptr` and `s.len`.
+        local word = s.pointerBits / 8
+        (*out).align = word
+        (*out).size = 2 * word
+        (*out).dataSize = (*out).size
+        local f0 = new FieldLayout("ptr")
+        f0.offset = 0
+        f0.size = word
+        f0.align = word
+        (*out).fields.push(f0)
+        local f1 = new FieldLayout("len")
+        f1.offset = word
+        f1.size = word
+        f1.align = word
+        (*out).fields.push(f1)
+        return pushLayout(s, out)
+    }
+    if t.kind == T_SLICE {
+        // `[]T` and `[]mut T` are `{ ptr: *T, len: usize }`: the same two words as `str`, with the
+        // element type in `ptr` so indexing steps by `sizeof(T)`.
+        local word = s.pointerBits / 8
+        (*out).align = word
+        (*out).size = 2 * word
+        (*out).dataSize = (*out).size
+        local f0 = new FieldLayout("ptr")
+        f0.ty = t.elem
+        f0.offset = 0
+        f0.size = word
+        f0.align = word
+        (*out).fields.push(f0)
+        local f1 = new FieldLayout("len")
+        f1.offset = word
+        f1.size = word
+        f1.align = word
+        (*out).fields.push(f1)
+        return pushLayout(s, out)
+    }
+    if t.kind == T_NAMED {
+        s.error("E0703", at,
+                format("size of `{}` is unknown", s.types.text(resolved).asStr()).asStr(),
+                "type comes from another module (module loading not available here)")
+        return -1
+    }
+    local align: u64 = 1
+    local size = primitiveSize(s, s.types.at(resolved), &align)
+    if size < 0 { return -1 }
+    (*out).size = size as u64
+    (*out).align = align
+    (*out).dataSize = size as u64
+    return pushLayout(s, out)
+}
+
+fn pushLayout(s: *Sema, out: *TypeLayout) -> i32 {
+    s.layoutCache.push(out)
+    return (s.layoutCache.length() - 1) as i32
+}
+
+/// The layout of the struct or class `name`, from the cache or computed once.
+export fn layoutOfName(s: *Sema, name: str, at: XSpan) -> i32 {
+    for i in 0..s.layoutNames.length() {
+        if s.text(*s.layoutNames.get(i)) == name { return *s.layoutValues.get(i) }
+    }
+    local sym = s.find(name)
+    if sym < 0 {
+        local kind = (*s.symbols.get(sym as usize)).kind
+        if kind != SY_STRUCT && kind != SY_CLASS {
+            s.error("E0706", at, format("unknown type `{}`", name).asStr(), "not a struct or class")
+            return -1
+        }
+    }
+    for i in 0..s.layoutInProgress.length() {
+        if s.text(*s.layoutInProgress.get(i)) == name {
+            s.error("E0703", at, format("`{}` contains itself by value", name).asStr(),
+                    "recursive type has infinite size; use a pointer")
+            return -1
+        }
+    }
+    s.layoutInProgress.push(s.str(name))
+    local item = s.itemOf(sym)
+    local result = aggregateLayout(s, name, s.declOfItem(item), at)
+    s.layoutInProgressPop(s.str(name))
+    s.layoutNames.push(s.str(name))
+    s.layoutValues.push(result)
+    return result
+}
+
+/// True when the attribute list has `name` with the identifier argument `text`.
+fn attrHasIdent(s: *Sema, first: u32, count: u32, name: str, text: str) -> bool {
+    local a = s.findAttr(first, count, name)
+    if a < 0 { return false }
+    local attr = s.flat.attrAt(a)
+    for i in 0..(*attr).argsCount as usize {
+        local arg = (s.flat.r.attrArgs as usize + ((*attr).argsFirst + i as u32) as usize *
+            sizeOf(XAttrArg)) as *XAttrArg
+        if (*arg).kind == 0 && s.flat.strOf((*arg).text) == text {
+            return true
+        }
+    }
+    return false
+}
+
+/// The value of the argument of `name` carried under `key`, as text; "" when absent.
+fn attrKeyText(s: *Sema, first: u32, count: u32, name: str, key: str) -> str {
+    local a = s.findAttr(first, count, name)
+    if a < 0 { return "" }
+    local attr = s.flat.attrAt(a)
+    for i in 0..(*attr).argsCount as usize {
+        local arg = (s.flat.r.attrArgs as usize + ((*attr).argsFirst + i as u32) as usize *
+            sizeOf(XAttrArg)) as *XAttrArg
+        if s.flat.strOf((*arg).key) == key { return s.flat.strOf((*arg).text) }
+    }
+    return ""
+}
+
+/// The first positional integer argument of `name`, or -1.
+fn attrInt(s: *Sema, first: u32, count: u32, name: str) -> i64 {
+    local a = s.findAttr(first, count, name)
+    if a < 0 { return -1 }
+    local attr = s.flat.attrAt(a)
+    if (*attr).argsCount == 0 { return -1 }
+    local arg = (s.flat.r.attrArgs as usize + (*attr).argsFirst as usize * sizeOf(XAttrArg)) as *XAttrArg
+    if (*arg).kind == 1 { return (*arg).number }
+    return -1
+}
+
+/// The layout of one struct or class declaration.
+export fn aggregateLayout(s: *Sema, name: str, declIdx: i32, at: XSpan) -> i32 {
+    local d = s.declOf(declIdx)
+    local isClass = (*d).kind == XD_CLASS
+    local opaque = (*d).opaque != 0
+    local isUnion = (*d).isUnion != 0
+    if opaque {
+        s.error("E0703", at, format("`{}` is opaque and has no known size", name).asStr(),
+                "opaque `declare` types can only be used behind a pointer")
+        return -1
+    }
+    local out = new TypeLayout()
+    (*out).reprC = attrHasIdent(s, (*d).attrsFirst, (*d).attrsCount, "repr", "c")
+    (*out).packed = s.findAttr((*d).attrsFirst, (*d).attrsCount, "packed") >= 0
+    (*out).isUnion = isUnion
+    local scheme = attrKeyText(s, (*d).attrsFirst, (*d).attrsCount, "layout", "scheme")
+    if scheme.len > 0 {
+        if scheme != "v1" {
+            s.error("E0705", (*s.flat.attrAt(s.findAttr((*d).attrsFirst, (*d).attrsCount,
+                "layout"))).span, format("unknown layout scheme `{}`", scheme).asStr(),
+                "known schemes: v1")
+        }
+        (*out).scheme = String(scheme)
+    }
+    if attrHasIdent(s, (*d).attrsFirst, (*d).attrsCount, "layout", "shuffle") {
+        (*out).shuffled = true
+        local seed = attrKeyText(s, (*d).attrsFirst, (*d).attrsCount, "layout", "seed")
+        if seed.len > 0 {
+            (*out).seed = strToU64(seed)
+        } else {
+            (*out).seed = strHash(name)
+        }
+    }
+    local minAlign: u64 = 1
+    local alignAttr = s.findAttr((*d).attrsFirst, (*d).attrsCount, "align")
+    if alignAttr >= 0 {
+        local n = attrInt(s, (*d).attrsFirst, (*d).attrsCount, "align")
+        if n > 0 && (n & (n - 1)) == 0 {
+            minAlign = n as u64
+        } else {
+            s.error("E0705", (*s.flat.attrAt(alignAttr)).span,
+                    "`@align(N)` needs a power-of-two integer", "invalid alignment")
+        }
+    }
+
+    local ptr = s.pointerBits / 8
+    local cursor: u64 = 0
+    local align: u64 = 1
+
+    if isClass {
+        // A class with a virtual method carries the vptr.
+        for m in 0..(*d).methodsCount as usize {
+            local md = s.declOf(((*d).methodsFirst + m as u32) as i32)
+            if (*md).isVirtual != 0 { (*out).hasVptr = true }
+        }
+        if (*d).baseCount != 0 {
+            // The base class comes first; its layout fills the inherited fields.
+            local basePath = Vec<String>()
+            for i in 0..(*d).baseCount as usize {
+                basePath.push(String(s.text(*s.types.strs.get((*d).baseFirst + i as u32))))
+            }
+            local baseType = s.types.makeNamed(basePath)
+            local baseResolved = resolve(s, baseType)
+            if baseResolved < 0 { return -1 }
+            if (*s.types.at(baseResolved)).kind != T_CLASS {
+                s.error("E0706", (*d).nameSpan,
+                        format("base `{}` is not a class", s.types.pathOf(s.types.get(baseType)).asStr()).asStr(),
+                        "single inheritance needs a class base")
+                return -1
+            }
+            local base = layoutOf(s, baseResolved, at)
+            if base < 0 { return -1 }
+            local bl = *s.layoutCache.get(base as usize)
+            for i in 0..(*bl).fields.length() {
+                local f = *(*bl).fields.get(i)
+                (*f).inherited = true
+                (*out).fields.push(f)
+            }
+            (*out).hasVptr = (*out).hasVptr || (*bl).hasVptr
+            // Itanium: a polymorphic (non-POD) base lets derived members reuse its tail padding.
+            cursor = ((*out).reprC && (*bl).hasVptr) ? (*bl).dataSize : (*bl).size
+            align = (*bl).align
+        } else if (*out).hasVptr {
+            cursor = ptr
+            align = ptr
+        }
+        if (*out).hasVptr && cursor < ptr {
+            cursor = ptr
+        }
+    }
+
+    // The fields with their size and (packed-collapsed) alignment.
+    local pendingSizes = Vec<u64>()
+    local pendingAligns = Vec<u64>()
+    for i in 0..(*d).fieldsCount as usize {
+        local f = s.fields.get(((*d).fieldsFirst + i as u32) as usize)
+        local resolved = resolve(s, (*f).ty)
+        if resolved < 0 { return -1 }
+        local fl = layoutOf(s, resolved, (*f).span)
+        if fl < 0 { return -1 }
+        local lay = *s.layoutCache.get(fl as usize)
+        pendingSizes.push((*lay).size)
+        pendingAligns.push((*out).packed ? 1 : (*lay).align)
+    }
+    // Scheme v1: stable sort by alignment, largest first. Frozen once released.
+    local order = Vec<i32>()
+    for i in 0..(*d).fieldsCount as usize { order.push(i as i32) }
+    if !(*out).reprC && !(*out).packed {
+        for i in 1..order.length() {
+            local j = i
+            while j > 0 && *pendingAligns.get(*order.get(j - 1) as usize) <
+                            *pendingAligns.get(*order.get(j) as usize) {
+                local tmp = *order.get(j - 1)
+                order.set(j - 1, *order.get(j))
+                order.set(j, tmp)
+                j = j - 1
+            }
+        }
+        if (*out).shuffled {
+            shuffleOrder(&order, (*out).seed)
+        }
+    }
+    for k in 0..order.length() {
+        local idx = *order.get(k) as usize
+        local f = s.fields.get(((*d).fieldsFirst + idx as u32) as usize)
+        local fsize = *pendingSizes.get(idx)
+        local falign = *pendingAligns.get(idx)
+        local off = isUnion ? 0 : alignUp(cursor, falign)
+        local fl = new FieldLayout(s.text((*f).name))
+        fl.ty = (*f).ty
+        fl.offset = off
+        fl.size = fsize
+        fl.align = falign
+        (*out).fields.push(fl)
+        cursor = isUnion ? (cursor > fsize ? cursor : fsize) : off + fsize
+        if falign > align { align = falign }
+    }
+    (*out).dataSize = cursor
+    if align < minAlign { align = minAlign }
+    if isClass && (*d).baseCount == 0 && !(*out).hasVptr && (*d).fieldsCount == 0 && (*out).reprC {
+        cursor = cursor > 1 ? cursor : 1 // C++: an empty class is one byte
+    }
+    (*out).align = align
+    (*out).size = alignUp(cursor, align)
+    return pushLayout(s, out)
+}
+
+/// FNV-1a of `text`: the default shuffle seed.
+fn strHash(text: str) -> u64 {
+    local h: u64 = 0xcbf29ce484222325
+    for i in 0..text.len {
+        h = h ^ text[i] as u64
+        h = h * 0x100000001b3
+    }
+    return h
+}
+
+fn strToU64(text: str) -> u64 {
+    local v: u64 = 0
+    for i in 0..text.len {
+        if text[i] < b'0' || text[i] > b'9' { return v }
+        v = v * 10 + (text[i] - b'0') as u64
+    }
+    return v
+}
+
+/// A deterministic Fisher-Yates shuffle of `order` under `seed` (std::mt19937_64 in the C++
+/// source; any deterministic mix serves the same purpose: reproducibility per seed).
+fn shuffleOrder(order: *Vec<i32>, seed: u64) {
+    local n = (*order).length()
+    if n < 2 { return }
+    local state = seed
+    for i in 0..n - 1 {
+        // splitmix64 step
+        state = state + 0x9e3779b97f4a7c15
+        local z = state
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+        z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+        z = z ^ (z >> 31)
+        local j = i + (z % (n - i))
+        local tmp = *(*order).get(i)
+        (*order).set(i, *(*order).get(j))
+        (*order).set(j, tmp)
+    }
+}
