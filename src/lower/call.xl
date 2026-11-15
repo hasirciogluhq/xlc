@@ -118,7 +118,8 @@ fn lowerOverloadCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, decls
     local args = Vec<i32>()
     if !lowerArgs(l, e, &params, &args, name) { return -1 }
     local range = l.b.args(args)
-    local key = overloadKey((*entry).qname.asStr(), mangledParams(l.s, &params))
+    local mangled = mangledParams(l.s, &params)
+    local key = overloadKey((*entry).qname.asStr(), &mangled)
     return l.b.call(key.asStr(), range.0, range.1, exprTypeName(l, idx))
 }
 
@@ -166,7 +167,8 @@ fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef
     local qualified = format("{}.{}", (*m).cls.asStr(), name)
     local key = qualified.clone()
     if decls.length() > 1 {
-        key = overloadKey(qualified.asStr(), mangledParams(l.s, &params))
+        local mangled = mangledParams(l.s, &params)
+        key = overloadKey(qualified.asStr(), &mangled)
     }
     return l.b.call(key.asStr(), range.0, range.1, exprTypeName(l, idx))
 }

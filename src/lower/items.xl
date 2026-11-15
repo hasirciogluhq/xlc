@@ -199,10 +199,10 @@ export fn lowerTopFn(l: *Lowerer, item: i32, declIdx: i32) {
             overloaded = (*rec).overloadsCount > 1
         }
         local params = paramTypes(l, d)
-        local key = overloaded ? overloadKey(qname.asStr(), params) : qname.clone()
+        local key = overloaded ? overloadKey(qname.asStr(), &params) : qname.clone()
         if fnKeySeen(l, key.asStr()) {
             l.err("E0401", (*d).nameSpan,
-                format("`{}` is defined twice", overloadKey(l.s.text((*d).name), params).asStr()).asStr(),
+                format("`{}` is defined twice", overloadKey(l.s.text((*d).name), &params).asStr()).asStr(),
                 "give the overloads different parameter types")
             return
         }
@@ -244,7 +244,7 @@ export fn lowerMethods(l: *Lowerer, item: i32, declIdx: i32) {
                         "keep one declaration with this name")
                 }
                 local params = paramTypes(l, m)
-                key = overloadKey(key.asStr(), params)
+                key = overloadKey(key.asStr(), &params)
             }
             if fnKeySeen(l, key.asStr()) {
                 l.err("E0401", (*m).nameSpan,

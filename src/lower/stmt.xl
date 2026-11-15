@@ -7,12 +7,13 @@ from "./state" import Lowerer
 
 /// The if-chain of a `switch`: arm `i` is `if conds[i] { bodies[i] }`, each arm's `else` is the
 /// arm after it, and the default body is the last `else`. Returns the statements of the chain:
-/// the outermost `if`, or the default body when there is no arm.
-export fn switchChain(l: *Lowerer, conds: Vec<i32>, bodies: Vec<Vec<i32>>, defaultBody: Vec<i32>) -> Vec<i32> {
-    local chain = defaultBody
-    for k in 0..conds.length() {
-        local i = conds.length() - 1 - k
-        local ifIdx = l.b.ifStmt(*conds.get(i), (*bodies.get(i)).clone(), chain)
+/// the outermost `if`, or the default body when there is no arm. The three lists are borrowed:
+/// the caller still reads `conds` after the call (to tell an arm from none).
+export fn switchChain(l: *Lowerer, conds: *Vec<i32>, bodies: *Vec<Vec<i32>>, defaultBody: *Vec<i32>) -> Vec<i32> {
+    local chain = (*defaultBody).clone()
+    for k in 0..(*conds).length() {
+        local i = (*conds).length() - 1 - k
+        local ifIdx = l.b.ifStmt(*(*conds).get(i), (*(*bodies).get(i)).clone(), chain)
         chain = Vec<i32>()
         chain.push(ifIdx)
     }

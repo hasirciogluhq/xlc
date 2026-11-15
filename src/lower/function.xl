@@ -826,7 +826,7 @@ export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
         conds.push(cond)
         bodies.push(body)
     }
-    local chain = switchChain(l, conds, bodies, defaultBody)
+    local chain = switchChain(l, &conds, &bodies, &defaultBody)
     for i in 0..chain.length() {
         inner.push(*chain.get(i))
     }
@@ -951,7 +951,7 @@ fn lowerConditionSwitch(l: *Lowerer, st: *XStmt) -> i32 {
         conds.push(cond)
         bodies.push(lowerBlockInto(l, (*c).body))
     }
-    local chain = switchChain(l, conds, bodies, defaultBody)
+    local chain = switchChain(l, &conds, &bodies, &defaultBody)
     if conds.length() > 0 {
         return *chain.get(0)
     }
