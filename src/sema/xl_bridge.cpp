@@ -20,7 +20,7 @@ struct XlLowered::Impl {
         if (session != nullptr) {
             xlcLowerFree(session);
         }
-        xlcParseFree(parse);
+        xlcParseFree(parse.block);
     }
 };
 
