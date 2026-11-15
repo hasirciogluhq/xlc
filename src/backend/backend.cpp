@@ -1,287 +1,21 @@
-// The backend behind the C API of include/xlang/backend_c.h: one session drives the whole C++
-// pipeline (compilation, lowering, analyses, emission) exactly as src/cli/main.cpp arranged it
-// before the CLI moved to xlang. The entry points convert the flat boundary values, keep the
-// ordering guarantees of the old `run()`, and turn every `XlangError` into a reported diagnostic
-// and a failing exit code.
+// The frontend of the backend's C API (include/xlang/backend_c.h): the session, the sema, the
+// lowering, the dumps and the boundary queries the output step needs. The entry points convert
+// the flat boundary values, keep the ordering the CLI asks for, and turn every `XlangError` into
+// a reported diagnostic and a failing exit code. Code generation is src/backend/codegen.cpp.
 #include "xlang/backend_c.h"
 
-#include "cli/emit.h"
-#include "xlang/analysis/analysis.h"
-#include "xlang/codegen/archive.h"
+#include "backend/session.hpp"
 #include "xlang/hir/hir.h"
-#include "xlang/lang/config.h"
-#include "xlang/lang/frontend.h"
-#include "xlang/mir/build.h"
-#include "xlang/sema/compilation.h"
-#include "xlang/sema/sema.h"
-#include "xlang/util/diagnostics.h"
-#include "xlang/util/error.h"
-#include "xlang/util/source.h"
+#include "xlang/sema/layout.h"
 
-#include <cstdint>
-#include <filesystem>
 #include <format>
 #include <iostream>
-#include <memory>
-#include <string>
-#include <vector>
-
-namespace xlang {
-
-namespace fs = std::filesystem;
-
-namespace {
-
-/// The bytes of an empty string: the boundary wants a valid pointer even for length zero.
-const char kEmptyBytes[1] = {'\0'};
-
-/// Whether the backend colors stderr; the CLI decides once with `xlcSetColor`
-/// (src/cli/console.xl).
-bool g_color = false;
-
-/// The ANSI style `code` (`1;31` bold red, `1;33` bold yellow), or nothing when color is off.
-std::string style(std::string_view code) {
-    return g_color ? std::format("\x1b[{}m", code) : std::string();
-}
-
-/// The bold-red or bold-yellow `N error(s), M warning(s)` line, as the CLI always printed it.
-void printSummary(const DiagnosticEngine& diagnostics) {
-    std::cerr << std::format("{}{} error(s), {} warning(s){}\n",
-                             style(diagnostics.hasErrors() ? "1;31" : "1;33"), diagnostics.errorCount(),
-                             diagnostics.warningCount(), style("0"));
-}
-
-XlcStr viewOf(const std::string& s) {
-    return XlcStr{s.empty() ? kEmptyBytes : s.data(), static_cast<uint32_t>(s.size())};
-}
-
-std::string_view textOf(XlcStr s) {
-    return std::string_view(s.bytes == nullptr ? kEmptyBytes : s.bytes, s.len);
-}
-
-std::string stringOf(XlcStr s) {
-    return std::string(textOf(s));
-}
-
-std::vector<std::string> listOf(XlcStrList list) {
-    std::vector<std::string> out;
-    out.reserve(list.count);
-    for (std::uint32_t i = 0; i < list.count; ++i) {
-        out.emplace_back(textOf(list.items[i]));
-    }
-    return out;
-}
-
-/// The diagnostic configuration the C++ CLI derived from the parsed options.
-DiagnosticOptions diagnosticOptions(const XlcConfig& config) {
-    DiagnosticOptions out;
-    out.allow = listOf(config.allow);
-    out.deny = listOf(config.deny);
-    out.warn_all = config.warn_all != 0;
-    out.allow_all = config.allow_all != 0;
-    out.color = g_color;
-    out.context_errors = static_cast<std::size_t>(config.context_errors);
-    out.context_warnings = static_cast<std::size_t>(config.context_warnings);
-    out.log_path = stringOf(config.log_path);
-    out.format = textOf(config.diag_format) == "json" ? DiagFormat::Json : DiagFormat::Text;
-    out.log_level = textOf(config.diag_log_level) == "error"   ? DiagLogLevel::Error
-                    : textOf(config.diag_log_level) == "warn" ? DiagLogLevel::Warn
-                                                              : DiagLogLevel::All;
-    return out;
-}
-
-/// The build configuration the C++ CLI derived from the parsed options; throws `XlangError` on
-/// a bad target or definition, like the CLI did.
-BuildConfig buildConfig(const XlcConfig& raw) {
-    BuildConfig config;
-    const std::string target = stringOf(raw.target);
-    if (!target.empty()) {
-        auto parsed = parseTargetTriple(target);
-        if (!parsed) {
-            throw XlangError(std::format("unsupported target `{}` (x86_64/aarch64 on "
-                                         "linux/macos/windows)",
-                                         target));
-        }
-        config.target = std::move(*parsed);
-    }
-    const std::string opt = stringOf(raw.opt);
-    if (!opt.empty()) {
-        config.opt_level = std::stoi(opt);
-    }
-    config.debug = raw.debug != 0;
-    config.cpu = stringOf(raw.cpu);
-    config.mangle = stringOf(raw.mangle);
-    config.safety = stringOf(raw.safety);
-    config.layout_scheme = stringOf(raw.layout_scheme);
-    config.layout_history = stringOf(raw.layout_history);
-    config.crt_link = raw.crt != 0;
-    for (const std::string& def : listOf(raw.defines)) {
-        const auto [name, value] = std::pair{def.substr(0, def.find('=')),
-                                             def.find('=') == std::string::npos
-                                                 ? ""
-                                                 : def.substr(def.find('=') + 1)};
-        if (name.empty()) {
-            throw XlangError("empty name in -D");
-        }
-        config.defines[name] = ConfigValue::parse(value);
-    }
-    for (const std::string& name : listOf(raw.undefs)) {
-        if (config.defines.erase(name) == 0 && config.lookup(name)) {
-            throw XlangError(std::format(
-                "`{}` is a builtin definition and cannot be undefined", name));
-        }
-    }
-    return config;
-}
-
-void printError(std::string_view message) {
-    std::cerr << std::format("{}error:{} {}\n", style("1;31"), style("0"), message);
-}
-
-/// The state of one compilation: everything `run()` of the old C++ CLI held between the stages
-/// the CLI now drives one call at a time.
-class Session {
-public:
-    explicit Session(const XlcConfig& raw) : config_(buildConfig(raw)) {
-        diagnostics_.configure(diagnosticOptions(raw));
-    }
-
-    DiagnosticEngine& diagnostics() { return diagnostics_; }
-    const BuildConfig& config() const { return config_; }
-
-    void addModuleRoot(std::string name, fs::path dir) {
-        module_roots_.emplace_back(std::move(name), std::move(dir));
-    }
-
-    void addImplicitImport(std::string spec) { imports_.push_back(std::move(spec)); }
-
-    void loadRoot(const fs::path& root) {
-        // The layout history sits next to the root unless `--layout-history` named a file; the
-        // compilation borrows it, so it lives in the session.
-        const std::string history_path = config_.layout_history.empty()
-                                             ? (root.parent_path() / "xl.layout").string()
-                                             : config_.layout_history;
-        history_ = std::make_unique<LayoutHistory>(LayoutHistory::load(history_path));
-        history_path_ = history_path;
-        compilation_ = std::make_unique<Compilation>(sources_, config_, diagnostics_,
-                                                     history_.get());
-        for (auto& [name, dir] : module_roots_) {
-            compilation_->addModuleRoot(name, dir);
-        }
-        for (const std::string& spec : imports_) {
-            compilation_->addImplicitImport(spec);
-        }
-        compilation_->loadRoot(root);
-        root_ = root;
-    }
-
-    void analyze() {
-        compilation_->finish();
-        if (!diagnostics_.hasErrors()) {
-            compilation_->analyzeAll();
-        }
-    }
-
-    /// Lowers once: HIR, then MIR, then the static analyses, in the order of the old `run()`.
-    /// Never runs on a program with errors.
-    void ensureLowered() {
-        if (lowered_ || diagnostics_.hasErrors()) {
-            return;
-        }
-        hir_module_ = compilation_->lowerAll();
-        mir_module_ = mir::build(hir_module_);
-        if (!diagnostics_.hasErrors()) {
-            analysis::analyze(hir_module_, *mir_module_, diagnostics_);
-        }
-        lowered_ = true;
-    }
-
-    hir::Module& hirModule() { return hir_module_; }
-    mir::Module& mirModule() { return *mir_module_; }
-    Compilation& compilation() { return *compilation_; }
-    SourceManager& sources() { return sources_; }
-    const std::string& historyPath() const { return history_path_; }
-    LayoutHistory& history() { return *history_; }
-    const fs::path& root() const { return root_; }
-
-    /// Keeps `result` alive in the session and points `out` at it; the views stay valid until the
-    /// next emit or the end of the session.
-    void publish(cli::EmitResult result, XlcEmitResult& out) {
-        emitted_ = std::move(result);
-        object_names_.clear();
-        object_views_.clear();
-        import_views_.clear();
-        for (const fs::path& o : emitted_.objects) {
-            object_names_.push_back(o.string());
-        }
-        for (const std::string& name : object_names_) {
-            object_views_.push_back(viewOf(name));
-        }
-        for (const auto& [library, symbol] : emitted_.imports) {
-            import_views_.push_back(XlcImport{viewOf(library), viewOf(symbol)});
-        }
-        out.objects = XlcStrList{object_views_.data(), static_cast<uint32_t>(object_views_.size())};
-        out.imports = import_views_.data();
-        out.import_count = static_cast<uint32_t>(import_views_.size());
-        out.temporary = emitted_.temporary ? 1 : 0;
-    }
-
-private:
-    BuildConfig config_;
-    SourceManager sources_;
-    DiagnosticEngine diagnostics_{sources_, std::cerr};
-    std::vector<std::pair<std::string, fs::path>> module_roots_;
-    std::vector<std::string> imports_;
-    std::unique_ptr<LayoutHistory> history_;
-    std::string history_path_;
-    std::unique_ptr<Compilation> compilation_;
-    fs::path root_;
-    bool lowered_{false};
-    hir::Module hir_module_;
-    std::optional<mir::Module> mir_module_;
-    cli::EmitResult emitted_;
-    std::vector<std::string> object_names_;
-    std::vector<XlcStr> object_views_;
-    std::vector<XlcImport> import_views_;
-};
-
-/// The guard every entry point uses: report an `XlangError` (or anything else) and fail. An
-/// empty message means the failure was already reported in its own words.
-template <typename F>
-int32_t guard(F&& body) {
-    try {
-        body();
-        return 0;
-    } catch (const XlangError& error) {
-        if (error.what()[0] != '\0') {
-            printError(error.what());
-        }
-        return 1;
-    } catch (const std::exception& error) {
-        printError(error.what());
-        return 1;
-    }
-}
-
-cli::EmitRequest emitRequestOf(const XlcEmitRequest& raw) {
-    cli::EmitRequest request;
-    request.root = stringOf(raw.root);
-    request.output = stringOf(raw.output);
-    request.emit = stringOf(raw.emit);
-    request.incremental = raw.incremental != 0;
-    request.cache_dir = stringOf(raw.cache_dir);
-    request.has_inputs = raw.has_inputs != 0;
-    return request;
-}
-
-}  // namespace
-
-}  // namespace xlang
 
 using namespace xlang;
+using namespace xlang::backend;
 
 void XLC_BACKEND_CALL xlcSetColor(int32_t on) {
-    g_color = on != 0;
+    setColor(on != 0);
 }
 
 int32_t XLC_BACKEND_CALL xlcExplain(XlcStr code) {
@@ -407,14 +141,12 @@ int32_t XLC_BACKEND_CALL xlcSessionDumpMir(XlcSession* session) {
     });
 }
 
-int32_t XLC_BACKEND_CALL xlcSessionDumpLayout(XlcSession* session, XlcStr type_name,
-                                              int32_t record) {
+int32_t XLC_BACKEND_CALL xlcSessionDumpLayout(XlcSession* session, XlcStr type_name, int32_t record) {
     Session* s = reinterpret_cast<Session*>(session);
     return guard([&] {
         Sema& sema = *s->compilation().rootSema();
         const std::string name = stringOf(type_name);
-        const std::vector<std::string> names =
-            name.empty() ? sema.aggregateNames() : std::vector<std::string>{name};
+        const std::vector<std::string> names = name.empty() ? sema.aggregateNames() : std::vector<std::string>{name};
         for (const std::string& aggregate : names) {
             if (auto layout = sema.layoutOfName(aggregate, Span{})) {
                 LayoutRecord layout_record{aggregate, *layout};
@@ -436,36 +168,58 @@ void XLC_BACKEND_CALL xlcSessionTarget(XlcSession* session, XlcTarget* target) {
     *target = XlcTarget{viewOf(t.triple), viewOf(t.os), viewOf(t.arch)};
 }
 
+int32_t XLC_BACKEND_CALL xlcSessionOptLevel(XlcSession* session) {
+    return reinterpret_cast<Session*>(session)->config().opt_level;
+}
+
 const void* XLC_BACKEND_CALL xlcSessionHirModule(XlcSession* session) {
     Session* s = reinterpret_cast<Session*>(session);
     s->ensureLowered();
     return &s->hirModule();
 }
 
-int32_t XLC_BACKEND_CALL xlcLlvmEmit(XlcSession* session, const XlcEmitRequest* request,
-                                     XlcEmitResult* result) {
-    Session* s = reinterpret_cast<Session*>(session);
-    s->publish({}, *result);
-    return guard([&] {
-        s->ensureLowered();
-        if (!s->diagnostics().hasErrors()) {
-            s->publish(cli::emitOutput(s->compilation(), s->hirModule(), s->config(), s->sources(),
-                                       s->diagnostics(), emitRequestOf(*request)),
-                       *result);
-        }
-    });
+void XLC_BACKEND_CALL xlcSessionKeep(XlcSession* session, XlcIndexList functions, XlcIndexList globals) {
+    const auto indices = [](XlcIndexList list) {
+        return list.count == 0 ? std::vector<std::uint32_t>() : std::vector<std::uint32_t>(list.items, list.items + list.count);
+    };
+    reinterpret_cast<Session*>(session)->keep(indices(functions), indices(globals));
 }
 
-int32_t XLC_BACKEND_CALL xlcArchive(XlcStrList objects, XlcStr output, XlcStr os) {
-    return guard([&] {
-        std::vector<fs::path> paths;
-        for (const std::string& o : listOf(objects)) {
-            paths.emplace_back(o);
-        }
-        TargetInfo target;
-        target.os = stringOf(os);
-        codegen::archive(paths, stringOf(output), target);
-    });
+int32_t XLC_BACKEND_CALL xlcSessionSizeOf(XlcSession* session, XlcStr name, int64_t* size) {
+    const auto bytes = reinterpret_cast<Session*>(session)->sizeOf(stringOf(name));
+    if (!bytes) {
+        return 1;
+    }
+    *size = static_cast<int64_t>(*bytes);
+    return 0;
+}
+
+uint32_t XLC_BACKEND_CALL xlcSessionModuleCount(XlcSession* session) {
+    return static_cast<uint32_t>(reinterpret_cast<Session*>(session)->modules().size());
+}
+
+int32_t XLC_BACKEND_CALL xlcSessionModule(XlcSession* session, uint32_t index, XlcModule* module) {
+    const std::vector<XlcModule>& modules = reinterpret_cast<Session*>(session)->modules();
+    if (index >= modules.size()) {
+        return 1;
+    }
+    *module = modules[index];
+    return 0;
+}
+
+void XLC_BACKEND_CALL xlcSessionConfigKey(XlcSession* session, XlcStr emit, XlcStr* key) {
+    const std::string& text = reinterpret_cast<Session*>(session)->configKey(stringOf(emit));
+    *key = viewOf(text);
+}
+
+void XLC_BACKEND_CALL xlcSessionDiagnose(XlcSession* session, XlcStr code, const XlcSpan* span, XlcStr message,
+                                         XlcStr hint) {
+    Session* s = reinterpret_cast<Session*>(session);
+    Span at{};
+    if (span != nullptr) {
+        at = Span{span->file, span->line, span->column, span->end_line, span->end_column};
+    }
+    s->diagnostics().error(stringOf(code), at, stringOf(message), stringOf(hint));
 }
 
 int32_t XLC_BACKEND_CALL xlcSessionHasErrors(XlcSession* session) {
@@ -477,8 +231,7 @@ int64_t XLC_BACKEND_CALL xlcSessionErrorCount(XlcSession* session) {
 }
 
 int64_t XLC_BACKEND_CALL xlcSessionWarningCount(XlcSession* session) {
-    return static_cast<int64_t>(
-        reinterpret_cast<Session*>(session)->diagnostics().warningCount());
+    return static_cast<int64_t>(reinterpret_cast<Session*>(session)->diagnostics().warningCount());
 }
 
 void XLC_BACKEND_CALL xlcSessionPrintSummary(XlcSession* session) {

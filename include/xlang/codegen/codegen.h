@@ -77,10 +77,8 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-/// HIR -> LLVM (plan 4.7). Returns nullptr after reporting errors.
+/// HIR -> LLVM (plan 4.7). Returns nullptr after reporting errors. The C entry (codegen_c.h) is the
+/// only caller outside the tests.
 [[nodiscard]] std::unique_ptr<Artifact> generate(const CodegenInput& input);
-
-/// `--emit=header`: `extern "C"` header for `export(c)` functions/globals and `@repr(c)` types (5.7).
-[[nodiscard]] std::string generateHeader(const hir::Module& module, const LayoutQuery& layout, const std::string& guard);
 
 }  // namespace xlang::codegen
