@@ -1,0 +1,789 @@
+// The HIR builder of the xlang lowering pass: appends expression and statement records to the
+// flat arenas of hir/abi.xl and materializes the whole `XlcHirModule` at the end. The C++
+// `Lowerer` built shared_ptr trees; the flat form is strictly post-order (children before the
+// parent that indexes them), which the builders here keep.
+from "std" import String, Vec, format
+from "../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirEnum, XlcHirEnumMember,
+    XlcHirAggregate, XlcHirField, XlcHirVtableSlot, XlcHirInterface, XlcHirIfaceMethod,
+    XlcHirImpl, XlcHirExpr, XlcHirStmt, XlcHirLocal, XlcHirFieldInit, XlcHirAsmOperand,
+    XlcHirStr, E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, E_NIL, E_LOCAL_REF,
+    E_GLOBAL_REF, E_FUNC_REF, E_EXTERNAL, E_UNARY, E_BINARY, E_SELECT, E_CAST, E_CALL,
+    E_CALL_INDIRECT, E_CALL_VIRTUAL, E_CALL_ITABLE, E_CALL_EXTERNAL, E_SYSCALL, E_FIELD,
+    E_INDEX, E_SLICE, E_DEREF, E_ADDR_OF, E_ARRAY_LIST, E_ARRAY_REPEAT, E_TUPLE_LIT,
+    E_STRUCT_LIT, E_NEW, E_TO_INTERFACE, E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG,
+    E_ATOMIC_CAS, E_ATOMIC_ADD, E_FENCE, E_ASM, E_CONSTRUCT, E_MOVE, E_MATERIALIZE,
+    E_RAW_READ, E_UNWIND_PADS, E_UNWIND_PAD_COUNT, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF,
+    S_WHILE, S_CONTINUE, S_BREAK, S_BLOCK, S_TRY
+
+/// One function while it is built: its locals and body statement ranges are per-function lists
+/// that the materialization flattens.
+export class FnBuild {
+    name: String
+    symbol: String
+    ret: String
+    locals: Vec<XlcHirLocal>
+    paramCount: u32
+    body: Vec<i32>
+    unwind: Vec<i32>
+    hasBody: bool
+    exported: bool
+    exportC: bool
+    registered: bool
+    isEntry: bool
+    isInit: bool
+    isFini: bool
+
+    fn init(self, name: str) {
+        self.name = String(name)
+        self.symbol = String("")
+        self.ret = String("void")
+        self.locals = Vec<XlcHirLocal>()
+        self.paramCount = 0
+        self.body = Vec<i32>()
+        self.unwind = Vec<i32>()
+        self.hasBody = true
+        self.exported = false
+        self.exportC = false
+        self.registered = false
+        self.isEntry = false
+        self.isInit = false
+        self.isFini = false
+    }
+}
+
+/// The arenas of one HIR module under construction.
+export class HirBuilder {
+    fns: Vec<*FnBuild>
+    globals: Vec<XlcHirGlobalRec>
+    enums: Vec<EnumRec>
+    aggregates: Vec<AggrRec>
+    interfaces: Vec<IfaceRec>
+    impls: Vec<ImplRec>
+    exprs: Vec<XlcHirExpr>
+    stmts: Vec<XlcHirStmt>
+    fieldInits: Vec<XlcHirFieldInit>
+    operands: Vec<XlcHirAsmOperand>
+    refs: Vec<u32>
+    bytes: Vec<u8>
+    strs: Vec<XlcHirStr>
+    panicFunction: String
+    allocFunction: String
+    freeFunction: String
+    unwindFunction: String
+    argsFunction: String
+    initFns: Vec<String>
+    finiFns: Vec<String>
+
+    fn init(self) {
+        self.fns = Vec<*FnBuild>()
+        self.globals = Vec<XlcHirGlobalRec>()
+        self.enums = Vec<EnumRec>()
+        self.aggregates = Vec<AggrRec>()
+        self.interfaces = Vec<IfaceRec>()
+        self.impls = Vec<ImplRec>()
+        self.exprs = Vec<XlcHirExpr>()
+        self.stmts = Vec<XlcHirStmt>()
+        self.fieldInits = Vec<XlcHirFieldInit>()
+        self.operands = Vec<XlcHirAsmOperand>()
+        self.refs = Vec<u32>()
+        self.bytes = Vec<u8>()
+        self.strs = Vec<XlcHirStr>()
+        self.panicFunction = String("")
+        self.allocFunction = String("")
+        self.freeFunction = String("")
+        self.unwindFunction = String("")
+        self.argsFunction = String("")
+        self.initFns = Vec<String>()
+        self.finiFns = Vec<String>()
+    }
+
+    /// Interns `text` and returns its view into the module's byte arena.
+    fn str(self, text: str) -> XlcHirStr {
+        local off = self.bytes.length() as u32
+        for i in 0..text.len {
+            self.bytes.push(text[i])
+        }
+        local out: XlcHirStr
+        out.bytes = (self.bytes.data as usize + off as usize) as *u8
+        out.len = text.len as u32
+        // The view is recorded so the arena cannot be read around; the bytes stay put because the
+        // Vec only grows and the materialization copies it once, in order.
+        self.strs.push(out)
+        return out
+    }
+
+    // ------------------------------------------------------------------ expressions
+
+    /// Appends a bare record of `kind` and returns its index; the callers fill the fields.
+    fn expr(self, kind: i32, typeName: str) -> i32 {
+        local e: XlcHirExpr
+        e.kind = kind
+        e.typeName = self.str(typeName)
+        e.lhs = -1
+        e.rhs = -1
+        e.localId = 0
+        e.index = 0
+        e.intValue = 0
+        e.implicit = 0
+        e.checked = 0
+        e.throughPointer = 0
+        e.registered = 0
+        e.nomem = 0
+        e.noreturn = 0
+        self.exprs.push(e)
+        return (self.exprs.length() - 1) as i32
+    }
+
+    fn exprAt(self, idx: i32) -> *XlcHirExpr {
+        return (self.exprs.data as usize + idx as usize * sizeOf(XlcHirExpr)) as *XlcHirExpr
+    }
+
+    fn intConst(self, value: u64, typeName: str) -> i32 {
+        local idx = self.expr(E_INT_CONST, typeName)
+        (*self.exprAt(idx)).intValue = value
+        return idx
+    }
+
+    fn floatConst(self, value: f64, typeName: str) -> i32 {
+        local idx = self.expr(E_FLOAT_CONST, typeName)
+        (*self.exprAt(idx)).floatValue = value
+        return idx
+    }
+
+    fn boolConst(self, value: bool, typeName: str) -> i32 {
+        local idx = self.expr(E_BOOL_CONST, typeName)
+        (*self.exprAt(idx)).boolValue = value ? 1 : 0
+        return idx
+    }
+
+    fn strConst(self, text: str, typeName: str) -> i32 {
+        local idx = self.expr(E_STR_CONST, typeName)
+        (*self.exprAt(idx)).text = self.str(text)
+        return idx
+    }
+
+    fn nil(self, typeName: str) -> i32 {
+        return self.expr(E_NIL, typeName)
+    }
+
+    fn localRef(self, id: u32, typeName: str) -> i32 {
+        local idx = self.expr(E_LOCAL_REF, typeName)
+        (*self.exprAt(idx)).localId = id
+        return idx
+    }
+
+    fn globalRef(self, name: str, typeName: str) -> i32 {
+        local idx = self.expr(E_GLOBAL_REF, typeName)
+        (*self.exprAt(idx)).text = self.str(name)
+        return idx
+    }
+
+    fn funcRef(self, name: str, typeName: str) -> i32 {
+        local idx = self.expr(E_FUNC_REF, typeName)
+        (*self.exprAt(idx)).text = self.str(name)
+        return idx
+    }
+
+    fn unary(self, op: str, lhs: i32, typeName: str) -> i32 {
+        local idx = self.expr(E_UNARY, typeName)
+        local e = self.exprAt(idx)
+        (*e).unaryOp = self.str(op)
+        (*e).lhs = lhs
+        return idx
+    }
+
+    fn binary(self, op: str, lhs: i32, rhs: i32, typeName: str) -> i32 {
+        local idx = self.expr(E_BINARY, typeName)
+        local e = self.exprAt(idx)
+        (*e).binaryOp = self.str(op)
+        (*e).lhs = lhs
+        (*e).rhs = rhs
+        return idx
+    }
+
+    fn select(self, cond: i32, thenValue: i32, elseValue: i32, typeName: str) -> i32 {
+        local idx = self.expr(E_SELECT, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = cond
+        (*e).rhs = thenValue
+        (*e).argFirst = self.refs.length() as u32
+        self.refs.push(elseValue as u32)
+        (*e).argCount = 1
+        return idx
+    }
+
+    fn cast(self, value: i32, typeName: str, implicit: bool) -> i32 {
+        local idx = self.expr(E_CAST, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = value
+        (*e).implicit = implicit ? 1 : 0
+        return idx
+    }
+
+    /// A call with its arguments already appended to `refs` in order.
+    fn call(self, name: str, argFirst: u32, argCount: u32, typeName: str) -> i32 {
+        local idx = self.expr(E_CALL, typeName)
+        local e = self.exprAt(idx)
+        (*e).text = self.str(name)
+        (*e).argFirst = argFirst
+        (*e).argCount = argCount
+        return idx
+    }
+
+    fn callIndirect(self, fnValue: i32, argFirst: u32, argCount: u32, typeName: str) -> i32 {
+        local idx = self.expr(E_CALL_INDIRECT, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = fnValue
+        (*e).argFirst = argFirst
+        (*e).argCount = argCount
+        return idx
+    }
+
+    fn field(self, base: i32, name: str, typeName: str, throughPointer: bool, index: u32) -> i32 {
+        local idx = self.expr(E_FIELD, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = base
+        (*e).text = self.str(name)
+        (*e).throughPointer = throughPointer ? 1 : 0
+        (*e).index = index
+        return idx
+    }
+
+    fn index(self, base: i32, idx: i32, typeName: str) -> i32 {
+        local at = self.expr(E_INDEX, typeName)
+        local e = self.exprAt(at)
+        (*e).lhs = base
+        (*e).rhs = idx
+        return at
+    }
+
+    fn slice(self, base: i32, lo: i32, hi: i32, typeName: str) -> i32 {
+        local idx = self.expr(E_SLICE, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = base
+        (*e).rhs = lo
+        (*e).argFirst = self.refs.length() as u32
+        self.refs.push(hi as u32)
+        (*e).argCount = 1
+        return idx
+    }
+
+    fn deref(self, base: i32, typeName: str) -> i32 {
+        local idx = self.expr(E_DEREF, typeName)
+        (*self.exprAt(idx)).lhs = base
+        return idx
+    }
+
+    fn addrOf(self, base: i32, typeName: str) -> i32 {
+        local idx = self.expr(E_ADDR_OF, typeName)
+        (*self.exprAt(idx)).lhs = base
+        return idx
+    }
+
+    /// An argument list recorded in `refs` in order; returns its range.
+    fn args(self, list: Vec<i32>) -> (u32, u32) {
+        local first = self.refs.length() as u32
+        for i in 0..list.length() {
+            self.refs.push(*list.get(i) as u32)
+        }
+        return (first, (list.length()) as u32)
+    }
+
+    fn arrayList(self, list: Vec<i32>, typeName: str) -> i32 {
+        local range = self.args(list)
+        local idx = self.expr(E_ARRAY_LIST, typeName)
+        local e = self.exprAt(idx)
+        (*e).argFirst = range.0
+        (*e).argCount = range.1
+        return idx
+    }
+
+    fn arrayRepeat(self, value: i32, count: u64, typeName: str) -> i32 {
+        local idx = self.expr(E_ARRAY_REPEAT, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = value
+        (*e).intValue = count
+        return idx
+    }
+
+    fn tupleLit(self, list: Vec<i32>, typeName: str) -> i32 {
+        return self.arrayList(list, typeName)
+    }
+
+    fn structLit(self, inits: Vec<i32>, typeName: str) -> i32 {
+        local first = self.fieldInits.length() as u32
+        for i in 0..inits.length() {
+            local v = *inits.get(i)
+            local rec: XlcHirFieldInit
+            rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
+            rec.value = v
+            self.fieldInits.push(rec)
+        }
+        local idx = self.expr(E_STRUCT_LIT, typeName)
+        local e = self.exprAt(idx)
+        (*e).fieldFirst = first
+        (*e).fieldCount = inits.length() as u32
+        return idx
+    }
+
+    /// Sets the name of the field-init record `first + i`.
+    fn fieldName(self, first: u32, i: u32, name: str) {
+        local rec = (self.fieldInits.data as usize + (first + i) as usize *
+            sizeOf(XlcHirFieldInit)) as *XlcHirFieldInit
+        (*rec).name = self.str(name)
+    }
+
+    /// `new T`: the memory the init writes is `lhs`; the type name is the pointer type.
+    fn newExpr(self, typeName: str) -> i32 {
+        return self.expr(E_NEW, typeName)
+    }
+
+    fn construct(self, initFn: str, list: Vec<i32>, typeName: str) -> i32 {
+        local range = self.args(list)
+        local idx = self.expr(E_CONSTRUCT, typeName)
+        local e = self.exprAt(idx)
+        (*e).text = self.str(initFn)
+        (*e).argFirst = range.0
+        (*e).argCount = range.1
+        return idx
+    }
+
+    fn moveExpr(self, lhs: i32, flag: u32, typeName: str) -> i32 {
+        local idx = self.expr(E_MOVE, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = lhs
+        (*e).localId = flag
+        return idx
+    }
+
+    fn materialize(self, lhs: i32, localId: u32, flag: u32, typeName: str) -> i32 {
+        local idx = self.expr(E_MATERIALIZE, typeName)
+        local e = self.exprAt(idx)
+        (*e).lhs = lhs
+        (*e).localId = localId
+        (*e).index = flag
+        return idx
+    }
+
+    fn syscall(self, list: Vec<i32>, typeName: str) -> i32 {
+        return self.arrayList(list, typeName)
+    }
+
+    // ------------------------------------------------------------------ statements
+
+    fn stmt(self, kind: i32) -> i32 {
+        local st: XlcHirStmt
+        st.kind = kind
+        st.target = -1
+        st.value = -1
+        st.postTest = 0
+        self.stmts.push(st)
+        return (self.stmts.length() - 1) as i32
+    }
+
+    fn stmtAt(self, idx: i32) -> *XlcHirStmt {
+        return (self.stmts.data as usize + idx as usize * sizeOf(XlcHirStmt)) as *XlcHirStmt
+    }
+
+    /// A statement list recorded in `refs` in order; returns its range.
+    fn stmtList(self, list: Vec<i32>) -> (u32, u32) {
+        local first = self.refs.length() as u32
+        for i in 0..list.length() {
+            self.refs.push(*list.get(i) as u32)
+        }
+        return (first, list.length() as u32)
+    }
+
+    fn localStmt(self, id: u32, name: str, typeName: str, value: i32) -> i32 {
+        local idx = self.stmt(S_LOCAL)
+        local st = self.stmtAt(idx)
+        (*st).localId = id
+        (*st).value = value
+        // The name and type live in the function's local table; the statement only refers.
+        return idx
+    }
+
+    fn assign(self, target: i32, value: i32) -> i32 {
+        local idx = self.stmt(S_ASSIGN)
+        local st = self.stmtAt(idx)
+        (*st).target = target
+        (*st).value = value
+        return idx
+    }
+
+    fn returnStmt(self, value: i32) -> i32 {
+        local idx = self.stmt(S_RETURN)
+        (*self.stmtAt(idx)).value = value
+        return idx
+    }
+
+    fn exprStmt(self, value: i32) -> i32 {
+        local idx = self.stmt(S_EXPR)
+        (*self.stmtAt(idx)).value = value
+        return idx
+    }
+
+    fn ifStmt(self, cond: i32, body: Vec<i32>, elseBody: Vec<i32>) -> i32 {
+        local idx = self.stmt(S_IF)
+        local st = self.stmtAt(idx)
+        (*st).value = cond
+        local b = self.stmtList(body)
+        (*st).bodyFirst = b.0
+        (*st).bodyCount = b.1
+        local e = self.stmtList(elseBody)
+        (*st).elseFirst = e.0
+        (*st).elseCount = e.1
+        return idx
+    }
+
+    fn whileStmt(self, cond: i32, body: Vec<i32>, depth: u32, postTest: bool) -> i32 {
+        local idx = self.stmt(S_WHILE)
+        local st = self.stmtAt(idx)
+        (*st).value = cond
+        local b = self.stmtList(body)
+        (*st).bodyFirst = b.0
+        (*st).bodyCount = b.1
+        (*st).depth = depth
+        (*st).postTest = postTest ? 1 : 0
+        return idx
+    }
+
+    fn continueStmt(self, depth: u32) -> i32 {
+        local idx = self.stmt(S_CONTINUE)
+        (*self.stmtAt(idx)).depth = depth
+        return idx
+    }
+
+    fn breakStmt(self, depth: u32) -> i32 {
+        local idx = self.stmt(S_BREAK)
+        (*self.stmtAt(idx)).depth = depth
+        return idx
+    }
+
+    fn blockStmt(self, body: Vec<i32>) -> i32 {
+        local idx = self.stmt(S_BLOCK)
+        local st = self.stmtAt(idx)
+        local b = self.stmtList(body)
+        (*st).bodyFirst = b.0
+        (*st).bodyCount = b.1
+        return idx
+    }
+
+    fn tryStmt(self, body: Vec<i32>, handler: Vec<i32>, msgLocal: u32) -> i32 {
+        local idx = self.stmt(S_TRY)
+        local st = self.stmtAt(idx)
+        local b = self.stmtList(body)
+        (*st).bodyFirst = b.0
+        (*st).bodyCount = b.1
+        local h = self.stmtList(handler)
+        (*st).elseFirst = h.0
+        (*st).elseCount = h.1
+        (*st).msgLocal = msgLocal
+        return idx
+    }
+
+    // ------------------------------------------------------------------ module entities
+
+    fn addFn(self, f: *FnBuild) {
+        self.fns.push(f)
+    }
+
+    /// The materialized module. The sub-arrays (locals, bodies, members, fields, vtables) are
+    /// flattened per entity in order, so every pointer the entities carry is stable.
+    fn materialize(self, keepAlive: *HirKeep) -> XlcHirModule {
+        // The byte arena itself is the storage: the Vec only grows, so the views recorded in
+        // `strs` stay valid as long as the keep-alive holds the Vec.
+        local m: XlcHirModule
+        // Functions: locals and bodies flattened in order.
+        local locals = Vec<XlcHirLocal>()
+        local bodies = Vec<u32>()
+        local unwinds = Vec<u32>()
+        local fns = Vec<XlcHirFunction>()
+        for i in 0..self.fns.length() {
+            local f = *self.fns.get(i)
+            local rec: XlcHirFunction
+            rec.name = self.str((*f).name.asStr())
+            rec.symbol = self.str((*f).symbol.asStr())
+            rec.ret = self.str((*f).ret.asStr())
+            rec.locals = (locals.data as usize + locals.length() as usize * sizeOf(XlcHirLocal)) as *XlcHirLocal
+            for j in 0..(*f).locals.length() {
+                locals.push(*(*f).locals.get(j))
+            }
+            rec.localCount = (*f).locals.length() as u32
+            rec.paramCount = (*f).paramCount
+            rec.bodyFirst = bodies.length() as u32
+            for j in 0..(*f).body.length() {
+                bodies.push(*(*f).body.get(j) as u32)
+            }
+            rec.bodyCount = (*f).body.length() as u32
+            rec.unwindFirst = unwinds.length() as u32
+            for j in 0..(*f).unwind.length() {
+                unwinds.push(*(*f).unwind.get(j) as u32)
+            }
+            rec.unwindCount = (*f).unwind.length() as u32
+            rec.hasBody = (*f).hasBody ? 1 : 0
+            rec.exported = (*f).exported ? 1 : 0
+            rec.exportC = (*f).exportC ? 1 : 0
+            rec.registered = (*f).registered ? 1 : 0
+            rec.isEntry = (*f).isEntry ? 1 : 0
+            rec.isInit = (*f).isInit ? 1 : 0
+            rec.isFini = (*f).isFini ? 1 : 0
+            fns.push(rec)
+        }
+        m.functions = fns.data
+        m.functionCount = fns.length() as u32
+        // Globals, enums, aggregates, interfaces and impls.
+        local globals = Vec<XlcHirGlobal>()
+        for i in 0..self.globals.length() {
+            local g = self.globals.get(i)
+            local rec: XlcHirGlobal
+            rec.name = self.str((*g).name.asStr())
+            rec.typeName = self.str((*g).typeName.asStr())
+            rec.init = (*g).init
+            rec.constant = (*g).constant ? 1 : 0
+            rec.exported = (*g).exported ? 1 : 0
+            rec.exportC = (*g).exportC ? 1 : 0
+            rec.registered = (*g).registered ? 1 : 0
+            globals.push(rec)
+        }
+        m.globals = globals.data
+        m.globalCount = globals.length() as u32
+        local enums = Vec<XlcHirEnum>()
+        local members = Vec<XlcHirEnumMember>()
+        for i in 0..self.enums.length() {
+            local en = self.enums.get(i)
+            local rec: XlcHirEnum
+            rec.name = self.str((*en).name.asStr())
+            rec.underlying = self.str((*en).underlying.asStr())
+            rec.members = (members.data as usize + members.length() as usize *
+                sizeOf(XlcHirEnumMember)) as *XlcHirEnumMember
+            for j in 0..(*en).memberNames.length() {
+                local mem: XlcHirEnumMember
+                mem.name = self.str((*(*en).memberNames.get(j)).asStr())
+                mem.value = *(*en).memberValues.get(j)
+                mem.text = self.str((*(*en).memberTexts.get(j)).asStr())
+                members.push(mem)
+            }
+            rec.memberCount = (*en).memberNames.length() as u32
+            enums.push(rec)
+        }
+        m.enums = enums.data
+        m.enumCount = enums.length() as u32
+        local aggregates = Vec<XlcHirAggregate>()
+        local aggrFields = Vec<XlcHirField>()
+        local vtables = Vec<XlcHirVtableSlot>()
+        for i in 0..self.aggregates.length() {
+            local ag = self.aggregates.get(i)
+            local rec: XlcHirAggregate
+            rec.name = self.str((*ag).name.asStr())
+            rec.base = self.str((*ag).base.asStr())
+            rec.fields = (aggrFields.data as usize + aggrFields.length() as usize *
+                sizeOf(XlcHirField)) as *XlcHirField
+            for j in 0..(*ag).fieldNames.length() {
+                local fld: XlcHirField
+                fld.name = self.str((*(*ag).fieldNames.get(j)).asStr())
+                fld.typeName = self.str((*(*ag).fieldTypeNames.get(j)).asStr())
+                aggrFields.push(fld)
+            }
+            rec.fieldCount = (*ag).fieldNames.length() as u32
+            rec.vtable = (vtables.data as usize + vtables.length() as usize *
+                sizeOf(XlcHirVtableSlot)) as *XlcHirVtableSlot
+            for j in 0..(*ag).vtableMethods.length() {
+                local slot: XlcHirVtableSlot
+                slot.method = self.str((*(*ag).vtableMethods.get(j)).asStr())
+                slot.function = self.str((*(*ag).vtableFunctions.get(j)).asStr())
+                vtables.push(slot)
+            }
+            rec.vtableCount = (*ag).vtableMethods.length() as u32
+            rec.isClass = (*ag).isClass ? 1 : 0
+            rec.isUnion = (*ag).isUnion ? 1 : 0
+            rec.opaque = (*ag).opaque ? 1 : 0
+            aggregates.push(rec)
+        }
+        m.aggregates = aggregates.data
+        m.aggregateCount = aggregates.length() as u32
+        local interfaces = Vec<XlcHirInterface>()
+        local ifaceMethods = Vec<XlcHirIfaceMethod>()
+        local ifaceParams = Vec<XlcHirStr>()
+        for i in 0..self.interfaces.length() {
+            local ifc = self.interfaces.get(i)
+            local rec: XlcHirInterface
+            rec.name = self.str((*ifc).name.asStr())
+            rec.methods = (ifaceMethods.data as usize + ifaceMethods.length() as usize *
+                sizeOf(XlcHirIfaceMethod)) as *XlcHirIfaceMethod
+            for j in 0..(*ifc).methodNames.length() {
+                local im: XlcHirIfaceMethod
+                im.name = self.str((*(*ifc).methodNames.get(j)).asStr())
+                im.ret = self.str((*(*ifc).methodRets.get(j)).asStr())
+                im.paramFirst = ifaceParams.length() as u32
+                local params = (*ifc).methodParams.get(j)
+                for k in 0..(*params).length() {
+                    ifaceParams.push(self.str((*(*params).get(k)).asStr()))
+                }
+                im.paramCount = params.length() as u32
+                ifaceMethods.push(im)
+            }
+            rec.methodCount = (*ifc).methodNames.length() as u32
+            interfaces.push(rec)
+        }
+        m.interfaces = interfaces.data
+        m.interfaceCount = interfaces.length() as u32
+        local impls = Vec<XlcHirImpl>()
+        for i in 0..self.impls.length() {
+            local im = self.impls.get(i)
+            local rec: XlcHirImpl
+            rec.interfaceName = self.str((*im).interfaceName.asStr())
+            rec.typeName = self.str((*im).typeName.asStr())
+            rec.methodFirst = ifaceParams.length() as u32
+            for j in 0..(*im).methods.length() {
+                ifaceParams.push(self.str((*(*im).methods.get(j)).asStr()))
+            }
+            rec.methodCount = (*im).methods.length() as u32
+            impls.push(rec)
+        }
+        m.impls = impls.data
+        m.implCount = impls.length() as u32
+        m.exprs = self.exprs.data
+        m.exprCount = self.exprs.length() as u32
+        m.stmts = self.stmts.data
+        m.stmtCount = self.stmts.length() as u32
+        m.fields = self.fieldInits.data
+        m.fieldCount = self.fieldInits.length() as u32
+        m.operands = self.operands.data
+        m.operandCount = self.operands.length() as u32
+        m.refs = self.refs.data
+        m.refCount = self.refs.length() as u32
+        m.strings = self.strs.data
+        m.stringCount = self.strs.length() as u32
+        m.panicFunction = self.str(self.panicFunction.asStr())
+        m.allocFunction = self.str(self.allocFunction.asStr())
+        m.freeFunction = self.str(self.freeFunction.asStr())
+        m.unwindFunction = self.str(self.unwindFunction.asStr())
+        m.argsFunction = self.str(self.argsFunction.asStr())
+        local initFirst = keepAlive.inits.length() as u32
+        for i in 0..self.initFns.length() {
+            keepAlive.inits.push(self.str(self.initFns.get(i).asStr()))
+        }
+        m.initFirst = initFirst
+        m.initCount = self.initFns.length() as u32
+        local finiFirst = keepAlive.finis.length() as u32
+        for i in 0..self.finiFns.length() {
+            keepAlive.finis.push(self.str(self.finiFns.get(i).asStr()))
+        }
+        m.finiFirst = finiFirst
+        m.finiCount = self.finiFns.length() as u32
+        keepAlive.fns = fns
+        keepAlive.locals = locals
+        keepAlive.bodies = bodies
+        keepAlive.unwinds = unwinds
+        keepAlive.builder = self
+        return m
+    }
+}
+
+/// The storage a materialized module keeps alive: the Vecs the raw pointers point into.
+export class HirKeep {
+    fns: Vec<XlcHirFunction>
+    locals: Vec<XlcHirLocal>
+    bodies: Vec<u32>
+    unwinds: Vec<u32>
+    builder: *HirBuilder ///< the arenas live in the builder; keep it alive
+    inits: Vec<XlcHirStr>
+    finis: Vec<XlcHirStr>
+
+    fn init(self) {
+        self.inits = Vec<XlcHirStr>()
+        self.finis = Vec<XlcHirStr>()
+    }
+}
+
+/// One global while it is built.
+export class XlcHirGlobalRec {
+    name: String
+    typeName: String
+    init: i32
+    constant: bool
+    exported: bool
+    exportC: bool
+    registered: bool
+
+    fn init(self, name: str, typeName: str) {
+        self.name = String(name)
+        self.typeName = String(typeName)
+        self.init = -1
+        self.constant = false
+        self.exported = false
+        self.exportC = false
+        self.registered = false
+    }
+}
+
+/// One enum while it is built.
+export class EnumRec {
+    name: String
+    underlying: String
+    memberNames: Vec<String>
+    memberValues: Vec<i64>
+    memberTexts: Vec<String>
+
+    fn init(self, name: str, underlying: str) {
+        self.name = String(name)
+        self.underlying = String(underlying)
+        self.memberNames = Vec<String>()
+        self.memberValues = Vec<i64>()
+        self.memberTexts = Vec<String>()
+    }
+}
+
+/// One struct or class while it is built.
+export class AggrRec {
+    name: String
+    base: String
+    fieldNames: Vec<String>
+    fieldTypeNames: Vec<String>
+    vtableMethods: Vec<String>
+    vtableFunctions: Vec<String>
+    isClass: bool
+    isUnion: bool
+    opaque: bool
+
+    fn init(self, name: str) {
+        self.name = String(name)
+        self.base = String("")
+        self.fieldNames = Vec<String>()
+        self.fieldTypeNames = Vec<String>()
+        self.vtableMethods = Vec<String>()
+        self.vtableFunctions = Vec<String>()
+        self.isClass = false
+        self.isUnion = false
+        self.opaque = false
+    }
+}
+
+/// One interface while it is built.
+export class IfaceRec {
+    name: String
+    methodNames: Vec<String>
+    methodRets: Vec<String>
+    methodParams: Vec<Vec<String>>
+
+    fn init(self, name: str) {
+        self.name = String(name)
+        self.methodNames = Vec<String>()
+        self.methodRets = Vec<String>()
+        self.methodParams = Vec<Vec<String>>()
+    }
+}
+
+/// One `impl` while it is built.
+export class ImplRec {
+    interfaceName: String
+    typeName: String
+    methods: Vec<String>
+
+    fn init(self, iface: str, ty: str) {
+        self.interfaceName = String(iface)
+        self.typeName = String(ty)
+        self.methods = Vec<String>()
+    }
+}
