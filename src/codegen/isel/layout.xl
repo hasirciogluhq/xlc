@@ -1,131 +1,348 @@
-// Memory layout for the native backend: the size and alignment of a type spelling, and the byte
-// offset of a field. The flat HIR (hir/abi.xl) carries types as spellings only, so the selector
-// computes layouts itself from the aggregate table.
-//
-// @todo Only `@repr(c)` structs are laid out: their order and padding are the C rules (natural
-// alignment, declaration order), which is all a spelling can reproduce. The default scheme may
-// reorder fields (sema/layout_calc.xl, "scheme v1"), classes carry a vptr and a base, and the flat
-// HIR has no offsets. Any other aggregate is reported as unsupported until the flat form carries
-// the layout the semantic pass already computed (recorded in xlang-docs/known-limitations.md).
+// Memory layout for the native backend: the size and alignment of a type spelling and the byte
+// offset of a field. The flat HIR (hir/abi.xl) carries types as spellings, so the layout is
+// computed here from the aggregate table with the same scheme as the semantic phase
+// (src/sema/layout_calc.xl, scheme v1):
+//   - a class with a virtual method, or whose base has one, starts with the vptr (8 bytes);
+//   - a class continues after its base class (base fields first, inherited);
+//   - fields are sorted by alignment, largest first, stable, unless the aggregate is `@repr(c)`
+//     (declaration order) or a union (every field at offset 0);
+//   - the size is the end of the last field rounded up to the alignment.
+// Tuples are `@repr(c)` in element order; `str`, slices and interfaces are two words.
+// @todo `@packed`, `@align(N)`, `@layout(shuffle)` and recorded layouts of `declare`d types are
+// not in the flat HIR, so an aggregate that uses them is laid out as plain v1 (recorded in
+// xlang-docs/known-limitations.md); the field index of a HIR field expression is its position in
+// the sorted order computed here, as in the semantic phase.
+from "std" import String, Vec
 from "std/str" import fromParts
 from "../../hir/abi" import XlcHirModule, XlcHirAggregate, view
-from "types" import Scalar, KIND_OTHER, KIND_BOOL, KIND_FLOAT, scalarOf
+from "types" import Scalar, KIND_OTHER, KIND_BOOL, scalarOf
 
-/// Size and alignment in bytes; `ok` is false for a type the selector cannot lay out.
-export struct Layout {
+/// How the selector holds a value of a type.
+export const K_VOID: u32 = 0
+export const K_NEVER: u32 = 1
+export const K_INT: u32 = 2      // integer, bool, pointer, function pointer, enum: one register
+export const K_FLOAT: u32 = 3
+export const K_STR: u32 = 4      // aggregates below live in memory and travel as an address
+export const K_SLICE: u32 = 5
+export const K_ARRAY: u32 = 6
+export const K_TUPLE: u32 = 7
+export const K_STRUCT: u32 = 8   // struct or class
+export const K_INTERFACE: u32 = 9
+export const K_UNKNOWN: u32 = 10
+
+/// One laid-out field: its place and its type spelling.
+export class FieldInfo {
+    offset: u64
     size: u64
     align: u64
-    ok: bool
+    typeName: String
+
+    fn init(self, offset: u64, size: u64, align: u64, typeName: str) {
+        self.offset = offset
+        self.size = size
+        self.align = align
+        self.typeName = String(typeName)
+    }
+}
+
+/// A computed aggregate layout.
+export class AggLayout {
+    name: String
+    size: u64
+    align: u64
+    hasVptr: bool
+    fields: Vec<FieldInfo>
+
+    fn init(self, name: str) {
+        self.name = String(name)
+        self.align = 1
+        self.fields = Vec<FieldInfo>()
+    }
 }
 
 fn alignUp(v: u64, a: u64) -> u64 {
     return (v + a - 1) & ~(a - 1)
 }
 
-/// The aggregate named `name`, or nil.
-export fn findAggregate(m: *XlcHirModule, name: str) -> *XlcHirAggregate {
-    for i in 0..m.aggregateCount as usize {
-        local a: *XlcHirAggregate = &m.aggregates[i]
-        if view(a.name) == name {
-            return a
-        }
-    }
-    return nil
-}
+/// The layouts of one module, computed on demand and cached by aggregate name.
+export class Layouts {
+    m: *XlcHirModule
+    cache: Vec<AggLayout>
 
-/// Parses `[T; N]` into the element spelling and the length; false when `s` is not an array.
-/// The element ends at the last `;`, so a nested array element is kept whole.
-fn parseArray(s: str, elem: *str, n: *u64) -> bool {
-    if s.len < 5 || s.ptr[0] != b'[' || s.ptr[s.len - 1] != b']' {
-        return false
+    fn init(self, m: *XlcHirModule) {
+        self.m = m
+        self.cache = Vec<AggLayout>()
     }
-    local semi: usize = 0
-    local found = false
-    for k in 1..s.len - 1 {
-        if s.ptr[k] == b';' {
-            semi = k
-            found = true
-        }
-    }
-    if !found {
-        return false
-    }
-    local count: u64 = 0
-    for k in semi + 1..s.len - 1 {
-        local c: u8 = s.ptr[k]
-        if c >= b'0' && c <= b'9' {
-            count = count * 10 + (c - b'0') as u64
-        } else if c != b' ' {
-            return false
-        }
-    }
-    *elem = fromParts(&s.ptr[1], semi - 1)
-    *n = count
-    return true
-}
 
-/// The layout of the type spelled `spelling`.
-export fn layoutOf(m: *XlcHirModule, spelling: str) -> Layout {
-    local bad = Layout { size: 0, align: 1, ok: false }
-    local s: Scalar = scalarOf(m, spelling)
-    if s.kind != KIND_OTHER {
-        local bytes: u64 = s.kind == KIND_BOOL ? 1 : (s.bits / 8) as u64
-        return Layout { size: bytes, align: bytes, ok: true }
-    }
-    local elem: str = ""
-    local n: u64 = 0
-    if parseArray(spelling, &elem, &n) {
-        local e: Layout = layoutOf(m, elem)
-        if !e.ok {
-            return bad
-        }
-        return Layout { size: e.size * n, align: e.align, ok: true }
-    }
-    local a: *XlcHirAggregate = findAggregate(m, spelling)
-    if a == nil || a.reprC == 0 || a.isClass != 0 || a.opaque != 0 {
-        return bad
-    }
-    local cursor: u64 = 0
-    local align: u64 = 1
-    for i in 0..a.fieldCount as usize {
-        local f: Layout = layoutOf(m, view(a.fields[i].typeName))
-        if !f.ok {
-            return bad
-        }
-        if a.isUnion != 0 {
-            if f.size > cursor {
-                cursor = f.size
+    fn aggregate(self, name: str) -> *XlcHirAggregate {
+        for i in 0..self.m.aggregateCount as usize {
+            local a: *XlcHirAggregate = &self.m.aggregates[i]
+            if view(a.name) == name {
+                return a
             }
-        } else {
-            cursor = alignUp(cursor, f.align) + f.size
         }
-        if f.align > align {
-            align = f.align
+        return nil
+    }
+
+    fn isInterface(self, name: str) -> bool {
+        for i in 0..self.m.interfaceCount as usize {
+            if view(self.m.interfaces[i].name) == name {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// The class of a type spelling.
+    fn kind(self, s: str) -> u32 {
+        if s == "void" {
+            return K_VOID
+        }
+        if s == "never" {
+            return K_NEVER
+        }
+        if s == "str" {
+            return K_STR
+        }
+        if s.len >= 2 && s.ptr[0] == b'[' && s.ptr[1] == b']' {
+            return K_SLICE
+        }
+        if s.len >= 1 && s.ptr[0] == b'[' {
+            return K_ARRAY
+        }
+        if s.len >= 1 && s.ptr[0] == b'(' {
+            return K_TUPLE
+        }
+        local sc: Scalar = scalarOf(self.m, s)
+        if sc.kind == KIND_OTHER {
+            if self.aggregate(s) != nil {
+                return K_STRUCT
+            }
+            if self.isInterface(s) {
+                return K_INTERFACE
+            }
+            return K_UNKNOWN
+        }
+        return sc.kind == 4 ? K_FLOAT : K_INT
+    }
+
+    /// True for a type held in memory and passed by address.
+    fn isMem(self, s: str) -> bool {
+        local k: u32 = self.kind(s)
+        return k >= K_STR && k <= K_INTERFACE && k != K_UNKNOWN
+    }
+
+    /// Splits a tuple spelling `(A, B<..>, [C; 2])` into its elements.
+    fn tupleElems(self, s: str) -> Vec<String> {
+        local out = Vec<String>()
+        local depth: i32 = 0
+        local start: usize = 1
+        for k in 1..s.len - 1 {
+            local c: u8 = s.ptr[k]
+            if c == b'(' || c == b'[' || c == b'<' {
+                depth += 1
+            } else if c == b')' || c == b']' || c == b'>' {
+                depth -= 1
+            } else if c == b',' && depth == 0 {
+                out.push(trimmed(fromParts(&s.ptr[start], k - start)))
+                start = k + 1
+            }
+        }
+        if start < s.len - 1 {
+            out.push(trimmed(fromParts(&s.ptr[start], s.len - 1 - start)))
+        }
+        return out
+    }
+
+    /// The element spelling and the length of `[T; N]`.
+    fn arrayParts(self, s: str, elem: *String, n: *u64) {
+        local semi: usize = 0
+        local depth: i32 = 0
+        for k in 1..s.len - 1 {
+            local c: u8 = s.ptr[k]
+            if c == b'[' || c == b'(' {
+                depth += 1
+            } else if c == b']' || c == b')' {
+                depth -= 1
+            } else if c == b';' && depth == 0 {
+                semi = k
+            }
+        }
+        local count: u64 = 0
+        for k in semi + 1..s.len - 1 {
+            local c: u8 = s.ptr[k]
+            if c >= b'0' && c <= b'9' {
+                count = count * 10 + (c - b'0') as u64
+            }
+        }
+        *elem = trimmed(fromParts(&s.ptr[1], semi - 1))
+        *n = count
+    }
+
+    /// The element spelling of `*T` or `[]T` / `[]mut T`.
+    fn sliceElem(self, s: str) -> String {
+        local at: usize = 2
+        if s.len > 6 && s.ptr[2] == b'm' && s.ptr[3] == b'u' && s.ptr[4] == b't' && s.ptr[5] == b' ' {
+            at = 6
+        }
+        return String(fromParts(&s.ptr[at], s.len - at))
+    }
+
+    /// Size and alignment of any type spelling (0 and 1 for an unknown one).
+    fn sizeAlign(self, s: str, size: *u64, align: *u64) {
+        local k: u32 = self.kind(s)
+        *size = 0
+        *align = 1
+        if k == K_INT || k == K_FLOAT {
+            local sc: Scalar = scalarOf(self.m, s)
+            local bytes: u64 = sc.kind == KIND_BOOL ? 1 : (sc.bits / 8) as u64
+            *size = bytes
+            *align = bytes
+        } else if k == K_STR || k == K_SLICE || k == K_INTERFACE {
+            *size = 16
+            *align = 8
+        } else if k == K_ARRAY {
+            local elem = String()
+            local n: u64 = 0
+            self.arrayParts(s, &elem, &n)
+            local es: u64 = 0
+            local ea: u64 = 1
+            self.sizeAlign(elem.asStr(), &es, &ea)
+            *size = es * n
+            *align = ea
+        } else if k == K_TUPLE {
+            local elems = self.tupleElems(s)
+            local cursor: u64 = 0
+            local al: u64 = 1
+            for i in 0..elems.length() {
+                local es: u64 = 0
+                local ea: u64 = 1
+                self.sizeAlign(elems.get(i).asStr(), &es, &ea)
+                cursor = alignUp(cursor, ea) + es
+                if ea > al {
+                    al = ea
+                }
+            }
+            *size = alignUp(cursor, al)
+            *align = al
+        } else if k == K_STRUCT {
+            local l: *AggLayout = self.of(s)
+            if l != nil {
+                *size = l.size
+                *align = l.align
+            }
         }
     }
-    return Layout { size: alignUp(cursor, align), align: align, ok: true }
+
+    /// The layout of the struct or class `name`, computed once.
+    fn of(self, name: str) -> *AggLayout {
+        for i in 0..self.cache.length() {
+            if self.cache.get(i).name.equals(name) {
+                return self.cache.get(i)
+            }
+        }
+        local a: *XlcHirAggregate = self.aggregate(name)
+        if a == nil {
+            return nil
+        }
+        local out = AggLayout(name)
+        local cursor: u64 = 0
+        local align: u64 = 1
+        local isUnion = a.isUnion != 0
+        // The base class first: its fields are inherited, and the new fields continue after it.
+        local baseName: str = view(a.base)
+        if baseName.len > 0 {
+            local b: *AggLayout = self.of(baseName)
+            if b != nil {
+                for i in 0..b.fields.length() {
+                    local f: *FieldInfo = b.fields.get(i)
+                    out.fields.push(FieldInfo(f.offset, f.size, f.align, f.typeName.asStr()))
+                }
+                out.hasVptr = b.hasVptr
+                cursor = a.reprC != 0 && b.hasVptr ? lastEnd(b) : b.size
+                align = b.align
+            }
+        }
+        if a.vtableCount > 0 {
+            out.hasVptr = true
+        }
+        if out.hasVptr && cursor < 8 {
+            cursor = 8
+            if align < 8 {
+                align = 8
+            }
+        }
+        // Own fields: stable sort by alignment, largest first, unless `@repr(c)` or a union.
+        local n: usize = a.fieldCount as usize
+        local sizes = Vec<u64>()
+        local aligns = Vec<u64>()
+        local order = Vec<usize>()
+        for i in 0..n {
+            local fs: u64 = 0
+            local fa: u64 = 1
+            self.sizeAlign(view(a.fields[i].typeName), &fs, &fa)
+            sizes.push(fs)
+            aligns.push(fa)
+            order.push(i)
+        }
+        if a.reprC == 0 {
+            for i in 1..n {
+                local j: usize = i
+                while j > 0 && *aligns.get(*order.get(j - 1)) < *aligns.get(*order.get(j)) {
+                    local t: usize = *order.get(j - 1)
+                    order.set(j - 1, *order.get(j))
+                    order.set(j, t)
+                    j -= 1
+                }
+            }
+        }
+        for k in 0..n {
+            local idx: usize = *order.get(k)
+            local fs: u64 = *sizes.get(idx)
+            local fa: u64 = *aligns.get(idx)
+            local off: u64 = isUnion ? 0 : alignUp(cursor, fa)
+            out.fields.push(FieldInfo(off, fs, fa, view(a.fields[idx].typeName)))
+            cursor = isUnion ? (cursor > fs ? cursor : fs) : off + fs
+            if fa > align {
+                align = fa
+            }
+        }
+        out.align = align
+        out.size = alignUp(cursor, align)
+        self.cache.push(out)
+        return self.cache.get(self.cache.length() - 1)
+    }
+
+    /// The offset of field `index` (layout order) of struct or class `name`; 0 when unknown.
+    fn offsetOf(self, name: str, index: u32) -> u64 {
+        local l: *AggLayout = self.of(name)
+        if l == nil || index as usize >= l.fields.length() {
+            return 0
+        }
+        return l.fields.get(index as usize).offset
+    }
 }
 
-/// The byte offset of field `index` of the aggregate `name`, or -1 when it cannot be computed.
-export fn fieldOffset(m: *XlcHirModule, name: str, index: u32) -> i64 {
-    local a: *XlcHirAggregate = findAggregate(m, name)
-    if a == nil || a.reprC == 0 || a.isClass != 0 || index >= a.fieldCount {
-        return -1
-    }
-    if a.isUnion != 0 {
-        return 0
-    }
-    local cursor: u64 = 0
-    for i in 0..index as usize + 1 {
-        local f: Layout = layoutOf(m, view(a.fields[i].typeName))
-        if !f.ok {
-            return -1
+/// The end of the last field of `l`, without the tail padding.
+fn lastEnd(l: *AggLayout) -> u64 {
+    local e: u64 = 0
+    for i in 0..l.fields.length() {
+        local f: *FieldInfo = l.fields.get(i)
+        if f.offset + f.size > e {
+            e = f.offset + f.size
         }
-        cursor = alignUp(cursor, f.align)
-        if i == index as usize {
-            return cursor as i64
-        }
-        cursor += f.size
     }
-    return -1
+    return e
+}
+
+fn trimmed(s: str) -> String {
+    local a: usize = 0
+    local b: usize = s.len
+    while a < b && s.ptr[a] == b' ' {
+        a += 1
+    }
+    while b > a && s.ptr[b - 1] == b' ' {
+        b -= 1
+    }
+    return String(fromParts(&s.ptr[a], b - a))
 }

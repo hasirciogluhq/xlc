@@ -531,6 +531,12 @@ export fn mul32(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
     out.push(0x1b007c00 | (rm << 16) | (rn << 5) | rd)
 }
 
+/// `add Rd, Rn, Rm, lsl #sh` — the shifted-register add, `sf=1 0 0 01011 shift=00 0 Rm imm6 Rn Rd`:
+/// an address plus a scaled index in one instruction.
+export fn add64Lsl(out: *Vec<u32>, rd: u32, rn: u32, rm: u32, sh: u32) {
+    out.push(0x8b000000 | (rm << 16) | (sh << 10) | (rn << 5) | rd)
+}
+
 /// `ldrh Wt, [Xn, #off]` — zero-extending halfword load, imm12 in units of 2.
 export fn ldrhImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
     out.push(0x79400000 | ((byteOff / 2) << 10) | (rn << 5) | rt)

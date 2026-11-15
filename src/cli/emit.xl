@@ -26,7 +26,7 @@ from "program" import pruneProgram, addLinkImports
 from "incremental" import emitIncremental
 from "../driver/link" import LinkRequest, link
 from "../codegen/native" import emitNativeObj
-from "../codegen/llvm" import generate, writeArtifact, releaseArtifact, archive
+from "../driver/link" import archive
 from "../codegen/header" import headerText
 from "../hir/flatten" import Flat, flattenModule
 
@@ -35,7 +35,6 @@ export class EmitPlan {
     root: String
     output: String          // "" = next to `root`, named by `emit`
     emit: String            // exe|obj|ir|bc|header|static|shared
-    backend: String         // llvm|native
     incremental: bool
     cacheDir: String
     inputs: Vec<String>     // prebuilt objects and libraries handed to the linker
@@ -79,19 +78,11 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
     local output = plan.output.length() > 0 ? plan.output.clone() : defaultOutput(&plan.root, &plan.emit, &os)
     local windows = os.asStr() == "windows"
 
-    // The backend choice by target: `--backend=native` runs our arm64/Mach-O codegen, but only
-    // where it applies (macOS on arm64); everything else stays with LLVM.
-    if plan.backend.asStr() == "native" {
-        if os.asStr() != "macos" || arch.asStr() != "aarch64" {
-            local triple = ownedOf(target.triple)
-            fprint(2, format("error: the native backend supports only the arm64-apple-macos target, this build targets {}\n", triple.asStr()).asStr())
-            return false
-        }
-        if plan.emit.asStr() != "obj" {
-            fprint(2, format("error: the native backend currently emits obj only, `--emit {}` stays with LLVM\n", plan.emit.asStr()).asStr())
-            return false
-        }
-        return emitNativeObj(xlcSessionHirModule(session), &output)
+    // The one code generator is the native arm64 Mach-O backend (src/codegen/native).
+    if os.asStr() != "macos" || arch.asStr() != "aarch64" {
+        local triple = ownedOf(target.triple)
+        fprint(2, format("error: the code generator supports only the arm64-apple-macos target, this build targets {}\n", triple.asStr()).asStr())
+        return false
     }
 
     // Plan 24: only what the roots reach is code-generated and linked; the flat module below is
@@ -128,14 +119,8 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
     local none = String()
 
     if !linked {
-        // obj, ir, bc: written in place.
-        local artifact = generate(session, &stem, &plan.emit, false, &none)
-        if artifact == nil {
-            return false
-        }
-        local ok = writeArtifact(artifact, optLevel, emit, &output)
-        releaseArtifact(artifact)
-        return ok
+        // obj: written in place.
+        return emitNativeObj(&f.m, false, "", &output)
     }
 
     if plan.incremental {
@@ -145,15 +130,9 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
     } else {
         // The intermediate object sits next to the output (same directory, so the same permissions
         // and file system); the CLI removes it whether or not the link succeeds.
-        local artifact = generate(session, &stem, &plan.emit, false, &none)
-        if artifact == nil {
-            return false
-        }
         local obj = output.clone()
-        obj.append(windows ? ".tmp.obj" : ".tmp.o")
-        local ok = writeArtifact(artifact, optLevel, "obj", &obj)
-        releaseArtifact(artifact)
-        if !ok {
+        obj.append(".tmp.o")
+        if !emitNativeObj(&f.m, false, "", &obj) {
             return false
         }
         objects.push(obj)
@@ -165,7 +144,7 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
 
     local ok = false
     if emit == "static" {
-        ok = archive(&objects, &output, target.os)
+        ok = archive(&objects, &output)
     } else {
         local r = LinkRequest()
         for i in 0..objects.length() {

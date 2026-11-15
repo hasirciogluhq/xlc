@@ -1,11 +1,8 @@
--- xlc: the xlang compiler (C++23, LLVM). One executable, `xlc`.
+-- xlc: the xlang compiler. One executable, `xlc`. The code generator is the native arm64 Mach-O
+-- backend written in xlang (src/codegen); there is no LLVM.
 --
 --   xmake f -m release && xmake        build into build/<plat>/<arch>/release/
 --   xmake run xlc-tests                frontend/sema/HIR unit tests
---
--- LLVM comes from the system: `$LLVM_CONFIG`, then Homebrew, then `llvm-config` on PATH. It is
--- linked statically (only the components the compiler uses), so the released binary has no LLVM
--- runtime dependency.
 --
 -- The version below is the single source of truth: release tags must match it (`vX.Y.Z` or
 -- `vX.Y.Z-rc.N`, see .github/workflows/release.yml).
@@ -16,124 +13,9 @@ set_project("xlc")
 set_version(xlc_version)
 set_languages("c++23")
 set_warnings("all")
-if is_plat("windows") then
-    set_symbols("debug") -- a PDB next to the exe: crash dumps and debuggers show function names
-    -- clang-cl produced a stack frame that was not 16-aligned around `__int128` code (see
-    -- `ConstValue`); every function realigns its frame instead of trusting the caller.
-    add_cxxflags("/clang:-mstackrealign", {tools = "clang_cl"})
-end
 add_rules("mode.debug", "mode.release")
 add_rules("plugin.compile_commands.autoupdate", {outputdir = "build"})
 add_defines("XLANG_VERSION=\"" .. xlc_version .. "\"")
-
--- Finds llvm-config: `$LLVM_CONFIG`, then Homebrew, then the pinned LLVM 23 install of
--- apt.llvm.org (`/usr/lib/llvm-23`), then `llvm-config` on PATH. Probed by file existence only:
--- this function runs with the xmakefile's restricted environment, which has no `os.which`, no
--- `assert` and no way to run a program. The version is pinned, not discovered: the code needs
--- the LLVM 20+ APIs, and the runners carry an older llvm-dev that must never win. When nothing
--- matches it returns the bare name, so the caller's `llvm-config` invocation fails with the
--- linker's own clear message.
-local function find_llvm_config()
-    if os.getenv("LLVM_CONFIG") then
-        return os.getenv("LLVM_CONFIG")
-    end
-    local candidates = {}
-    for _, prefix in ipairs({os.getenv("HOMEBREW_PREFIX"), "/opt/homebrew", "/usr/local"}) do
-        if prefix then
-            table.insert(candidates, path.join(prefix, "opt/llvm/bin/llvm-config"))
-        end
-    end
-    table.insert(candidates, "/usr/lib/llvm-23/bin/llvm-config")
-    table.insert(candidates, "/usr/bin/llvm-config")
-    for _, c in ipairs(candidates) do
-        if os.isfile(c) then
-            return c
-        end
-    end
-    return "llvm-config"
-end
-
-local function add_llvm(target)
-    local cfg = find_llvm_config()
-    local function query(args)
-        return (os.iorun(cfg .. " " .. args)):trim()
-    end
-    target:add("sysincludedirs", query("--includedir"))
-    target:add("linkdirs", query("--libdir"))
-    -- llvm-config spells a library `-lLLVMCore` (Unix) or `LLVMCore.lib` / a full path (MSVC).
-    local function add_lib(lib)
-        if lib:startswith("-l") then
-            target:add("links", lib:sub(3))
-        elseif lib:endswith(".lib") then
-            if lib:find("[/\\]") then
-                target:add("linkdirs", path.directory(lib))
-            end
-            local name = path.basename(lib)
-            -- llvm-config names the zstd *import* library (`zstd.dll.lib`); the release links the
-            -- static one so the binary needs no zstd.dll next to it.
-            if name == "zstd.dll" or name == "zstd" then
-                name = "zstd_static"
-            elseif name == "z" then
-                name = "zlibstatic" -- conda's zlib: `zlib.lib` is the import library
-            elseif name == "xml2" then
-                return -- only LLVM's Windows manifest tool needs libxml2; it is not linked
-            end
-            target:add("links", name)
-        elseif #lib > 0 and not lib:startswith("-") then
-            target:add("links", lib)
-        end
-    end
-    for _, lib in ipairs(query("--link-static --libs aarch64 x86 passes irreader bitwriter object mc target codegen"):split("%s+")) do
-        add_lib(lib)
-    end
-    -- clang-cl does not link compiler-rt by itself: the 128-bit helpers (`__floattidf`, ...) that
-    -- `__int128` code needs live in clang_rt.builtins.
-    if is_plat("windows") then
-        local dir = try { function () return os.iorun("clang-cl /clang:-print-resource-dir") end }
-        if dir then
-            local lib = path.join(dir:trim(), "lib", "windows", "clang_rt.builtins-x86_64.lib")
-            assert(os.isfile(lib), "clang_rt.builtins not found: " .. lib)
-            add_lib(lib)
-        end
-    end
-    -- Homebrew keeps zstd & co. outside the default linker search path.
-    for _, dir in ipairs({"/opt/homebrew/lib", "/usr/local/lib"}) do
-        if os.isdir(dir) then
-            target:add("linkdirs", dir)
-        end
-    end
-    -- Whatever LLVM itself needs from the system (zlib, zstd, curses, ...), as llvm-config knows it.
-    -- The released binary must start on a machine that has none of the build machine's packages, so
-    -- a library outside the OS itself is linked as a static archive or left out:
-    --   z3, xml2  only LLVM parts the compiler never links use them (the Z3 constraint solver of
-    --             LLVMSupport, the Windows manifest tool); Homebrew's z3 has no archive at all.
-    --   zstd      linked from its archive (`libzstd.a`) where one is installed.
-    local skipped = {z3 = true, xml2 = true}
-    local static_dirs = {"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"}
-    for _, lib in ipairs(query("--link-static --system-libs"):split("%s+")) do
-        local name = lib:startswith("-l") and lib:sub(3) or path.basename(lib):gsub("^lib", ""):gsub("[%.%d]*%.dylib$", ""):gsub("%.so.*$", "")
-        if not is_plat("windows") and skipped[name] then
-            -- not linked
-        elseif not is_plat("windows") and name == "zstd" then
-            local archive
-            for _, dir in ipairs(static_dirs) do
-                if os.isfile(path.join(dir, "libzstd.a")) then
-                    archive = path.join(dir, "libzstd.a")
-                    break
-                end
-            end
-            if archive then
-                target:add("ldflags", archive, {force = true})
-            else
-                target:add("syslinks", "zstd")
-            end
-        elseif lib:startswith("-l") then
-            target:add("syslinks", lib:sub(3))
-        else
-            add_lib(lib)
-        end
-    end
-end
 
 -- The xlang parts of the compiler (the lexer, the preprocessor, the macro expander) are compiled
 -- by an installed `xl` into one object, reached from C++ through the C ABIs in
@@ -149,9 +31,7 @@ local xlc_modules = {
     {"xlc-sema",     {"src/sema/**.cpp"}},
     {"xlc-hir",      {"src/hir/**.cpp"}},
     {"xlc-mir",      {"src/mir/**.cpp"}},
-    {"xlc-codegen",  {"src/codegen/**.cpp"}},
     {"xlc-analysis", {"src/analysis/**.cpp"}},
-    {"xlc-cli",      {"src/driver/**.cpp"}},
     {"xlc-backend",  {"src/backend/**.cpp"}},
 }
 
@@ -161,18 +41,12 @@ function add_xlc_modules()
         add_deps(module[1])
     end
     -- The modules are cyclic (the xlang object in `xlc-lang` calls the backend C API, and the
-    -- backend calls the pipeline through it), and the ELF linker scans archives once; a link
-    -- group lets it rescan. Only the GNU-style linkers implement the group (`--start-group`, in
-    -- xmake's gcc/clang tool modules); the MSVC `link.exe`/`lld-link` has none, so on Windows the
-    -- group would silently drop every archive from the link line. Guard to the linkers that have
-    -- it and keep plain `add_deps` propagation elsewhere.
-    if is_plat("linux") or is_plat("macosx") then
-        local names = {}
-        for _, module in ipairs(xlc_modules) do
-            table.insert(names, module[1])
-        end
-        add_linkgroups(names, {group = true})
+    -- backend calls the pipeline through it): a link group lets the linker rescan.
+    local names = {}
+    for _, module in ipairs(xlc_modules) do
+        table.insert(names, module[1])
     end
+    add_linkgroups(names, {group = true})
     add_includedirs("include", "src", {public = true})
 end
 
@@ -182,7 +56,6 @@ for _, module in ipairs(xlc_modules) do
         set_default(false)
         add_files(module[2])
         add_includedirs("include", "src", {public = true})
-        on_load(add_llvm)
     target_end()
 end
 
@@ -199,85 +72,27 @@ target_end()
 -- constructor shim src/bootstrap.cpp and the module archives. It ships in no release; the
 -- `xlc` target below builds the real binary from src/main.xl with `--crt` through it.
 target("xlc-bootstrap")
-    -- The released xlc for Windows has no lowering for `try` (E0714 on windows/x86_64), and
-    -- every stdlib-importing program reaches it, so no bootstrap object can be built there:
-    -- the rung needs a compiler release with Windows unwinding. The Windows CI builds the C++
-    -- archives and the unit tests only.
-    if is_plat("windows") then
-        set_enabled(false)
-    end
     set_kind("binary")
     set_default(false)
     set_basename("xlc-bootstrap")
     add_files("src/bootstrap.cpp")
     add_xlang_object("src/bootstrap.xl")
     add_xlc_modules()
-    on_load(add_llvm)
-    if is_plat("linux") then
-        -- Released binaries carry their C++ runtime: no libstdc++ DSO to install next to them.
-        add_ldflags("-static-libstdc++", "-static-libgcc", {force = true})
-    end
 
--- The binary: the CLI is xlang code (`src/main.xl`, `@entry fn main`) and the C++ backend joins
+-- The binary: the CLI is xlang code (`src/main.xl`, `@entry fn main`) and the C++ front half joins
 -- it as the static archives of the modules above. `xlc` performs the final link itself in its
--- `--crt` mode: the boot hooks become image constructors/destructors and the platform C++
--- compiler driver brings the CRT startup files, libc, the C++ runtime and the
--- static-initializer runners. The `xlc` that compiles and links is `XL_XL`: the bootstrap
--- binary built by the `xlc-bootstrap` target above, or `$XL_XL` to bootstrap from another
--- compiler that speaks `--crt`. The stdlib comes from `$XLANG_STD` first of all (on CI the
--- toolchain action sets it), else the `xl-std` submodule checkout when it exists (local
--- development), else the newest stdlib the toolchain installed (`~/.xlang/std/<version>`).
+-- `--crt` mode through the platform C++ compiler driver. The `xlc` that compiles and links is
+-- `XL_XL`: the bootstrap binary built by the `xlc-bootstrap` target above, or `$XL_XL` to
+-- bootstrap from another compiler that speaks `--crt`. The stdlib comes from `$XLANG_STD` first
+-- of all, else the `xl-std` submodule checkout when it exists (local development), else the
+-- newest stdlib the toolchain installed (`~/.xlang/std/<version>`).
 target("xlc")
-    -- See `xlc-bootstrap` above: without a bootstrap there is no compiler to build this with.
-    if is_plat("windows") then
-        set_enabled(false)
-    end
     set_kind("binary")
     set_default(true)
     set_basename("xlc")
     add_deps("xlc-bootstrap")
     add_deps("xlc-backend")
     add_includedirs("include", "src")
-    on_load(function (target)
-        -- The LLVM archives for the `--crt` link are resolved here, not at the xmakefile scope:
-        -- only target scripts can run programs (`os.iorun`). The same components `add_llvm`
-        -- links, as full archive paths so the order the driver sees them in does not matter.
-        local cfg = find_llvm_config()
-        local function query(args)
-            return (os.iorun(cfg .. " " .. args)):trim()
-        end
-        local libdir = query("--libdir")
-        local llvmargs = {}
-        for _, lib in ipairs(query("--link-static --libs aarch64 x86 passes irreader bitwriter object mc target codegen"):split("%s+")) do
-            if lib:startswith("-l") then
-                table.insert(llvmargs, path.join(libdir, "lib" .. lib:sub(3) .. ".a"))
-            end
-        end
-        -- Whatever LLVM itself needs from the system (zlib, zstd, curses, ...), as llvm-config
-        -- knows it. z3 and xml2 are left out: only LLVM parts the compiler never links use them,
-        -- and Homebrew's z3 has no archive at all. zstd is linked from its archive where one is
-        -- installed.
-        local skipped = {z3 = true, xml2 = true}
-        local static_dirs = {"/opt/homebrew/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu"}
-        for _, lib in ipairs(query("--link-static --system-libs"):split("%s+")) do
-            local name = lib:startswith("-l") and lib:sub(3) or path.basename(lib):gsub("^lib", ""):gsub("[%.%d]*%.dylib$", ""):gsub("%.so.*$", "")
-            if skipped[name] then
-                -- not linked
-            elseif name == "zstd" then
-                local archive
-                for _, dir in ipairs(static_dirs) do
-                    if os.isfile(path.join(dir, "libzstd.a")) then
-                        archive = path.join(dir, "libzstd.a")
-                        break
-                    end
-                end
-                table.insert(llvmargs, archive or "-lzstd")
-            else
-                table.insert(llvmargs, lib)
-            end
-        end
-        target:data_set("llvm_link_args", llvmargs)
-    end)
     on_build(function (target, opt)
         import("core.project.depend")
         local xlcbin = os.getenv("XL_XL") or target:dep("xlc-bootstrap"):targetfile()
@@ -301,20 +116,10 @@ target("xlc")
         for _, a in ipairs(archives) do
             table.insert(args, "--link-arg=" .. a)
         end
-        for _, a in ipairs(target:data("llvm_link_args")) do
-            table.insert(args, "--link-arg=" .. a)
-        end
-        -- The C++ runtime of the backend archives; the driver brings libc itself. On Linux the
-        -- released binary carries it (as the bootstrap does): no libstdc++/libgcc_s DSO is part
-        -- of the base system (test/e2e `links-only-system-libraries`).
-        if is_plat("macosx") then
-            table.insert(args, "--link-arg=-lc++")
-        elseif is_plat("linux") then
-            table.insert(args, "--link-arg=-static-libstdc++")
-            table.insert(args, "--link-arg=-static-libgcc")
-        end
-        -- Rebuild only when a source of the binary changed: every `.xl` under `src` (the CLI and
-        -- the ported compiler parts the compiler.xl object carries) or one of the archives.
+        -- The C++ runtime of the front-half archives; the driver brings libc itself.
+        table.insert(args, "--link-arg=-lc++")
+        -- Rebuild only when a source of the binary changed: every `.xl` under `src` or one of the
+        -- archives.
         local inputs = {}
         for _, pattern in ipairs({"src/*.xl", "src/**/*.xl"}) do
             for _, f in ipairs(os.files(pattern)) do
@@ -337,11 +142,6 @@ target("xlc")
 
 -- Frontend/sema/HIR unit tests: `xmake build xlc-tests && xmake run xlc-tests`.
 target("xlc-tests")
-    -- The tests reach the lexer, which is xlang code: without the xlang object (see the
-    -- `xlang.object` rule) `xlcLex` and the other C entry points are unresolved on Windows.
-    if is_plat("windows") then
-        set_enabled(false)
-    end
     set_kind("binary")
     set_default(false)
     add_files("test/unit/*.cpp")

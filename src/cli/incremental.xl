@@ -12,7 +12,7 @@ from "../hir/abi" import XlcHirModule, view
 from "backend" import XlcSession, XlcModule, XlcStr, xstr, xview, strOf, xlcSessionModuleCount, xlcSessionModule,
     xlcSessionConfigKey, xlcSessionOptLevel, xlcSessionDiagnose, xlcSessionHasErrors
 from "path" import dirOf, joinPath
-from "../codegen/llvm" import generate, writeArtifact, releaseArtifact
+from "../codegen/native" import emitNativeObj
 from "entry" import boundarySpan
 from "../util/source" import spanNone
 
@@ -113,7 +113,6 @@ export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String,
     }
 
     local ext: str = windows ? ".obj" : ".o"
-    local optLevel = xlcSessionOptLevel(session)
     for i in 0..count {
         local row = mods.get(i)
         local key = xview(row.key)
@@ -124,9 +123,7 @@ export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String,
         local leaf = format("{}-{:016x}{}", name.asStr(), mix(baseHash(i, cfg.asStr(), &mods, &memo, &state), salt.asStr()), ext)
         local obj = joinPath(cacheRoot.asStr(), leaf.asStr(), windows)
         if !exists(&obj) {
-            local onlyKey = String(key)
-            local artifact = generate(session, &name, emit, true, &onlyKey)
-            if artifact == nil {
+            if !emitNativeObj(m, true, key, &obj) {
                 if xlcSessionHasErrors(session) == 0 {
                     local span = boundarySpan(spanNone())
                     local message = format("code generation for module `{}` failed without a diagnostic", name.asStr())
@@ -134,11 +131,6 @@ export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String,
                     local hintText = strOf(hint)
                     xlcSessionDiagnose(session, strOf("E0714"), &span, xstr(&message), hintText)
                 }
-                return false
-            }
-            local ok = writeArtifact(artifact, optLevel, "obj", &obj)
-            releaseArtifact(artifact)
-            if !ok {
                 return false
             }
         }

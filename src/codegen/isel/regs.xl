@@ -19,12 +19,15 @@ from "types" import Scalar, KIND_OTHER, KIND_FLOAT, scalarOf
 /// The first and last callee-saved register handed to locals.
 export const FIRST_SAVED: u32 = 19
 export const LAST_SAVED: u32 = 28
+export const FIRST_SAVED_FLOAT: u32 = 8
+export const LAST_SAVED_FLOAT: u32 = 15
 
 /// Where every local of one function lives.
 export class Frame {
     home: Vec<i32>       // per local: the register number, or -1 for a stack slot
     slot: Vec<u32>       // per local: the byte offset from `sp` of its slot (when home is -1)
-    saved: Vec<u32>      // the callee-saved registers the function uses, in order
+    saved: Vec<u32>      // the callee-saved integer registers the function uses, in order
+    savedFloat: Vec<u32> // the callee-saved vector registers it uses; kept after the integer ones
     slotBytes: u32       // bytes of local slots, at the bottom of the frame
     total: u32           // the whole frame below the frame record: slots, saved registers, padding
 
@@ -32,6 +35,7 @@ export class Frame {
         self.home = Vec<i32>()
         self.slot = Vec<u32>()
         self.saved = Vec<u32>()
+        self.savedFloat = Vec<u32>()
         self.slotBytes = 0
         self.total = 0
     }
@@ -118,25 +122,35 @@ export fn assignFrame(m: *XlcHirModule, f: *XlcHirFunction) -> Frame {
         fr.home.push(-1)
         fr.slot.push(0)
     }
-    // Heaviest first: repeated selection over at most ten rounds.
-    local next: u32 = FIRST_SAVED
-    while next <= LAST_SAVED {
-        local best: i32 = -1
-        local bestWeight: u64 = 1
-        for i in 0..f.localCount as usize {
-            local s: Scalar = scalarOf(m, view(f.locals[i].typeName))
-            local eligible = s.kind != KIND_OTHER && s.kind != KIND_FLOAT && !*w.taken.get(i) && *fr.home.get(i) < 0
-            if eligible && *w.weight.get(i) > bestWeight {
-                best = i as i32
-                bestWeight = *w.weight.get(i)
+    // Heaviest first: repeated selection, once per register class. Integers, booleans and pointers
+    // take `x19`..`x28`; floats take `d8`..`d15` (AAPCS64 keeps the low 64 bits of v8-v15 across
+    // calls, which holds an `f64` and an `f32` whole).
+    for pass in 0..2 {
+        local isFloat = pass == 1
+        local next: u32 = isFloat ? FIRST_SAVED_FLOAT : FIRST_SAVED
+        local last: u32 = isFloat ? LAST_SAVED_FLOAT : LAST_SAVED
+        while next <= last {
+            local best: i32 = -1
+            local bestWeight: u64 = 1
+            for i in 0..f.localCount as usize {
+                local s: Scalar = scalarOf(m, view(f.locals[i].typeName))
+                local classOk = isFloat ? s.kind == KIND_FLOAT : (s.kind != KIND_OTHER && s.kind != KIND_FLOAT)
+                if classOk && !*w.taken.get(i) && *fr.home.get(i) < 0 && *w.weight.get(i) > bestWeight {
+                    best = i as i32
+                    bestWeight = *w.weight.get(i)
+                }
             }
+            if best < 0 {
+                break
+            }
+            fr.home.set(best as usize, next as i32)
+            if isFloat {
+                fr.savedFloat.push(next)
+            } else {
+                fr.saved.push(next)
+            }
+            next += 1
         }
-        if best < 0 {
-            break
-        }
-        fr.home.set(best as usize, next as i32)
-        fr.saved.push(next)
-        next += 1
     }
     for i in 0..f.localCount as usize {
         if *fr.home.get(i) < 0 {
@@ -144,7 +158,7 @@ export fn assignFrame(m: *XlcHirModule, f: *XlcHirFunction) -> Frame {
             fr.slotBytes += 8
         }
     }
-    local bytes: u32 = fr.slotBytes + (fr.saved.length() as u32) * 8
+    local bytes: u32 = fr.slotBytes + ((fr.saved.length() + fr.savedFloat.length()) as u32) * 8
     fr.total = (bytes + 15) / 16 * 16
     return fr
 }

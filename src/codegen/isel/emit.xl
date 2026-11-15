@@ -1,0 +1,148 @@
+// Instruction-emission helpers of the native selector: constants, canonical-form repair, address
+// arithmetic and typed loads and stores. Each function appends words to a code buffer and uses
+// only `x16` and `x17` (the intra-procedure-call scratch registers, never allocated) for what it
+// needs, so a caller may keep any other register live across it.
+//
+// Canonical form (types.xl): an integer of `bits` bits is held in a 64-bit register sign- or
+// zero-extended from its width, a `bool` is 0 or 1. A load of a narrow integer therefore picks the
+// extending instruction (`ldrsb`/`ldrsh`/`ldrsw` for signed, `ldrb`/`ldrh`/`ldr w` for unsigned) so
+// the loaded register is canonical with no further instruction; a store writes only the width.
+// @spec https://developer.arm.com/documentation/ddi0487/latest (C6.2 LDR/STR immediate, unsigned offset)
+from "std" import Vec
+from "../arm64" import X16, X17, SP, XZR, movReg64, loadConst64, movz64, add64Imm, sub64Imm,
+    add64Reg, sbfm64, ubfm64, ldr64Imm, str64Imm, ldr32Imm, str32Imm, ldrbImm, strbImm,
+    ldrswImm, ldrhImm, strhImm, ldrsbImm, ldrshImm, logicalImm64, orr64Imm
+from "../arm64/float" import ldrFloat, strFloat
+from "types" import Scalar, KIND_INT, KIND_BOOL, KIND_PTR
+
+/// `rd = rn` re-established as a canonical value of scalar `s`: the sign- or zero-extension of its
+/// low `bits` bits, or bit 0 for a bool. A 64-bit integer and a pointer are already whole.
+export fn normalizeReg(out: *Vec<u32>, rd: u32, rn: u32, s: Scalar) {
+    if s.kind == KIND_BOOL {
+        ubfm64(out, rd, rn, 0, 0)
+    } else if s.kind == KIND_INT && s.bits < 64 {
+        if s.signed {
+            sbfm64(out, rd, rn, 0, s.bits - 1)
+        } else {
+            ubfm64(out, rd, rn, 0, s.bits - 1)
+        }
+    } else if rd != rn {
+        movReg64(out, rd, rn)
+    }
+}
+
+/// True when `normalizeReg` of `s` emits an instruction even for rd == rn.
+export fn needsNormalize(s: Scalar) -> bool {
+    return s.kind == KIND_BOOL || (s.kind == KIND_INT && s.bits < 64)
+}
+
+/// `rd = v`: one `movn` for a small negative value, one `orr` with a bitmask immediate when the
+/// value is one (runs of ones, replicated patterns), else `movz` plus at most three `movk`.
+export fn movConst(out: *Vec<u32>, rd: u32, v: u64) {
+    local inv: u64 = ~v
+    if inv <= 0xffff {
+        // movn Rd, #imm16: Rd = ~imm16 (`1 00 100101 hw imm16 Rd`).
+        out.push(0x92800000 | ((inv as u32) << 5) | rd)
+        return
+    }
+    local enc: i32 = logicalImm64(v)
+    if enc >= 0 && v > 0xffffffff {
+        orr64Imm(out, rd, XZR, enc as u32)
+        return
+    }
+    loadConst64(out, rd, v)
+}
+
+/// `rd = rn + off` for any 64-bit `off`; `rn` may be `sp`.
+export fn addOff(out: *Vec<u32>, rd: u32, rn: u32, off: i64) {
+    if off == 0 {
+        if rd != rn {
+            add64Imm(out, rd, rn, 0, false)
+        }
+    } else if off > 0 && off < 4096 {
+        add64Imm(out, rd, rn, off as u32, false)
+    } else if off < 0 && off > -4096 {
+        sub64Imm(out, rd, rn, (-off) as u32, false)
+    } else {
+        // A far offset: build it in x17, then add through x16 when the base is `sp`
+        // (the register form of `add` reads register 31 as xzr, not sp).
+        movConst(out, X17, off as u64)
+        local b: u32 = rn
+        if rn == SP {
+            add64Imm(out, X16, SP, 0, false)
+            b = X16
+        }
+        add64Reg(out, rd, b, X17)
+    }
+}
+
+/// The base register and the immediate to put in a load or store of `size` bytes at `base + off`:
+/// the pair directly when the unsigned scaled 12-bit field reaches, else the address is built in
+/// x17 first. Returns the base register; the immediate is written through `imm`.
+fn legalize(out: *Vec<u32>, base: u32, off: i64, size: u32, imm: *u32) -> u32 {
+    if off >= 0 && off % (size as i64) == 0 && off / (size as i64) < 4096 {
+        *imm = off as u32
+        return base
+    }
+    addOff(out, X17, base, off)
+    *imm = 0
+    return X17
+}
+
+/// Loads scalar `s` from `[base + off]` into `rd` in canonical form.
+export fn loadTyped(out: *Vec<u32>, rd: u32, base: u32, off: i64, s: Scalar) {
+    local size: u32 = s.kind == KIND_BOOL ? 1 : s.bits / 8
+    local imm: u32 = 0
+    local b: u32 = legalize(out, base, off, size, &imm)
+    if size == 1 {
+        if s.kind == KIND_INT && s.signed {
+            ldrsbImm(out, rd, b, imm)
+        } else {
+            ldrbImm(out, rd, b, imm)
+        }
+    } else if size == 2 {
+        if s.signed {
+            ldrshImm(out, rd, b, imm)
+        } else {
+            ldrhImm(out, rd, b, imm)
+        }
+    } else if size == 4 {
+        if s.signed {
+            ldrswImm(out, rd, b, imm)
+        } else {
+            ldr32Imm(out, rd, b, imm)
+        }
+    } else {
+        ldr64Imm(out, rd, b, imm)
+    }
+}
+
+/// Stores the low bytes of `rs` as scalar `s` to `[base + off]`.
+export fn storeTyped(out: *Vec<u32>, rs: u32, base: u32, off: i64, s: Scalar) {
+    local size: u32 = s.kind == KIND_BOOL ? 1 : s.bits / 8
+    local imm: u32 = 0
+    local b: u32 = legalize(out, base, off, size, &imm)
+    if size == 1 {
+        strbImm(out, rs, b, imm)
+    } else if size == 2 {
+        strhImm(out, rs, b, imm)
+    } else if size == 4 {
+        str32Imm(out, rs, b, imm)
+    } else {
+        str64Imm(out, rs, b, imm)
+    }
+}
+
+/// Loads a float (`dbl` for `f64`) from `[base + off]` into vector register `fd`.
+export fn loadFloat(out: *Vec<u32>, fd: u32, base: u32, off: i64, dbl: bool) {
+    local imm: u32 = 0
+    local b: u32 = legalize(out, base, off, dbl ? 8 : 4, &imm)
+    ldrFloat(out, dbl, fd, b, imm)
+}
+
+/// Stores a float from vector register `fs` to `[base + off]`.
+export fn storeFloat(out: *Vec<u32>, fs: u32, base: u32, off: i64, dbl: bool) {
+    local imm: u32 = 0
+    local b: u32 = legalize(out, base, off, dbl ? 8 : 4, &imm)
+    strFloat(out, dbl, fs, b, imm)
+}

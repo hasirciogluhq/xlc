@@ -1,26 +1,23 @@
 // The native backend: the arm64 encoder (arm64), the Mach-O object writer (macho) and the
-// instruction selector from the HIR (isel). The CLI dispatches here when `--backend=native` and
-// the resolved target is arm64-apple-macos; every other target stays with LLVM.
-//
-// The entry takes the C++ `hir::Module` of the session as a raw pointer (xlcSessionHirModule),
-// flattens it into the flat `XlcHirModule` of hir/abi.xl (hir/flatten.xl), selects it to arm64
-// (isel) and writes the Mach-O object (macho).
-from "std" import String, format, fsWrite
+// instruction selector from the flat HIR (isel). It is the only code generator of xlc: macOS on
+// arm64 (Apple silicon) is the one supported target.
+from "std" import String
 from "std/io" import fprint
-from "../../hir/flatten" import Flat, flattenModule
+from "std/io/fs" import fsWrite
+from "../../hir/abi" import XlcHirModule
 from "../isel" import select
 from "../macho" import MachoObject, writeObject
 
-/// Emits one Mach-O object for `module` to `output`. False (reported) when the module uses
-/// something the native backend does not lower yet.
-export fn emitNativeObj(module: *void, output: *String) -> bool {
-    local f = Flat()
-    flattenModule(&f, module)
+/// Writes the Mach-O object of `m` to `output`. With `only` set, only the functions and globals of
+/// the module keyed `only` are defined and every other symbol stays external (the incremental
+/// build); `hasOnly` false defines the whole program and its boot code. False (reported) when the
+/// module uses something the selector does not lower.
+export fn emitNativeObj(m: *XlcHirModule, hasOnly: bool, only: str, output: *String) -> bool {
     local o = MachoObject()
-    select(&f.m, &o)
+    select(m, &o, hasOnly, only)
     local bytes = writeObject(&o)
     if !fsWrite(output.cstr(), bytes.asStr()) {
-        fprint(2, format("error: cannot write {}\n", output.asStr()).asStr())
+        fprint(2, "error: cannot write the object file\n")
         return false
     }
     return true

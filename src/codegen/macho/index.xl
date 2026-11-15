@@ -70,6 +70,7 @@ export class MachoSym {
 /// One section: the contents, the relocations against them, and the header fields.
 export class MachoSection {
     name: String
+    segname: String   // the segment the linker places the section in: `__TEXT`, `__DATA`
     flags: u32
     alignLog2: u32
     code: Vec<u8>
@@ -77,6 +78,7 @@ export class MachoSection {
 
     fn init(self, name: str, flags: u32, alignLog2: u32) {
         self.name = String(name)
+        self.segname = String("__TEXT")
         self.flags = flags
         self.alignLog2 = alignLog2
         self.code = Vec<u8>()
@@ -143,6 +145,26 @@ export class MachoObject {
         local spelled = machoName(name)
         self.syms.push(MachoSym(spelled.asStr(), false, 0, 0))
         return (self.syms.length() - 1) as u32
+    }
+
+    /// Moves `section` into the segment `name` (`__DATA` for writable data).
+    fn setSegment(self, section: u32, name: str) {
+        self.sections.get(section).segname = String(name)
+    }
+
+    /// Appends a little-endian 64-bit value to a data section.
+    fn addQuad(self, section: u32, v: u64) {
+        for k in 0..8 {
+            self.addByte(section, ((v >> ((k * 8) as u64)) & 0xff) as u8)
+        }
+    }
+
+    /// An 8-byte absolute pointer relocation (`ARM64_RELOC_UNSIGNED`) against `symIndex` at byte
+    /// `addr` of a data section; the 8 bytes already there are the addend.
+    fn addDataReloc(self, section: u32, addr: u32, symIndex: u32) {
+        local s: *MachoSection = self.sections.get(section)
+        s.relocs.push(MachoReloc { addr: addr, symIndex: symIndex, pcrel: false, lengthLog2: 3,
+            isExtern: true, rtype: RELOC_UNSIGNED })
     }
 
     /// Adds a relocation against `symIndex` at byte `addr` of `section`.
@@ -272,7 +294,7 @@ export fn writeObject(o: *MachoObject) -> String {
     for i in 0..nsect {
         local s: *MachoSection = o.sections.get(i)
         putName16(&out, s.name.asStr())  // sectname
-        putName16(&out, "__TEXT")        // segname
+        putName16(&out, s.segname.asStr())  // segname
         put64(&out, *vmaddr.get(i) as u64)  // the virtual address inside the segment
         put64(&out, s.code.length() as u64)
         put32(&out, *dataOff.get(i))
