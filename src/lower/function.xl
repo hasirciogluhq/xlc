@@ -12,7 +12,9 @@ from "../lang/ast/ast" import XSpan, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_L
     XS_BREAK, XS_UNSAFE, XS_BLOCK
 from "../sema/sema" import Sema
 from "../sema/item" import SDecl, SItem, SParam
-from "../lang/ast/ast" import XStmt, XExpr
+from "../lang/ast/ast" import XStmt, XExpr, XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF, XU_BITNOT,
+    XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE,
+    XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
 from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY
 from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
@@ -309,11 +311,11 @@ export fn lowerExpr(l: *Lowerer, idx: i32) -> i32 {
         if (*e).kind == XE_BINARY {
             local lhs = lowerExpr(l, (*e).lhs)
             local rhs = lowerExpr(l, (*e).rhs)
-            return l.b.binary(l.s.exprTextAt(idx), lhs, rhs, l.exprTypeName(idx))
+            return l.b.binary(binaryOpName((*e).binaryOp), lhs, rhs, l.exprTypeName(idx))
         }
         if (*e).kind == XE_UNARY {
             local lhs = lowerExpr(l, (*e).lhs)
-            return l.b.unary(l.s.exprTextAt(idx), lhs, l.exprTypeName(idx))
+            return l.b.unary(unaryOpName((*e).unaryOp), lhs, l.exprTypeName(idx))
         }
         if (*e).kind == XE_CAST {
             local value = lowerExpr(l, (*e).lhs)
@@ -710,4 +712,41 @@ export fn lowerNew(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
     (*p).fieldFirst = first
     (*p).fieldCount = l.b.fieldInits.length() as u32 - first
     return at
+}
+
+/// The spelling of a `UnaryOp` (Neg=0 Not=1 Deref=2 AddrOf=3 BitNot=4), the form the HIR keeps.
+fn unaryOpName(op: i32) -> str {
+    switch {
+        case op == XU_NEG { return "-" }
+        case op == XU_NOT { return "!" }
+        case op == XU_DEREF { return "*" }
+        case op == XU_ADDROF { return "&" }
+        case op == XU_BITNOT { return "~" }
+    }
+    return "?"
+}
+
+/// The spelling of a `BinaryOp` (Add=0 .. Shr=17, declaration order).
+fn binaryOpName(op: i32) -> str {
+    switch {
+        case op == XB_ADD { return "+" }
+        case op == XB_SUB { return "-" }
+        case op == XB_MUL { return "*" }
+        case op == XB_DIV { return "/" }
+        case op == XB_MOD { return "%" }
+        case op == XB_EQ { return "==" }
+        case op == XB_NE { return "!=" }
+        case op == XB_LT { return "<" }
+        case op == XB_LE { return "<=" }
+        case op == XB_GT { return ">" }
+        case op == XB_GE { return ">=" }
+        case op == XB_AND { return "&&" }
+        case op == XB_OR { return "||" }
+        case op == XB_BITAND { return "&" }
+        case op == XB_BITOR { return "|" }
+        case op == XB_BITXOR { return "^" }
+        case op == XB_SHL { return "<<" }
+        case op == XB_SHR { return ">>" }
+    }
+    return "?"
 }
