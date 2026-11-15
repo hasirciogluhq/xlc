@@ -49,7 +49,9 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
             if inner < 0 { return -1 }
             if t.kind == T_POINTER { return s.types.makePointer(inner) }
             if t.kind == T_SLICE { return s.types.makeSlice(inner, t.isMutable != 0) }
-            return s.types.makeArray(inner, t.length as i32)
+            local arr = s.types.makeArray(inner, t.length as i32)
+            (*s.types.at(arr)).bits = t.bits
+            return arr
         }
         case t.kind == T_TUPLE {
             local args = Vec<i32>()

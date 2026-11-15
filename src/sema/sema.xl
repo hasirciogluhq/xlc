@@ -536,6 +536,14 @@ export class Sema {
         return (self.items.length() - 1) as i32
     }
 
+    /// Interns every item of the flat program, in order. Runs before `collect`, which reads the
+    /// items by their index in the Sema's arena.
+    fn internProgram(self) {
+        for i in 0..self.flat.r.itemsCount as usize {
+            self.internItem(self.flat.r.itemsFirst + i as u32)
+        }
+    }
+
     /// The statement index recorded at position `i` of the flat `stmtRefs` arena.
     fn stmtIndexOf(self, i: u32) -> i32 {
         return self.refAt("stmt", i as i32)
@@ -603,7 +611,7 @@ export class Sema {
     /// Marks an alias as being resolved; false when it is already in progress (a cycle).
     fn aliasInProgressPush(self, name: XStr) -> bool {
         for i in 0..self.aliasInProgress.length() {
-            if eqStr(&(self.flat.r), *self.aliasInProgress.get(i), name) { return false }
+            if self.text(*self.aliasInProgress.get(i)) == self.text(name) { return false }
         }
         self.aliasInProgress.push(name)
         return true
@@ -612,7 +620,7 @@ export class Sema {
     /// Clears the in-progress mark of a named cache (`define`, `enum`, `layout`).
     fn inProgressPop(self, list: *Vec<XStr>, name: XStr) {
         for i in 0..(*list).length() {
-            if eqText(&(self.flat.r), *(*list).get(i), self.text(name)) {
+            if self.text(*(*list).get(i)) == self.text(name) {
                 (*list).remove(i)
                 return
             }
@@ -653,8 +661,9 @@ export class Sema {
 
     /// The index of the symbol called `name`, or -1.
     fn find(self, name: str) -> i32 {
+        // The names are interned in this Sema's own table, not in the flat AST's bytes.
         for i in 0..self.symNames.length() {
-            if eqText(&(self.flat.r), *self.symNames.get(i), name) { return i as i32 }
+            if self.text(*self.symNames.get(i)) == name { return i as i32 }
         }
         return -1
     }

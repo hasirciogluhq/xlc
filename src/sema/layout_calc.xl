@@ -189,11 +189,13 @@ export fn layoutOfName(s: *Sema, name: str, at: XSpan) -> i32 {
     }
     local sym = s.find(name)
     if sym < 0 {
-        local kind = (*s.symbols.get(sym as usize)).kind
-        if kind != SY_STRUCT && kind != SY_CLASS {
-            s.error("E0706", at, format("unknown type `{}`", name).asStr(), "not a struct or class")
-            return -1
-        }
+        s.error("E0706", at, format("unknown type `{}`", name).asStr(), "not declared in this module")
+        return -1
+    }
+    local kind = (*s.symbols.get(sym as usize)).kind
+    if kind != SY_STRUCT && kind != SY_CLASS {
+        s.error("E0706", at, format("unknown type `{}`", name).asStr(), "not a struct or class")
+        return -1
     }
     for i in 0..s.layoutInProgress.length() {
         if s.text(*s.layoutInProgress.get(i)) == name {

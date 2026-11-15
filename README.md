@@ -212,7 +212,11 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 include/xlang/   public headers (lang, sema, hir, mir, analysis, codegen, util)
 src/lang/        lexer, preprocessor, macros, parser, AST (all xlang); cpp/ holds the C++ AST,
                  types, config and bridges that the C++ sema still reads, removed with it
-src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR
+src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR (C++ reference);
+                 xl_bridge.cpp/.hpp is the C++ side of the xlang lowering pass
+src/lower/       the xlang lowering pass (flat HIR, written in xlang): program.xl is its entry,
+                 typing.xl the per-expression types, function.xl the expression walk; the sema
+                 it runs is src/sema/*.xl
 src/hir/         HIR dump and reachability pruning
 src/mir/         HIR -> MIR (control-flow graph per function), written in xlang: builder/,
                  model.xl, dump.xl; xl_bridge.cpp/.hpp is the thin C bridge for C++ callers

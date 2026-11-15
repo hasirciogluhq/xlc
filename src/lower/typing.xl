@@ -1,0 +1,295 @@
+// Per-expression types of the xlang lowering pass: the type an expression has when the context
+// names none (the C++ `Lowerer::expr` with no expected type, the typed AST's `e.type`). A literal
+// without context is `i32` (`i64` when the value does not fit), `f64`, `bool`, `str` or `u8`; a
+// name takes the type of its declaration in scope; the operators and calls take the types their
+// operands and callees declare. `-1` means the type is not known yet: the callers then keep the
+// expression as written, and the text is empty in the dump.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XType, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL,
+    XE_STRING_LITERAL, XE_BYTE_LITERAL, XE_NAME, XE_UNARY, XE_BINARY, XE_CALL, XE_INDEX, XE_SLICE,
+    XE_FIELD, XE_CAST, XE_ARRAY_LIST, XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW, XE_TERNARY,
+    XU_NOT, XU_DEREF, XU_ADDROF, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE, XB_AND, XB_OR,
+    XB_SHL, XB_SHR
+from "../sema/types" import Types, T_VOID, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ARRAY,
+    T_ENUM, T_STRUCT, T_CLASS, T_STR, T_SLICE, T_TUPLE
+from "../sema/resolve" import resolve
+from "../sema/conversion" import commonBinaryType, C_OK
+from "../sema/module_scope" import lookupEntity
+from "../sema/item" import SDecl
+from "../sema/const_eval" import evalConst
+from "../sema/const_value" import CV_INT, CV_FLOAT, CV_BOOL, CV_STRING
+from "./state" import Lowerer, ScopeEntry, SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT
+
+/// True for an unsuffixed numeric literal, or `-` of one: it takes the type of the other operand.
+export fn isLiteralExpr(l: *Lowerer, idx: i32) -> bool {
+    local e = l.s.exprAt(idx)
+    if (*e).kind == XE_INT_LITERAL || (*e).kind == XE_FLOAT_LITERAL { return true }
+    if (*e).kind == XE_UNARY && (*e).unaryOp == 0 {
+        local inner = l.s.exprAt((*e).lhs)
+        return (*inner).kind == XE_INT_LITERAL || (*inner).kind == XE_FLOAT_LITERAL
+    }
+    return false
+}
+
+/// True for a float literal, or `-` of one.
+export fn isFloatLiteralExpr(l: *Lowerer, idx: i32) -> bool {
+    local e = l.s.exprAt(idx)
+    if (*e).kind == XE_FLOAT_LITERAL { return true }
+    if (*e).kind == XE_UNARY && (*e).unaryOp == 0 {
+        return (*l.s.exprAt((*e).lhs)).kind == XE_FLOAT_LITERAL
+    }
+    return false
+}
+
+/// The type of an expression with no context: a Types index, -1 when unknown.
+export fn exprType(l: *Lowerer, idx: i32) -> i32 {
+    if idx < 0 { return -1 }
+    local e = l.s.exprAt(idx)
+    local k = (*e).kind
+    if k == XE_INT_LITERAL {
+        return (*e).intValue > 2147483647 ? l.s.types.makeInt(64, true) : l.s.types.makeInt(32, true)
+    }
+    if k == XE_FLOAT_LITERAL { return l.s.types.makeFloat(64) }
+    if k == XE_BOOL_LITERAL { return l.s.types.makeBool() }
+    if k == XE_STRING_LITERAL { return l.s.types.makeStr() }
+    if k == XE_BYTE_LITERAL { return l.s.types.makeInt(8, false) }
+    if k == XE_NAME { return nameType(l, idx) }
+    if k == XE_UNARY { return unaryType(l, e) }
+    if k == XE_BINARY { return binaryType(l, e) }
+    if k == XE_CALL { return callType(l, e) }
+    if k == XE_INDEX {
+        local base = resolveBase(l, exprType(l, (*e).lhs))
+        local bt = l.s.types.get(base)
+        if bt.kind == T_STR { return l.s.types.makeInt(8, false) }
+        if bt.kind == T_SLICE || bt.kind == T_POINTER || bt.kind == T_ARRAY { return bt.elem }
+        return -1
+    }
+    if k == XE_FIELD { return fieldType(l, idx) }
+    if k == XE_CAST || k == XE_STRUCT_LITERAL { return resolve(l.s, l.s.types.internAst((*e).typeIdx)) }
+    if k == XE_NEW {
+        local inner = resolve(l.s, l.s.types.internAst((*e).typeIdx))
+        return inner < 0 ? -1 : l.s.types.makePointer(inner)
+    }
+    if k == XE_TERNARY {
+        local t = exprType(l, (*e).rhs)
+        return t >= 0 ? t : exprType(l, l.s.refAt("expr", (*e).argsFirst as i32))
+    }
+    if k == XE_ARRAY_LIST {
+        if (*e).argsCount == 0 { return -1 }
+        local elem = exprType(l, l.s.refAt("expr", (*e).argsFirst as i32))
+        return elem < 0 ? -1 : l.s.types.makeArrayN(elem, (*e).argsCount)
+    }
+    if k == XE_TUPLE_LITERAL {
+        local parts = Vec<i32>()
+        for i in 0..(*e).argsCount as usize {
+            local t = exprType(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32))
+            if t < 0 { return -1 }
+            parts.push(t)
+        }
+        return l.s.types.makeTuple(parts)
+    }
+    return -1
+}
+
+/// The type of the text `exprTypeName` names: "" when the type is unknown.
+export fn exprTypeName(l: *Lowerer, idx: i32) -> str {
+    return typeNameOf(l, exprType(l, idx))
+}
+
+/// The type a struct literal or `new` names, resolved (a Types index, -1 when it is unknown).
+export fn aggregateTypeOf(l: *Lowerer, e: *XExpr) -> i32 {
+    return resolve(l.s, l.s.types.internAst((*e).typeIdx))
+}
+
+/// The spelling of type `t` for the HIR, kept alive by the lowering; "" for -1.
+export fn typeNameOf(l: *Lowerer, t: i32) -> str {
+    if t < 0 { return "" }
+    return l.keep(l.s.types.text(t).asStr())
+}
+
+/// True for an integer type `t` (a Types index).
+export fn isIntType(l: *Lowerer, t: i32) -> bool {
+    return t >= 0 && l.s.types.get(t).kind == T_INT
+}
+
+/// True for a float type `t` (a Types index).
+export fn isFloatType(l: *Lowerer, t: i32) -> bool {
+    return t >= 0 && l.s.types.get(t).kind == T_FLOAT
+}
+
+/// The type an expression has where the context asks for `want` (-1 for none): an unsuffixed
+/// integer literal takes a numeric `want`, a float literal a float `want`; anything else has its
+/// type with no context (`exprType`).
+export fn effectiveType(l: *Lowerer, idx: i32, want: i32) -> i32 {
+    if want >= 0 && isLiteralExpr(l, idx) {
+        if isFloatLiteralExpr(l, idx) {
+            if isFloatType(l, want) { return want }
+        } else if isNumeric(l, want) {
+            return want
+        }
+    }
+    return exprType(l, idx)
+}
+
+/// The pointee of a pointer (`*T` gives `T`), or the type itself.
+export fn resolveBase(l: *Lowerer, t: i32) -> i32 {
+    if t < 0 { return -1 }
+    local rec = l.s.types.get(t)
+    if rec.kind == T_POINTER { return rec.elem }
+    return t
+}
+
+/// The type a name has: its scope entry's type, or a constant's value type.
+fn nameType(l: *Lowerer, idx: i32) -> i32 {
+    local name = l.s.exprTextAt(idx)
+    local entry = l.lookupName(name)
+    if entry == nil {
+        if name == "nil" { return l.s.types.makePointer(l.s.types.makeVoid()) }
+        return -1
+    }
+    if (*entry).kind == SE_LOCAL { return (*entry).ty }
+    if (*entry).kind == SE_GLOBAL {
+        return (*entry).ty < 0 ? -1 : resolve(l.s, (*entry).ty)
+    }
+    if (*entry).kind == SE_CONSTANT {
+        local v = evalConst(l.s, idx)
+        return v < 0 ? -1 : constType(l, v)
+    }
+    return -1
+}
+
+/// The type of a constant value: integers i32 (i64 when they do not fit), floats f64, bools,
+/// strings str.
+fn constType(l: *Lowerer, v: i32) -> i32 {
+    local cv = *l.s.consts.get(v as usize)
+    if (*cv).kind == CV_INT {
+        local wide = (*cv).intValue.lo > 2147483647 || (*cv).intValue.hi != 0
+        return wide ? l.s.types.makeInt(64, true) : l.s.types.makeInt(32, true)
+    }
+    if (*cv).kind == CV_FLOAT { return l.s.types.makeFloat(64) }
+    if (*cv).kind == CV_BOOL { return l.s.types.makeBool() }
+    return l.s.types.makeStr()
+}
+
+/// The type of a unary operation: `!` is bool, `*p` the pointee, `&x` a pointer to `x`, the
+/// others keep the operand's type.
+fn unaryType(l: *Lowerer, e: *XExpr) -> i32 {
+    if (*e).unaryOp == XU_NOT { return l.s.types.makeBool() }
+    local inner = exprType(l, (*e).lhs)
+    if inner < 0 { return -1 }
+    if (*e).unaryOp == XU_DEREF {
+        local rec = l.s.types.get(inner)
+        return rec.kind == T_POINTER ? rec.elem : -1
+    }
+    if (*e).unaryOp == XU_ADDROF { return l.s.types.makePointer(inner) }
+    return inner
+}
+
+/// The result of a binary operation. Comparisons and `&&`/`||` are bool; a shift keeps the left
+/// operand's type; arithmetic takes the common type of the two numeric operands. A literal
+/// operand takes the type of the other one, as in the C++ pass.
+fn binaryType(l: *Lowerer, e: *XExpr) -> i32 {
+    local op = (*e).binaryOp
+    if (op >= XB_EQ && op <= XB_GE) || op == XB_AND || op == XB_OR {
+        return l.s.types.makeBool()
+    }
+    local a = -1
+    local b = -1
+    if isLiteralExpr(l, (*e).lhs) && !isLiteralExpr(l, (*e).rhs) {
+        b = exprType(l, (*e).rhs)
+        a = b
+    } else {
+        a = exprType(l, (*e).lhs)
+        b = isLiteralExpr(l, (*e).rhs) ? a : exprType(l, (*e).rhs)
+    }
+    if a < 0 || b < 0 { return -1 }
+    if op == XB_SHL || op == XB_SHR { return exprType(l, (*e).lhs) }
+    if !isNumeric(l, a) || !isNumeric(l, b) {
+        return l.s.types.same(a, b) ? a : -1
+    }
+    local c = commonBinaryType(l.s.types, a, b, l.s.pointerBits)
+    return c.status == C_OK ? c.ty : -1
+}
+
+/// True for an integer or a float type.
+export fn isNumeric(l: *Lowerer, t: i32) -> bool {
+    if t < 0 { return false }
+    local k = l.s.types.get(t).kind
+    return k == T_INT || k == T_FLOAT
+}
+
+/// The result of a call: a plain function name with one declaration gives its declared return
+/// type; the layout queries and `syscall` have fixed types. Overloads and methods are not typed
+/// yet (-1).
+fn callType(l: *Lowerer, e: *XExpr) -> i32 {
+    local lhs = l.s.exprAt((*e).lhs)
+    if (*lhs).kind != XE_NAME { return -1 }
+    local callee = l.s.exprTextAt((*e).lhs)
+    if callee == "sizeOf" || callee == "alignOf" || callee == "offsetOf" {
+        return l.s.types.makeInt(0, false) // usize: the C++ pass folds them to a usize constant
+    }
+    if callee == "syscall" { return l.s.types.makeInt(64, true) }
+    local entry = l.lookupName(callee)
+    if entry == nil || (*entry).kind != SE_FUNCTION || (*entry).overloads.length() != 1 {
+        return -1
+    }
+    local d = l.s.declOfItem(*(*entry).overloads.get(0))
+    if d < 0 { return -1 }
+    local decl = l.s.declAt(d as usize)
+    if (*decl).hasRet == 0 { return l.s.types.makeVoid() }
+    return resolve(l.s, (*decl).ret)
+}
+
+/// The type of a field access `base.name` (`idx` is the access): `len` of a `str` or slice is
+/// `usize`, `ptr` of a `str` is `*u8`, and a struct or class field has its declared type; the base
+/// may be a pointer to the aggregate.
+fn fieldType(l: *Lowerer, idx: i32) -> i32 {
+    local e = l.s.exprAt(idx)
+    local base = resolveBase(l, exprType(l, (*e).lhs))
+    if base < 0 { return -1 }
+    local name = l.s.exprTextAt(idx)
+    local rec = l.s.types.get(base)
+    if rec.kind == T_STR || rec.kind == T_SLICE {
+        if name == "len" { return l.s.types.makeInt(0, false) }
+        if name == "ptr" { return l.s.types.makePointer(rec.kind == T_STR ? l.s.types.makeInt(8, false) : rec.elem) }
+        return -1
+    }
+    return fieldTypeOf(l, base, name)
+}
+
+/// The declaration of the struct or class `ty` (a Types index), nil when it is none.
+fn aggregateDecl(l: *Lowerer, ty: i32) -> *SDecl {
+    if ty < 0 { return nil }
+    local rec = l.s.types.get(ty)
+    if rec.kind != T_STRUCT && rec.kind != T_CLASS { return nil }
+    local path = l.s.types.pathOf(rec)
+    local ref = lookupEntity(l.s, path.asStr())
+    if ref.sym < 0 { return nil }
+    local d = l.s.declOfItem(l.s.itemOf(ref.sym))
+    if d < 0 { return nil }
+    return l.s.declAt(d as usize)
+}
+
+/// The position of field `name` in the struct or class `ty`, -1 when there is none.
+export fn fieldPos(l: *Lowerer, ty: i32, name: str) -> i32 {
+    local decl = aggregateDecl(l, ty)
+    if decl == nil { return -1 }
+    for i in 0..(*decl).fieldsCount as usize {
+        if l.s.text((*l.s.fieldAt((*decl).fieldsFirst as usize + i)).name) == name { return i as i32 }
+    }
+    return -1
+}
+
+/// The position of field `name` as the HIR records it (0 when the name is not a field).
+export fn fieldIndexOf(l: *Lowerer, ty: i32, name: str) -> u32 {
+    local i = fieldPos(l, ty, name)
+    return i < 0 ? 0 : i as u32
+}
+
+/// The resolved type of field `name` of the struct or class `ty` (a Types index), -1 if none.
+export fn fieldTypeOf(l: *Lowerer, ty: i32, name: str) -> i32 {
+    local i = fieldPos(l, ty, name)
+    if i < 0 { return -1 }
+    local decl = aggregateDecl(l, ty)
+    return resolve(l.s, (*l.s.fieldAt((*decl).fieldsFirst as usize + i as usize)).ty)
+}

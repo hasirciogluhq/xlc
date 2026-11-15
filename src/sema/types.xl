@@ -151,12 +151,14 @@ export class Types {
 
     fn makeFnPtr(self, params: Vec<i32>, ret: i32) -> i32 {
         local idx = self.push(T_FN_PTR)
-        local t = self.at(idx)
-        (*t).paramsFirst = self.types.length() as u32
+        local first = self.types.length() as u32
         for i in 0..params.length() {
             self.types.push(self.get(*params.get(i)))
         }
-        (*t).paramsCount = (self.types.length() as u32) - (*t).paramsFirst
+        // The record is addressed again: the pushes above may have moved the arena.
+        local t = self.at(idx)
+        (*t).paramsFirst = first
+        (*t).paramsCount = (self.types.length() as u32) - first
         (*t).ret = ret
         return idx
     }
@@ -169,14 +171,23 @@ export class Types {
         return idx
     }
 
+    /// An array of a known length `n` that no source expression spells (a literal's type): the
+    /// length is kept in `bits`, and `length` is -1.
+    fn makeArrayN(self, elem: i32, n: u32) -> i32 {
+        local idx = self.makeArray(elem, -1)
+        (*self.at(idx)).bits = n
+        return idx
+    }
+
     fn makeTuple(self, args: Vec<i32>) -> i32 {
         local idx = self.push(T_TUPLE)
-        local t = self.at(idx)
-        (*t).argsFirst = self.types.length() as u32
+        local first = self.types.length() as u32
         for i in 0..args.length() {
             self.types.push(self.get(*args.get(i)))
         }
-        (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
+        local t = self.at(idx)
+        (*t).argsFirst = first
+        (*t).argsCount = (self.types.length() as u32) - first
         return idx
     }
 
@@ -194,14 +205,15 @@ export class Types {
     fn makeAggregate(self, kind: i32, segs: Vec<String>, args: Vec<i32>) -> i32 {
         local idx = self.push(kind)
         local range = self.internPath(segs)
-        local t = self.at(idx)
-        (*t).pathFirst = range.0
-        (*t).pathCount = range.1
-        (*t).argsFirst = self.types.length() as u32
+        local first = self.types.length() as u32
         for i in 0..args.length() {
             self.types.push(self.get(*args.get(i)))
         }
-        (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
+        local t = self.at(idx)
+        (*t).pathFirst = range.0
+        (*t).pathCount = range.1
+        (*t).argsFirst = first
+        (*t).argsCount = (self.types.length() as u32) - first
         return idx
     }
 
@@ -247,37 +259,52 @@ export class Types {
         if idx < 0 { return -1 }
         local src = self.ast.typeAt(idx)
         local dst = self.push((*src).kind)
-        local t = self.at(dst)
-        (*t).bits = (*src).bits
-        (*t).isSigned = (*src).isSigned
-        (*t).isMutable = (*src).isMutable
-        (*t).length = (*src).length
-        (*t).span = (*src).span
         // The path segments point into the AST bytes; copy them into this store's table.
         local segs = Vec<String>()
         for i in 0..(*src).pathCount as usize {
             segs.push(self.ast.text(self.ast.pathSeg((*src).pathFirst + i as u32)))
         }
         local range = self.internPath(segs)
+        // The children are interned first: each call may grow the arena, so the record at `dst`
+        // is only addressed again once they are all in place.
+        local elem = self.internAst((*src).elem)
+        local ret = self.internAst((*src).ret)
+        local paramsFirst = self.internList((*src).paramsFirst, (*src).paramsCount)
+        local argsFirst = self.internList((*src).argsFirst, (*src).argsCount)
+        local t = self.at(dst)
+        (*t).bits = (*src).bits
+        (*t).isSigned = (*src).isSigned
+        (*t).isMutable = (*src).isMutable
+        (*t).length = (*src).length
+        (*t).span = (*src).span
         (*t).pathFirst = range.0
         (*t).pathCount = range.1
-        (*t).elem = self.internAst((*src).elem)
-        (*t).ret = self.internAst((*src).ret)
+        (*t).elem = elem
+        (*t).ret = ret
         if (*src).paramsCount != 0 {
-            (*t).paramsFirst = self.types.length() as u32
-            for i in 0..(*src).paramsCount as usize {
-                self.internAst(self.ast.ref(self.ast.r.typeRefs, (*src).paramsFirst + i as u32))
-            }
-            (*t).paramsCount = (self.types.length() as u32) - (*t).paramsFirst
+            (*t).paramsFirst = paramsFirst
+            (*t).paramsCount = (*src).paramsCount
         }
         if (*src).argsCount != 0 {
-            (*t).argsFirst = self.types.length() as u32
-            for i in 0..(*src).argsCount as usize {
-                self.internAst(self.ast.ref(self.ast.r.typeRefs, (*src).argsFirst + i as u32))
-            }
-            (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
+            (*t).argsFirst = argsFirst
+            (*t).argsCount = (*src).argsCount
         }
         return dst
+    }
+
+    /// Interns the `count` type references of the list at `first` (the `typeRefs` arena) into
+    /// `count` consecutive records; returns the index of the first one. Each record is a copy of
+    /// the interned type, so the list is contiguous even when the types it names have parts.
+    fn internList(self, first: u32, count: u32) -> u32 {
+        local at = self.types.length() as u32
+        for i in 0..count as usize {
+            self.push(T_VOID)
+        }
+        for i in 0..count as usize {
+            local r = self.internAst(self.ast.ref(self.ast.r.typeRefs, first + i as u32))
+            self.types.set((at + i as u32) as usize, self.get(r))
+        }
+        return at
     }
 
     /// `i32`, `u8`, `usize`, `f64`, `bool`, `void` -> the type; -1 for any other name.
@@ -344,7 +371,8 @@ export class Types {
                 local out = String("[")
                 out.append(self.text(t.elem))
                 out.append("; ")
-                out.append(self.lengthText(t.length))
+                // A length no expression spells (`makeArrayN`) is the number in `bits`.
+                out.append(t.length < 0 ? format("{}", t.bits) : self.lengthText(t.length))
                 out.append("]")
                 return out
             }

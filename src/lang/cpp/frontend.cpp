@@ -146,6 +146,15 @@ Program parseSource(const SourceManager& sources, FileId file, const BuildConfig
     return parseSource(sources, file, config, diagnostics, macros);
 }
 
+XlcParseResult parseSourceFlat(const SourceManager& sources, FileId file, const BuildConfig& config,
+                               DiagnosticEngine& diagnostics) {
+    const std::map<std::string, ConfigValue> resolved = config.resolved();
+    const std::vector<XlcDefine> defines = flatDefines(resolved);
+    return xlcFrontendParse(sources.handle(), file, defines.data(),
+                            static_cast<std::uint32_t>(defines.size()), nullptr, 0,
+                            diagnostics.handle());
+}
+
 Program parseFile(const SourceManager& sources, FileId file, DiagnosticEngine& diagnostics) {
     BuildConfig config;
     return parseSource(sources, file, config, diagnostics);

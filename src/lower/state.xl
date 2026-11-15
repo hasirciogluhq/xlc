@@ -141,7 +141,11 @@ export class Lowerer {
     extraEntries: Vec<*ScopeEntry>
     starImport: bool
 
+    // The configuration: `--safety=checked` (the default) emits the bounds checks.
+    checkedSafety: bool
+
     // The function under construction.
+    fnRetTy: i32   ///< Types index of the return type (void when none)
     fnName: String
     fnSymbol: String
     fnRet: String
@@ -161,6 +165,9 @@ export class Lowerer {
     // The function keys already handed out (E0401 for a duplicate signature).
     fnKeys: Vec<String>
 
+    // The type texts the HIR records borrow (see `keep`).
+    keptTexts: Vec<*String>
+
     // The current class when a method body is lowered ("" for a free function).
     currentClass: String
     selfLocal: u32
@@ -176,6 +183,8 @@ export class Lowerer {
         self.extraNames = Vec<String>()
         self.extraEntries = Vec<*ScopeEntry>()
         self.starImport = false
+        self.checkedSafety = true
+        self.fnRetTy = -1
         self.fnName = String("")
         self.fnSymbol = String("")
         self.fnRet = String("void")
@@ -188,6 +197,7 @@ export class Lowerer {
         self.needsDropValue = Vec<bool>()
         self.prelude = Vec<i32>()
         self.fnKeys = Vec<String>()
+        self.keptTexts = Vec<*String>()
         self.currentClass = String("")
         self.selfLocal = 0
         self.hasSelf = false
@@ -200,15 +210,11 @@ export class Lowerer {
         return self.s.types.text(idx)
     }
 
-    /// The type name attached to an expression record. The flat AST carries a type index only on
-    /// a few forms; the lowering pass currently passes the declared type when available and an
-    /// empty string otherwise, pending per-expression type inference in the xl sema.
-    fn exprTypeName(self, idx: i32) -> str {
-        local e = self.s.exprAt(idx)
-        if (*e).typeIdx >= 0 {
-            return self.typeName((*e).typeIdx).asStr()
-        }
-        return ""
+    /// Keeps a type text alive for the rest of the lowering and returns a view of it. The HIR
+    /// records borrow these views, so the text must outlive the expression that named it.
+    fn keep(self, text: str) -> str {
+        self.keptTexts.push(new String(text))
+        return (*self.keptTexts.get(self.keptTexts.length() - 1)).asStr()
     }
 
     /// The ConstValue index of a `define` constant by name, or -1.
@@ -285,7 +291,7 @@ export class Lowerer {
             local item = i as i32
             local declIdx = self.s.declOfItem(item)
             if declIdx < 0 { continue }
-            local d = self.s.declOf(declIdx)
+            local d = self.s.declAt(declIdx as usize)
             if (*d).kind == 10 { // import: handled through the bindings below
                 continue
             }
