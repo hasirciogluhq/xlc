@@ -158,6 +158,7 @@ export struct XlcHirStmt {
 @repr(c)
 export struct XlcHirFunction {
     name: XlcHirStr
+    module: XlcHirStr  ///< the defining module's key ("" for the root)
     symbol: XlcHirStr
     ret: XlcHirStr
     locals: *XlcHirLocal
@@ -170,6 +171,8 @@ export struct XlcHirFunction {
     hasBody: i32
     exported: i32
     exportC: i32
+    declared: i32
+    importLibrary: XlcHirStr  ///< `@library("name")` on a `declare fn`, empty otherwise
     registered: i32
     isEntry: i32
     isInit: i32
@@ -180,6 +183,8 @@ export struct XlcHirFunction {
 @repr(c)
 export struct XlcHirGlobal {
     name: XlcHirStr
+    module: XlcHirStr
+    symbol: XlcHirStr
     typeName: XlcHirStr
     init: i32
     constant: i32
@@ -226,6 +231,7 @@ export struct XlcHirAggregate {
     isClass: i32
     isUnion: i32
     opaque: i32
+    reprC: i32
 }
 
 /// One method of an interface; the parameter types are a range in `strings`.

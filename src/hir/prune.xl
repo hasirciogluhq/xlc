@@ -41,11 +41,20 @@ fn entryCmp(a: *NameEntry, b: *NameEntry) -> i32 {
     return compare(a.name, b.name)
 }
 
-/// Binary search for `name`; -1 when absent. TEMP: linear scan to isolate the lookup.
+/// Binary search over the sorted entries for `name`; -1 when absent.
 fn lookupName(entries: *Vec<NameEntry>, name: str) -> i32 {
-    for i in 0..entries.length() {
-        if eq(entries.get(i).name, name) {
-            return entries.get(i).idx as i32
+    local lo: usize = 0
+    local hi: usize = entries.length()
+    while lo < hi {
+        local mid = lo + (hi - lo) / 2
+        local c = compare(entries.get(mid).name, name)
+        if c == 0 {
+            return entries.get(mid).idx as i32
+        }
+        if c < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
         }
     }
     return -1

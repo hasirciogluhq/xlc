@@ -1,6 +1,7 @@
 // The boundary between the CLI written in xlang and the C++ backend: the flat structs of
-// include/xlang/backend_c.h mirrored field for field, the `declare fn` bindings, and the helpers
-// that turn `String`s into boundary strings and back.
+// include/xlang/backend_c.h mirrored field for field, the `declare fn` bindings of the session
+// (include/xlang/backend_c.h), and the helpers that turn strings into boundary strings and back.
+// The code generation bindings are in src/codegen/llvm.xl (include/xlang/codegen/codegen_c.h).
 from "std" import String, Vec
 from "std/str" import fromParts
 
@@ -16,6 +17,23 @@ export struct XlcStr {
 export struct XlcStrList {
     items: *XlcStr
     count: u32
+}
+
+/// A list of indices (functions, globals or modules). Matches `XlcIndexList`.
+@repr(c)
+export struct XlcIndexList {
+    items: *u32
+    count: u32
+}
+
+/// A source span. Matches `XlcSpan`, the layout of `xlang::Span`.
+@repr(c)
+export struct XlcSpan {
+    file: u32
+    line: u32
+    column: u32
+    endLine: u32
+    endColumn: u32
 }
 
 /// The command-line configuration, already parsed into values. Field order and types match
@@ -44,39 +62,21 @@ export struct XlcConfig {
     crt: i32
 }
 
-/// What code generation writes and where. Field order and types match `XlcEmitRequest`.
-@repr(c)
-export struct XlcEmitRequest {
-    root: XlcStr
-    output: XlcStr
-    emit: XlcStr
-    incremental: i32
-    cacheDir: XlcStr
-    hasInputs: i32
-}
-
-/// One `@library` import. Matches `XlcImport`.
-@repr(c)
-export struct XlcImport {
-    library: XlcStr
-    symbol: XlcStr
-}
-
-/// The objects to archive or link. Matches `XlcEmitResult`; the strings live in the session.
-@repr(c)
-export struct XlcEmitResult {
-    objects: XlcStrList
-    imports: *XlcImport
-    importCount: u32
-    temporary: i32
-}
-
 /// The resolved target. Matches `XlcTarget`; the strings live in the session.
 @repr(c)
 export struct XlcTarget {
     triple: XlcStr
     os: XlcStr
     arch: XlcStr
+}
+
+/// One source module of the compilation, in dependency order. Matches `XlcModule`.
+@repr(c)
+export struct XlcModule {
+    key: XlcStr
+    text: XlcStr
+    registered: i32
+    deps: XlcIndexList
 }
 
 /// The opaque backend session, behind `xlcSessionNew`/`xlcSessionFree`.
@@ -117,11 +117,21 @@ export declare fn xlcSessionDumpLayout(session: *XlcSession, typeName: XlcStr, r
 @allow(W0301)
 export declare fn xlcSessionTarget(session: *XlcSession, target: *XlcTarget)
 @allow(W0301)
+export declare fn xlcSessionOptLevel(session: *XlcSession) -> i32
+@allow(W0301)
 export declare fn xlcSessionHirModule(session: *XlcSession) -> *void
 @allow(W0301)
-export declare fn xlcLlvmEmit(session: *XlcSession, request: *XlcEmitRequest, result: *XlcEmitResult) -> i32
+export declare fn xlcSessionKeep(session: *XlcSession, functions: XlcIndexList, globals: XlcIndexList)
 @allow(W0301)
-export declare fn xlcArchive(objects: XlcStrList, output: XlcStr, os: XlcStr) -> i32
+export declare fn xlcSessionSizeOf(session: *XlcSession, name: XlcStr, size: *i64) -> i32
+@allow(W0301)
+export declare fn xlcSessionModuleCount(session: *XlcSession) -> u32
+@allow(W0301)
+export declare fn xlcSessionModule(session: *XlcSession, index: u32, module: *XlcModule) -> i32
+@allow(W0301)
+export declare fn xlcSessionConfigKey(session: *XlcSession, emit: XlcStr, key: *XlcStr)
+@allow(W0301)
+export declare fn xlcSessionDiagnose(session: *XlcSession, code: XlcStr, span: *XlcSpan, message: XlcStr, hint: XlcStr)
 @allow(W0301)
 export declare fn xlcSessionHasErrors(session: *XlcSession) -> i32
 @allow(W0301)
@@ -143,6 +153,19 @@ export fn xstr(s: *String) -> XlcStr {
         return XlcStr { bytes: &kEmptyByte, len: 0 }
     }
     return XlcStr { bytes: s.ptr, len: s.len as u32 }
+}
+
+/// `str` -> boundary string. The bytes stay alive as long as the view does.
+export fn strOf(s: str) -> XlcStr {
+    if s.len == 0 {
+        return XlcStr { bytes: &kEmptyByte, len: 0 }
+    }
+    return XlcStr { bytes: s.ptr, len: s.len as u32 }
+}
+
+/// Boundary string -> a `str` view. The bytes stay alive for the one call that uses it.
+export fn xview(s: XlcStr) -> str {
+    return fromParts(s.bytes, s.len as usize)
 }
 
 /// Boundary string -> an owned `String` copy.

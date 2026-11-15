@@ -151,7 +151,7 @@ local xlc_modules = {
     {"xlc-mir",      {"src/mir/**.cpp"}},
     {"xlc-codegen",  {"src/codegen/**.cpp"}},
     {"xlc-analysis", {"src/analysis/**.cpp"}},
-    {"xlc-cli",      {"src/cli/emit.cpp", "src/driver/**.cpp"}},
+    {"xlc-cli",      {"src/driver/**.cpp"}},
     {"xlc-backend",  {"src/backend/**.cpp"}},
 }
 

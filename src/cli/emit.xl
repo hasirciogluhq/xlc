@@ -1,24 +1,34 @@
-// The output step of the CLI: where the output goes, code generation, then the archive
-// (`xlcArchive`, LLVM's writer) or the link (src/driver/link.xl) of the objects it produced.
+// The output step of the CLI: where the output goes, the program pruned and checked, the header or
+// the code generated, then the archive (src/codegen/llvm.xl, LLVM's writer) or the link
+// (src/driver/link.xl) of the objects it produced.
 //
 // The backend choice by target happens here, before any codegen runs: `--backend=native` with
-// arm64-apple-macos and `--emit=obj` goes to the native backend (src/codegen/native, pure
-// xlang, no LLVM call); everything else goes through the LLVM codegen C API (`xlcLlvmEmit`).
+// arm64-apple-macos and `--emit=obj` goes to the native backend (src/codegen/native, pure xlang,
+// no LLVM call); everything else goes through the LLVM codegen (src/codegen/llvm.xl).
 //
-//   obj, ir, bc, header   written by the backend straight to the output (`-o -` streams)
-//   exe, shared           linked from the backend's objects plus the prebuilt inputs
-//   static                archived from the backend's objects
+//   header                 written from the flat HIR (src/codegen/header.xl) to the output (`-o -` streams)
+//   obj, ir, bc            written by the code generator straight to the output (`-o -` streams)
+//   exe, shared            linked from the code generator's objects plus the prebuilt inputs
+//   static                 archived from the code generator's objects
 //
-// Without `--incremental` the backend writes one scratch object next to the output (same
+// Without `--incremental` the code generator writes one scratch object next to the output (same
 // directory, so the same file system and permissions), removed here whether or not the link
-// succeeds; `--incremental` objects live in the cache and stay.
+// succeeds; `--incremental` objects live in the cache and stay (src/cli/incremental.xl).
 from "std" import String, Vec, format
 from "std/io" import fprint
 from "std/io/files" import removeFile
-from "backend" import XlcSession, XlcEmitRequest, XlcEmitResult, XlcTarget, XlcStr, xlcSessionTarget, xlcSessionHirModule, xlcLlvmEmit,
-                      xlcSessionHasErrors, xlcArchive, xstr, xlist, ownedOf
-from "../driver/link" import LinkRequest, Import, link
+from "std/io/fs" import fsWrite
+from "std/str" import toUpperAscii
+from "backend" import XlcSession, XlcTarget, xlcSessionTarget, xlcSessionHirModule, xlcSessionHasErrors, xlcSessionOptLevel, ownedOf, xstr
+from "path" import stemOf, fileNameOf, dirOf
+from "entry" import checkEntry
+from "program" import pruneProgram, addLinkImports
+from "incremental" import emitIncremental
+from "../driver/link" import LinkRequest, link
 from "../codegen/native" import emitNativeObj
+from "../codegen/llvm" import generate, writeArtifact, releaseArtifact, archive
+from "../codegen/header" import headerText
+from "../hir/flatten" import Flat, flattenModule
 
 /// Everything the output step needs from the command line.
 export class EmitPlan {
@@ -38,24 +48,11 @@ export class EmitPlan {
     }
 }
 
-/// The index of the last path separator in `path`, or -1: `/` everywhere, `\` too on Windows.
-fn lastSeparator(path: *String) -> i64 {
-    local at = path.findLast("/")
-#if os == "windows"
-    local back = path.findLast("\\")
-    at = back > at ? back : at
-#endif
-    return at
-}
-
 /// The default output: next to the input, named after it (`main.xl` -> `main`, `main.exe`,
 /// `libmain.a`, `main.dll`, ...).
 export fn defaultOutput(root: *String, emit: *String, os: *String) -> String {
-    local cut = lastSeparator(root)
-    local dir = cut < 0 ? String() : root.slice(0, cut as usize + 1)
-    local name = cut < 0 ? root.clone() : root.slice(cut as usize + 1, root.length() - cut as usize - 1)
-    local dot = name.findLast(".")
-    local stem = dot > 0 ? name.slice(0, dot as usize) : name.clone()
+    local dir = dirOf(root.asStr())
+    local stem = stemOf(root.asStr())
     local windows = os.asStr() == "windows"
     local kind = emit.asStr()
     // (prefix, suffix) around the stem; the last row is `shared`.
@@ -80,6 +77,7 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
     local os = ownedOf(target.os)
     local arch = ownedOf(target.arch)
     local output = plan.output.length() > 0 ? plan.output.clone() : defaultOutput(&plan.root, &plan.emit, &os)
+    local windows = os.asStr() == "windows"
 
     // The backend choice by target: `--backend=native` runs our arm64/Mach-O codegen, but only
     // where it applies (macOS on arm64); everything else stays with LLVM.
@@ -96,44 +94,101 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
         return emitNativeObj(xlcSessionHirModule(session), &output)
     }
 
-    local req: XlcEmitRequest
-    req.root = xstr(&plan.root)
-    req.output = xstr(&output)
-    req.emit = xstr(&plan.emit)
-    req.incremental = plan.incremental ? 1 : 0
-    req.cacheDir = xstr(&plan.cacheDir)
-    req.hasInputs = plan.inputs.length() > 0 ? 1 : 0
-    local result: XlcEmitResult
-    if xlcLlvmEmit(session, &req, &result) != 0 || xlcSessionHasErrors(session) != 0 {
+    // Plan 24: only what the roots reach is code-generated and linked; the flat module below is
+    // read after that prune, so it describes exactly what is generated.
+    pruneProgram(session, plan.emit.asStr(), plan.inputs.length() > 0)
+    local f = Flat()
+    flattenModule(&f, xlcSessionHirModule(session))
+
+    local rootName = fileNameOf(plan.root.asStr())
+    local stem = stemOf(plan.root.asStr())
+    if !checkEntry(session, &f.m, plan.emit.asStr(), rootName.asStr(), os.asStr(), plan.crt) {
         return false
     }
-    if result.objects.count == 0 {
-        return true  // obj, ir, bc, header: written in place
+
+    if plan.emit.asStr() == "header" {
+        local guard = toUpperAscii(format("XLANG_{}_H", stem.asStr()).asStr())
+        local text = headerText(session, &f.m, guard.asStr())
+        if output.asStr() == "-" { // `-o -` streams, like the LLVM writers of ir, bc and obj
+            fprint(1, text.asStr())
+            return true
+        }
+        if !fsWrite(output.cstr(), text.asStr()) {
+            fprint(2, format("error: cannot write `{}`\n", output.asStr()).asStr())
+            return false
+        }
+        return true
     }
 
+    local emit = plan.emit.asStr()
+    local linked = emit == "exe" || emit == "static" || emit == "shared"
+    local optLevel = xlcSessionOptLevel(session)
     local objects = Vec<String>()
-    for i in 0..result.objects.count as usize { objects.push(ownedOf(result.objects.items[i])) }
+    local temporary = false
+    local none = String()
+
+    if !linked {
+        // obj, ir, bc: written in place.
+        local artifact = generate(session, &stem, &plan.emit, false, &none)
+        if artifact == nil {
+            return false
+        }
+        local ok = writeArtifact(artifact, optLevel, emit, &output)
+        releaseArtifact(artifact)
+        return ok
+    }
+
+    if plan.incremental {
+        if !emitIncremental(session, &f.m, &plan.emit, &stem, &output, &plan.cacheDir, windows, &objects) {
+            return false
+        }
+    } else {
+        // The intermediate object sits next to the output (same directory, so the same permissions
+        // and file system); the CLI removes it whether or not the link succeeds.
+        local artifact = generate(session, &stem, &plan.emit, false, &none)
+        if artifact == nil {
+            return false
+        }
+        local obj = output.clone()
+        obj.append(windows ? ".tmp.obj" : ".tmp.o")
+        local ok = writeArtifact(artifact, optLevel, "obj", &obj)
+        releaseArtifact(artifact)
+        if !ok {
+            return false
+        }
+        objects.push(obj)
+        temporary = true
+    }
+    if xlcSessionHasErrors(session) != 0 {
+        return false
+    }
+
     local ok = false
-    if plan.emit.asStr() == "static" {
-        local arena = Vec<XlcStr>()
-        ok = xlcArchive(xlist(&objects, &arena), xstr(&output), target.os) == 0
+    if emit == "static" {
+        ok = archive(&objects, &output, target.os)
     } else {
         local r = LinkRequest()
-        for o in objects { r.objects.push(o.clone()) }
-        for o in plan.inputs { r.objects.push(o.clone()) }
+        for i in 0..objects.length() {
+            r.objects.push(objects.get(i).clone())
+        }
+        for o in plan.inputs {
+            r.objects.push(o.clone())
+        }
         r.output = output.clone()
-        r.shared = plan.emit.asStr() == "shared"
+        r.shared = emit == "shared"
         r.crt = plan.crt
         r.os = os.clone()
         r.arch = ownedOf(target.arch)
-        for i in 0..result.importCount as usize {
-            r.imports.push(Import(ownedOf(result.imports[i].library), ownedOf(result.imports[i].symbol)))
+        addLinkImports(&f.m, &r)
+        for a in plan.linkArgs {
+            r.extraArgs.push(a.clone())
         }
-        for a in plan.linkArgs { r.extraArgs.push(a.clone()) }
         ok = link(&r)
     }
-    if result.temporary != 0 {
-        for o in objects { removeFile(o) }
+    if temporary {
+        for i in 0..objects.length() {
+            removeFile(objects.get(i))
+        }
     }
     return ok
 }

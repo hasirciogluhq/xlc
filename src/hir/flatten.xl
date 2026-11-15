@@ -77,6 +77,7 @@ const XS_DEPTH: usize = 124
 // ---- offsets: hir::Function (sizeof 432) -------------------------------------------------------
 
 const XF_NAME: usize = 0
+const XF_MODULE: usize = 24
 const XF_SYMBOL: usize = 48
 const XF_LOCALS: usize = 96
 const XF_PARAM_COUNT: usize = 120
@@ -86,6 +87,8 @@ const XF_UNWIND_BODY: usize = 312
 const XF_HAS_BODY: usize = 337
 const XF_EXPORTED: usize = 338
 const XF_EXPORT_C: usize = 339
+const XF_DECLARED: usize = 340
+const XF_IMPORT_LIBRARY: usize = 344
 const XF_REGISTERED: usize = 368
 const XF_IS_INIT: usize = 400
 const XF_IS_FINI: usize = 401
@@ -95,6 +98,8 @@ const XF_SPAN: usize = 408
 // ---- offsets: hir::Global (sizeof 296), Local (208), FieldInit (40), AsmOperand (40) -----------
 
 const XG_NAME: usize = 0
+const XG_MODULE: usize = 24
+const XG_SYMBOL: usize = 48
 const XG_TYPE: usize = 72
 const XG_INIT: usize = 232
 const XG_CONSTANT: usize = 240
@@ -118,6 +123,7 @@ const XAO_VALUE: usize = 32
 
 const XAG_NAME: usize = 0
 const XAG_VTABLE: usize = 24
+const XAG_REPR_C: usize = 48
 const XAG_IS_CLASS: usize = 49
 const XAG_BASE: usize = 56
 const XAG_FIELDS: usize = 80
@@ -721,7 +727,10 @@ fn functionNode(f: *Flat, raw: *void, locals: (u32, u32)) {
 
     local fu: XlcHirFunction
     fu.name = cxxStr(raw)
+    fu.module = cxxStr((raw as usize + XF_MODULE) as *void)
     fu.symbol = cxxStr((raw as usize + XF_SYMBOL) as *void)
+    fu.declared = rdU8(raw, XF_DECLARED) != 0 ? 1 : 0
+    fu.importLibrary = cxxStr((raw as usize + XF_IMPORT_LIBRARY) as *void)
     fu.ret = typeSpelling(f, (raw as usize + XF_RET) as *void)
     fu.locals = (f.locals.data as usize + locals.0 as usize * sizeOf(XlcHirLocal)) as *XlcHirLocal
     fu.localCount = locals.1
@@ -746,6 +755,8 @@ fn globalNode(f: *Flat, raw: *void) {
     local initRaw = rdPtr(raw, XG_INIT)
     local g: XlcHirGlobal
     g.name = cxxStr(raw)
+    g.module = cxxStr((raw as usize + XG_MODULE) as *void)
+    g.symbol = cxxStr((raw as usize + XG_SYMBOL) as *void)
     g.typeName = typeSpelling(f, (raw as usize + XG_TYPE) as *void)
     g.init = initRaw != 0 ? exprNode(f, initRaw as *void) : -1
     g.constant = rdU8(raw, XG_CONSTANT) != 0 ? 1 : 0
@@ -815,6 +826,7 @@ fn aggregateNode(f: *Flat, raw: *void, parts: (u32, u32, u32, u32)) {
     a.isClass = rdU8(raw, XAG_IS_CLASS) != 0 ? 1 : 0
     a.isUnion = rdU8(raw, XAG_IS_UNION) != 0 ? 1 : 0
     a.opaque = rdU8(raw, XAG_OPAQUE) != 0 ? 1 : 0
+    a.reprC = rdU8(raw, XAG_REPR_C) != 0 ? 1 : 0
     f.aggregates.push(a)
 }
 
