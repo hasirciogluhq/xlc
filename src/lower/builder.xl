@@ -317,8 +317,14 @@ export class HirBuilder {
         return idx
     }
 
+    /// `(a, b, ...)`: the tuple record over the same argument list an array literal uses.
     fn tupleLit(self, list: Vec<i32>, typeName: str) -> i32 {
-        return self.arrayList(list, typeName)
+        local range = self.args(list)
+        local idx = self.expr(E_TUPLE_LIT, typeName)
+        local e = self.exprAt(idx)
+        (*e).argFirst = range.0
+        (*e).argCount = range.1
+        return idx
     }
 
     fn structLit(self, inits: Vec<i32>, typeName: str) -> i32 {

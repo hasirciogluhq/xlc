@@ -329,6 +329,7 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
     /// A `let`: the local, its optional initializer and the binding.
 export fn lowerLet(l: *Lowerer, idx: i32) -> i32 {
         local st = l.s.stmtAt(idx)
+        if (*st).namesCount > 0 { return lowerTupleLocal(l, idx) }
         local name = l.s.stmtTextAt(idx)
         // The declared type, resolved; without one, the type of the initializer.
         local declared = -1
@@ -350,6 +351,51 @@ export fn lowerLet(l: *Lowerer, idx: i32) -> i32 {
         (*e).localId = id
         l.scopes.declare(e)
         return l.b.localStmt(id, name, tyName, value)
+    }
+
+/// `local (a, b) = expr` (C++ stmt/tuple.cpp): the tuple is held once in the hidden local `$tupleN`
+/// and each name is a local that reads its element. The hold and every name but the last go to
+/// `emitted` (before the statement); the last name's local is the statement returned.
+fn lowerTupleLocal(l: *Lowerer, idx: i32) -> i32 {
+        local st = l.s.stmtAt(idx)
+        if (*st).expr < 0 {
+            l.err("E0708", (*st).span, "a tuple target needs an initializer", "write `local (a, b) = expr`")
+            return -1
+        }
+        local value = lowerExprWant(l, (*st).expr, -1)
+        local tupleTy = exprType(l, (*st).expr)
+        if value < 0 || tupleTy < 0 { return -1 }
+        if l.s.types.get(tupleTy).kind != T_TUPLE {
+            local shown = l.s.types.text(tupleTy)
+            l.err("E0708", (*l.s.exprAt((*st).expr)).span,
+                format("cannot take `{}` apart: it is not a tuple", shown.asStr()).asStr(),
+                "a tuple target needs a tuple value on the right")
+            return -1
+        }
+        local count = l.s.types.get(tupleTy).argsCount
+        if count != (*st).namesCount {
+            l.err("E0708", (*st).span,
+                format("the tuple target names {} variable(s), the value has {}", (*st).namesCount, count).asStr(),
+                "write one name per tuple element")
+            return -1
+        }
+        local tupleName = typeNameOf(l, tupleTy)
+        local hold = hiddenLocal(l, "tuple", tupleName)
+        local holdName = format("$tuple{}", l.hiddenCount - 1)
+        l.emitted.push(l.b.localStmt(hold, holdName.asStr(), tupleName, value))
+        local last = -1
+        for i in 0..(*st).namesCount as usize {
+            local name = l.s.flat.strOf(l.s.flat.pathSeg((*st).namesFirst + i as u32))
+            local elemTy = (l.s.types.get(tupleTy).argsFirst + i as u32) as i32
+            local elemName = typeNameOf(l, elemTy)
+            local field = l.b.field(l.b.localRef(hold, tupleName), "", elemName, false, i as u32)
+            local id = addLocal(l, name, elemName)
+            local decl = l.b.localStmt(id, name, elemName, field)
+            bindLocal(l, name, id, elemTy)
+            if last >= 0 { l.emitted.push(last) }
+            last = decl
+        }
+        return last
     }
 
     /// Lowers one expression and returns its HIR index, or -1.
