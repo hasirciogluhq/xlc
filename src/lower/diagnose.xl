@@ -8,11 +8,32 @@
 // returns true and reports nothing: those forms are not checked here.
 from "std" import String, format
 from "../lang/ast/ast" import XExpr, XSpan
-from "../sema/types" import Types, T_VOID, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ARRAY,
-    T_ENUM, T_STRUCT, T_CLASS, T_INTERFACE, T_STR, T_SLICE, T_TUPLE
+from "../sema/types" import Types, T_VOID, T_NEVER, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR,
+    T_ARRAY, T_ENUM, T_STRUCT, T_CLASS, T_INTERFACE, T_STR, T_SLICE, T_TUPLE
 from "../sema/conversion" import implicitConversion, C_OK, C_WARN, C_SIGNEDNESS, C_NEEDS_CAST
 from "./state" import Lowerer
 from "./typing" import exprType, typeNameOf, fieldPos, aggregateDecl
+from "../sema/layout_calc" import attrHasIdent
+
+/// Whether C can express the type `t` (C++ Lowerer::cCompatible): void, bool, integers, floats,
+/// pointers and function pointers, an integer enum, and a struct marked `@repr(c)`. A type that is
+/// not known (-1) is not expressible.
+export fn cCompatible(l: *Lowerer, t: i32) -> bool {
+    if t < 0 { return false }
+    local k = l.s.types.get(t).kind
+    if k == T_VOID || k == T_NEVER || k == T_BOOL || k == T_INT || k == T_FLOAT || k == T_FN_PTR || k == T_POINTER {
+        return true
+    }
+    if k == T_ENUM {
+        local under = l.s.types.get(t).elem
+        return under >= 0 && l.s.types.get(under).kind == T_INT
+    }
+    if k == T_STRUCT {
+        local decl = aggregateDecl(l, t)
+        return decl != nil && attrHasIdent(l.s, (*decl).attrsFirst, (*decl).attrsCount, "repr", "c")
+    }
+    return false
+}
 
 /// The spelling of a type, as the diagnostics quote it (the C++ `typeToString`).
 fn tname(l: *Lowerer, t: i32) -> String {

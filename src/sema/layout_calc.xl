@@ -214,7 +214,7 @@ export fn layoutOfName(s: *Sema, name: str, at: XSpan) -> i32 {
 }
 
 /// True when the attribute list has `name` with the identifier argument `text`.
-fn attrHasIdent(s: *Sema, first: u32, count: u32, name: str, text: str) -> bool {
+export fn attrHasIdent(s: *Sema, first: u32, count: u32, name: str, text: str) -> bool {
     local a = s.findAttr(first, count, name)
     if a < 0 { return false }
     local attr = s.flat.attrAt(a)

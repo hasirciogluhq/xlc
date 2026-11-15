@@ -161,6 +161,9 @@ const Sample kRemainingSamples[] = {
     {"array-len-through-pointer", "fn f(p: *[i32; 3]) -> usize {\n    return p.len\n}\n"},
     {"unsafe-signedness",
      "fn f(a: i32) -> i32 {\n    unsafe {\n        local r: u32 = a\n    }\n    return 0\n}\n"},
+    {"export-c-fn", "export(c) fn add(a: i32, b: i32) -> i32 {\n    return a + b\n}\n"},
+    {"export-c-repr-struct-pointer",
+     "@repr(c)\nstruct P { x: i32, y: i32 }\nexport(c) fn sum(p: *P) -> i32 {\n    return p.x + p.y\n}\n"},
     {"global-aggregate",
      "struct P { x: i32, y: i32 }\nglobal origin: P = P { x: 1, y: 2 }\nfn f() -> i32 {\n    return origin.x\n}\n"},
     {"global-array", "global table: [i32; 3] = [1, 2, 3]\nfn f() -> i32 {\n    return table[1]\n}\n"},
@@ -179,6 +182,11 @@ const Sample kRemainingSamples[] = {
 };
 
 const Sample kRemainingDiagnostics[] = {
+    {"err-export-c-str", "export(c) fn f(s: str) -> i32 {\n    return 0\n}\n"},
+    {"err-export-c-struct-value",
+     "struct P { x: i32 }\nexport(c) fn f(p: P) -> i32 {\n    return p.x\n}\n"},
+    {"err-declare-str", "declare fn ext(s: str) -> i32\n"},
+    {"err-reserved-symbol", "fn _start() {\n}\n"},
     {"err-global-call",
      "fn g() -> i32 {\n    return 1\n}\nglobal v: i32 = g()\nfn f() -> i32 {\n    return v\n}\n"},
     {"err-global-reads-global",

@@ -18,7 +18,9 @@ from "./helpers" import baseInitKey, overloadKey
 export fn lowerItemsTouch() { return }
 from "./function" import lowerFunction, lowerFunctionDecl, lowerExprAs, lowerExprWant
 from "./queries" import enumMemberValue, isConstValue
-from "./typing" import exprTypeName
+from "./typing" import exprType, exprTypeName
+from "./diagnose" import cCompatible
+from "./overload" import declParamTypes, declRetType
 from "./instances" import lowerPendingInstances, lowerImpls
 
 /// The declaration kinds of the flat AST (mirrored here for the dispatch).
@@ -151,6 +153,16 @@ export fn lowerGlobal(l: *Lowerer, item: i32, declIdx: i32) {
             l.err("E0715", (*l.s.exprAt(init)).span, "untyped `const` needs a literal value",
                 "write its type: `const NAME: T = ...`")
         }
+        // An `export(c)` global holds a type C can express (E0302), checked before its initializer.
+        if (*it).exportC != 0 {
+            local gty = hasType ? resolve(l.s, (*d).ty) : (init >= 0 ? exprType(l, init) : -1)
+            if !cCompatible(l, gty) {
+                local shown = gty >= 0 ? l.s.types.text(gty) : String("?")
+                l.err("E0302", (*d).nameSpan,
+                    format("`{}` has a type that C cannot express", shown.asStr()).asStr(),
+                    "`export(c)` needs C-compatible types (integers, floats, bool, pointers, `@repr(c)` structs)")
+            }
+        }
         local value = -1
         local tyText: String
         if hasType {
@@ -205,6 +217,27 @@ export fn lowerTopFn(l: *Lowerer, item: i32, declIdx: i32) {
                 format("`{}` is defined twice", overloadKey(l.s.text((*d).name), &params).asStr()).asStr(),
                 "give the overloads different parameter types")
             return
+        }
+        // The C convention of an `export(c)` or `declare` function: every type of its signature must
+        // be one C can express (E0302), and its symbol must not be one the compiler generates (E0726).
+        if (*it).exportC != 0 || (*it).declared != 0 {
+            local ok = cCompatible(l, declRetType(l.s, d))
+            local ps = declParamTypes(l.s, d)
+            for i in 0..ps.length() {
+                ok = ok && cCompatible(l, *ps.get(i))
+            }
+            if !ok {
+                local what = (*it).exportC != 0 ? "export(c)" : "declare"
+                l.err("E0302", (*d).nameSpan,
+                    format("`{}` signature uses a type that C cannot express", what).asStr(),
+                    "integers, floats, bool, pointers, function pointers, `@repr(c)` structs and integer enums only")
+            }
+        }
+        local symbol = l.s.linkName(item, l.s.text((*d).name), declParamTypes(l.s, d), overloaded)
+        if symbol.asStr() == "_start" || symbol.asStr() == "mainCRTStartup" || symbol.asStr() == "_xl_initAll" {
+            l.err("E0726", (*d).nameSpan,
+                format("symbol `{}` is reserved for the compiler's entry point", symbol.asStr()).asStr(),
+                "rename it: the compiler generates this symbol to start the program")
         }
         l.fnKeys.push(key.clone())
         lowerFunction(l, item, declIdx, key.asStr(), l.s.text((*d).name), "")
