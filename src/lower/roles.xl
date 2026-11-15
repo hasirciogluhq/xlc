@@ -9,9 +9,9 @@ from "../sema/sema" import Sema
 from "../sema/item" import SDecl
 from "../sema/types" import Types, T_VOID, T_NEVER, T_INT, T_POINTER
 from "../util/source" import Span
-from "../util/diagnostics" import Diagnostic, Label, SEV_ERROR
 from "./state" import Lowerer
 from "./overload" import declParamTypes, declRetType
+from "./diagnose" import reportTwoSites
 
 /// The kind of a type index, -1 for an unknown one.
 fn kindAt(t: *Types, idx: i32) -> i32 {
@@ -83,17 +83,9 @@ fn roleNeeds(role: str) -> String {
 
 /// E0502 with both registrations marked: the second one is reported, the first one is kept.
 fn reportTwice(l: *Lowerer, role: str, first: Span, second: Span) {
-    local diag = l.s.diag
-    local d: Diagnostic
-    d.code = diag.txt("E0502")
-    d.severity = SEV_ERROR
-    d.message = diag.txt(format("role `{}` is registered twice", role).asStr())
-    d.labelsFirst = diag.labels.length() as i32
-    diag.labels.push(Label { span: first, text: diag.txt("first registration") })
-    diag.labels.push(Label { span: second, text: diag.txt("second registration") })
-    d.labelsCount = 2
-    d.fix = diag.txt("keep one registration per role in your program; a library default is replaced by registering the role in your own code")
-    diag.report(d)
+    reportTwoSites(l, "E0502", format("role `{}` is registered twice", role).asStr(), first,
+        "first registration", second, "second registration",
+        "keep one registration per role in your program; a library default is replaced by registering the role in your own code")
 }
 
 /// The role registrations of the module, in item order. A registration that does not fit its role

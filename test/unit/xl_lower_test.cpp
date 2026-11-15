@@ -171,6 +171,8 @@ const Sample kRemainingSamples[] = {
     {"export-c-repr-struct-pointer",
      "@repr(c)\nstruct P { x: i32, y: i32 }\nexport(c) fn sum(p: *P) -> i32 {\n    return p.x + p.y\n}\n"},
     {"local-tuple", "fn f(t: (i32, f64)) -> f64 {\n    local (a, b) = t\n    return b\n}\n"},
+    {"local-const", "fn f() -> i32 {\n    const K: i32 = 3\n    return K\n}\n"},
+    {"local-const-untyped", "fn f() -> i32 {\n    const K = 4\n    return K\n}\n"},
     {"local-tuple-call",
      "fn pair(a: i32) -> (i32, i32) {\n    return (a, 2)\n}\n"
      "fn f() -> i32 {\n    local (x, y) = pair(1)\n    return x + y\n}\n"},
@@ -197,6 +199,9 @@ const Sample kRemainingDiagnostics[] = {
      "struct P { x: i32 }\nexport(c) fn f(p: P) -> i32 {\n    return p.x\n}\n"},
     {"err-declare-str", "declare fn ext(s: str) -> i32\n"},
     {"err-reserved-symbol", "fn _start() {\n}\n"},
+    {"err-local-const-call", "fn g() -> i32 {\n    return 1\n}\nfn f() -> i32 {\n    const K = g()\n    return 0\n}\n"},
+    {"err-local-const-duplicate",
+     "fn f() -> i32 {\n    const K: i32 = 1\n    const K: i32 = 2\n    return K\n}\n"},
     {"err-tuple-not-tuple", "fn f(a: i32) -> i32 {\n    local (x, y) = a\n    return 0\n}\n"},
     {"err-tuple-count", "fn f(t: (i32, i32)) -> i32 {\n    local (x, y, z) = t\n    return 0\n}\n"},
     {"err-role-signature", "register(free) fn release(p: i32) {\n}\n"},

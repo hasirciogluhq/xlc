@@ -20,15 +20,16 @@ from "./stmt" import switchChain
 from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
-from "./builder" import FnBuild
-from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName, lowerArrayLen
+from "./builder" import FnBuild, XlcHirGlobalRec
+from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName, lowerArrayLen,
+    isConstValue
 from "./call" import lowerCall
 from "./methods" import classSelfType
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
     fieldTypeOf
 from "./diagnose" import coerceChecked, checkCast, checkIndex, checkSlice, checkDeref, checkField,
-    checkStructLit, checkDuplicateInit, knownField
+    checkStructLit, checkDuplicateInit, knownField, reportTwoSites
 from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
 from "../sema/const_eval" import evalConst
 from "../sema/const_value" import CV_INT
@@ -225,6 +226,9 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
         if (*st).kind == XS_LOCAL {
             return lowerLet(l, idx)
         }
+        if (*st).kind == XS_CONST {
+            return lowerLocalConst(l, idx)
+        }
         if (*st).kind == XS_EXPR {
             local value = lowerExpr(l, (*st).expr)
             if value < 0 { return -1 }
@@ -396,6 +400,54 @@ fn lowerTupleLocal(l: *Lowerer, idx: i32) -> i32 {
             last = decl
         }
         return last
+    }
+
+/// `const NAME = expr` or `const NAME: T = expr` in a body (C++ global.cpp, lowerLocalConst): the
+/// value becomes a private global named `fn$NAME$N` (N is the hidden counter, shared with the
+/// hidden locals) and the name is bound to it in the scope. The statement adds nothing to the block.
+fn lowerLocalConst(l: *Lowerer, idx: i32) -> i32 {
+        local st = l.s.stmtAt(idx)
+        local name = l.s.stmtTextAt(idx)
+        local t = -1
+        local value = -1
+        if (*st).hasType != 0 {
+            t = resolve(l.s, l.s.types.internAst((*st).typeIdx))
+            value = lowerExprAs(l, (*st).expr, t)
+        } else {
+            value = lowerExprWant(l, (*st).expr, -1)
+            if value >= 0 { t = exprType(l, (*st).expr) }
+        }
+        // The initializer of a `const` must be a compile-time constant (E0715); otherwise the
+        // global has no initializer.
+        if value >= 0 {
+            local off = -1
+            if !isConstValue(l, value, &off) {
+                local at = (*l.b.exprAt(off >= 0 ? off : value)).span
+                l.s.diag.error("E0715", at, "`const` initializer is not a compile-time constant",
+                    "a `const` holds literals, arithmetic on them, arrays and struct literals; it cannot call functions or read other names")
+                value = -1
+            }
+        }
+        local gname = format("{}${}${}", l.fnName.asStr(), name, l.hiddenCount)
+        l.hiddenCount = l.hiddenCount + 1
+        local rec = new XlcHirGlobalRec(gname.asStr(), typeNameOf(l, t))
+        (*rec).constant = true
+        if value >= 0 { (*rec).init = value }
+        l.b.globals.push(rec)
+        local e = new ScopeEntry()
+        (*e).kind = SE_GLOBAL
+        (*e).name = String(name)
+        (*e).ty = t
+        (*e).span = l.s.span((*st).span)
+        (*e).qname = gname.clone()
+        (*e).readonly = true
+        if !l.scopes.declare(e) {
+            local first = (*l.scopes.lookup(name)).span
+            reportTwoSites(l, "E0401", format("`{}` is defined twice in this scope", name).asStr(),
+                first, "first definition", l.s.span((*st).span), "second definition",
+                "rename one of them")
+        }
+        return -1
     }
 
     /// Lowers one expression and returns its HIR index, or -1.

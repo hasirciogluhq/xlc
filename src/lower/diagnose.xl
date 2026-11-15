@@ -14,6 +14,26 @@ from "../sema/conversion" import implicitConversion, C_OK, C_WARN, C_SIGNEDNESS,
 from "./state" import Lowerer
 from "./typing" import exprType, typeNameOf, fieldPos, aggregateDecl
 from "../sema/layout_calc" import attrHasIdent
+from "../util/source" import Span
+from "../util/diagnostics" import Diagnostic, Label, SEV_ERROR
+
+/// A diagnostic with two marked places, the C++ two-site form: `code` with `message`, the first
+/// place labelled `firstLabel` and the second `secondLabel`, and the fix `fix`. Labels go into the
+/// engine's label arena, so both are shown with the diagnostic.
+export fn reportTwoSites(l: *Lowerer, code: str, message: str, first: Span, firstLabel: str,
+        second: Span, secondLabel: str, fix: str) {
+    local diag = l.s.diag
+    local d: Diagnostic
+    d.code = diag.txt(code)
+    d.severity = SEV_ERROR
+    d.message = diag.txt(message)
+    d.labelsFirst = diag.labels.length() as i32
+    diag.labels.push(Label { span: first, text: diag.txt(firstLabel) })
+    diag.labels.push(Label { span: second, text: diag.txt(secondLabel) })
+    d.labelsCount = 2
+    d.fix = diag.txt(fix)
+    diag.report(d)
+}
 
 /// Whether C can express the type `t` (C++ Lowerer::cCompatible): void, bool, integers, floats,
 /// pointers and function pointers, an integer enum, and a struct marked `@repr(c)`. A type that is
