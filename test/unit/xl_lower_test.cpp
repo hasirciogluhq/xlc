@@ -104,6 +104,57 @@ const Sample kSamples[] = {
      "fn read(c: *Counter) -> i32 {\n    return c.get() + 1\n}\n"},
 };
 
+// Lane A (statements and items): the statement and item forms the xlang lowering ports. Kept as
+// one block so the other lanes' samples stay apart.
+const Sample kLaneASamples[] = {
+    // Statements: locals, assignments, branches and loops.
+    {"let-forms",
+     "fn f() -> i32 {\n    local a: i32\n    local b = 2\n    local c: i64 = 3\n"
+     "    local d := 4\n    return b + d\n}\n"},
+    {"return-void", "fn f(a: i32) {\n    if a > 0 {\n        return\n    }\n}\n"},
+    {"if-else", "fn sgn(a: i32) -> i32 {\n    if a > 0 {\n        return 1\n    } else {\n        return 0\n    }\n}\n"},
+    {"if-else-if",
+     "fn sgn(a: i32) -> i32 {\n    if a > 0 {\n        return 1\n    } else if a < 0 {\n"
+     "        return -1\n    } else {\n        return 0\n    }\n}\n"},
+    {"if-no-else", "fn f(a: i32) -> i32 {\n    local r = 0\n    if a > 0 {\n        r = 1\n    }\n    return r\n}\n"},
+    {"while-break-continue",
+     "fn f(n: i32) -> i32 {\n    local i = 0\n    while i < n {\n        i++\n"
+     "        if i == 2 {\n            continue\n        }\n        if i > 5 {\n            break\n        }\n"
+     "    }\n    return i\n}\n"},
+    {"do-while",
+     "fn f(n: i32) -> i32 {\n    local i = 0\n    do {\n        i += 1\n    } while i < n\n    return i\n}\n"},
+    {"for-c", "fn f(n: i32) -> i32 {\n    local s = 0\n    for local i = 0; i < n; i++ {\n        s += i\n    }\n    return s\n}\n"},
+    {"for-range", "fn f(n: i32) -> i32 {\n    local s = 0\n    for i in 0..n {\n        s += i\n    }\n    return s\n}\n"},
+    {"for-range-inclusive", "fn f(n: i32) -> i32 {\n    local s = 0\n    for i in 0..=n {\n        s += i\n    }\n    return s\n}\n"},
+    {"labeled-break",
+     "fn f(n: i32) -> i32 {\n    local s = 0\n    outer: while s < n {\n        while true {\n"
+     "            s++\n            break outer\n        }\n    }\n    return s\n}\n"},
+    {"labeled-continue",
+     "fn f(n: i32) -> i32 {\n    local s = 0\n    outer: for i in 0..n {\n        for j in 0..n {\n"
+     "            s += j\n            continue outer\n        }\n    }\n    return s\n}\n"},
+    {"switch-values",
+     "fn f(a: i32) -> i32 {\n    switch a {\n        case 1, 2 {\n            return 10\n        }\n"
+     "        case 3 {\n            return 30\n        }\n        default {\n            return 0\n        }\n    }\n}\n"},
+    {"switch-subjectless",
+     "fn f(a: i32) -> i32 {\n    switch {\n        case a > 0 {\n            return 1\n        }\n"
+     "        default {\n            return 0\n        }\n    }\n}\n"},
+    {"assignments",
+     "struct Point { x: i32, y: i32 }\n"
+     "fn set(p: *i32, q: *Point, a: []mut i32) {\n    local x = 1\n    x = 2\n    x += 3\n"
+     "    x -= 1\n    x *= 2\n    x++\n    x--\n    *p = x\n    q.x = 4\n    a[0] = 5\n}\n"},
+    {"block-statement", "fn f() -> i32 {\n    local y = 1\n    {\n        local z = y + 1\n        y = z\n    }\n    return y\n}\n"},
+    {"expression-statement", "fn g() -> i32 {\n    return 1\n}\nfn f() {\n    g()\n}\n"},
+    {"defer-call", "fn g() {\n}\nfn f() {\n    defer g()\n    g()\n}\n"},
+    {"defer-block", "fn g() {\n}\nfn f() {\n    defer {\n        g()\n    }\n    g()\n}\n"},
+    {"try-catch",
+     "register(unwind) fn unwind(op: i32, snap: *usize, msg: *u8) { }\n"
+     "fn g() {\n}\nfn f() {\n    try {\n        g()\n    } catch e {\n        g()\n    }\n}\n"},
+    // Items: globals, enums and their use.
+    {"global-variable", "global counter: i32 = 0\nfn bump() -> i32 {\n    counter += 1\n    return counter\n}\n"},
+    {"enum-plain", "enum Color {\n    Red\n    Green\n    Blue\n}\nfn pick() -> Color {\n    return Color.Green\n}\n"},
+    {"enum-valued", "enum Small: u8 {\n    A\n    B = 10\n    C\n}\nfn pick() -> Small {\n    return Small.C\n}\n"},
+};
+
 /// Samples the C++ pass rejects: the xlang pass must report the same diagnostics (codes, spans and
 /// text) and produce no dump. Each rejected statement is a `local`, not a `return`, so that the
 /// function still returns on every path (the C++ flow check adds nothing). A warning sample has a
@@ -172,10 +223,14 @@ void testSamplesMatchTheCppLowering() {
     for (const Sample& s : kSamples) {
         equal += sampleEqual(s) ? 1 : 0;
     }
+    for (const Sample& s : kLaneASamples) {
+        equal += sampleEqual(s) ? 1 : 0;
+    }
     for (const Sample& s : kDiagnosticSamples) {
         equal += sampleEqual(s) ? 1 : 0;
     }
-    const int total = static_cast<int>(std::size(kSamples) + std::size(kDiagnosticSamples));
+    const int total = static_cast<int>(std::size(kSamples) + std::size(kLaneASamples) +
+                                       std::size(kDiagnosticSamples));
     std::cout << "xlang lowering: " << equal << " of " << total
               << " samples equal the C++ pass (HIR and diagnostics)\n";
     CHECK_EQ(equal, total);

@@ -216,8 +216,10 @@ src/lang/        lexer, preprocessor, macros, parser, AST (all xlang); cpp/ hold
 src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR (C++ reference);
                  xl_bridge.cpp/.hpp is the C++ side of the xlang lowering pass
 src/lower/       the xlang lowering pass (flat HIR, written in xlang): program.xl is its entry,
-                 typing.xl the per-expression types, function.xl the expression walk,
-                 diagnose.xl the conversion, cast, index, slice, field and literal checks;
+                 typing.xl the per-expression types, function.xl the expression walk and the
+                 statement walk (loops, jumps, assignments, switch, defer, try),
+                 stmt.xl the switch if-chain builder, diagnose.xl the conversion, cast, index,
+                 slice, field and literal checks;
                  call.xl the calls (functions, overloads, methods, function values),
                  overload.xl the overload keys and the choice among candidates, methods.xl the
                  class declarations and the method lookup through base classes; the sema it runs

@@ -16,7 +16,7 @@ from "./builder" import FnBuild, EnumRec, AggrRec, IfaceRec, XlcHirGlobalRec
 from "./helpers" import baseInitKey, overloadKey
 
 export fn lowerItemsTouch() { return }
-from "./function" import lowerFunction, lowerFunctionDecl, lowerConstInit
+from "./function" import lowerFunction, lowerFunctionDecl, lowerConstInit, enumMemberValue
 from "./instances" import lowerPendingInstances, lowerImpls
 
 /// The declaration kinds of the flat AST (mirrored here for the dispatch).
@@ -84,20 +84,16 @@ export fn lowerBatch(l: *Lowerer) {
 export fn lowerEnum(l: *Lowerer, item: i32, declIdx: i32) {
         local d = l.s.declOf(item)
         checkEnum(l.s, declIdx)
-        local rec = new EnumRec(l.s.text((*d).name), "")
+        local rec = new EnumRec(l.s.text((*d).name), "i32")
         if (*d).hasUnderlying != 0 {
             (*rec).underlying = l.typeName((*d).underlying)
         }
         for i in 0..(*d).membersCount as usize {
             local m = l.s.memberAt((*d).membersFirst as usize + i)
             (*rec).memberNames.push(String(l.s.text((*m).name)))
-            // The member value: evaluated by the const folder when written, auto-numbered else.
-            local value = i as i64
-            if (*m).value >= 0 {
-                local cv = *l.s.consts.get(evalConst(l.s, (*m).value) as usize)
-                value = (*cv).intValue.lo as i64
-            }
-            (*rec).memberValues.push(value)
+            // The member value: the enum's own numbering (`enumMember`: written values, then one
+            // more than the previous one).
+            (*rec).memberValues.push(enumMemberValue(l, d, l.s.text((*m).name)))
             (*rec).memberTexts.push(String(""))
         }
         l.b.enums.push(rec)

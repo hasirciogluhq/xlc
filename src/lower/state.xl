@@ -172,7 +172,12 @@ export class Lowerer {
     currentClass: String
     selfLocal: u32
     hasSelf: bool
-    loopDepth: i32 ///< current loop nesting depth for break/continue targeting
+    loops: Vec<String>  ///< the enclosing loops, outermost first: their labels ("" for none)
+    emitted: Vec<i32>   ///< statements a lowering puts before the one it returns (`lowerBlockInto`)
+    loopMarks: Vec<i32> ///< per loop on `loops`: the number of defer frames when it was entered
+    defers: Vec<Vec<i32>> ///< the defer frames, one per block: the guarded `defer` statements
+    fnFlags: Vec<u32>   ///< the `defer` flags of the function, declared at its head
+    hiddenCount: i32    ///< the suffix of the next compiler-made local (`$end0`, `$ret1`, ...)
 
     fn init(self, s: *Sema, b: *HirBuilder, isLibrary: bool) {
         self.s = s
@@ -201,7 +206,12 @@ export class Lowerer {
         self.currentClass = String("")
         self.selfLocal = 0
         self.hasSelf = false
-        self.loopDepth = 0
+        self.loops = Vec<String>()
+        self.emitted = Vec<i32>()
+        self.loopMarks = Vec<i32>()
+        self.defers = Vec<Vec<i32>>()
+        self.fnFlags = Vec<u32>()
+        self.hiddenCount = 0
     }
 
     /// The spelling of a type for the HIR (the same text the C++ pass writes).

@@ -15,16 +15,18 @@ from "../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirEnum,
     E_RAW_READ, E_UNWIND_PADS, E_UNWIND_PAD_COUNT, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF,
     S_WHILE, S_CONTINUE, S_BREAK, S_BLOCK, S_TRY
 
-/// One function while it is built: its locals and body statement ranges are per-function lists
-/// that the materialization flattens.
+/// One function while it is built: its locals are a per-function list that the materialization
+/// flattens; the body and the unwind pads are ranges of the statement arena (see `stmtList`).
 export class FnBuild {
     name: String
     symbol: String
     ret: String
     locals: Vec<XlcHirLocal>
     paramCount: u32
-    body: Vec<i32>
-    unwind: Vec<i32>
+    bodyFirst: u32
+    bodyCount: u32
+    unwindFirst: u32
+    unwindCount: u32
     hasBody: bool
     exported: bool
     exportC: bool
@@ -39,8 +41,10 @@ export class FnBuild {
         self.ret = String("void")
         self.locals = Vec<XlcHirLocal>()
         self.paramCount = 0
-        self.body = Vec<i32>()
-        self.unwind = Vec<i32>()
+        self.bodyFirst = 0
+        self.bodyCount = 0
+        self.unwindFirst = 0
+        self.unwindCount = 0
         self.hasBody = true
         self.exported = false
         self.exportC = false
@@ -395,13 +399,17 @@ export class HirBuilder {
         return (self.stmts.data as usize + idx as usize * sizeOf(XlcHirStmt)) as *XlcHirStmt
     }
 
-    /// A statement list recorded in `refs` in order; returns its range.
-    fn stmtList(self, list: Vec<i32>) -> (u32, u32) {
-        local first = self.refs.length() as u32
-        for i in 0..list.length() {
-            self.refs.push(*list.get(i) as u32)
+    /// A statement list as a run of the statement arena: the flat form reads a body as
+    /// `stmts[first..first + count]`, so the listed statements are copied to the end of the arena
+    /// in order. A copy keeps the child ranges its record already holds (those were copied
+    /// before), and the original stays where it was, unreferenced.
+    fn stmtList(self, list: *Vec<i32>) -> (u32, u32) {
+        local first = self.stmts.length() as u32
+        for i in 0..(*list).length() {
+            local copy = *self.stmtAt(*(*list).get(i))
+            self.stmts.push(copy)
         }
-        return (first, list.length() as u32)
+        return (first, (*list).length() as u32)
     }
 
     fn localStmt(self, id: u32, name: str, typeName: str, value: i32) -> i32 {
@@ -433,31 +441,41 @@ export class HirBuilder {
         return idx
     }
 
+    // The lists are copied before the record is fetched: a copy may grow the arena.
     fn ifStmt(self, cond: i32, body: Vec<i32>, elseBody: Vec<i32>) -> i32 {
         local idx = self.stmt(S_IF)
+        local b = self.stmtList(&body)
+        local e = self.stmtList(&elseBody)
         local st = self.stmtAt(idx)
         (*st).value = cond
-        local b = self.stmtList(body)
         (*st).bodyFirst = b.0
         (*st).bodyCount = b.1
-        local e = self.stmtList(elseBody)
         (*st).elseFirst = e.0
         (*st).elseCount = e.1
         return idx
     }
 
-    fn whileStmt(self, cond: i32, body: Vec<i32>, depth: u32, postTest: bool) -> i32 {
+    /// A `while` (or, with `postTest`, a `do ... while`) whose step list is set by `setStep`.
+    fn whileStmt(self, cond: i32, body: Vec<i32>, postTest: bool) -> i32 {
         local idx = self.stmt(S_WHILE)
+        local b = self.stmtList(&body)
         local st = self.stmtAt(idx)
         (*st).value = cond
-        local b = self.stmtList(body)
         (*st).bodyFirst = b.0
         (*st).bodyCount = b.1
-        (*st).depth = depth
         (*st).postTest = postTest ? 1 : 0
         return idx
     }
 
+    /// Sets the step list of a `while` record (the C-style `for` step, the range increment).
+    fn setStep(self, loop: i32, step: Vec<i32>) {
+        local s = self.stmtList(&step)
+        local st = self.stmtAt(loop)
+        (*st).stepFirst = s.0
+        (*st).stepCount = s.1
+    }
+
+    /// `continue` and `break` leave `depth` loops (0 for the innermost loop).
     fn continueStmt(self, depth: u32) -> i32 {
         local idx = self.stmt(S_CONTINUE)
         (*self.stmtAt(idx)).depth = depth
@@ -472,8 +490,8 @@ export class HirBuilder {
 
     fn blockStmt(self, body: Vec<i32>) -> i32 {
         local idx = self.stmt(S_BLOCK)
+        local b = self.stmtList(&body)
         local st = self.stmtAt(idx)
-        local b = self.stmtList(body)
         (*st).bodyFirst = b.0
         (*st).bodyCount = b.1
         return idx
@@ -481,11 +499,11 @@ export class HirBuilder {
 
     fn tryStmt(self, body: Vec<i32>, handler: Vec<i32>, msgLocal: u32) -> i32 {
         local idx = self.stmt(S_TRY)
+        local b = self.stmtList(&body)
+        local h = self.stmtList(&handler)
         local st = self.stmtAt(idx)
-        local b = self.stmtList(body)
         (*st).bodyFirst = b.0
         (*st).bodyCount = b.1
-        local h = self.stmtList(handler)
         (*st).elseFirst = h.0
         (*st).elseCount = h.1
         (*st).msgLocal = msgLocal
@@ -510,8 +528,6 @@ export class HirBuilder {
         // after the loops.
         local locals = Vec<XlcHirLocal>()
         local localFirst = Vec<usize>()
-        local bodies = Vec<u32>()
-        local unwinds = Vec<u32>()
         local fns = Vec<XlcHirFunction>()
         for i in 0..self.fns.length() {
             local f = *self.fns.get(i)
@@ -525,16 +541,10 @@ export class HirBuilder {
             }
             rec.localCount = (*f).locals.length() as u32
             rec.paramCount = (*f).paramCount
-            rec.bodyFirst = bodies.length() as u32
-            for j in 0..(*f).body.length() {
-                bodies.push(*(*f).body.get(j) as u32)
-            }
-            rec.bodyCount = (*f).body.length() as u32
-            rec.unwindFirst = unwinds.length() as u32
-            for j in 0..(*f).unwind.length() {
-                unwinds.push(*(*f).unwind.get(j) as u32)
-            }
-            rec.unwindCount = (*f).unwind.length() as u32
+            rec.bodyFirst = (*f).bodyFirst
+            rec.bodyCount = (*f).bodyCount
+            rec.unwindFirst = (*f).unwindFirst
+            rec.unwindCount = (*f).unwindCount
             rec.hasBody = (*f).hasBody ? 1 : 0
             rec.exported = (*f).exported ? 1 : 0
             rec.exportC = (*f).exportC ? 1 : 0
@@ -704,8 +714,6 @@ export class HirBuilder {
         // when this function returns.
         keepAlive.fns = fns
         keepAlive.locals = locals
-        keepAlive.bodies = bodies
-        keepAlive.unwinds = unwinds
         keepAlive.globals = globals
         keepAlive.enums = enums
         keepAlive.members = members
@@ -725,8 +733,6 @@ export class HirBuilder {
 export class HirKeep {
     fns: Vec<XlcHirFunction>
     locals: Vec<XlcHirLocal>
-    bodies: Vec<u32>
-    unwinds: Vec<u32>
     globals: Vec<XlcHirGlobal>
     enums: Vec<XlcHirEnum>
     members: Vec<XlcHirEnumMember>
@@ -744,8 +750,6 @@ export class HirKeep {
     fn init(self) {
         self.fns = Vec<XlcHirFunction>()
         self.locals = Vec<XlcHirLocal>()
-        self.bodies = Vec<u32>()
-        self.unwinds = Vec<u32>()
         self.globals = Vec<XlcHirGlobal>()
         self.enums = Vec<XlcHirEnum>()
         self.members = Vec<XlcHirEnumMember>()

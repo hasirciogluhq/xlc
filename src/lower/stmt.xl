@@ -1,0 +1,20 @@
+// Statement shapes of the xlang lowering pass that only build HIR from already lowered parts: the
+// if-chain of a `switch` (C++ stmt/switch.cpp). The walk over the flat AST stays in function.xl,
+// which lowers the conditions and the case bodies and then calls these builders, so this file
+// imports nothing that imports it back.
+from "std" import String, Vec, format
+from "./state" import Lowerer
+
+/// The if-chain of a `switch`: arm `i` is `if conds[i] { bodies[i] }`, each arm's `else` is the
+/// arm after it, and the default body is the last `else`. Returns the statements of the chain:
+/// the outermost `if`, or the default body when there is no arm.
+export fn switchChain(l: *Lowerer, conds: Vec<i32>, bodies: Vec<Vec<i32>>, defaultBody: Vec<i32>) -> Vec<i32> {
+    local chain = defaultBody
+    for k in 0..conds.length() {
+        local i = conds.length() - 1 - k
+        local ifIdx = l.b.ifStmt(*conds.get(i), (*bodies.get(i)).clone(), chain)
+        chain = Vec<i32>()
+        chain.push(ifIdx)
+    }
+    return chain
+}
