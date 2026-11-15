@@ -56,7 +56,7 @@ const Sample kSamples[] = {
     {"negate", "fn neg(a: i32) -> i32 {\n    return -a\n}\n"},
     {"ternary", "fn pick(a: i32) -> i32 {\n    return a > 0 ? a : 0\n}\n"},
     // Casts, pointers and aggregates.
-    {"cast", "fn narrow(a: i32) -> u8 {\n    return a as u8\n}\n"},
+    {"cast","fn narrow(a: i32) -> u8 {\n    return a as u8\n}\n"},
     {"cast-float", "fn toi(f: f64) -> i32 {\n    return f as i32\n}\n"},
     {"address-and-deref",
      "fn addr(a: i32) -> *i32 {\n    return &a\n}\n"
@@ -77,6 +77,29 @@ const Sample kSamples[] = {
     // Builtins.
     {"syscall", "fn pid() -> i64 {\n    return syscall(39)\n}\n"},
     {"size-of", "fn sz() -> u64 {\n    return sizeOf(i64)\n}\n"},
+    // Lane B: calls (overloads, class methods). Samples of this block are the calls lane.
+    {"overload-by-float",
+     "fn pick(a: i32) -> i32 {\n    return a\n}\n"
+     "fn pick(a: f64) -> f64 {\n    return a\n}\n"
+     "fn main() -> f64 {\n    return pick(2.5)\n}\n"},
+    {"overload-by-int-width",
+     "fn pick(a: i32) -> i32 {\n    return a\n}\n"
+     "fn pick(a: i64) -> i64 {\n    return a\n}\n"
+     "fn main() -> i64 {\n    local x: i32 = 1\n    return pick(x) + pick(7)\n}\n"},
+    {"method-call",
+     "class Counter {\n    n: i32\n    fn get(self) -> i32 {\n        return self.n\n    }\n}\n"
+     "fn read(c: Counter) -> i32 {\n    return c.get()\n}\n"},
+    {"method-call-through-pointer",
+     "class Counter {\n    n: i32\n    fn get(self) -> i32 {\n        return self.n\n    }\n}\n"
+     "fn read(c: *Counter) -> i32 {\n    return c.get() + 1\n}\n"},
+    {"method-call-overloaded",
+     "class Box {\n    n: i32\n    fn put(self, a: i32) -> i32 {\n        return a\n    }\n"
+     "    fn put(self, a: f64) -> f64 {\n        return a\n    }\n}\n"
+     "fn go(b: Box) -> f64 {\n    return b.put(1.5)\n}\n"},
+    {"method-call-on-field",
+     "class Counter {\n    n: i32\n    fn get(self) -> i32 {\n        return self.n\n    }\n}\n"
+     "struct Holder {\n    c: Counter\n}\n"
+     "fn read(h: Holder) -> i32 {\n    return h.c.get()\n}\n"},
 };
 
 /// The text of the HIR the xlang pass builds for `text`; the diagnostics go to `diagnostics`.

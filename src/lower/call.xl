@@ -1,0 +1,217 @@
+// Calls of the xlang lowering pass. A call names a function, a method or a function value, and
+// the builtin forms `syscall` and the layout queries. The C++ twin is src/sema/lower/call/
+// (call.cpp, method.cpp, overload.cpp, builtins.cpp).
+//
+// Lowered here: a function with one declaration, an overloaded function (the chosen overload is
+// the key `name$T...`), a method of a class or struct found through its bases (direct calls, the
+// receiver passed by address unless it is a pointer), calls through a local or global function
+// value, a call through a function-pointer field, and `syscall`.
+//
+// Not lowered yet, and reported with E0709 or left as the value call: generic functions and
+// methods (their instances), virtual methods (vtable slots), interface methods, constructors,
+// sum-variant calls, `operator()` on a class value, packs, and the `__builtin_` forms.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
+from "../sema/types" import T_POINTER
+from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL
+from "./function" import lowerExpr, lowerExprAs, lowerLayoutQuery
+from "./typing" import exprType, exprTypeName, typeNameOf, resolveBase, argSpecs, chooseDecl,
+    functionDecls
+from "./methods" import findMethod, methodsNamed, MethodRef
+from "./overload" import PICK_NONE, PICK_AMBIGUOUS, declParamTypes, mangledParams
+from "./helpers" import overloadKey
+
+/// A call: the callee's form decides the lowering (see the file comment). Returns the HIR
+/// expression index, -1 after a diagnostic.
+export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
+    local e = l.s.exprAt(idx)
+    local calleeIdx = (*e).lhs
+    local callee = l.s.exprAt(calleeIdx)
+    if (*callee).kind == XE_NAME {
+        local name = l.s.exprTextAt(calleeIdx)
+        // The layout queries fold to constants here: the HIR has no sizeof form.
+        if name == "sizeOf" || name == "alignOf" || name == "offsetOf" {
+            return lowerLayoutQuery(l, idx, e, name)
+        }
+        // `syscall(nr, args...)` is the HIR syscall form, not a call.
+        if name == "syscall" { return lowerSyscall(l, idx, e) }
+        local entry = l.lookupName(name)
+        if entry != nil && (*entry).kind == SE_FUNCTION {
+            local decls = functionDecls(l, entry)
+            if decls.length() > 1 { return lowerOverloadCall(l, idx, e, entry, &decls) }
+            if decls.length() == 1 {
+                return lowerDirectCall(l, idx, e, entry, *decls.get(0))
+            }
+        }
+        if entry != nil && ((*entry).kind == SE_LOCAL || (*entry).kind == SE_GLOBAL) {
+            return lowerValueCall(l, idx, e)
+        }
+        if entry == nil { return lowerNamedCall(l, idx, e, name) }
+    }
+    if (*callee).kind == XE_FIELD {
+        local recvTy = exprType(l, (*callee).lhs)
+        if recvTy >= 0 {
+            local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt(calleeIdx))
+            if (*m).found {
+                if (*m).isVirtual {
+                    l.err("E0709", (*e).span,
+                        "a virtual method call is not lowered by the xlang pass yet",
+                        "call it through the C++ pass")
+                    return -1
+                }
+                return lowerMethodCall(l, idx, e, (*callee).lhs, m)
+            }
+        }
+    }
+    return lowerValueCall(l, idx, e)
+}
+
+/// Reports a call whose overloads do not decide: E0404 when none fits, E0403 when several fit
+/// equally well. Returns -1 for the caller.
+fn reportNoPick(l: *Lowerer, e: *XExpr, name: str, pick: i32) -> i32 {
+    if pick == PICK_AMBIGUOUS {
+        l.err("E0403", (*e).span, format("call to `{}` is ambiguous", name).asStr(),
+            "write the argument types so one overload is closer")
+    } else if pick == PICK_NONE {
+        l.err("E0404", (*e).span, format("no `{}` fits this call", name).asStr(),
+            "check the arguments")
+    }
+    return -1
+}
+
+/// Lowers the arguments of call `e` into `out`, each converted to its parameter type. False when
+/// the count is wrong (E0710) or an argument does not lower.
+fn lowerArgs(l: *Lowerer, e: *XExpr, params: *Vec<i32>, out: *Vec<i32>, name: str) -> bool {
+    if (*e).argsCount as usize != (*params).length() {
+        l.err("E0710", (*e).span,
+            format("`{}` takes {} argument(s), {} given", name, (*params).length(), (*e).argsCount).asStr(),
+            "wrong number of arguments")
+        return false
+    }
+    for i in 0..(*e).argsCount as usize {
+        local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
+        local v = lowerExprAs(l, a, *(*params).get(i))
+        if v < 0 { return false }
+        (*out).push(v)
+    }
+    return true
+}
+
+/// A function with one declaration: its arguments convert to the declared parameter types.
+fn lowerDirectCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, d: i32) -> i32 {
+    local name = l.s.exprTextAt((*e).lhs)
+    local params = declParamTypes(l.s, l.s.declAt(d as usize))
+    local args = Vec<i32>()
+    if !lowerArgs(l, e, &params, &args, name) { return -1 }
+    local range = l.b.args(args)
+    return l.b.call((*entry).qname.asStr(), range.0, range.1, exprTypeName(l, idx))
+}
+
+/// An overloaded function: the overload the arguments pick is called under its own key, the
+/// name with the chosen parameter types (`name$i32`), the key the declaration was lowered under.
+fn lowerOverloadCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, decls: *Vec<i32>) -> i32 {
+    local name = l.s.exprTextAt((*e).lhs)
+    local pick = chooseDecl(l, decls, argSpecs(l, e))
+    if pick < 0 { return reportNoPick(l, e, name, pick) }
+    local params = declParamTypes(l.s, l.s.declAt(*(*decls).get(pick as usize) as usize))
+    local args = Vec<i32>()
+    if !lowerArgs(l, e, &params, &args, name) { return -1 }
+    local range = l.b.args(args)
+    local key = overloadKey((*entry).qname.asStr(), mangledParams(l.s, &params))
+    return l.b.call(key.asStr(), range.0, range.1, exprTypeName(l, idx))
+}
+
+/// A method call: the receiver becomes the first argument, by address unless it already is a
+/// pointer. The callee is the method's key: `Class.name`, or with the parameter types when the
+/// class has several methods of that name (the C++ `methodCandidates`).
+fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef) -> i32 {
+    local name = l.s.exprTextAt((*e).lhs)
+    local decls = methodsNamed(l.s, (*m).cdecl, name)
+    for i in 0..decls.length() {
+        if (*l.s.declAt(*decls.get(i) as usize)).genericCount > 0 {
+            l.err("E0709", (*e).span,
+                format("generic method `{}` is not lowered by the xlang pass yet", name).asStr(),
+                "call it through the C++ pass")
+            return -1
+        }
+    }
+    local pick = 0
+    if decls.length() > 1 {
+        pick = chooseDecl(l, &decls, argSpecs(l, e))
+        if pick < 0 { return reportNoPick(l, e, name, pick) }
+    }
+    local params = declParamTypes(l.s, l.s.declAt(*decls.get(pick as usize) as usize))
+    local recvTy = exprType(l, recvIdx)
+    local selfArg = -1
+    if l.s.types.get(recvTy).kind == T_POINTER {
+        selfArg = lowerExpr(l, recvIdx)
+    } else {
+        if !isPlace(l, recvIdx) {
+            l.err("E0709", (*e).span, "a method needs an addressable receiver",
+                "store the value in a variable first")
+            return -1
+        }
+        local base = lowerExpr(l, recvIdx)
+        if base < 0 { return -1 }
+        selfArg = l.b.addrOf(base, typeNameOf(l, l.s.types.makePointer(recvTy)))
+    }
+    if selfArg < 0 { return -1 }
+    local rest = Vec<i32>()
+    if !lowerArgs(l, e, &params, &rest, name) { return -1 }
+    local args = Vec<i32>()
+    args.push(selfArg)
+    for i in 0..rest.length() { args.push(*rest.get(i)) }
+    local range = l.b.args(args)
+    local qualified = format("{}.{}", (*m).cls.asStr(), name)
+    local key = qualified.clone()
+    if decls.length() > 1 {
+        key = overloadKey(qualified.asStr(), mangledParams(l.s, &params))
+    }
+    return l.b.call(key.asStr(), range.0, range.1, exprTypeName(l, idx))
+}
+
+/// A call to a name that no scope binds: kept as a call to the name, as the lowering always did
+/// (an unresolved name is diagnosed by the caller that owns the module).
+fn lowerNamedCall(l: *Lowerer, idx: i32, e: *XExpr, name: str) -> i32 {
+    local args = Vec<i32>()
+    for i in 0..(*e).argsCount as usize {
+        local v = lowerExpr(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32))
+        if v < 0 { return -1 }
+        args.push(v)
+    }
+    local range = l.b.args(args)
+    return l.b.call(name, range.0, range.1, exprTypeName(l, idx))
+}
+
+/// A call through a function value: a local or global of a function type, or a function-pointer
+/// field. The arguments are lowered as written; the callee is the operand.
+fn lowerValueCall(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
+    local args = Vec<i32>()
+    for i in 0..(*e).argsCount as usize {
+        local v = lowerExpr(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32))
+        if v < 0 { return -1 }
+        args.push(v)
+    }
+    local range = l.b.args(args)
+    local fnValue = lowerExpr(l, (*e).lhs)
+    if fnValue < 0 { return -1 }
+    return l.b.callIndirect(fnValue, range.0, range.1, exprTypeName(l, idx))
+}
+
+/// `syscall(nr, args...)`: the arguments as written, the HIR syscall form.
+fn lowerSyscall(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
+    local sysArgs = Vec<i32>()
+    for i in 0..(*e).argsCount as usize {
+        sysArgs.push(lowerExpr(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)))
+    }
+    local sysRange = l.b.args(sysArgs)
+    return l.b.syscallExpr(sysRange.0, sysRange.1, exprTypeName(l, idx))
+}
+
+/// True for an expression that names storage, so its address can be taken: a name, a field, an
+/// index or a dereference.
+fn isPlace(l: *Lowerer, idx: i32) -> bool {
+    local e = l.s.exprAt(idx)
+    if (*e).kind == XE_NAME || (*e).kind == XE_FIELD || (*e).kind == XE_INDEX { return true }
+    return (*e).kind == XE_UNARY && (*e).unaryOp == XU_DEREF
+}

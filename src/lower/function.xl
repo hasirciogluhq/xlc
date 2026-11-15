@@ -20,6 +20,7 @@ from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
 from "./builder" import FnBuild
+from "./call" import lowerCall
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf
 from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
@@ -513,83 +514,6 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
         l.err("E0706", (*l.s.exprAt(idx)).span,
             format("`{}` has no lowered form here", name).asStr(), "not a value")
         return -1
-    }
-
-    /// A call: the callee name, the arguments in order.
-    /// The declared type of parameter `i` (self excluded) of the function `entry` names, when the
-    /// name has exactly one declaration; -1 otherwise.
-export fn calleeParamType(l: *Lowerer, entry: *ScopeEntry, i: u32) -> i32 {
-        if entry == nil || (*entry).kind != SE_FUNCTION || (*entry).overloads.length() != 1 {
-            return -1
-        }
-        local d = l.s.declOfItem(*(*entry).overloads.get(0))
-        if d < 0 { return -1 }
-        local decl = l.s.declAt(d as usize)
-        local k: u32 = 0
-        for j in 0..(*decl).paramsCount as usize {
-            local p = l.s.paramAt((*decl).paramsFirst as usize + j)
-            if (*p).isSelf != 0 { continue }
-            if k == i { return resolve(l.s, (*p).ty) }
-            k = k + 1
-        }
-        return -1
-    }
-
-export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
-        local e = l.s.exprAt(idx)
-        // The layout queries fold to constants here: the HIR has no sizeof form.
-        local calleeText = l.s.exprTextAt((*e).lhs)
-        if calleeText == "sizeOf" || calleeText == "alignOf" || calleeText == "offsetOf" {
-            return lowerLayoutQuery(l, idx, e, calleeText)
-        }
-        // `syscall(nr, args...)` is the HIR syscall form, not a call.
-        if calleeText == "syscall" {
-            local sysArgs = Vec<i32>()
-            for i in 0..(*e).argsCount as usize {
-                sysArgs.push(lowerExpr(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)))
-            }
-            local sysRange = l.b.args(sysArgs)
-            return l.b.syscallExpr(sysRange.0, sysRange.1, exprTypeName(l, idx))
-        }
-        // A plain function name with one declaration: each argument converts to its parameter.
-        local direct = l.s.exprAt((*e).lhs)
-        local callee = (*direct).kind == XE_NAME ? l.lookupName(l.s.exprTextAt((*e).lhs)) : nil
-        local args = Vec<i32>()
-        local count = (*e).argsCount
-        for i in 0..count as usize {
-            local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
-            local v = lowerExprAs(l, a, calleeParamType(l, callee, i as u32))
-            if v < 0 { return -1 }
-            args.push(v)
-        }
-        local range = l.b.args(args.clone())
-        local lhs = l.s.exprAt((*e).lhs)
-        if (*lhs).kind == XE_NAME {
-            local callee = l.s.exprTextAt((*e).lhs)
-            local entry = l.lookupName(callee)
-            if entry != nil && (*entry).kind == SE_FUNCTION {
-                return l.b.call((*entry).qname.asStr(), range.0, range.1, exprTypeName(l,idx))
-            }
-            return l.b.call(callee, range.0, range.1, exprTypeName(l,idx))
-        }
-        if (*lhs).kind == XE_FIELD {
-            // A method call: the receiver becomes the first argument; the qualified name is
-            // filled in when the xl sema assigns per-expression types.
-            local receiver = lowerExpr(l, (*lhs).lhs)
-            if receiver < 0 { return -1 }
-            local method = l.s.exprTextAt((*e).lhs)
-            local withSelf = Vec<i32>()
-            withSelf.push(receiver)
-            for i in 0..args.length() {
-                withSelf.push(*args.get(i))
-            }
-            local full = l.b.args(withSelf)
-            return l.b.call(method, full.0, full.1, exprTypeName(l,idx))
-        }
-        // A call through a value (a function pointer): the callee expression is the operand.
-        local fnValue = lowerExpr(l, (*e).lhs)
-        if fnValue < 0 { return -1 }
-        return l.b.callIndirect(fnValue, range.0, range.1, exprTypeName(l,idx))
     }
 
 /// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)`: folded to an integer constant from the

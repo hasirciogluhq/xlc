@@ -30,13 +30,13 @@ const XD_ENUM: i32 = 6
 const XD_TYPE_ALIAS: i32 = 7
 const XD_DEFINE_CONST: i32 = 8
 
-    /// The resolved parameter types of a declaration, self excluded.
+    /// The mangled parameter types of a declaration, self excluded: the parts of its overload key.
 export fn paramTypes(l: *Lowerer, d: *SDecl) -> Vec<String> {
         local out = Vec<String>()
         for i in 0..(*d).paramsCount as usize {
             local p = l.s.paramAt((*d).paramsFirst as usize + i)
             if (*p).isSelf != 0 { continue }
-            out.push(l.typeName(resolve(l.s, (*p).ty)))
+            out.push(l.s.types.mangle(resolve(l.s, (*p).ty)))
         }
         return out
     }
