@@ -1,0 +1,399 @@
+// MIR: the control-flow graph of each function, built from the flat HIR (src/hir/abi.xl). The xlang
+// port of include/xlang/mir/mir.h.
+//
+// HIR is a typed tree: good for checks about types and names. MIR is what the flow analyses
+// (moves, borrows, initialization) and the optimizations work on:
+//   - a function is a list of basic blocks; each block is straight-line statements ending in one
+//     terminator, and every edge between blocks is explicit;
+//   - every intermediate value is a local, so an expression never nests: an operand is a place
+//     read by copy or by move, or a constant;
+//   - a place is a local with a path of projections (`a.f`, `*p`, `a[i]`), the unit a move, a
+//     borrow or a drop acts on.
+//
+// @invariant MIR is built only from HIR and never refers back to it: names, type spellings,
+// operator spellings and spans are copied out, so a MIR module outlives the flat form it came from.
+// A span on every statement and terminator points at the source so a finding is reported at the
+// code the user wrote.
+// @todo MIR does not yet carry what only code generation needs (the `asm` template and clobbers,
+// the landing pad of `unwind_body`); codegen reads the HIR until it does.
+//
+// Types, operators and names are kept as the spellings the HIR carries (`typeName`, `binaryOp`,
+// `unaryOp`), so a MIR type is compared as text: `void`, `never`, `bool`, `*T` (pointer to T).
+//
+// The classes below are not `struct`s: each owns `String` or `Vec` fields, and a struct is plain
+// data (E0721). Every class has an `init` that gives every field a value.
+from "std" import String, Vec
+from "../util/source" import Span, spanNone
+
+// ---- Local kinds: parameters, user variables, drop flags and temporaries ------------------------
+
+export const LK_PARAM: u8 = 0
+export const LK_USER: u8 = 1
+export const LK_DROP_FLAG: u8 = 2
+export const LK_TEMP: u8 = 3
+
+// ---- Projection kinds ---------------------------------------------------------------------------
+
+export const PK_FIELD: u8 = 0
+export const PK_DEREF: u8 = 1
+export const PK_INDEX: u8 = 2
+
+// ---- Operand kinds ------------------------------------------------------------------------------
+
+export const OK_COPY: u8 = 0
+export const OK_MOVE: u8 = 1
+export const OK_CONSTANT: u8 = 2
+
+// ---- Constant kinds -----------------------------------------------------------------------------
+
+export const CK_NONE: u8 = 0      ///< no value: the operand of a `void` return, a missing slice bound
+export const CK_INT: u8 = 1       ///< intBits: the two's complement bits
+export const CK_FLOAT: u8 = 2     ///< floatValue
+export const CK_BOOL: u8 = 3      ///< boolValue
+export const CK_STR: u8 = 4       ///< text: the bytes
+export const CK_NIL: u8 = 5       ///< the null pointer of the constant's type
+export const CK_FUNCTION: u8 = 6  ///< text: the HIR name; the address of the function
+export const CK_GLOBAL: u8 = 7    ///< text: the HIR name; the address of the global
+
+// ---- Rvalue kinds -------------------------------------------------------------------------------
+
+export const RK_USE: u8 = 0          ///< operands[0]
+export const RK_ADDRESS_OF: u8 = 1   ///< `&place`
+export const RK_UNARY: u8 = 2        ///< unaryOp operands[0]
+export const RK_BINARY: u8 = 3       ///< operands[0] binaryOp operands[1]; `checked` for a checked `/`, `%`
+export const RK_CAST: u8 = 4         ///< operands[0] as `type`
+export const RK_AGGREGATE: u8 = 5    ///< operands[i] goes to field `fields[i]` (`fields` empty: positional)
+export const RK_REPEAT: u8 = 6       ///< `[operands[0]; count]`
+export const RK_ZERO: u8 = 7         ///< a zeroed `type`; a class also gets its vptr
+export const RK_SLICE: u8 = 8        ///< `place[operands[0]..operands[1]]`; a `None` constant is a missing bound
+export const RK_TO_INTERFACE: u8 = 9 ///< operands[0] as interface `type`, implemented by `name`
+
+// ---- Builtin kinds (the callee of a `Builtin` call) ----------------------------------------------
+
+export const BI_ALLOC: u8 = 0
+export const BI_ATOMIC_LOAD: u8 = 1
+export const BI_ATOMIC_STORE: u8 = 2
+export const BI_ATOMIC_XCHG: u8 = 3
+export const BI_ATOMIC_CAS: u8 = 4
+export const BI_ATOMIC_ADD: u8 = 5
+export const BI_FENCE: u8 = 6
+export const BI_ASM: u8 = 7
+export const BI_UNWIND_PADS: u8 = 8
+export const BI_UNWIND_PAD_COUNT: u8 = 9
+
+// ---- Callee kinds -------------------------------------------------------------------------------
+
+export const CL_DIRECT: u8 = 0    ///< name: the HIR function
+export const CL_INDIRECT: u8 = 1  ///< value: the function pointer
+export const CL_VIRTUAL: u8 = 2   ///< index: the vtable slot; name: the statically resolved function
+export const CL_INTERFACE: u8 = 3 ///< value: the interface; name: the method; index: its itable slot
+export const CL_SYSCALL: u8 = 4   ///< args[0] is the number
+export const CL_BUILTIN: u8 = 5   ///< builtin
+
+// ---- Terminator kinds ---------------------------------------------------------------------------
+
+export const TK_GOTO: u8 = 0        ///< to targets[0]
+export const TK_BRANCH: u8 = 1      ///< operand true: targets[0], false: targets[1]
+export const TK_CALL: u8 = 2        ///< destination = callee(args); continues at targets[0]; none when it never returns
+export const TK_DROP: u8 = 3        ///< runs the drop glue `glue` on `place`; continues at targets[0]
+export const TK_TRY: u8 = 4         ///< snapshot into `place`, the message buffer is local `message`; body targets[0], catch targets[1]
+export const TK_RETURN: u8 = 5      ///< returns operand (a `None` constant in a `void` function)
+export const TK_UNREACHABLE: u8 = 6 ///< no path reaches the end of the block
+
+/// One local of the frame. `name` is the source name, empty for a temporary the builder made.
+export class Local {
+    kind: u8
+    name: String
+    typeName: String
+    span: Span
+
+    fn init(self) {
+        self.kind = LK_TEMP
+        self.name = String()
+        self.typeName = String()
+        self.span = spanNone()
+    }
+}
+
+/// One step of a place path: a field index, a dereference, or an element whose index is in local
+/// `index`. `checked` marks a bounds-checked element (`--safety=checked`).
+export class Projection {
+    kind: u8
+    field: u32
+    index: u32
+    checked: bool
+
+    fn init(self) {
+        self.kind = PK_FIELD
+        self.field = 0
+        self.index = 0
+        self.checked = false
+    }
+}
+
+/// A memory location: `local` followed by `projections` (`a.f`, `*p`, `(*p).f`, `a[i]`).
+export class Place {
+    localId: u32
+    projections: Vec<Projection>
+
+    fn init(self) {
+        self.localId = 0
+        self.projections = Vec<Projection>()
+    }
+
+}
+
+/// A compile-time value. The field that holds the value is the one `kind` names.
+export class Constant {
+    kind: u8
+    typeName: String
+    intBits: u64
+    floatValue: f64
+    boolValue: bool
+    text: String
+
+    fn init(self) {
+        self.kind = CK_NONE
+        self.typeName = String()
+        self.intBits = 0
+        self.floatValue = 0.0
+        self.boolValue = false
+        self.text = String()
+    }
+
+}
+
+/// A value an rvalue or a call consumes: a copy or move of `place`, or a `constant`.
+export class Operand {
+    kind: u8
+    place: Place
+    constant: Constant
+
+    fn init(self) {
+        self.kind = OK_COPY
+        self.place = Place()
+        self.constant = Constant()
+    }
+
+}
+
+/// The right side of an assignment. Which fields are used depends on `kind` (see the RK_ names).
+export class Rvalue {
+    kind: u8
+    typeName: String
+    place: Place
+    operands: Vec<Operand>
+    fields: Vec<u32>
+    count: u64
+    name: String
+    op: String ///< the operator spelling: unaryOp or binaryOp, as the HIR spells it
+    checked: bool
+
+    fn init(self) {
+        self.kind = RK_USE
+        self.typeName = String()
+        self.place = Place()
+        self.operands = Vec<Operand>()
+        self.fields = Vec<u32>()
+        self.count = 0
+        self.name = String()
+        self.op = String()
+        self.checked = false
+    }
+
+}
+
+/// A place with no projections: local `local`.
+export fn placeOf(slot: u32) -> Place {
+    local p = Place()
+    p.localId = slot
+    return p
+}
+
+/// A constant operand.
+export fn constantOperand(c: Constant) -> Operand {
+    local o = Operand()
+    o.kind = OK_CONSTANT
+    o.constant = c
+    return o
+}
+
+/// A copy or move of `p`.
+export fn placeOperand(kind: u8, p: Place) -> Operand {
+    local o = Operand()
+    o.kind = kind
+    o.place = p
+    return o
+}
+
+/// An rvalue that is one operand read.
+export fn useRvalue(o: Operand) -> Rvalue {
+    local r = Rvalue()
+    r.kind = RK_USE
+    r.operands.push(o)
+    return r
+}
+
+/// `place = value`; a statement never transfers control.
+export class Statement {
+    place: Place
+    value: Rvalue
+    span: Span
+
+    fn init(self) {
+        self.place = Place()
+        self.value = Rvalue()
+        self.span = spanNone()
+    }
+}
+
+/// What a `Call` terminator calls. `builtin` is set for CL_BUILTIN; `type` for BI_ALLOC; `index`
+/// is the memory order of an atomic or fence, the slot of a virtual or interface call.
+export class Callee {
+    kind: u8
+    name: String
+    index: u32
+    value: Operand
+    builtin: u8
+    typeName: String
+
+    fn init(self) {
+        self.kind = CL_DIRECT
+        self.name = String()
+        self.index = 0
+        self.value = Operand()
+        self.builtin = BI_ALLOC
+        self.typeName = String()
+    }
+}
+
+/// The control transfer that ends a block. Fields not named by `kind` are unused.
+export class Terminator {
+    kind: u8
+    operand: Operand     ///< Branch: the condition; Return: the value
+    callee: Callee       ///< Call
+    args: Vec<Operand>   ///< Call
+    hasDestination: bool ///< Call: whether `destination` is set (none for a `void` call)
+    destination: Place   ///< Call: where the result goes
+    place: Place         ///< Drop: the dropped place; Try: the snapshot buffer
+    glue: String         ///< Drop: the drop glue function
+    message: u32         ///< Try: the message buffer local
+    targets: Vec<u32>
+    hasUnwind: bool      ///< Call, Drop: whether `unwind` is set
+    unwind: u32          ///< Call, Drop: the `catch` a panic in it jumps to
+    span: Span
+
+    fn init(self) {
+        self.kind = TK_UNREACHABLE
+        self.operand = Operand()
+        self.callee = Callee()
+        self.args = Vec<Operand>()
+        self.hasDestination = false
+        self.destination = Place()
+        self.place = Place()
+        self.glue = String()
+        self.message = 0
+        self.targets = Vec<u32>()
+        self.hasUnwind = false
+        self.unwind = 0
+        self.span = spanNone()
+    }
+
+}
+
+export class BasicBlock {
+    statements: Vec<Statement>
+    terminator: Terminator
+
+    fn init(self) {
+        self.statements = Vec<Statement>()
+        self.terminator = Terminator()
+    }
+}
+
+/// The MIR of one function. Block 0 is the entry.
+export class Body {
+    name: String ///< the HIR function's qualified name
+    locals: Vec<Local>
+    paramCount: u32
+    ret: String
+    blocks: Vec<BasicBlock>
+    span: Span
+
+    fn init(self) {
+        self.name = String()
+        self.locals = Vec<Local>()
+        self.paramCount = 0
+        self.ret = String()
+        self.blocks = Vec<BasicBlock>()
+        self.span = spanNone()
+    }
+}
+
+/// The MIR of a program: one body per HIR function that has a body, in HIR order.
+export class Module {
+    bodies: Vec<Body>
+
+    fn init(self) {
+        self.bodies = Vec<Body>()
+    }
+}
+
+impl Place {
+    fn isLocal(self: *Place) -> bool {
+        return self.projections.length() == 0
+    }
+
+    /// A copy of this place with `proj` appended.
+    fn project(self: *Place, proj: Projection) -> Place {
+        local p = self.clone()
+        p.projections.push(proj)
+        return p
+    }
+
+    fn clone(self: *Place) -> Place {
+        local p = Place()
+        p.localId = self.localId
+        for i in 0..self.projections.length() {
+            p.projections.push(*self.projections.get(i))
+        }
+        return p
+    }
+}
+
+impl Constant {
+    fn clone(self: *Constant) -> Constant {
+        local c = Constant()
+        c.kind = self.kind
+        c.typeName = self.typeName.clone()
+        c.intBits = self.intBits
+        c.floatValue = self.floatValue
+        c.boolValue = self.boolValue
+        c.text = self.text.clone()
+        return c
+    }
+}
+
+impl Operand {
+    fn clone(self: *Operand) -> Operand {
+        local o = Operand()
+        o.kind = self.kind
+        o.place = self.place.clone()
+        o.constant = self.constant.clone()
+        return o
+    }
+}
+
+impl Terminator {
+    /// The blocks control can go to next: `targets`, then `unwind`.
+    fn successors(self: *Terminator) -> Vec<u32> {
+        local out = Vec<u32>()
+        for i in 0..self.targets.length() {
+            out.push(*self.targets.get(i))
+        }
+        if self.hasUnwind {
+            out.push(self.unwind)
+        }
+        return out
+    }
+}
