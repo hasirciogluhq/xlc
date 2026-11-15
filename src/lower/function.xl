@@ -12,6 +12,7 @@ from "../lang/ast/ast" import XSpan, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_L
     XS_BREAK, XS_UNSAFE, XS_BLOCK
 from "../sema/sema" import Sema
 from "../sema/item" import SDecl, SItem, SParam
+from "../lang/ast/ast" import XStmt
 from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY
 from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
@@ -209,6 +210,48 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             local value = lowerExpr(l, (*st).expr)
             return l.b.assign(target, value)
         }
+        if (*st).kind == XS_FOR {
+            return lowerCFor(l, st)
+        }
+        if (*st).kind == XS_FOR_RANGE {
+            return lowerForRange(l, idx, st)
+        }
+        if (*st).kind == XS_SWITCH {
+            return lowerSwitch(l, idx, st)
+        }
+        if (*st).kind == XS_DEFER {
+            // The deferred statements run when the enclosing scope unwinds: they join the
+            // function's unwind list (the C++ pass builds unwind pads).
+            local body = lowerStmtList(l, (*st).init)
+            for i in 0..body.length() {
+                l.fnUnwind.push(*body.get(i))
+            }
+            return -1
+        }
+        if (*st).kind == XS_TRY {
+            local body = lowerBlockInto(l, (*st).body)
+            local handler = Vec<i32>()
+            if (*st).elseBody >= 0 {
+                handler = lowerBlockInto(l, (*st).elseBody)
+            }
+            local msgLocal = addLocal(l,l.s.stmtTextAt(idx), "String")
+            return l.b.tryStmt(body, handler, msgLocal)
+        }
+        if (*st).kind == XS_DO_WHILE {
+            local cond = lowerExpr(l, (*st).expr)
+            l.loopDepth = l.loopDepth + 1
+            local body = lowerBlockInto(l, (*st).body)
+            l.loopDepth = l.loopDepth - 1
+            return l.b.whileStmt(cond, body, l.loopDepth as u32, true)
+        }
+        if (*st).kind == XS_DELETE {
+            // `delete p`: drop the value, then free. The registered free function.
+            local p = lowerExpr(l, (*st).expr)
+            local args = Vec<i32>()
+            args.push(p)
+            local range = l.b.args(args)
+            return l.b.exprStmt(l.b.call(l.b.freeFunction.asStr(), range.0, range.1, "void"))
+        }
         l.err("E0500", (*st).span, "this statement form is not lowered yet",
             "the xlang lowering pass is still being ported")
         return -1
@@ -367,3 +410,120 @@ export fn runConstInit(l: *Lowerer, exprIdx: i32, tyName: str) -> i32 {
         // Not constant: lowered as an expression; the codegen emits a dynamic initializer.
         return lowerExpr(l, exprIdx)
     }
+
+/// The statements of the single-statement block or statement `idx`, as a list.
+export fn lowerStmtList(l: *Lowerer, idx: i32) -> Vec<i32> {
+    local out = Vec<i32>()
+    if idx < 0 { return out }
+    local st = lowerStmt(l, idx)
+    if st >= 0 { out.push(st) }
+    return out
+}
+
+/// A C-style `for`: the initializer, the condition, the step and the body, as a block holding
+/// the initializer and a `while` whose body ends with the step. A `continue` inside the body
+/// still runs the step because the C++ pass moves the step under every `continue`; the flat
+/// form keeps that fix-up to the statement walker of a later pass.
+export fn lowerCFor(l: *Lowerer, st: *XStmt) -> i32 {
+    local inner = Vec<i32>()
+    if (*st).init >= 0 {
+        local init = lowerStmt(l, (*st).init)
+        if init >= 0 { inner.push(init) }
+    }
+    local cond = -1
+    if (*st).expr >= 0 {
+        cond = lowerExpr(l, (*st).expr)
+    } else {
+        cond = l.b.boolConst(true, "bool")
+    }
+    l.loopDepth = l.loopDepth + 1
+    local body = lowerBlockInto(l, (*st).body)
+    l.loopDepth = l.loopDepth - 1
+    if (*st).step >= 0 {
+        local step = lowerStmt(l, (*st).step)
+        if step >= 0 { body.push(step) }
+    }
+    inner.push(l.b.whileStmt(cond, body, l.loopDepth as u32, false))
+    return l.b.blockStmt(inner)
+}
+
+/// A `for i in lo..hi` (or `..=`): a counter local compared against the bound.
+export fn lowerForRange(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
+    local name = l.s.stmtTextAt(idx)
+    local lo = lowerExpr(l, (*st).expr)
+    local hi = lowerExpr(l, (*st).expr2)
+    local counter = addLocal(l,name, "i64")
+    local entry = new ScopeEntry()
+    (*entry).kind = SE_LOCAL
+    (*entry).name = String(name)
+    (*entry).ty = -1
+    (*entry).localId = counter
+    l.scopes.declare(entry)
+    local inner = Vec<i32>()
+    // counter = lo
+    local target = l.b.localRef(counter, "i64")
+    inner.push(l.b.assign(target, lo))
+    l.loopDepth = l.loopDepth + 1
+    local body = lowerBlockInto(l, (*st).body)
+    l.loopDepth = l.loopDepth - 1
+    // counter = counter + 1
+    local ref = l.b.localRef(counter, "i64")
+    local one = l.b.intConst(1, "i64")
+    local inc = l.b.binary("+", ref, one, "i64")
+    body.push(l.b.assign(l.b.localRef(counter, "i64"), inc))
+    // counter < hi (or <=)
+    local cmp = l.b.binary((*st).rangeInclusive != 0 ? "<=" : "<",
+        l.b.localRef(counter, "i64"), hi, "bool")
+    inner.push(l.b.whileStmt(cmp, body, l.loopDepth as u32, false))
+    return l.b.blockStmt(inner)
+}
+
+/// A `switch`: an if/else chain over the case values; the default case is the last `else`.
+export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
+    local value = lowerExpr(l, (*st).expr)
+    local chain = Vec<i32>()
+    local defaultBody = Vec<i32>()
+    for i in 0..(*st).casesCount as usize {
+        local c = l.s.flat.caseAt(((*st).casesFirst + i as u32) as i32)
+        local body = lowerBlockInto(l, (*c).body)
+        if (*c).isDefault != 0 {
+            defaultBody = body
+            continue
+        }
+        // One `if` per case value, chained through the else arms.
+        for j in 0..(*c).valuesCount as usize {
+            local v = l.s.refAt("expr", ((*c).valuesFirst + j as u32) as i32)
+            local cv = lowerExpr(l, v)
+            local cond = l.b.binary("==", value, cv, "bool")
+            if j + 1 < (*c).valuesCount as usize {
+                // Several values sharing one body: nested `if`s fall through to the same body.
+                local rest = Vec<i32>()
+                chain.push(l.b.ifStmt(cond, body, rest))
+                continue
+            }
+            chain.push(l.b.ifStmt(cond, body, Vec<i32>()))
+        }
+    }
+    // Chain the ifs: each else arm holds the rest; the default body is the last else.
+    local out = Vec<i32>()
+    if chain.length() == 0 {
+        out = defaultBody
+    } else {
+        // Build from the last if backwards: elseFirst ranges over stmt refs.
+        local acc = defaultBody
+        for k in 0..chain.length() {
+            local idxK = chain.length() - 1 - k
+            local ifIdx = *chain.get(idxK)
+            local stp = l.b.stmtAt(ifIdx)
+            (*stp).elseFirst = l.b.refs.length() as u32
+            for m in 0..acc.length() {
+                l.b.refs.push(*acc.get(m) as u32)
+            }
+            (*stp).elseCount = acc.length() as u32
+            acc = Vec<i32>()
+            acc.push(ifIdx)
+        }
+        out = acc
+    }
+    return l.b.blockStmt(out)
+}
