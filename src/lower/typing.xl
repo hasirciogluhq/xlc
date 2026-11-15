@@ -339,6 +339,8 @@ fn fieldType(l: *Lowerer, idx: i32) -> i32 {
     }
     // `[T; N].len` is the constant length as `usize` (C++ fieldExpr).
     if rec.kind == T_ARRAY && name == "len" { return l.s.types.makeInt(0, false) }
+    // `t.N` of a tuple is element N, whose type is the N-th entry of the type's argument arena.
+    if rec.kind == T_TUPLE && (*e).intValue < (rec.argsCount as u64) { return (rec.argsFirst + (*e).intValue as u32) as i32 }
     return fieldTypeOf(l, base, name)
 }
 

@@ -15,7 +15,7 @@ from "../sema/item" import SDecl, SItem, SParam
 from "../lang/ast/ast" import XStmt, XExpr, XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF, XU_BITNOT,
     XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE,
     XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
-from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_STR, T_INT, T_BOOL, T_ENUM
+from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_STR, T_INT, T_BOOL, T_ENUM, T_TUPLE
 from "./stmt" import switchChain
 from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
@@ -448,7 +448,10 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
             if fieldName == "len" && owner >= 0 && l.s.types.get(owner).kind == T_ARRAY {
                 return lowerArrayLen(l, e, owner)
             }
-            return l.b.field(base, fieldName, exprTypeName(l, idx), viaPointer, fieldIndexOf(l, owner, fieldName))
+            // A tuple element is named by its position, which the parser keeps in `intValue`.
+            local index = fieldIndexOf(l, owner, fieldName)
+            if owner >= 0 && l.s.types.get(owner).kind == T_TUPLE { index = (*e).intValue as u32 }
+            return l.b.field(base, fieldName, exprTypeName(l, idx), viaPointer, index)
         }
         if (*e).kind == XE_INDEX {
             return lowerIndex(l, idx, e)

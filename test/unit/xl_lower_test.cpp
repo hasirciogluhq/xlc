@@ -161,6 +161,10 @@ const Sample kRemainingSamples[] = {
     {"array-len-through-pointer", "fn f(p: *[i32; 3]) -> usize {\n    return p.len\n}\n"},
     {"unsafe-signedness",
      "fn f(a: i32) -> i32 {\n    unsafe {\n        local r: u32 = a\n    }\n    return 0\n}\n"},
+    {"tuple-field-types",
+     "fn second(t: (i32, f64)) -> f64 {\n    return t.1\n}\n"
+     "fn first(t: (i32, f64)) -> i32 {\n    return t.0\n}\n"},
+    {"tuple-field-through-pointer", "fn second(t: *(i32, f64)) -> f64 {\n    return t.1 * 2.0\n}\n"},
     {"switch-values-three",
      "fn f(a: i32) -> i32 {\n    switch a {\n        case 1 {\n            return 10\n        }\n"
      "        case 2, 3 {\n            return 20\n        }\n        default {\n            return 0\n        }\n"
