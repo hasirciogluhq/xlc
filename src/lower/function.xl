@@ -293,6 +293,13 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             local body = lowerBlockInto(l, (*st).body)
             return l.b.blockStmt(body)
         }
+        if (*st).kind == XS_UNSAFE {
+            // Inside `unsafe { }` a signedness change converts (C++ Stmt::Kind::Unsafe).
+            l.unsafeDepth += 1
+            local body = lowerBlockInto(l, (*st).body)
+            l.unsafeDepth -= 1
+            return l.b.blockStmt(body)
+        }
         if (*st).kind == XS_ASSIGN {
             return lowerAssign(l, st)
         }

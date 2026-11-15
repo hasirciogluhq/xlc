@@ -178,6 +178,7 @@ export class Lowerer {
     defers: Vec<Vec<i32>> ///< the defer frames, one per block: the guarded `defer` statements
     fnFlags: Vec<u32>   ///< the `defer` flags of the function, declared at its head
     hiddenCount: i32    ///< the suffix of the next compiler-made local (`$end0`, `$ret1`, ...)
+    unsafeDepth: i32    ///< the `unsafe { }` blocks around the statement being lowered (C++ unsafe_)
 
     fn init(self, s: *Sema, b: *HirBuilder, isLibrary: bool) {
         self.s = s
@@ -212,6 +213,7 @@ export class Lowerer {
         self.defers = Vec<Vec<i32>>()
         self.fnFlags = Vec<u32>()
         self.hiddenCount = 0
+        self.unsafeDepth = 0
     }
 
     /// The spelling of a type for the HIR (the same text the C++ pass writes).

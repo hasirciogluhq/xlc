@@ -4,8 +4,8 @@
 //
 // Each check reports at the span of the expression it judges and returns false when it reported,
 // so the caller leaves the expression out (the C++ returns nullptr). A check that needs a feature
-// the xlang pass does not have yet (an operator function, an interface value, an unsafe block, an
-// inherited field) returns true and reports nothing: those forms are not checked here.
+// the xlang pass does not have yet (an operator function, an interface value, an inherited field)
+// returns true and reports nothing: those forms are not checked here.
 from "std" import String, format
 from "../lang/ast/ast" import XExpr, XSpan
 from "../sema/types" import Types, T_VOID, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ARRAY,
@@ -60,13 +60,14 @@ fn degradesSlice(t: *Types, src: i32, to: i32) -> bool {
 /// the known type `want`: the rules of `implicitConversion`, with the diagnostics of the C++
 /// `coerce`. Returns the converted value, or -1 after an error. A signed integer to a float is
 /// W0601 and converts; a conversion that needs `as` is E0708, a signedness change E0601.
-/// `unsafe` is not tracked yet, so a signedness change is always an error here.
+/// Inside `unsafe { }` (`l.unsafeDepth > 0`) a signedness change is accepted for the rules of
+/// `implicitConversion`.
 export fn coerceChecked(l: *Lowerer, idx: i32, value: i32, src: i32, want: i32) -> i32 {
     // Interface boxing is not ported: the value is left as it is.
     if l.s.types.get(want).kind == T_INTERFACE || degradesSlice(l.s.types, src, want) {
         return value
     }
-    local r = implicitConversion(l.s.types, src, want, false, l.s.pointerBits)
+    local r = implicitConversion(l.s.types, src, want, l.unsafeDepth > 0, l.s.pointerBits)
     local at = (*l.s.exprAt(idx)).span
     local a = tname(l, src)
     local b = tname(l, want)

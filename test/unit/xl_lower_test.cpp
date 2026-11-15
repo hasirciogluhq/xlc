@@ -159,6 +159,8 @@ const Sample kLaneASamples[] = {
 const Sample kRemainingSamples[] = {
     {"array-len", "fn f(a: [i32; 3]) -> usize {\n    return a.len\n}\n"},
     {"array-len-through-pointer", "fn f(p: *[i32; 3]) -> usize {\n    return p.len\n}\n"},
+    {"unsafe-signedness",
+     "fn f(a: i32) -> i32 {\n    unsafe {\n        local r: u32 = a\n    }\n    return 0\n}\n"},
     {"switch-values-three",
      "fn f(a: i32) -> i32 {\n    switch a {\n        case 1 {\n            return 10\n        }\n"
      "        case 2, 3 {\n            return 20\n        }\n        default {\n            return 0\n        }\n"
@@ -166,6 +168,9 @@ const Sample kRemainingSamples[] = {
 };
 
 const Sample kRemainingDiagnostics[] = {
+    {"err-signedness-after-unsafe",
+     "fn f(a: i32) -> i32 {\n    unsafe {\n        local r: u32 = a\n    }\n    local s: u32 = a\n"
+     "    return 0\n}\n"},
     {"err-array-len-side-effect",
      "fn make(a: [i32; 3]) -> [i32; 3] {\n    return a\n}\n"
      "fn f(a: [i32; 3]) -> i32 {\n    local r = make(a).len\n    return 0\n}\n"},
