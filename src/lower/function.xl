@@ -49,11 +49,6 @@ export fn lowerFunctionDecl(l: *Lowerer, item: i32, declIdx: i32, qname: str, lo
     runFunctionDecl(l, item, declIdx, qname, localName, owner)
 }
 
-/// The initializer of a global: a constant expression folded to a literal.
-export fn lowerConstInit(l: *Lowerer, exprIdx: i32, tyName: str) -> i32 {
-    return runConstInit(l, exprIdx, tyName)
-}
-
     /// Opens the function under construction: the header fields, the scope and the parameters.
 export fn beginFunction(l: *Lowerer, qname: str, localName: str, owner: str, ret: str) {
         l.fnName = String(qname)
@@ -376,9 +371,19 @@ export fn lowerExprAs(l: *Lowerer, idx: i32, want: i32) -> i32 {
 
     /// Lowers `idx` with the context type `want` (-1 for none). An unsuffixed literal takes the
     /// type it is given: an integer one a float type too. The operators pass `want` on to the
-    /// operands that are literals (see `lowerBinary`).
+    /// operands that are literals (see `lowerBinary`). The node it builds takes the span of `idx`;
+    /// the operands are lowered inside, and each restores the span of its parent.
 export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
         if idx < 0 { return -1 }
+        local saved = l.b.span
+        l.b.span = l.s.span((*l.s.exprAt(idx)).span)
+        local v = lowerExprNode(l, idx, want)
+        l.b.span = saved
+        return v
+    }
+
+    /// The expression walk of `lowerExprWant` (the node kinds, one branch each).
+fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
         local e = l.s.exprAt(idx)
         if (*e).kind == XE_INT_LITERAL {
             if want >= 0 && isFloatType(l, want) {
@@ -614,28 +619,6 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
         l.err("E0706", (*l.s.exprAt(idx)).span,
             format("`{}` has no lowered form here", name).asStr(), "not a value")
         return -1
-    }
-
-    /// The initializer of a global: a constant expression folded to a literal.
-export fn runConstInit(l: *Lowerer, exprIdx: i32, tyName: str) -> i32 {
-        local value = evalConst(l.s, exprIdx)
-        if value >= 0 {
-            local cv = *l.s.consts.get(value as usize)
-            if (*cv).kind == 0 {
-                return l.b.intConst((*cv).intValue.lo, tyName)
-            }
-            if (*cv).kind == 1 {
-                return l.b.floatConst((*cv).floatValue, tyName)
-            }
-            if (*cv).kind == 2 {
-                return l.b.boolConst((*cv).boolValue, tyName)
-            }
-            if (*cv).kind == 3 {
-                return l.b.strConst((*cv).text.asStr(), tyName)
-            }
-        }
-        // Not constant: lowered as an expression; the codegen emits a dynamic initializer.
-        return lowerExpr(l, exprIdx)
     }
 
 /// The statements of the single-statement block or statement `idx`, as a list.

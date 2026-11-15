@@ -5,6 +5,9 @@ from "std" import String, Vec, format
 from "../lang/ast/ast" import XExpr, XU_NEG, XU_NOT, XU_DEREF, XU_ADDROF, XU_BITNOT,
     XB_ADD, XB_SUB, XB_MUL, XB_DIV, XB_MOD, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE,
     XB_AND, XB_OR, XB_BITAND, XB_BITOR, XB_BITXOR, XB_SHL, XB_SHR
+from "../hir/abi" import E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, E_NIL, E_FUNC_REF,
+    E_EXTERNAL, E_GLOBAL_REF, E_UNARY, E_BINARY, E_CAST, E_INDEX, E_FIELD, E_ADDR_OF, E_ARRAY_LIST,
+    E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_TO_INTERFACE
 from "../sema/item" import SDecl
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOfName
@@ -137,4 +140,64 @@ export fn binaryOpName(op: i32) -> str {
         case op == XB_SHR { return ">>" }
     }
     return "?"
+}
+
+/// True when the lowered expression `idx` is a compile-time constant (C++ Lowerer::isConstValue):
+/// literals, function and external references, arithmetic and casts of constants, arrays, tuples
+/// and struct literals of constants, and `&global` with constant indexes and fields. When it is
+/// not, `offender` receives the first node that is not, unless it already holds one.
+export fn isConstValue(l: *Lowerer, idx: i32, offender: *i32) -> bool {
+    local e = l.b.exprAt(idx)
+    local k = (*e).kind
+    if k == E_INT_CONST || k == E_FLOAT_CONST || k == E_BOOL_CONST || k == E_STR_CONST || k == E_NIL ||
+        k == E_FUNC_REF || k == E_EXTERNAL { return true }
+    if k == E_UNARY || k == E_CAST || k == E_TO_INTERFACE || k == E_ARRAY_REPEAT {
+        return (*e).lhs >= 0 && isConstValue(l, (*e).lhs, offender)
+    }
+    if k == E_BINARY {
+        return (*e).lhs >= 0 && (*e).rhs >= 0 && isConstValue(l, (*e).lhs, offender) &&
+            isConstValue(l, (*e).rhs, offender)
+    }
+    if k == E_ARRAY_LIST || k == E_TUPLE_LIT {
+        for i in 0..(*e).argCount as usize {
+            if !isConstValue(l, *l.b.refs.get(((*e).argFirst + i as u32) as usize) as i32, offender) {
+                return false
+            }
+        }
+        return true
+    }
+    if k == E_STRUCT_LIT {
+        for i in 0..(*e).fieldCount as usize {
+            local f = l.b.fieldInits.get(((*e).fieldFirst + i as u32) as usize)
+            if !isConstValue(l, (*f).value, offender) { return false }
+        }
+        return true
+    }
+    if k == E_ADDR_OF {
+        // `&global`, `&global[const]`, `&global.field` (not through a pointer)
+        local cur = (*e).lhs
+        while cur >= 0 {
+            local c = l.b.exprAt(cur)
+            if (*c).kind == E_GLOBAL_REF { return true }
+            if (*c).kind == E_INDEX {
+                local r = (*c).rhs
+                if r < 0 || (*l.b.exprAt(r)).kind != E_INT_CONST {
+                    return failAt(cur, offender)
+                }
+                cur = (*c).lhs
+            } else if (*c).kind == E_FIELD && (*c).throughPointer == 0 {
+                cur = (*c).lhs
+            } else {
+                return failAt(idx, offender)
+            }
+        }
+        return failAt(idx, offender)
+    }
+    return failAt(idx, offender)
+}
+
+/// Records `idx` as the offender when none is recorded yet; the result is always false.
+fn failAt(idx: i32, offender: *i32) -> bool {
+    if *offender < 0 { *offender = idx }
+    return false
 }

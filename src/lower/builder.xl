@@ -3,6 +3,7 @@
 // `Lowerer` built shared_ptr trees; the flat form is strictly post-order (children before the
 // parent that indexes them), which the builders here keep.
 from "std" import String, Vec, format
+from "../util/source" import Span
 from "../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirEnum, XlcHirEnumMember,
     XlcHirAggregate, XlcHirField, XlcHirVtableSlot, XlcHirInterface, XlcHirIfaceMethod,
     XlcHirImpl, XlcHirExpr, XlcHirStmt, XlcHirLocal, XlcHirFieldInit, XlcHirAsmOperand,
@@ -70,6 +71,7 @@ export class HirBuilder {
     refs: Vec<u32>
     owned: Vec<*String>  ///< the heap blocks the string views point into
     strs: Vec<XlcHirStr>
+    span: Span ///< the source span the next expression record takes (set by the expression walk)
     panicFunction: String
     allocFunction: String
     freeFunction: String
@@ -92,6 +94,7 @@ export class HirBuilder {
         self.refs = Vec<u32>()
         self.owned = Vec<*String>()
         self.strs = Vec<XlcHirStr>()
+        self.span = Span { file: 0, line: 0, column: 0, endLine: 0, endColumn: 0 }
         self.panicFunction = String("")
         self.allocFunction = String("")
         self.freeFunction = String("")
@@ -120,6 +123,7 @@ export class HirBuilder {
     fn expr(self, kind: i32, typeName: str) -> i32 {
         local e: XlcHirExpr
         e.kind = kind
+        e.span = self.span
         e.typeName = self.str(typeName)
         e.lhs = -1
         e.rhs = -1

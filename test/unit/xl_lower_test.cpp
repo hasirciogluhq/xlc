@@ -161,6 +161,13 @@ const Sample kRemainingSamples[] = {
     {"array-len-through-pointer", "fn f(p: *[i32; 3]) -> usize {\n    return p.len\n}\n"},
     {"unsafe-signedness",
      "fn f(a: i32) -> i32 {\n    unsafe {\n        local r: u32 = a\n    }\n    return 0\n}\n"},
+    {"global-aggregate",
+     "struct P { x: i32, y: i32 }\nglobal origin: P = P { x: 1, y: 2 }\nfn f() -> i32 {\n    return origin.x\n}\n"},
+    {"global-array", "global table: [i32; 3] = [1, 2, 3]\nfn f() -> i32 {\n    return table[1]\n}\n"},
+    {"global-no-init", "global z: i32\nfn f() -> i32 {\n    return z\n}\n"},
+    {"global-address", "global g: i32 = 1\nglobal p: *i32 = &g\nfn f() -> i32 {\n    return *p\n}\n"},
+    {"const-untyped-literal", "const N = 4\nfn f() -> i32 {\n    return N\n}\n"},
+    {"global-coerced", "global w: i64 = 7\nfn f() -> i64 {\n    return w\n}\n"},
     {"tuple-field-types",
      "fn second(t: (i32, f64)) -> f64 {\n    return t.1\n}\n"
      "fn first(t: (i32, f64)) -> i32 {\n    return t.0\n}\n"},
@@ -172,6 +179,14 @@ const Sample kRemainingSamples[] = {
 };
 
 const Sample kRemainingDiagnostics[] = {
+    {"err-global-call",
+     "fn g() -> i32 {\n    return 1\n}\nglobal v: i32 = g()\nfn f() -> i32 {\n    return v\n}\n"},
+    {"err-global-reads-global",
+     "global a: i32 = 1\nglobal b: i32 = a\nfn f() -> i32 {\n    return b\n}\n"},
+    {"err-const-call",
+     "fn g() -> i32 {\n    return 1\n}\nconst C: i32 = g() + 1\nfn f() -> i32 {\n    return C\n}\n"},
+    {"err-untyped-const-call",
+     "fn g() -> i32 {\n    return 1\n}\nconst C = g()\nfn f() -> i32 {\n    return C\n}\n"},
     {"err-signedness-after-unsafe",
      "fn f(a: i32) -> i32 {\n    unsafe {\n        local r: u32 = a\n    }\n    local s: u32 = a\n"
      "    return 0\n}\n"},

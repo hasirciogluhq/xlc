@@ -16,8 +16,9 @@ from "./builder" import FnBuild, EnumRec, AggrRec, IfaceRec, XlcHirGlobalRec
 from "./helpers" import baseInitKey, overloadKey
 
 export fn lowerItemsTouch() { return }
-from "./function" import lowerFunction, lowerFunctionDecl, lowerConstInit
-from "./queries" import enumMemberValue
+from "./function" import lowerFunction, lowerFunctionDecl, lowerExprAs, lowerExprWant
+from "./queries" import enumMemberValue, isConstValue
+from "./typing" import exprTypeName
 from "./instances" import lowerPendingInstances, lowerImpls
 
 /// The declaration kinds of the flat AST (mirrored here for the dispatch).
@@ -137,19 +138,54 @@ export fn lowerInterface(l: *Lowerer, item: i32, declIdx: i32) {
         l.b.interfaces.push(rec)
     }
 
+/// A global or `const` (C++ item/global.cpp). The initializer is lowered with the declared type
+/// (`coerce`), or on its own when the type is left out; its type is then the initializer's. It
+/// must be a compile-time constant: checked on the lowered HIR by `checkGlobalInit`.
 export fn lowerGlobal(l: *Lowerer, item: i32, declIdx: i32) {
         local d = l.s.declOf(item)
         local it = l.s.items.get(item as usize)
-        local rec = new XlcHirGlobalRec(l.s.qualify(l.s.text((*d).name)).asStr(),
-            l.typeName(resolve(l.s, (*d).ty)).asStr())
+        local init = (*d).init
+        local hasType = (*d).ty >= 0
+        // An untyped global needs a literal value: its type is the default type of the value.
+        if !hasType && init >= 0 && evalConst(l.s, init) < 0 {
+            l.err("E0715", (*l.s.exprAt(init)).span, "untyped `const` needs a literal value",
+                "write its type: `const NAME: T = ...`")
+        }
+        local value = -1
+        local tyText: String
+        if hasType {
+            local ty = resolve(l.s, (*d).ty)
+            tyText = l.typeName(ty)
+            if init >= 0 { value = lowerExprAs(l, init, ty) }
+        } else {
+            tyText = String(init >= 0 ? exprTypeName(l, init) : "")
+            if init >= 0 { value = lowerExprWant(l, init, -1) }
+        }
+        local rec = new XlcHirGlobalRec(l.s.qualify(l.s.text((*d).name)).asStr(), tyText.asStr())
         (*rec).constant = (*d).isConst != 0
         (*rec).exported = (*it).exported != 0 || (*it).exportC != 0 || (*it).registered != 0
         (*rec).exportC = (*it).exportC != 0
         (*rec).registered = (*it).registered != 0
-        if (*d).init >= 0 {
-            (*rec).init = lowerConstInit(l, (*d).init, l.typeName(resolve(l.s, (*d).ty)).asStr())
+        if init >= 0 {
+            if value >= 0 { checkGlobalInit(l, (*d).isConst != 0, value) }
+            (*rec).init = value
         }
         l.b.globals.push(rec)
+    }
+
+/// The initializer `value` of a global must be a compile-time constant (C++ item/global.cpp):
+/// E0715 for a `const`, E0707 for a global, at the first node that is not one.
+fn checkGlobalInit(l: *Lowerer, isConst: bool, value: i32) {
+        local off = -1
+        if isConstValue(l, value, &off) { return }
+        local at = (*l.b.exprAt(off >= 0 ? off : value)).span
+        if isConst {
+            l.s.diag.error("E0715", at, "`const` initializer is not a compile-time constant",
+                "a `const` holds literals, arithmetic on them, arrays and struct literals; it cannot call functions or read other names")
+        } else {
+            l.s.diag.error("E0707", at, "global initializer is not a compile-time constant",
+                "globals are statically initialized: no calls, no reads of other globals")
+        }
     }
 
 export fn lowerTopFn(l: *Lowerer, item: i32, declIdx: i32) {
