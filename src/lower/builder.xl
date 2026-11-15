@@ -255,14 +255,19 @@ export class HirBuilder {
         return at
     }
 
+    /// `base[lo..hi]`: the upper bound is `rhs` (-1 when absent), the lower bound the one argument
+    /// (none when absent), as the C++ Slice node holds them.
     fn slice(self, base: i32, lo: i32, hi: i32, typeName: str) -> i32 {
         local idx = self.expr(E_SLICE, typeName)
         local e = self.exprAt(idx)
         (*e).lhs = base
-        (*e).rhs = lo
+        (*e).rhs = hi
         (*e).argFirst = self.refs.length() as u32
-        self.refs.push(hi as u32)
-        (*e).argCount = 1
+        (*e).argCount = 0
+        if lo >= 0 {
+            self.refs.push(lo as u32)
+            (*e).argCount = 1
+        }
         return idx
     }
 

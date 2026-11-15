@@ -34,9 +34,9 @@ the incremental module table and the `@library` imports.
 
 ## Broken or unverified
 
-- `test/unit/c_abi_test.cpp` and `test/unit/lower_test.cpp` include `xlang/hir/prune.h`, which is
-  gone (the C++ prune was replaced by `src/hir/prune.xl`). The unit test build fails until they
-  use the xlang prune. Not touched, per the order.
+- The C++ prune tests of `test/unit/c_abi_test.cpp` and `test/unit/lower_test.cpp` were removed
+  with the `xlang/hir/prune.h` include (the C++ prune is gone; `src/hir/prune.xl` has no unit test
+  yet). The KeepExports cases (`export(c)` kept for a prebuilt-object link) are uncovered.
 - Nothing above was built or run end to end. Only the raw compiler's `--check` ran over the xlang
   files, and `clang++ -fsyntax-only` over the three changed backend C++ files.
 - The `Vec` iteration and the `format` specs (`{:016x}`) of the incremental object names have not
