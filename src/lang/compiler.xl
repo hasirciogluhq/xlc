@@ -12,6 +12,14 @@ from "../hir/prune" import xlcHirPrune, xlcHirPruneFree
 from "parser/parser" import xlcParse
 from "../sema/flat" import Flat
 from "../sema/types" import Types
+from "../sema/resolve" import resolve
+from "../sema/instances" import instantiate, internInstance, instantiateMethod
+from "../sema/subst" import TypeEnv, substituteType, instantiateFn, instantiateDecl
+from "../sema/module_scope" import lookupEntity, lookupQualified, entityByQName, entityOfExpr, exprToType
+from "../sema/int128" import I128, i128Of, i128Text
+from "../sema/const_value" import ConstValue, constInt, constText
+from "../sema/sema" import Sema
+from "../sema/item" import SItem, SDecl, SParam, SField, SSumVariant, SEnumMember, SImportName
 from "../sema/conversion" import implicitConversion, commonBinaryType
 from "../sema/layout" import LayoutHistory, formatLayoutRecord
 from "../util/source" import xlcUtilSourcesNew, xlcUtilAddFile, xlcUtilSourcesFree

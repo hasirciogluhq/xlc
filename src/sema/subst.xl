@@ -1,0 +1,229 @@
+// Type substitution and generic instantiation (plan 2.7): the `TypeEnv` maps a type parameter's
+// name to the concrete type; `substituteType` rewrites a type through it, and the instantiate
+// functions copy a declaration with every type in it substituted. The xlang source of
+// lang/ast/clone.cpp. Bodies are NOT copied: an instance shares the generic declaration's body
+// and the lowering applies the env lazily while it walks the body (see lower/expr).
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XD_FN, XD_STRUCT, XD_CLASS, XD_INTERFACE, XD_IMPL, XD_ENUM
+from "./sema" import Sema, EntityRef, SY_FN, SY_STRUCT, SY_CLASS, SY_INTERFACE, SY_ENUM
+from "./item" import SDecl, SParam, SField, SSumVariant, SEnumMember
+from "./types" import Types, T_NAMED, T_POINTER, T_ARRAY, T_SLICE, T_TUPLE, T_FN_PTR
+from "./flat" import eqText
+
+/// A type parameter's name mapped to the concrete type it stands for (a Types index).
+export class TypeEnv {
+    names: Vec<String>
+    tys: Vec<i32>
+
+    fn init(self) {
+        self.names = Vec<String>()
+        self.tys = Vec<i32>()
+    }
+
+    fn put(self, name: str, ty: i32) {
+        for i in 0..self.names.length() {
+            if (*self.names.get(i)).asStr() == name {
+                self.tys.set(i, ty)
+                return
+            }
+        }
+        self.names.push(String(name))
+        self.tys.push(ty)
+    }
+
+    /// The type `name` stands for, or -1.
+    fn get(self, name: str) -> i32 {
+        for i in 0..self.names.length() {
+            if (*self.names.get(i)).asStr() == name { return *self.tys.get(i) }
+        }
+        return -1
+    }
+
+    /// Drops `name` (a method's own type parameter shadows the type's).
+    fn remove(self, name: str) {
+        for i in 0..self.names.length() {
+            if (*self.names.get(i)).asStr() == name {
+                self.names.remove(i)
+                self.tys.remove(i)
+                return
+            }
+        }
+    }
+
+    /// A copy of the env.
+    fn clone(self) -> *TypeEnv {
+        local out = new TypeEnv()
+        for i in 0..self.names.length() {
+            out.names.push((*self.names.get(i)).clone())
+            out.tys.push(*self.tys.get(i))
+        }
+        return out
+    }
+}
+
+/// Rewrites `idx` through `env`; the input is never rewritten, the result is a copy.
+export fn substituteType(s: *Sema, idx: i32, env: *TypeEnv) -> i32 {
+    if idx < 0 || env == nil { return idx }
+    local t = s.types.get(idx)
+    if t.kind == T_NAMED && t.pathCount == 1 && t.argsCount == 0 {
+        local name = s.text(*s.types.strs.get(t.pathFirst))
+        local hit = env.get(name)
+        if hit >= 0 {
+            local out = s.types.internType(hit)
+            (*s.types.at(out)).span = t.span
+            return out
+        }
+        return idx
+    }
+    // Rebuild the record with its children substituted.
+    local elem = t.elem
+    if elem >= 0 { elem = substituteType(s, elem, env) }
+    local ret = t.ret
+    if ret >= 0 { ret = substituteType(s, ret, env) }
+    local args = Vec<i32>()
+    for i in 0..t.argsCount as usize {
+        args.push(substituteType(s, (t.argsFirst + i) as i32, env))
+    }
+    local params = Vec<i32>()
+    for i in 0..t.paramsCount as usize {
+        params.push(substituteType(s, (t.paramsFirst + i) as i32, env))
+    }
+    local out = s.types.rebuild(t.kind, elem, ret, args, params, t.isMutable != 0, t.length as i32)
+    (*s.types.at(out)).span = t.span
+    return out
+}
+
+/// Instantiates a `fn` declaration: the parameters and the return type substituted, the body
+/// shared with the generic. The generic parameters stay (a generic method of an instance stays
+/// generic and is instantiated per call).
+export fn instantiateFn(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
+    local src = s.declOf(declIdx)
+    local d: SDecl
+    d = *src
+    d.kind = (*src).kind
+    d.name = (*src).name
+    // Parameters with substituted types.
+    local pFirst = s.params.length() as u32
+    for i in 0..(*src).paramsCount as usize {
+        local p = s.params.get(((*src).paramsFirst + i as u32) as usize)
+        local np = *p
+        np.ty = substituteType(s, (*p).ty, env)
+        s.params.push(np)
+    }
+    d.paramsFirst = pFirst
+    d.paramsCount = (*src).paramsCount
+    d.ret = substituteType(s, (*src).ret, env)
+    d.ty = substituteType(s, (*src).ty, env)
+    d.body = (*src).body // shared; the lowering applies the env lazily
+    d.methodsFirst = 0
+    d.methodsCount = 0
+    s.decls.push(d)
+    return (s.decls.length() - 1) as i32
+}
+
+/// A method of a generic type's instance: the type's parameters are replaced, and a method that
+/// is generic itself stays generic (`fn map<U>` of `Box<T>` is `fn map<U>` of `Box<i32>`), so it
+/// is instantiated per call like the method of a plain class. A method parameter that shadows a
+/// type parameter keeps its own meaning.
+fn cloneMethod(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
+    local own = env.clone()
+    local src = s.declOf(declIdx)
+    for i in 0..(*src).genericCount as usize {
+        own.remove(s.text(*s.types.strs.get((*src).genericFirst + i as u32)))
+    }
+    local out = instantiateFn(s, declIdx, own)
+    // The generic parameters are copied by the record copy inside instantiateFn.
+    return out
+}
+
+/// Instantiates a declaration under `env`, renaming it to `newName`. Returns the new SDecl index.
+export fn instantiateDecl(s: *Sema, declIdx: i32, env: *TypeEnv, newName: str) -> i32 {
+    local src = s.declOf(declIdx)
+    local kind = (*src).kind
+    if kind == XD_FN {
+        local out = instantiateFn(s, declIdx, env)
+        (*s.declOf(out)).name = s.str(newName)
+        return out
+    }
+    local d: SDecl
+    d = *src
+    d.name = s.str(newName)
+    d.methodsFirst = 0
+    d.methodsCount = 0
+    // Fields with substituted types.
+    local fFirst = s.fields.length() as u32
+    for i in 0..(*src).fieldsCount as usize {
+        local f = s.fields.get(((*src).fieldsFirst + i as u32) as usize)
+        local nf = *f
+        nf.ty = substituteType(s, (*f).ty, env)
+        s.fields.push(nf)
+    }
+    d.fieldsFirst = fFirst
+    d.fieldsCount = (*src).fieldsCount
+    if kind == XD_STRUCT {
+        // The variant list of a payload enum is data of the type, not of its text: an instance
+        // `Result<i32, E>` needs it to be matched like the declaration, with its payload types
+        // substituted (`Ok(T)` is `Ok(i32)` there).
+        local vFirst = s.variants.length() as u32
+        for i in 0..(*src).variantsCount as usize {
+            local v = s.variants.get(((*src).variantsFirst + i as u32) as usize)
+            local nv = *v
+            local payFirst = s.types.types.length() as u32
+            for j in 0..(*v).payloadCount as usize {
+                local pt = substituteType(s, ((*v).payloadFirst + j) as i32, env)
+                s.types.pushRaw(pt)
+            }
+            nv.payloadFirst = payFirst
+            nv.payloadCount = (*v).payloadCount
+            s.variants.push(nv)
+        }
+        d.variantsFirst = vFirst
+        d.variantsCount = (*src).variantsCount
+    }
+    if kind == XD_CLASS || kind == XD_INTERFACE {
+        // Methods: cloned with the env minus each method's own type parameters.
+        local mFirst = s.decls.length() as u32
+        for i in 0..(*src).methodsCount as usize {
+            cloneMethod(s, ((*src).methodsFirst + i as u32) as i32, env)
+        }
+        d.methodsFirst = mFirst
+        d.methodsCount = (*src).methodsCount
+    }
+    if kind == XD_IMPL {
+        local aFirst = s.types.types.length() as u32
+        for i in 0..(*src).ifaceArgsCount as usize {
+            local at = substituteType(s, ((*src).ifaceArgsFirst + i) as i32, env)
+            s.types.pushRaw(at)
+        }
+        d.ifaceArgsFirst = aFirst
+        d.ifaceArgsCount = (*src).ifaceArgsCount
+        d.implTarget = substituteType(s, (*src).implTarget, env)
+        local mFirst = s.decls.length() as u32
+        for i in 0..(*src).methodsCount as usize {
+            cloneMethod(s, ((*src).methodsFirst + i as u32) as i32, env)
+        }
+        d.methodsFirst = mFirst
+        d.methodsCount = (*src).methodsCount
+    }
+    if kind == XD_ENUM {
+        d.underlying = substituteType(s, (*src).underlying, env)
+        local memFirst = s.members.length() as u32
+        for i in 0..(*src).membersCount as usize {
+            local m = s.members.get(((*src).membersFirst + i as u32) as usize)
+            local nm = *m
+            local payFirst = s.types.types.length() as u32
+            for j in 0..(*m).payloadCount as usize {
+                local pt = substituteType(s, ((*m).payloadFirst + j) as i32, env)
+                s.types.pushRaw(pt)
+            }
+            nm.payloadFirst = payFirst
+            nm.payloadCount = (*m).payloadCount
+            nm.value = (*m).value // shared expr; the env applies lazily
+            s.members.push(nm)
+        }
+        d.membersFirst = memFirst
+        d.membersCount = (*src).membersCount
+    }
+    s.decls.push(d)
+    return (s.decls.length() - 1) as i32
+}

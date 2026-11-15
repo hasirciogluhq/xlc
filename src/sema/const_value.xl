@@ -1,0 +1,91 @@
+// The compile-time value of a literal, a `define` constant, a `-D` flag, an enum member or a
+// layout query (the C++ `ConstValue`). The evaluation itself lives in const_eval.xl. The integer
+// is the 128-bit pair of int128.xl; the text of a string value is owned.
+from "std" import String, format
+from "./int128" import I128, i128Of, i128Text, i128Eq
+
+/// The kind of a compile-time value (the order of `ConstValue::Kind`).
+export const CV_INT: i32 = 0
+export const CV_FLOAT: i32 = 1
+export const CV_BOOL: i32 = 2
+export const CV_STRING: i32 = 3
+
+/// A compile-time value. The string text is owned; copy or compare through `strText`.
+export class ConstValue {
+    kind: i32
+    intValue: I128
+    floatValue: f64
+    boolValue: bool
+    text: String
+
+    fn init(self) {
+        self.kind = CV_INT
+        self.intValue = I128 { hi: 0, lo: 0 }
+        self.text = String()
+    }
+
+    fn initCopy(self, other: *ConstValue) {
+        self.kind = (*other).kind
+        self.intValue = (*other).intValue
+        self.floatValue = (*other).floatValue
+        self.boolValue = (*other).boolValue
+        self.text = (*other).text.clone()
+    }
+}
+
+/// A fresh integer value.
+export fn constInt(v: I128) -> *ConstValue {
+    local c = new ConstValue()
+    c.kind = CV_INT
+    c.intValue = v
+    return c
+}
+
+export fn constFloat(v: f64) -> *ConstValue {
+    local c = new ConstValue()
+    c.kind = CV_FLOAT
+    c.floatValue = v
+    return c
+}
+
+export fn constBool(v: bool) -> *ConstValue {
+    local c = new ConstValue()
+    c.kind = CV_BOOL
+    c.boolValue = v
+    return c
+}
+
+export fn constString(v: str) -> *ConstValue {
+    local c = new ConstValue()
+    c.kind = CV_STRING
+    c.text = String(v)
+    return c
+}
+
+/// The text form: the decimal of an integer, the shortest float form, `true`/`false`, or a quoted
+/// string.
+export fn constText(c: *ConstValue) -> String {
+    switch {
+        case (*c).kind == CV_INT { return i128Text((*c).intValue) }
+        case (*c).kind == CV_FLOAT { return format("{}", (*c).floatValue) }
+        case (*c).kind == CV_BOOL { return String((*c).boolValue ? "true" : "false") }
+        default {
+            local out = String("\"")
+            out.append((*c).text.asStr())
+            out.append("\"")
+            return out
+        }
+    }
+}
+
+/// True when the two values are the same kind and hold the same bits.
+export fn constEq(a: *ConstValue, b: *ConstValue) -> bool {
+    if (*a).kind != (*b).kind { return false }
+    switch {
+        case (*a).kind == CV_INT { return i128Eq((*a).intValue, (*b).intValue) }
+        case (*a).kind == CV_FLOAT { return (*a).floatValue == (*b).floatValue }
+        case (*a).kind == CV_BOOL { return (*a).boolValue == (*b).boolValue }
+        default { return (*a).text.equals((*b).text.asStr()) }
+    }
+    return false
+}

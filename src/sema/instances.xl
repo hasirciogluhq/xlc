@@ -1,0 +1,310 @@
+// Generic instances (plan 6): `instantiate`, method instances and the queues the lowering pass
+// drains. Each instance is a declaration cloned by subst.xl, interned in the Sema's item arena
+// and named `f<i32, str>`. A generic payload enum is several items (`E`, `E$Tag`, `E$Data`,
+// `E$V`), so instantiating `E` also interns the instance of each part, named `E<i32>$V` after
+// it. The xlang source of sema/instances.cpp.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XSpan, XD_FN, XD_STRUCT, XD_CLASS, XD_INTERFACE, XD_IMPL,
+    XD_ENUM
+from "./sema" import Sema, EntityRef, InstanceInfo, SY_FN, SY_STRUCT, SY_CLASS, SY_INTERFACE,
+    SY_ENUM
+from "./item" import SDecl, SField
+from "./types" import Types, T_STRUCT, T_CLASS, T_INTERFACE, T_ENUM
+from "./subst" import TypeEnv, substituteType, instantiateDecl, instantiateFn
+
+/// How many levels of aggregates a type nests; E0725 caps it at 64.
+fn typeNesting(s: *Sema, idx: i32) -> i32 {
+    if idx < 0 { return 0 }
+    local t = s.types.get(idx)
+    local best = 0
+    if t.elem >= 0 { best = typeNesting(s, t.elem) }
+    if t.ret >= 0 {
+        local r = typeNesting(s, t.ret)
+        if r > best { best = r }
+    }
+    for i in 0..t.argsCount as usize {
+        local a = typeNesting(s, (t.argsFirst + i) as i32)
+        if a > best { best = a }
+    }
+    for i in 0..t.paramsCount as usize {
+        local p = typeNesting(s, (t.paramsFirst + i) as i32)
+        if p > best { best = p }
+    }
+    if t.kind == T_STRUCT || t.kind == T_CLASS || t.kind == T_INTERFACE || t.kind == T_ENUM {
+        return best + 1
+    }
+    return best
+}
+
+/// The spelling of a type as an instance-name fragment: `::` becomes `.` (`::` separates the
+/// module in qualified names, `.` is what the instance name shows).
+fn spelledForName(s: *Sema, idx: i32) -> String {
+    local text = s.types.text(idx)
+    local bs = text.asStr()
+    local out = String("")
+    local i = 0 as usize
+    local n = bs.len
+    while i < n {
+        if i + 1 < n && bs[i] == b':' && bs[i + 1] == b':' {
+            out.append(".")
+            i = i + 2
+        } else {
+            out.push(bs[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+/// Instantiates the generic entity `generic` with `args`; the instance lives in the module that
+/// owns the generic declaration.
+export fn instantiate(s: *Sema, generic: EntityRef, args: Vec<i32>, at: XSpan) -> EntityRef {
+    local owner = generic.owner != nil ? generic.owner : s
+    local item = owner.itemOf(generic.sym)
+    local params = owner.genericParamsOf(item)
+    if params.1 != args.length() as u32 {
+        s.error("E0724", at,
+            format("`{}` takes {} type argument(s), {} given", owner.text(generic.foundAs),
+                   params.1, args.length()).asStr(),
+            "write one type per type parameter")
+        local r: EntityRef
+        r.owner = nil
+        r.sym = -1
+        r.name = XStr { off: 0, len: 0 }
+        r.foundAs = XStr { off: 0, len: 0 }
+        return r
+    }
+    local nesting = 0
+    for i in 0..args.length() {
+        local n = typeNesting(s, *args.get(i))
+        if n > nesting { nesting = n }
+    }
+    if nesting > 64 {
+        s.error("E0725", at, "generic instantiation too deep",
+            "the type arguments nest more than 64 levels")
+        local r: EntityRef
+        r.owner = nil
+        r.sym = -1
+        r.name = XStr { off: 0, len: 0 }
+        r.foundAs = XStr { off: 0, len: 0 }
+        return r
+    }
+    local shown = String("")
+    for i in 0..args.length() {
+        if i != 0 { shown.append(", ") }
+        shown.append(spelledForName(s, *args.get(i)).asStr())
+    }
+    local localName = format("{}<{}>", owner.text(generic.foundAs), shown.asStr())
+    local existing = owner.find(localName.asStr())
+    if existing >= 0 {
+        local r: EntityRef
+        r.owner = owner
+        r.sym = existing
+        r.name = *owner.symNames.get(existing as usize)
+        r.foundAs = *owner.symNames.get(existing as usize)
+        return r
+    }
+    local env = new TypeEnv()
+    for i in 0..params.1 as usize {
+        env.put(owner.text(*owner.types.strs.get(params.0 + i as u32)), *args.get(i))
+    }
+    // The parts of an enum instance keep the declaration's naming scheme with the arguments after
+    // the `$` suffix: `Result$Ok<T, E>` becomes `Result$Ok<i32, MyErr>`, which is exactly what
+    // `Lowerer::sumPart` builds from the instance name `Result<i32, MyErr>`.
+    local origin = owner.qualify(owner.text(generic.name))
+    local inst = instantiateDecl(owner, owner.declOfItem(item), env, localName.asStr())
+    local instItem = owner.internItemOf(inst)
+    local sym = internInstance(owner, instItem, localName.asStr(), origin.asStr(), args.clone(), at)
+    local d = owner.declOf(inst)
+    if (*d).kind == XD_STRUCT && (*d).variantsCount != 0 {
+        // A payload enum is one type made of several items: `E`, `E$Tag`, `E$Data` and one
+        // `E$Variant` per variant with data. An instance of `E` is built out of the instances of
+        // the others (its fields are typed with them), so they are made here, in the module that
+        // owns `E`, with the same arguments: the instance of `E` is never half-made.
+        local dataName = format("{}$Data<{}>", owner.text(generic.foundAs), shown.asStr())
+        if owner.find(dataName.asStr()) < 0 {
+            // The union is rebuilt from the declaration with the instance name: it has no item of
+            // the enum to be cloned from without its payload structs.
+            local unionIdx = synthUnionOf(owner, inst, dataName.asStr())
+            local unionItem = owner.internItemOf(unionIdx)
+            internInstance(owner, unionItem, dataName.asStr(), origin.asStr(), args.clone(), at)
+        }
+        for v in 0..(*d).variantsCount as usize {
+            local variant = owner.variants.get(((*d).variantsFirst + v as u32) as usize)
+            if (*variant).payloadCount == 0 { continue }
+            local part = format("{}${}<{}>", owner.text(generic.foundAs),
+                owner.text((*variant).name), shown.asStr())
+            if owner.find(part.asStr()) >= 0 { continue }
+            // The payload struct is cloned from the declaration item itself: its fields are the
+            // enum's payload types, which the substitution makes concrete.
+            local payloadIdx = synthPayloadOf(owner, inst, part.asStr(), (*variant).name)
+            local payloadItem = owner.internItemOf(payloadIdx)
+            internInstance(owner, payloadItem, part.asStr(), origin.asStr(), args.clone(), at)
+        }
+    }
+    local r: EntityRef
+    r.owner = owner
+    r.sym = sym
+    r.name = *owner.symNames.get(sym as usize)
+    r.foundAs = r.name
+    return r
+}
+
+/// The union item of a payload enum instance: one field per variant with data, typed with the
+/// part's instance name.
+fn synthUnionOf(s: *Sema, inst: i32, name: str) -> i32 {
+    local d = s.declOf(inst)
+    local nd: SDecl
+    nd = *d
+    nd.name = s.str(name)
+    nd.isPayload = 0
+    nd.isUnion = 1
+    local fFirst = s.fields.length() as u32
+    for v in 0..(*d).variantsCount as usize {
+        local variant = s.variants.get(((*d).variantsFirst + v as u32) as usize)
+        if (*variant).payloadCount == 0 { continue }
+        local part = format("{}${}<{}>", s.text((*d).name), s.text((*variant).name), "")
+        // The part name needs the argument spelling; take it from the instance name.
+        local instName = s.text((*d).name)
+        part = format("{}${}{}", cutArgs(instName).asStr(), s.text((*variant).name),
+            argsOf(instName).asStr())
+        local f: SField
+        f.name = s.str(s.text((*variant).name))
+        local path = Vec<String>()
+        path.push(part)
+        f.ty = s.types.makeNamed(path)
+        f.attrsFirst = 0
+        f.attrsCount = 0
+        f.span = (*d).span
+        s.fields.push(f)
+    }
+    nd.fieldsFirst = fFirst
+    nd.fieldsCount = (*d).variantsCount
+    nd.variantsFirst = 0
+    nd.variantsCount = 0
+    s.decls.push(nd)
+    return (s.decls.length() - 1) as i32
+}
+
+/// The payload struct of one variant of a payload enum instance: fields `_0..` typed with the
+/// substituted payload types.
+fn synthPayloadOf(s: *Sema, inst: i32, name: str, variantName: XStr) -> i32 {
+    local d = s.declOf(inst)
+    local nd: SDecl
+    nd = *d
+    nd.name = s.str(name)
+    nd.isUnion = 0
+    nd.isPayload = 1
+    local fFirst = s.fields.length() as u32
+    local variant = s.variants.get((*d).variantsFirst) // resolved below by name
+    for v in 0..(*d).variantsCount as usize {
+        local cand = s.variants.get(((*d).variantsFirst + v as u32) as usize)
+        if s.text((*cand).name) == s.text(variantName) { variant = cand }
+    }
+    for j in 0..(*variant).payloadCount as usize {
+        local f: SField
+        f.name = s.str(format("_{}", j).asStr())
+        f.ty = ((*variant).payloadFirst + j) as i32
+        f.attrsFirst = 0
+        f.attrsCount = 0
+        f.span = (*d).span
+        s.fields.push(f)
+    }
+    nd.fieldsFirst = fFirst
+    nd.fieldsCount = (*variant).payloadCount
+    nd.variantsFirst = 0
+    nd.variantsCount = 0
+    s.decls.push(nd)
+    return (s.decls.length() - 1) as i32
+}
+
+/// `Name<i32, E>` without its `<...>`: `Name`.
+fn cutArgs(name: str) -> String {
+    local out = String("")
+    for i in 0..name.len {
+        if name[i] == b'<' { break }
+        out.push(name[i])
+    }
+    return out
+}
+
+/// The `<...>` of `Name<i32, E>`, or "".
+fn argsOf(name: str) -> String {
+    local out = String("")
+    local seen = false
+    for i in 0..name.len {
+        if name[i] == b'<' { seen = true }
+        if seen { out.push(name[i]) }
+    }
+    return out
+}
+
+/// Interns an instance item as a symbol named `local`, records its InstanceInfo and queues it
+/// for the lowering pass. Returns the symbol index.
+export fn internInstance(s: *Sema, item: i32, localName: str, origin: str, args: Vec<i32>,
+                         at: XSpan) -> i32 {
+    local d = s.declOf(s.declOfItem(item))
+    local kind = SY_FN
+    if (*d).kind == XD_CLASS {
+        kind = SY_CLASS
+        s.aggregateOrder.push(s.str(localName))
+    } else if (*d).kind == XD_STRUCT {
+        kind = SY_STRUCT
+        s.aggregateOrder.push(s.str(localName))
+    } else if (*d).kind == XD_INTERFACE {
+        kind = SY_INTERFACE
+    } else if (*d).kind == XD_ENUM {
+        // `enum E<T>`: the tag and the union of a generic payload enum are enums too, and a
+        // generic value enum keeps being an enum. None of them owns a layout.
+        kind = SY_ENUM
+    }
+    local sym = s.addSymbol(s.str(localName), kind, item)
+    if s.find(localName) == sym || true {
+        // `addSymbol` always appends; an instance name is fresh (checked by the caller).
+        local info: InstanceInfo
+        info.generic = s.str(origin)
+        local aFirst = s.instanceArgs.length() as i32
+        for i in 0..args.length() {
+            s.instanceArgs.push(*args.get(i))
+        }
+        info.argsFirst = aFirst
+        info.argsCount = args.length() as u32
+        info.requestedAt = s.span(at)
+        info.parent = s.str(s.currentInstance.asStr())
+        info.parentOwner = -1
+        s.instanceInfos.push(info)
+        s.instanceItems.push(item)
+        s.instanceNames.push(s.str(localName))
+        s.pendingInstances.push(item)
+    }
+    return sym
+}
+
+/// Instantiates a method of a class instance: `Box<i32>.get`. Returns the index of the method
+/// instance in the Sema's `methodInstDecls`, or the existing one.
+export fn instantiateMethod(s: *Sema, generic: i32, cls: str, clsQ: str, args: Vec<i32>) -> i32 {
+    local gd = s.declOf(generic)
+    local key = format("{}.{}<", clsQ, s.text((*gd).name))
+    for i in 0..args.length() {
+        if i != 0 { key.append(", ") }
+        key.append(s.types.text(*args.get(i)).asStr())
+    }
+    key.append(">")
+    for i in 0..s.methodInstKeys.length() {
+        if s.text(*s.methodInstKeys.get(i)) == key.asStr() { return i as i32 }
+    }
+    local env = new TypeEnv()
+    for i in 0..(*gd).genericCount as usize {
+        if (i as u32) < args.length() as u32 {
+            env.put(s.text(*s.types.strs.get((*gd).genericFirst + i as u32)), *args.get(i))
+        }
+    }
+    local decl = instantiateFn(s, generic, env)
+    local idx = s.methodInstDecls.length() as i32
+    s.methodInstDecls.push(decl)
+    s.methodInstKeys.push(s.str(key.asStr()))
+    s.methodInstCls.push(s.str(cls))
+    s.methodInstClsQ.push(s.str(clsQ))
+    s.pendingMethods.push(idx)
+    return idx
+}

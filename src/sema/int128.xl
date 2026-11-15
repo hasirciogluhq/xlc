@@ -1,0 +1,267 @@
+// 128-bit signed integer arithmetic for compile-time values. xlang has no `i128` type yet, so the
+// constant evaluator works on a two's-complement pair of halves (`hi`, `lo`); this file is the
+// arithmetic that pair needs. Everything is plain functions over the `I128` record; the signed
+// division truncates toward zero like C++ and the hardware.
+from "std" import String, Vec, format
+
+/// A 128-bit two's-complement integer as its halves.
+export struct I128 {
+    hi: u64
+    lo: u64
+}
+
+export fn i128Of(v: i64) -> I128 {
+    local r: I128
+    r.lo = *(&v as *u64)
+    r.hi = v < 0 ? 0xFFFFFFFFFFFFFFFF : 0
+    return r
+}
+
+export fn i128U(v: u64) -> I128 {
+    local r: I128
+    r.lo = v
+    r.hi = 0
+    return r
+}
+
+/// The low half as a signed 64-bit value; callers range-check when it matters.
+export fn i128Low(a: I128) -> i64 {
+    return *(&a.lo as *i64)
+}
+
+/// True when the value fits a signed 64-bit integer.
+export fn i128FitsI64(a: I128) -> bool {
+    if a.hi == 0 { return (*(&a.lo as *i64)) >= 0 }
+    if a.hi == 0xFFFFFFFFFFFFFFFF { return (*(&a.lo as *i64)) < 0 }
+    return false
+}
+
+/// True when the value is negative.
+export fn i128Neg(a: I128) -> bool {
+    return a.hi >> 63 != 0
+}
+
+export fn i128Negate(a: I128) -> I128 {
+    local lo = ~a.lo + 1
+    local carry: u64 = lo == 0 ? 1 : 0
+    return I128 { hi: ~a.hi + carry, lo: lo }
+}
+
+export fn i128Add(a: I128, b: I128) -> I128 {
+    local lo = a.lo + b.lo
+    local carry: u64 = lo < a.lo ? 1 : 0
+    return I128 { hi: a.hi + b.hi + carry, lo: lo }
+}
+
+export fn i128Sub(a: I128, b: I128) -> I128 {
+    return i128Add(a, i128Negate(b))
+}
+
+export fn i128Eq(a: I128, b: I128) -> bool {
+    return a.hi == b.hi && a.lo == b.lo
+}
+
+/// True when `a < b` as signed values.
+export fn i128Lt(a: I128, b: I128) -> bool {
+    if a.hi != b.hi { return a.hi < b.hi }
+    return a.lo < b.lo
+}
+
+export fn i128Le(a: I128, b: I128) -> bool {
+    return i128Eq(a, b) || i128Lt(a, b)
+}
+
+/// True when `a < b` as unsigned values.
+export fn i128Ult(a: I128, b: I128) -> bool {
+    if a.hi != b.hi { return a.hi < b.hi }
+    return a.lo < b.lo
+}
+
+export fn i128And(a: I128, b: I128) -> I128 {
+    return I128 { hi: a.hi & b.hi, lo: a.lo & b.lo }
+}
+
+export fn i128Or(a: I128, b: I128) -> I128 {
+    return I128 { hi: a.hi | b.hi, lo: a.lo | b.lo }
+}
+
+export fn i128Xor(a: I128, b: I128) -> I128 {
+    return I128 { hi: a.hi ^ b.hi, lo: a.lo ^ b.lo }
+}
+
+export fn i128Not(a: I128) -> I128 {
+    return I128 { hi: ~a.hi, lo: ~a.lo }
+}
+
+/// Logical left shift by `n` (0..127; wider shifts are 0 by the C++ rule the evaluator inherits).
+export fn i128Shl(a: I128, n: u32) -> I128 {
+    if n >= 128 { return I128 { hi: 0, lo: 0 } }
+    if n >= 64 {
+        return I128 { hi: a.lo << (n - 64), lo: 0 }
+    }
+    if n == 0 { return a }
+    return I128 { hi: (a.hi << n) | (a.lo >> (64 - n)), lo: a.lo << n }
+}
+
+/// Arithmetic right shift (the sign moves in).
+export fn i128Shr(a: I128, n: u32) -> I128 {
+    if n >= 128 {
+        return a.hi >> 63 != 0 ? I128 { hi: 0xFFFFFFFFFFFFFFFF, lo: 0xFFFFFFFFFFFFFFFF }
+                               : I128 { hi: 0, lo: 0 }
+    }
+    if n >= 64 {
+        local fill: u64 = a.hi >> 63 != 0 ? 0xFFFFFFFFFFFFFFFF : 0
+        return I128 { hi: fill, lo: a.hi >> ((n - 64) as u32) }
+    }
+    if n == 0 { return a }
+    local lo = (a.lo >> n) | (a.hi << (64 - n))
+    return I128 { hi: a.hi >> n, lo: lo }
+}
+
+export fn i128Mul(a: I128, b: I128) -> I128 {
+    // Schoolbook over 64-bit halves with 32-bit digits; only the low 128 bits are kept.
+    local a0 = a.lo & 0xFFFFFFFF
+    local a1 = a.lo >> 32
+    local a2 = a.hi & 0xFFFFFFFF
+    local a3 = a.hi >> 32
+    local b0 = b.lo & 0xFFFFFFFF
+    local b1 = b.lo >> 32
+    local b2 = b.hi & 0xFFFFFFFF
+    local b3 = b.hi >> 32
+    // The product accumulates in four 64-bit columns; anything at column 4 and up is dropped.
+    local c0 = a0 * b0
+    local c1 = a0 * b1 + a1 * b0
+    local c2 = a0 * b2 + a1 * b1 + a2 * b0
+    local c3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 // only the low 32 bits matter
+    local lo = c0 + (c1 << 32)
+    local carry: u64 = lo < c0 ? 1 : 0
+    local hi = c2 + (c1 >> 32) + (c3 << 32) + carry
+    return I128 { hi: hi, lo: lo }
+}
+
+/// Unsigned 128-bit division with remainder by a nonzero divisor; the signed wrappers fix the
+/// signs. Schoolbook bit-by-bit restoring division over the 128 bits.
+export fn i128UDivMod(a: I128, b: I128, rem: *I128) -> I128 {
+    local q: I128 = I128 { hi: 0, lo: 0 }
+    local r: I128 = I128 { hi: 0, lo: 0 }
+    local i: i32 = 127
+    while i >= 0 {
+        // r = (r << 1) | bit i of a
+        r.hi = (r.hi << 1) | (r.lo >> 63)
+        local bit: u64 = i >= 64 ? (a.hi >> ((i - 64) as u32)) & 1 : (a.lo >> (i as u32)) & 1
+        r.lo = (r.lo << 1) | bit
+        if i128Ult(b, r) || i128Eq(b, r) {
+            r = i128Sub(r, b)
+            if i >= 64 {
+                q.hi = q.hi | (1 as u64 << (i - 64))
+            } else {
+                q.lo = q.lo | (1 as u64 << i)
+            }
+        }
+        i--
+    }
+    if rem != nil { *rem = r }
+    return q
+}
+
+/// Signed division truncating toward zero; the caller guarantees `b != 0`. Division of the most
+/// negative value by -1 wraps to itself (the two's-complement rule).
+export fn i128Div(a: I128, b: I128) -> I128 {
+    local rem: I128
+    local neg = i128Neg(a) != i128Neg(b)
+    local x = i128Neg(a) ? i128Negate(a) : a
+    local y = i128Neg(b) ? i128Negate(b) : b
+    local q = i128UDivMod(x, y, &rem)
+    return neg ? i128Negate(q) : q
+}
+
+/// Signed remainder with the sign of the dividend (the C++ rule).
+export fn i128Mod(a: I128, b: I128) -> I128 {
+    local rem: I128
+    local x = i128Neg(a) ? i128Negate(a) : a
+    local y = i128Neg(b) ? i128Negate(b) : b
+    local q = i128UDivMod(x, y, &rem)
+    if q.hi == 0xDEADBEEF { return q } // unreachable; keeps `q` used
+    return i128Neg(a) ? i128Negate(rem) : rem
+}
+
+/// Wraps `value` to the range of an integer type of `bits` bits.
+export fn i128Wrap(value: I128, bits: u32, isSigned: bool) -> I128 {
+    if bits >= 64 {
+        if bits == 64 {
+            return I128 { hi: 0, lo: value.lo }
+        }
+        return value
+    }
+    local mask: u64 = (1 as u64 << bits) - 1
+    local u = value.lo & mask
+    if isSigned && (u >> (bits - 1)) != 0 {
+        // sign-extend from `bits` bits
+        return I128 { hi: 0xFFFFFFFFFFFFFFFF, lo: u | ~mask }
+    }
+    return I128 { hi: 0, lo: u }
+}
+
+/// The value as a signed f64 (the direction of an `as f64` cast).
+export fn i128ToF64(a: I128) -> f64 {
+    local neg = i128Neg(a)
+    local x = neg ? i128Negate(a) : a
+    local v = x.hi as f64 * 18446744073709551616.0 + x.lo as f64
+    return neg ? -v : v
+}
+
+/// The nearest value of `v` as a 128-bit integer (the direction of a `as i128` cast).
+export fn i128FromF64(v: f64) -> I128 {
+    if v != v || v >= 1.7014118346046923e38 || v <= -1.7014118346046923e38 {
+        return v < 0 ? I128 { hi: 0x8000000000000000, lo: 0 } : I128 { hi: 0x7FFFFFFFFFFFFFFF, lo: 0xFFFFFFFFFFFFFFFF }
+    }
+    local neg = v < 0
+    local x = neg ? -v : v
+    local hi = (x / 18446744073709551616.0) as u64
+    local lo = (x - hi as f64 * 18446744073709551616.0) as u64
+    local r = I128 { hi: hi, lo: lo }
+    return neg ? i128Negate(r) : r
+}
+
+/// The decimal text of the value.
+export fn i128Text(a: I128) -> String {
+    if i128Eq(a, I128 { hi: 0, lo: 0 }) { return String("0") }
+    local neg = i128Neg(a)
+    local x = neg ? i128Negate(a) : a
+    local digits = Vec<u8>()
+    while !i128Eq(x, I128 { hi: 0, lo: 0 }) {
+        local rem: I128
+        x = i128UDivMod(x, I128 { hi: 0, lo: 10 }, &rem)
+        digits.push(b'0' + rem.lo as u8)
+    }
+    local out = String()
+    if neg { out.append("-") }
+    local i = digits.length()
+    while i > 0 {
+        i--
+        out.push(*digits.get(i))
+    }
+    return out
+}
+
+/// Parses a signed decimal (an optional `-` then digits); false when the text is not one. The
+/// value wraps like the literals of the language do.
+export fn i128Parse(text: str, out: *I128) -> bool {
+    local i: usize = 0
+    local neg = false
+    if text.len > 0 && text[0] == b'-' {
+        neg = true
+        i = 1
+    }
+    if i >= text.len { return false }
+    local v = I128 { hi: 0, lo: 0 }
+    local ten = I128 { hi: 0, lo: 10 }
+    while i < text.len {
+        local c = text[i]
+        if c < b'0' || c > b'9' { return false }
+        v = i128Add(i128Mul(v, ten), i128U(c - b'0' as u64))
+        i++
+    }
+    *out = neg ? i128Negate(v) : v
+    return true
+}

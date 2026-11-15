@@ -1,0 +1,829 @@
+// The semantic analysis of one module: the state the C++ `Sema` kept (name table, caches, the
+// instance bookkeeping) and the collection of the module's declarations into the Sema's own
+// arenas. The checks, constant evaluation, resolution and the lowering live in the sibling files;
+// they all hang off this class.
+//
+// One instance serves one module of a compilation; a standalone module has no compilation and
+// resolves imports as external names.
+from "std" import String, Vec, format
+from "std/str" import fromParts
+from "../util/diagnostics" import DiagnosticEngine, Diagnostic, Label, Note
+from "../util/source" import Span, spanNone
+from "../lang/ast/ast" import XDecl, XItem, XParam, XField, XSumVariant, XEnumMember, XImportName,
+    XExpr, XStmt, XBlock, XSpan, XStr, XD_FN, XD_GLOBAL, XD_STRUCT, XD_CLASS, XD_INTERFACE, XD_IMPL, XD_ENUM,
+    XD_TYPE_ALIAS, XD_DEFINE_CONST, XD_DEFINE_MACRO, XD_IMPORT, XD_EXPORT_FROM, XD_MACRO_CALL,
+    XD_TOP_LEVEL_CALL, XD_FN_ALIAS
+from "./flat" import Flat, eqStr, eqText, bytesOf
+from "./types" import Types, T_INT, T_FLOAT, T_BOOL, T_POINTER, T_STRUCT, T_CLASS, T_INTERFACE,
+    T_ENUM, T_NAMED
+from "./const_value" import ConstValue
+from "./item" import SItem, SDecl, SParam, SField, SSumVariant, SEnumMember, SImportName
+
+/// The kind of a collected name (the order of `Sema::Symbol::Kind`).
+export const SY_STRUCT: i32 = 0
+export const SY_CLASS: i32 = 1
+export const SY_INTERFACE: i32 = 2
+export const SY_ENUM: i32 = 3
+export const SY_ALIAS: i32 = 4
+export const SY_DEFINE: i32 = 5
+export const SY_GLOBAL: i32 = 6
+export const SY_FN: i32 = 7
+export const SY_FN_ALIAS: i32 = 8
+export const SY_MACRO: i32 = 9
+
+/// One collected name: its kind, its item and, for a function, every declaration of the name in
+/// declaration order (more than one = overloads). `item` is -1 for the builtin `MemoryOrder`.
+export struct Symbol {
+    kind: i32
+    item: i32
+    overloadsFirst: i32 ///< range in the Sema's `overloadRefs`
+    overloadsCount: u32
+}
+
+/// An import binding made by the compilation: a name that stands for an entity of another module,
+/// or a whole module (`import "m" as a`).
+export struct ImportBinding {
+    isNamespace: bool
+    moduleKey: XStr ///< defining module (entity) / the module itself (namespace)
+    name: XStr      ///< entity: name inside that module
+    span: Span
+}
+
+/// An entity found through scopes: the module that owns it and its local name there. `owner` is
+/// nil for this module.
+export struct EntityRef {
+    owner: *Sema ///< nil for this module
+    sym: i32     ///< the symbol index in the owner
+    name: XStr   ///< the entity's local name in the owner's string table
+    foundAs: XStr ///< the name it was found under (`Result<i32, E>$Ok` for a derived part)
+}
+
+/// The qualified name of an entity: `key::name` for an imported module, plain `name` for the root
+/// module and builtins.
+export fn qualify(owner: *Sema, name: XStr) -> String {
+    if owner.moduleKey.length() == 0 || owner.text(name) == "MemoryOrder" {
+        return String(owner.text(name))
+    }
+    local out = owner.moduleKey.clone()
+    out.append("::")
+    out.append(owner.text(name))
+    return out
+}
+
+/// A concrete instance of a generic declaration: its origin and type arguments.
+export struct InstanceInfo {
+    generic: XStr  ///< qualified name of the generic declaration
+    argsFirst: i32 ///< range in the Sema's `instanceArgs` (Types indices)
+    argsCount: u32
+    requestedAt: Span ///< where the instance was first requested
+    parent: XStr      ///< local name of the instance that requested it, -1 = none
+    parentOwner: i32  ///< the module that owns `parent`, -1 for this module
+}
+
+/// The semantic analysis of one module.
+export class Sema {
+    flat: *Flat
+    types: *Types
+    diag: *DiagnosticEngine
+
+    // The configuration the analysis reads.
+    mangleNone: bool       ///< --mangle=none
+    pointerBits: u32       ///< isize/usize width
+    moduleKey: String      ///< the module's key, "" for the root module
+    rootMangle: String     ///< the mangling name of the root module (a compilation sets it)
+    hasComp: bool          ///< set by the driver when this module runs inside a compilation
+
+    // The interned declarations.
+    items: Vec<SItem>
+    decls: Vec<SDecl>
+    params: Vec<SParam>
+    fields: Vec<SField>
+    variants: Vec<SSumVariant>
+    members: Vec<SEnumMember>
+    importNames: Vec<SImportName>
+
+    // The name table: parallel arrays, `symNames[i]` names `symbols[i]`.
+    symbols: Vec<Symbol>
+    symNames: Vec<XStr>
+    overloadRefs: Vec<i32>
+    aggregateOrder: Vec<XStr> ///< struct and class names, in source order
+
+    // Import bindings (a compilation fills them; a standalone module has none).
+    importBindings: Vec<ImportBinding>
+    importBindingNames: Vec<XStr>
+
+    // Generic instances.
+    instanceItems: Vec<i32>   ///< SItem indices of the instances of this module
+    instanceNames: Vec<XStr>  ///< their local names, parallel to `instanceItems`
+    instanceInfos: Vec<InstanceInfo>
+    instanceArgs: Vec<i32>    ///< the type arguments of the instances, ranged over
+    pendingInstances: Vec<i32> ///< SItem indices not lowered yet
+    itemInstance: Vec<i32>    ///< for every instance item, its index in `instanceNames` (-1 else)
+    currentInstance: String   ///< local name of the instance whose body is lowered
+
+    // Method instances (`Box<i32>.get`), their keys and the queue the lowering pass drains.
+    methodInstDecls: Vec<i32> ///< SDecl indices of the cloned methods
+    methodInstKeys: Vec<XStr>
+    methodInstCls: Vec<XStr>
+    methodInstClsQ: Vec<XStr>
+    pendingMethods: Vec<i32>  ///< indices into `methodInstDecls` not lowered yet
+
+    // Derived entity aliases: `Result<i32, E>$Ok` and the `Tag`/`Data` parts name no symbol of
+    // their own; the lookup derives them from the payload enum's instance. Keys are the full
+    // local names, values the EntityRefs in parallel.
+    instanceAliasNames: Vec<XStr>
+    instanceAliasRefs: Vec<EntityRef>
+
+    // Caches and cycle guards.
+    defineValues: Vec<i32>    ///< ConstValue results, -1 = known not constant
+    defineNames: Vec<XStr>
+    defineInProgress: Vec<XStr>
+    aliasInProgress: Vec<XStr>
+    layoutValues: Vec<i32>    ///< TypeLayout results (heap), -1 = known failed
+    layoutNames: Vec<XStr>
+    layoutInProgress: Vec<XStr>
+    enumValues: Vec<i32>      ///< per enum: range in `enumMemberValues`
+    enumNames: Vec<XStr>
+    enumMemberValues: Vec<i32> ///< ConstValue results, -1 = none (auto-numbered fills them)
+    enumInProgress: Vec<XStr>
+    reported: Vec<XStr>       ///< dedup keys of the diagnostics already reported
+    consts: Vec<*ConstValue>  ///< the arena the ConstValue results index into
+
+    // Synthesized expression/statement/block arenas for cloned instance bodies. Indices below the
+    // flat AST's counts read from the parse result; indices at or above read from these. Records
+    // in the synthesized arenas carry their text in this Sema's string table.
+    xexprs: Vec<XExpr>
+    xstmts: Vec<XStmt>
+    xblocks: Vec<XBlock>
+    xexprRefs: Vec<i32>
+    xstmtRefs: Vec<i32>
+
+    fn init(self, flat: *Flat, types: *Types, diag: *DiagnosticEngine) {
+        self.flat = flat
+        self.types = types
+        self.diag = diag
+        self.items = Vec<SItem>()
+        self.decls = Vec<SDecl>()
+        self.params = Vec<SParam>()
+        self.fields = Vec<SField>()
+        self.variants = Vec<SSumVariant>()
+        self.members = Vec<SEnumMember>()
+        self.importNames = Vec<SImportName>()
+        self.symbols = Vec<Symbol>()
+        self.symNames = Vec<XStr>()
+        self.overloadRefs = Vec<i32>()
+        self.aggregateOrder = Vec<XStr>()
+        self.importBindings = Vec<ImportBinding>()
+        self.importBindingNames = Vec<XStr>()
+        self.instanceItems = Vec<i32>()
+        self.instanceNames = Vec<XStr>()
+        self.instanceInfos = Vec<InstanceInfo>()
+        self.instanceArgs = Vec<i32>()
+        self.pendingInstances = Vec<i32>()
+        self.itemInstance = Vec<i32>()
+        self.currentInstance = String()
+        self.defineValues = Vec<i32>()
+        self.defineNames = Vec<XStr>()
+        self.defineInProgress = Vec<XStr>()
+        self.aliasInProgress = Vec<XStr>()
+        self.layoutValues = Vec<i32>()
+        self.layoutNames = Vec<XStr>()
+        self.layoutInProgress = Vec<XStr>()
+        self.enumValues = Vec<i32>()
+        self.enumNames = Vec<XStr>()
+        self.enumMemberValues = Vec<i32>()
+        self.enumInProgress = Vec<XStr>()
+        self.reported = Vec<XStr>()
+        self.consts = Vec<*ConstValue>()
+        self.methodInstDecls = Vec<i32>()
+        self.methodInstKeys = Vec<XStr>()
+        self.methodInstCls = Vec<XStr>()
+        self.methodInstClsQ = Vec<XStr>()
+        self.pendingMethods = Vec<i32>()
+        self.currentInstance = String("")
+        self.instanceAliasNames = Vec<XStr>()
+        self.instanceAliasRefs = Vec<EntityRef>()
+        self.xexprs = Vec<XExpr>()
+        self.xstmts = Vec<XStmt>()
+        self.xblocks = Vec<XBlock>()
+        self.xexprRefs = Vec<i32>()
+        self.xstmtRefs = Vec<i32>()
+        self.moduleKey = String()
+        self.rootMangle = String()
+    }
+
+    // --------------------------------------------------- synthesized-tree accessors
+
+    /// Expression record for index `idx`: from the flat AST below its count, from the synthesized
+    /// arena above it.
+    fn exprAt(self, idx: i32) -> *XExpr {
+        if idx < self.flat.r.exprCount as i32 {
+            return (self.flat.r.exprs as usize + idx as usize * sizeOf(XExpr)) as *XExpr
+        }
+        local j = idx - self.flat.r.exprCount as i32
+        return (self.xexprs.data as usize + (j as usize) * sizeOf(XExpr)) as *XExpr
+    }
+
+    fn stmtAt(self, idx: i32) -> *XStmt {
+        if idx < self.flat.r.stmtCount as i32 {
+            return (self.flat.r.stmts as usize + idx as usize * sizeOf(XStmt)) as *XStmt
+        }
+        local j = idx - self.flat.r.stmtCount as i32
+        return (self.xstmts.data as usize + (j as usize) * sizeOf(XStmt)) as *XStmt
+    }
+
+    fn blockAt(self, idx: i32) -> *XBlock {
+        if idx < self.flat.r.blockCount as i32 {
+            return (self.flat.r.blocks as usize + idx as usize * sizeOf(XBlock)) as *XBlock
+        }
+        local j = idx - self.flat.r.blockCount as i32
+        return (self.xblocks.data as usize + (j as usize) * sizeOf(XBlock)) as *XBlock
+    }
+
+    /// Index-arena reference: flat arenas below the AST's counts, synthesized arenas above.
+    fn refAt(self, which: str, idx: i32) -> i32 {
+        if which == "expr" {
+            if idx < self.flat.r.exprRefCount as i32 {
+                return self.flat.ref(self.flat.r.exprRefs, idx as u32)
+            }
+            return (*self.xexprRefs.get((idx - self.flat.r.exprRefCount as i32) as usize))
+        }
+        if idx < self.flat.r.stmtRefCount as i32 {
+            return self.flat.ref(self.flat.r.stmtRefs, idx as u32)
+        }
+        return (*self.xstmtRefs.get((idx - self.flat.r.stmtRefCount as i32) as usize))
+    }
+
+    /// The text an expression record's `text` field points at: flat-AST records read the parse
+    /// block's bytes, synthesized records read the Sema's table.
+    fn exprTextAt(self, idx: i32) -> str {
+        local e = self.exprAt(idx)
+        if idx < self.flat.r.exprCount as i32 {
+            return self.flat.strOf((*e).text)
+        }
+        return self.text((*e).text)
+    }
+
+    /// The text a statement record's `name` field points at, dispatched the same way.
+    fn stmtTextAt(self, idx: i32) -> str {
+        local st = self.stmtAt(idx)
+        if idx < self.flat.r.stmtCount as i32 {
+            return self.flat.strOf((*st).name)
+        }
+        return self.text((*st).name)
+    }
+
+    // ------------------------------------------------------------------ strings and spans
+
+    /// interns `text` in the Sema's string table (the `Types` byte table).
+    fn str(self, text: str) -> XStr {
+        return self.types.intern(text)
+    }
+
+    /// The bytes of a Sema string view.
+    fn text(self, s: XStr) -> str {
+        local b = &(self.types.bytes)
+        local p = ((*b).data as usize + s.off as usize) as *u8
+        return fromParts(p, s.len as usize)
+    }
+
+    /// The bytes of a Sema string view as an owned `String`.
+    fn textS(self, s: XStr) -> String {
+        return String(self.text(s))
+    }
+
+    /// The span of the flat AST as the engine's `Span`.
+    fn span(self, s: XSpan) -> Span {
+        local out: Span
+        out.file = s.file
+        out.line = s.line
+        out.column = s.column
+        out.endLine = s.endLine
+        out.endColumn = s.endColumn
+        return out
+    }
+
+    /// True when the span names a place (the flat default span is file 0, line 0).
+    fn spanValid(self, s: XSpan) -> bool {
+        return s.file != 0 || s.line != 0
+    }
+
+    // ------------------------------------------------------------------ diagnostics
+
+    /// Reports `code` at `at` unless the same diagnosis was already reported.
+    fn error(self, code: str, at: XSpan, message: str, label: str) {
+        local key = format("{}:{}:{}:{}:{}", code, at.file, at.line, at.column, message)
+        for i in 0..self.reported.length() {
+            if self.text(*self.reported.get(i)) == key.asStr() { return }
+        }
+        self.reported.push(self.str(key.asStr()))
+        self.diag.error(code, self.span(at), message, label)
+    }
+
+    /// E0707: the expression cannot be evaluated at compile time.
+    fn notConstant(self, at: XSpan, why: str) {
+        self.error("E0707", at, "expression is not a compile-time constant", why)
+    }
+
+    // ------------------------------------------------------------------ collection
+
+    /// interns one AST declaration and its children; returns the SDecl index.
+    fn internDecl(self, idx: i32) -> i32 {
+        local src = self.flat.declAt(idx)
+        local d: SDecl
+        d.kind = (*src).kind
+        d.name = self.str(self.flat.strOf((*src).name))
+        d.nameSpan = (*src).nameSpan
+        d.attrsFirst = (*src).attrsFirst
+        d.attrsCount = (*src).attrsCount
+        d.span = (*src).span
+        d.ret = -1
+        d.body = -1
+        d.ty = -1
+        d.init = -1
+        d.implTarget = -1
+        d.underlying = -1
+        d.call = -1
+        // Generic parameters.
+        local gFirst = self.types.strs.length() as u32
+        for i in 0..(*src).genericCount as usize {
+            self.types.strs.push(self.str(self.flat.strOf(
+                self.flat.pathSeg((*src).genericFirst + i as u32))))
+        }
+        d.genericFirst = gFirst
+        d.genericCount = (*src).genericCount
+        // Parameters.
+        local pFirst = self.params.length() as u32
+        for i in 0..(*src).paramsCount as usize {
+            local p = self.flat.paramAt(((*src).paramsFirst + i as u32) as i32)
+            local sp = SParam {
+                name: self.str(self.flat.strOf((*p).name)),
+                ty: self.types.internAst((*p).typeIdx),
+                isSelf: (*p).isSelf,
+                isPack: (*p).isPack,
+                typedSelf: (*p).typedSelf,
+                hasType: (*p).hasType,
+                span: (*p).span,
+            }
+            self.params.push(sp)
+        }
+        d.paramsFirst = pFirst
+        d.paramsCount = (*src).paramsCount
+        d.hasRet = (*src).hasRet
+        if (*src).hasRet != 0 { d.ret = self.types.internAst((*src).ret) }
+        d.hasBody = (*src).hasBody
+        d.body = (*src).body
+        d.isVirtual = (*src).isVirtual
+        d.isOverride = (*src).isOverride
+        d.hasType = (*src).hasType
+        if (*src).hasType != 0 { d.ty = self.types.internAst((*src).typeIdx) }
+        d.isConst = (*src).isConst
+        d.init = (*src).init
+        // Fields.
+        local fFirst = self.fields.length() as u32
+        for i in 0..(*src).fieldsCount as usize {
+            local f = self.flat.fieldAt(((*src).fieldsFirst + i as u32) as i32)
+            local sf = SField {
+                name: self.str(self.flat.strOf((*f).name)),
+                ty: self.types.internAst((*f).typeIdx),
+                attrsFirst: (*f).attrsFirst,
+                attrsCount: (*f).attrsCount,
+                span: (*f).span,
+            }
+            self.fields.push(sf)
+        }
+        d.fieldsFirst = fFirst
+        d.fieldsCount = (*src).fieldsCount
+        d.opaque = (*src).opaque
+        d.isUnion = (*src).isUnion
+        d.isPayload = (*src).isPayload
+        // Variants.
+        local vFirst = self.variants.length() as u32
+        for i in 0..(*src).variantsCount as usize {
+            local v = self.flat.variantAt(((*src).variantsFirst + i as u32) as i32)
+            local sv = SSumVariant { name: self.str(self.flat.strOf((*v).name)),
+                                     payloadFirst: self.types.types.length() as u32, payloadCount: 0 }
+            for j in 0..(*v).payloadCount as usize {
+                self.types.internAst(self.flat.ref(self.flat.r.typeRefs, (*v).payloadFirst + j as u32))
+            }
+            sv.payloadCount = (self.types.types.length() as u32) - sv.payloadFirst
+            self.variants.push(sv)
+        }
+        d.variantsFirst = vFirst
+        d.variantsCount = (*src).variantsCount
+        // Methods: nested declarations, interned recursively.
+        local mFirst = self.decls.length() as u32
+        for i in 0..(*src).methodsCount as usize {
+            self.internDecl(((*src).methodsFirst + i) as i32)
+        }
+        d.methodsFirst = mFirst
+        d.methodsCount = (*src).methodsCount
+        // Base class path.
+        local bFirst = self.types.strs.length() as u32
+        for i in 0..(*src).baseCount as usize {
+            self.types.strs.push(self.str(self.flat.strOf(
+                self.flat.pathSeg((*src).baseFirst + i as u32))))
+        }
+        d.baseHas = (*src).baseHas
+        d.baseFirst = bFirst
+        d.baseCount = (*src).baseCount
+        // Interface path and arguments of an `impl`.
+        local iFirst = self.types.strs.length() as u32
+        for i in 0..(*src).ifacePathCount as usize {
+            self.types.strs.push(self.str(self.flat.strOf(
+                self.flat.pathSeg((*src).ifacePathFirst + i as u32))))
+        }
+        d.ifacePathFirst = iFirst
+        d.ifacePathCount = (*src).ifacePathCount
+        d.ifaceArgsFirst = self.types.types.length() as u32
+        for i in 0..(*src).ifaceArgsCount as usize {
+            self.types.internAst(self.flat.ref(self.flat.r.typeRefs, (*src).ifaceArgsFirst + i as u32))
+        }
+        d.ifaceArgsCount = (self.types.types.length() as u32) - d.ifaceArgsFirst
+        d.implTarget = (*src).implTarget >= 0 ? self.types.internAst((*src).implTarget) : -1
+        d.hasUnderlying = (*src).hasUnderlying
+        if (*src).hasUnderlying != 0 { d.underlying = self.types.internAst((*src).underlying) }
+        // Enum members.
+        local eFirst = self.members.length() as u32
+        for i in 0..(*src).membersCount as usize {
+            local m = self.flat.memberAt(((*src).membersFirst + i as u32) as i32)
+            local sm = SEnumMember {
+                name: self.str(self.flat.strOf((*m).name)),
+                value: (*m).value,
+                hasPayload: (*m).hasPayload,
+                payloadFirst: self.types.types.length() as u32,
+                payloadCount: 0,
+                attrsFirst: (*m).attrsFirst,
+                attrsCount: (*m).attrsCount,
+                span: (*m).span,
+            }
+            for j in 0..(*m).payloadCount as usize {
+                self.types.internAst(self.flat.ref(self.flat.r.typeRefs, (*m).payloadFirst + j as u32))
+            }
+            sm.payloadCount = (self.types.types.length() as u32) - sm.payloadFirst
+            self.members.push(sm)
+        }
+        d.membersFirst = eFirst
+        d.membersCount = (*src).membersCount
+        // Macro parameters and body stay AST references (never substituted).
+        d.macroParamsFirst = (*src).macroParamsFirst
+        d.macroParamsCount = (*src).macroParamsCount
+        d.macroBodyFirst = (*src).macroBodyFirst
+        d.macroBodyCount = (*src).macroBodyCount
+        d.module = self.str(self.flat.strOf((*src).module))
+        d.moduleSpan = (*src).moduleSpan
+        d.alias = self.str(self.flat.strOf((*src).alias))
+        // Import and re-export names.
+        local nFirst = self.importNames.length() as u32
+        for i in 0..(*src).namesCount as usize {
+            local n = self.flat.importAt(((*src).namesFirst + i as u32) as i32)
+            self.importNames.push(SImportName {
+                name: self.str(self.flat.strOf((*n).name)),
+                alias: self.str(self.flat.strOf((*n).alias)),
+                span: (*n).span,
+            })
+        }
+        d.namesFirst = nFirst
+        d.namesCount = (*src).namesCount
+        local xFirst = self.importNames.length() as u32
+        for i in 0..(*src).exceptCount as usize {
+            local n = self.flat.importAt(((*src).exceptFirst + i as u32) as i32)
+            self.importNames.push(SImportName {
+                name: self.str(self.flat.strOf((*n).name)),
+                alias: self.str(self.flat.strOf((*n).alias)),
+                span: (*n).span,
+            })
+        }
+        d.exceptFirst = xFirst
+        d.exceptCount = (*src).exceptCount
+        d.macroArgsFirst = (*src).macroArgsFirst
+        d.macroArgsCount = (*src).macroArgsCount
+        d.call = (*src).call
+        // `fn alias` target path.
+        local tFirst = self.types.strs.length() as u32
+        for i in 0..(*src).targetPathCount as usize {
+            self.types.strs.push(self.str(self.flat.strOf(
+                self.flat.pathSeg((*src).targetPathFirst + i as u32))))
+        }
+        d.targetPathFirst = tFirst
+        d.targetPathCount = (*src).targetPathCount
+        d.targetSpan = (*src).targetSpan
+        self.decls.push(d)
+        return (self.decls.length() - 1) as i32
+    }
+
+    /// interns one AST item; returns the SItem index.
+    fn internItem(self, i: u32) -> i32 {
+        local src = self.flat.itemAt(i)
+        local it = SItem {
+            exported: (*src).exported,
+            exportC: (*src).exportC,
+            declared: (*src).declared,
+            registered: (*src).registered,
+            registerRole: self.str(self.flat.strOf((*src).registerRole)),
+            decl: self.internDecl((*src).decl),
+        }
+        self.items.push(it)
+        return (self.items.length() - 1) as i32
+    }
+
+    /// The interned declaration of item `i`.
+    fn declOf(self, i: i32) -> *SDecl {
+        local d = self.items.get(i as usize).decl
+        if d < 0 { return nil }
+        return (self.decls.data as usize + (d as u64) as usize * sizeOf(SDecl)) as *SDecl
+    }
+
+    /// The SDecl index of item `i`.
+    fn declOfItem(self, item: i32) -> i32 {
+        local d = self.items.get(item as usize).decl
+        if d < 0 { return -1 }
+        return d
+    }
+
+    /// Appends a synthesized declaration as a new item and returns its index.
+    fn internItemOf(self, decl: i32) -> i32 {
+        local it: SItem
+        it.decl = decl
+        self.items.push(it)
+        return (self.items.length() - 1) as i32
+    }
+
+    /// The qualified name of a local entity: `key::name` for an imported module, plain `name`
+    /// for the root module and builtins.
+    fn qualify(self, name: str) -> String {
+        if self.moduleKey.length() == 0 || name == "MemoryOrder" { return String(name) }
+        local out = self.moduleKey.clone()
+        out.append("::")
+        out.append(name)
+        return out
+    }
+
+    /// True when this module runs inside a compilation (module loading available).
+    fn hasCompilation(self) -> bool {
+        return self.hasComp
+    }
+
+
+
+    /// Marks an alias as being resolved; false when it is already in progress (a cycle).
+    fn aliasInProgressPush(self, name: XStr) -> bool {
+        for i in 0..self.aliasInProgress.length() {
+            if eqStr(&(self.flat.r), *self.aliasInProgress.get(i), name) { return false }
+        }
+        self.aliasInProgress.push(name)
+        return true
+    }
+
+    /// Clears the in-progress mark once an alias resolution finishes.
+    fn aliasInProgressPop(self, name: XStr) {
+        for i in 0..self.aliasInProgress.length() {
+            if eqStr(&(self.flat.r), *self.aliasInProgress.get(i), name) {
+                self.aliasInProgress.remove(i)
+                return
+            }
+        }
+    }
+
+    /// The index of `item` in the instance table, or -1 when it is not an instance.
+    fn itemInstanceOf(self, item: i32) -> i32 {
+        for i in 0..self.instanceItems.length() {
+            if *self.instanceItems.get(i) == item { return i as i32 }
+        }
+        return -1
+    }
+
+    // ------------------------------------------------------------------ name table
+
+    /// The index of the symbol called `name`, or -1.
+    fn find(self, name: str) -> i32 {
+        for i in 0..self.symNames.length() {
+            if eqText(&(self.flat.r), *self.symNames.get(i), name) { return i as i32 }
+        }
+        return -1
+    }
+
+    /// The item of symbol `i`, or -1 for the builtin `MemoryOrder`.
+    fn itemOf(self, sym: i32) -> i32 {
+        if sym < 0 { return -1 }
+        return (*self.symbols.get(sym as usize)).item
+    }
+
+    /// appends a symbol and returns its index.
+    fn addSymbol(self, name: XStr, kind: i32, item: i32) -> i32 {
+        local s = Symbol { kind: kind, item: item, overloadsFirst: -1, overloadsCount: 0 }
+        self.symbols.push(s)
+        self.symNames.push(name)
+        return (self.symbols.length() - 1) as i32
+    }
+
+    /// Runs the collection: every top-level declaration becomes a symbol, duplicates are E0401
+    /// and E0405. Called once by `analyze`.
+    fn collect(self) {
+        // Builtin `MemoryOrder` is an ordinary enum (plan 6.1 / 2.6).
+        local order = self.addSymbol(self.str("MemoryOrder"), SY_ENUM, -1)
+        if order == -12345 { return }
+        for i in 0..self.items.length() {
+            local d = self.declOf(i as i32)
+            local named = true
+            local kind: i32 = -1
+            switch {
+                case d.kind == XD_STRUCT {
+                    kind = SY_STRUCT
+                    if self.genericParamsOf(i as i32).0 == 0 {
+                        self.aggregateOrder.push(d.name)
+                    }
+                }
+                case d.kind == XD_CLASS {
+                    kind = SY_CLASS
+                    if self.genericParamsOf(i as i32).0 == 0 {
+                        self.aggregateOrder.push(d.name)
+                    }
+                }
+                case d.kind == XD_INTERFACE { kind = SY_INTERFACE }
+                case d.kind == XD_ENUM { kind = SY_ENUM }
+                case d.kind == XD_TYPE_ALIAS { kind = SY_ALIAS }
+                case d.kind == XD_DEFINE_CONST { kind = SY_DEFINE }
+                case d.kind == XD_GLOBAL { kind = SY_GLOBAL }
+                case d.kind == XD_FN { kind = SY_FN }
+                case d.kind == XD_FN_ALIAS { kind = SY_FN_ALIAS }
+                case d.kind == XD_DEFINE_MACRO { kind = SY_MACRO }
+                default { named = false }
+            }
+            if !named { continue }
+            local existing = self.find(self.text(d.name))
+            if kind == SY_FN {
+                // Functions may share a name (overloads); the signatures are checked when lowered.
+                if existing < 0 {
+                    local sym = self.addSymbol(d.name, kind, i as i32)
+                    self.startOverloads(sym, i as i32)
+                } else if (*self.symbols.get(existing as usize)).kind == SY_FN {
+                    self.pushOverload(existing, i as i32)
+                    continue
+                } else {
+                    self.reportDuplicate(existing, i as i32)
+                }
+            } else if existing < 0 {
+                self.addSymbol(d.name, kind, i as i32)
+            } else {
+                self.reportDuplicate(existing, i as i32)
+            }
+        }
+        // A name with overloads may only name ordinary functions.
+        for i in 0..self.symbols.length() {
+            local s = self.symbols.get(i)
+            if (*s).kind != SY_FN || (*s).overloadsCount < 2 { continue }
+            for j in 0..(*s).overloadsCount as usize {
+                local f = *self.overloadRefs.get((*s).overloadsFirst as usize + j)
+                local why = String()
+                local it = self.items.get(f as usize)
+                if self.text(self.declOf(f).name) == "main" {
+                    why = String("`main` is the entry point")
+                } else if it.registered != 0 {
+                    why = String("a `register`ed function fills a role")
+                } else if it.exportC != 0 {
+                    why = String("`export(c)` names one C symbol")
+                } else if it.declared != 0 {
+                    why = String("a `declare`d function is one external symbol")
+                }
+                if why.length() > 0 {
+                    local d2 = self.declOf(f)
+                    self.diag.error("E0405", self.span((*d2).nameSpan),
+                        format("{} cannot be overloaded: {}", self.text((*d2).name), why.asStr()).asStr(),
+                        "keep one declaration with this name")
+                }
+            }
+        }
+    }
+
+    /// opens the overload list of symbol `sym` with its first item.
+    fn startOverloads(self, sym: i32, item: i32) {
+        local s = self.symbols.get(sym as usize)
+        (*s).overloadsFirst = self.overloadRefs.length() as i32
+        (*s).overloadsCount = 1
+        self.overloadRefs.push(item)
+    }
+
+    /// adds one overload to symbol `sym`.
+    fn pushOverload(self, sym: i32, item: i32) {
+        local s = self.symbols.get(sym as usize)
+        self.overloadRefs.push(item)
+        (*s).overloadsCount++
+    }
+
+    /// E0401 with both definition sites.
+    fn reportDuplicate(self, first: i32, second: i32) {
+        local d1 = self.declOf((*self.symbols.get(first as usize)).item)
+        local d2 = self.declOf(second)
+        local diag: Diagnostic
+        diag.code = self.diag.txt("E0401")
+        // The engine's `error` carries one label; the two-site form goes through `report`.
+        local labels = Vec<Label>()
+        labels.push(Label { span: self.span(d1.nameSpan), text: self.diag.txt("first definition") })
+        labels.push(Label { span: self.span(d2.nameSpan), text: self.diag.txt("second definition") })
+        local d = Diagnostic {
+            code: self.diag.txt("E0401"),
+            severity: 2,
+            message: self.diag.txt(format("{} is defined twice", self.text(d2.name)).asStr()),
+            labelsFirst: -1,
+            labelsCount: 0,
+            notesFirst: -1,
+            notesCount: 0,
+            detail: self.diag.txt(""),
+            reason: self.diag.txt(""),
+            fix: self.diag.txt("rename one of them"),
+            suppressed: 0,
+            keyFile: 0,
+            keyLine: 0,
+            keyColumn: 0,
+        }
+        if labels.length() == 99999 { return }
+        self.diag.report(d)
+    }
+
+    /// Names of the type parameters of a `fn`, `struct`, `class`, `alias`, `interface` or `enum`;
+    /// none for anything else. Returns the range in the Sema string table.
+    fn genericParamsOf(self, item: i32) -> (u32, u32) {
+        // An instance names its type parameters nowhere: it is the declaration with the arguments
+        // already substituted.
+        if self.itemInstanceOf(item) >= 0 { return (0, 0) }
+        local d = self.declOf(item)
+        switch {
+            case d.kind == XD_FN || d.kind == XD_STRUCT || d.kind == XD_CLASS || d.kind == XD_TYPE_ALIAS || d.kind == XD_INTERFACE || d.kind == XD_ENUM {
+                return (d.genericFirst, d.genericCount)
+            }
+            default { return (0, 0) }
+        }
+    }
+
+    /// Link name of a function or global: the plain name for `export(c)`, `@mangle("x")`,
+    /// `declare`, and `--mangle=none` (an overloaded name is never plain), otherwise
+    /// `_xl$<module>$<name>$<mangled parameter types>`.
+    fn linkName(self, item: i32, localName: str, params: Vec<i32>, overloaded: bool) -> String {
+        local d = self.declOf(item)
+        if !overloaded {
+            // Priority: export(c) > @mangle on the item > @file(mangle) > --mangle.
+            if self.items.get(item as usize).exportC != 0 { return String(localName) }
+            local m = self.findAttr(d.attrsFirst, d.attrsCount, "mangle")
+            if m >= 0 {
+                local a = self.flat.attrAt(m)
+                if (*a).argsCount > 0 {
+                    local arg = self.flat.r.attrArgs[(*a).argsFirst]
+                    return arg.kind == 2 ? String(self.flat.strOf(arg.text)) : String(localName)
+                }
+            }
+            local none = self.mangleNone
+            if self.flat.r.fileAttrsCount > 0 {
+                for i in 0..self.flat.r.fileAttrsCount as usize {
+                    local f = self.flat.r.attrs[self.flat.r.fileAttrsFirst + i]
+                    if eqText(&(self.flat.r), f.name, "file") {
+                        for j in 0..f.argsCount as usize {
+                            local arg = self.flat.r.attrArgs[f.argsFirst + j]
+                            if eqText(&(self.flat.r), arg.key, "mangle") {
+                                none = self.flat.strOf(arg.text) == "none"
+                            }
+                        }
+                    }
+                }
+            }
+            if none || self.items.get(item as usize).declared != 0 { return String(localName) }
+        }
+        // `_xl$<module>$<name>$<param types>`; the module is the mangling name of the defining
+        // module.
+        local sig = String()
+        for i in 0..params.length() {
+            sig.append("$")
+            sig.append(self.types.mangle(*params.get(i)))
+        }
+        local module = self.moduleKey.clone()
+        if module.length() == 0 { module = self.rootMangle.clone() }
+        if module.length() == 0 { module = String("main") }
+        // `/` becomes `.` in the module part.
+        local modDot = String()
+        for i in 0..module.length() {
+            local ch = module.at(i)
+            modDot.push(ch == b'/' ? b'.' : ch)
+        }
+        // A generic instance is named `f<i32, str>`: its link name spells the brackets `G`/`E`.
+        local name = String()
+        for i in 0..localName.len as usize {
+            local c = localName[i]
+            if c == b'<' { name.append("G") } else if c == b'>' { name.append("E") } else if c == b',' || c == b'.' || c == b':' || c == b'*' || c == b'[' || c == b']' || c == b';' || c == b'(' || c == b')' { name.append("_") } else { name.push(c) }
+        }
+        local out = String("_xl$")
+        out.append(modDot)
+        out.append("$")
+        out.append(name)
+        out.append(sig)
+        return out
+    }
+
+    /// The index of the attribute called `name` in an AST attribute range, or -1.
+    fn findAttr(self, first: u32, count: u32, name: str) -> i32 {
+        for i in 0..count as usize {
+            local a = self.flat.r.attrs[first + i]
+            if eqText(&(self.flat.r), a.name, name) { return (first + i) as i32 }
+        }
+        return -1
+    }
+}

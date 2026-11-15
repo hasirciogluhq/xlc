@@ -205,6 +205,42 @@ export class Types {
         return idx
     }
 
+    /// Appends a copy of the record at `idx` without touching any parent record; the payload
+    /// lists of instances are built this way.
+    fn pushRaw(self, idx: i32) {
+        self.types.push(self.get(idx))
+    }
+
+    /// A shallow copy of the record at `idx`: the inline children (fnptr parameters, generic
+    /// arguments) are ranges of this same arena and stay valid.
+    fn internType(self, idx: i32) -> i32 {
+        self.types.push(self.get(idx))
+        return (self.types.length() - 1) as i32
+    }
+
+    /// Rebuilds a record of `kind` with substituted children; the shape of every kind is the
+    /// same flat record, so one builder serves all.
+    fn rebuild(self, kind: i32, elem: i32, ret: i32, args: Vec<i32>, params: Vec<i32>,
+               isMutable: bool, length: i32) -> i32 {
+        local idx = self.push(kind)
+        local t = self.at(idx)
+        (*t).elem = elem
+        (*t).ret = ret
+        (*t).length = length
+        (*t).isMutable = isMutable ? 1 : 0
+        (*t).argsFirst = self.types.length() as u32
+        for i in 0..args.length() {
+            self.types.push(self.get(*args.get(i)))
+        }
+        (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
+        (*t).paramsFirst = self.types.length() as u32
+        for i in 0..params.length() {
+            self.types.push(self.get(*params.get(i)))
+        }
+        (*t).paramsCount = (self.types.length() as u32) - (*t).paramsFirst
+        return idx
+    }
+
     /// Copies a type record of the module's AST into the arena and returns its index. Children
     /// come along recursively; the length expression stays an AST index.
     fn internAst(self, idx: i32) -> i32 {
@@ -216,6 +252,7 @@ export class Types {
         (*t).isSigned = (*src).isSigned
         (*t).isMutable = (*src).isMutable
         (*t).length = (*src).length
+        (*t).span = (*src).span
         // The path segments point into the AST bytes; copy them into this store's table.
         local segs = Vec<String>()
         for i in 0..(*src).pathCount as usize {

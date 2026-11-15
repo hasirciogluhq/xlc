@@ -1,0 +1,240 @@
+// Module scope lookups (plan 2.6): the name table, the import bindings and the derived entity
+// aliases of payload enum instances. The xlang source of sema/module_scope.cpp; the functions
+// take the owning `Sema` explicitly. The compilation-aware paths (import bindings, registered
+// names) need the compilation driver and come with it; a standalone module answers from its own
+// name table alone.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XE_NAME, XE_FIELD, XE_TYPE_OPERAND, XE_UNARY, XE_ARRAY_REPEAT,
+    XU_DEREF, XD_STRUCT, XE_INT_LITERAL
+from "./sema" import Sema, EntityRef, SY_STRUCT
+from "./types" import T_VOID, T_POINTER, T_ARRAY, T_NAMED, T_INT, T_FLOAT, T_BOOL, T_STR
+from "./flat" import eqStr, eqText
+from "./const_value" import ConstValue, CV_INT, constInt
+from "./int128" import I128
+
+/// The index of `name` in the derived alias table, or -1.
+fn findDerived(s: *Sema, name: str) -> i32 {
+    for i in 0..s.instanceAliasNames.length() {
+        if s.text(*s.instanceAliasNames.get(i)) == name { return i as i32 }
+    }
+    return -1
+}
+
+/// Records a derived alias and returns its EntityRef (the ref names the base entity).
+fn addDerived(s: *Sema, name: str, base: EntityRef) -> EntityRef {
+    local existing = findDerived(s, name)
+    if existing >= 0 { return *s.instanceAliasRefs.get(existing as usize) }
+    local key = s.str(name)
+    s.instanceAliasNames.push(key)
+    local r: EntityRef
+    r.owner = base.owner
+    r.sym = base.sym
+    r.name = base.name
+    r.foundAs = key
+    s.instanceAliasRefs.push(r)
+    return r
+}
+
+/// True when the declaration is a payload enum (a struct with variants).
+fn isPayloadEnum(s: *Sema, item: i32) -> bool {
+    if item < 0 { return false }
+    local d = s.declOf(item)
+    if d == nil { return false }
+    return (*d).kind == XD_STRUCT && (*d).variantsCount != 0
+}
+
+/// The empty EntityRef (nothing found).
+fn none() -> EntityRef {
+    local r: EntityRef
+    r.owner = nil
+    r.sym = -1
+    r.name = XStr { off: 0, len: 0 }
+    r.foundAs = XStr { off: 0, len: 0 }
+    return r
+}
+
+/// Resolves `name` through the module's own table, the derived aliases, the import bindings and
+/// the compilation's registered names.
+export fn lookupEntity(s: *Sema, name: str) -> EntityRef {
+    local sym = s.find(name)
+    if sym >= 0 {
+        local r: EntityRef
+        r.owner = nil
+        r.sym = sym
+        r.name = *s.symNames.get(sym as usize)
+        r.foundAs = r.name
+        return r
+    }
+    // A payload enum instance is named after it: `Result<i32, E>$Ok`. The parts are not written
+    // by hand (the declaration spells `Result$Ok<T, E>`, which resolves to the instance), but the
+    // lowering asks the table for them under that name: the instance is the item that knows the
+    // variants, so the lookup answers with it.
+    local cut = lastDollar(name)
+    if cut >= 0 {
+        local base = String(name).slice(0, cut as usize).asStr()
+        local baseSym = s.find(base)
+        if baseSym >= 0 && isPayloadEnum(s, s.itemOf(baseSym)) {
+            local r: EntityRef
+            r.owner = nil
+            r.sym = baseSym
+            r.name = *s.symNames.get(baseSym as usize)
+            r.foundAs = s.str(name)
+            return addDerived(s, name, r)
+        }
+    }
+    // Import bindings and registered names need the compilation driver.
+    if s.hasComp {
+        for i in 0..s.importBindingNames.length() {
+            local b = s.importBindings.get(i)
+            if (*b).isNamespace { continue }
+            if s.text(*s.importBindingNames.get(i)) == name {
+                // The compilation resolves the binding's module key to an owner; with the driver
+                // not ported yet the binding cannot be followed here.
+                return none()
+            }
+        }
+    }
+    return none()
+}
+
+/// Resolves `a.b` through a namespace import (`io.Writer`). Needs the compilation.
+export fn lookupQualified(s: *Sema, a: str, b: str) -> EntityRef {
+    if !s.hasComp { return none() }
+    for i in 0..s.importBindingNames.length() {
+        local bind = s.importBindings.get(i)
+        if !(*bind).isNamespace { continue }
+        if s.text(*s.importBindingNames.get(i)) == a {
+            return none() // the compilation driver resolves this; not ported yet
+        }
+    }
+    return none()
+}
+
+/// Resolves an already qualified name (`std.mem::Allocator`, `Result<i32, E>$Ok`). A standalone
+/// module answers from its own table under the full name.
+export fn entityByQName(s: *Sema, qname: str) -> EntityRef {
+    if !s.hasComp {
+        local sym = s.find(qname)
+        if sym >= 0 {
+            local r: EntityRef
+            r.owner = nil
+            r.sym = sym
+            r.name = *s.symNames.get(sym as usize)
+            r.foundAs = r.name
+            return r
+        }
+        return none()
+    }
+    // With the compilation: split at the last `::`, find the owner module, look the local part up
+    // there, falling back to the payload-enum parts of the instance.
+    return none() // the compilation driver resolves this; not ported yet
+}
+
+/// The compile-time value of an expression, or -1. A placeholder until const_eval.xl lands; the
+/// array-length path only needs integer literals, which it answers directly.
+fn evalConstExpr(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    if (*e).kind == XE_INT_LITERAL {
+        local cv = new ConstValue()
+        cv.kind = CV_INT
+        cv.intValue = I128 { hi: ((((*e).intValue as i64) >> 63) as u64), lo: (*e).intValue }
+        s.consts.push(cv)
+        return (s.consts.length() - 1) as i32
+    }
+    return -1
+}
+
+/// The entity a name or `a.b` expression refers to; -1 as `sym` when the expression is not an
+/// entity reference.
+export fn entityOfExpr(s: *Sema, exprIdx: i32) -> EntityRef {
+    local e = s.exprAt(exprIdx)
+    if (*e).kind == XE_NAME {
+        return lookupEntity(s, s.exprTextAt(exprIdx))
+    }
+    if (*e).kind == XE_FIELD {
+        local lhs = s.exprAt((*e).lhs)
+        if (*lhs).kind == XE_NAME {
+            return lookupQualified(s, s.exprTextAt((*e).lhs), s.exprTextAt(exprIdx))
+        }
+    }
+    return none()
+}
+
+/// The type an expression names, as a Types index; -1 when the expression is not a type. A
+/// `Name` already carrying a resolved type (a substituted type parameter) answers with it.
+export fn exprToType(s: *Sema, exprIdx: i32) -> i32 {
+    local e = s.exprAt(exprIdx)
+    if (*e).kind == XE_NAME {
+        if (*e).typeIdx >= 0 {
+            // A type parameter substituted by an instance: already resolved (see cloneExpr).
+            return (*e).typeIdx
+        }
+        local prim = s.types.primitiveFromName(s.exprTextAt(exprIdx))
+        if prim >= 0 {
+            (*s.types.at(prim)).span = (*e).span
+            return prim
+        }
+        local path = Vec<String>()
+        path.push(String(s.exprTextAt(exprIdx)))
+        local t = s.types.makeNamed(path)
+        (*s.types.at(t)).span = (*e).span
+        return t
+    }
+    if (*e).kind == XE_FIELD {
+        // `a.b.c`: the segments from right to left, then the base name.
+        local path = Vec<String>()
+        local cur = exprIdx
+        local ok = true
+        while ok {
+            local f = s.exprAt(cur)
+            if (*f).kind == XE_FIELD {
+                path.insert(0, String(s.exprTextAt(cur)))
+                cur = (*f).lhs
+            } else if (*f).kind == XE_NAME {
+                path.insert(0, String(s.exprTextAt(cur)))
+                ok = false
+            } else {
+                return -1
+            }
+        }
+        local t = s.types.makeNamed(path)
+        (*s.types.at(t)).span = (*e).span
+        return t
+    }
+    if (*e).kind == XE_TYPE_OPERAND {
+        local t = s.types.internAst((*e).typeIdx)
+        if t < 0 { return -1 }
+        (*s.types.at(t)).span = (*e).span
+        return t
+    }
+    if (*e).kind == XE_UNARY && (*e).unaryOp == XU_DEREF {
+        local inner = exprToType(s, (*e).lhs)
+        if inner < 0 { return -1 }
+        local t = s.types.makePointer(inner)
+        (*s.types.at(t)).span = (*e).span
+        return t
+    }
+    if (*e).kind == XE_ARRAY_REPEAT {
+        local elem = exprToType(s, (*e).lhs)
+        if elem < 0 { return -1 }
+        local v = evalConstExpr(s, (*e).rhs)
+        if v < 0 { return -1 }
+        local cv = *s.consts.get(v as usize)
+        if (*cv).kind != CV_INT { return -1 }
+        local len = s.types.makeArray(elem, (*cv).intValue.lo as i32)
+        (*s.types.at(len)).span = (*e).span
+        return len
+    }
+    return -1
+}
+
+/// The position of the last `$` in `name`, or -1.
+fn lastDollar(name: str) -> i32 {
+    local out = -1
+    for i in 0..name.len as usize {
+        if name[i] == b'$' { out = i as i32 }
+    }
+    return out
+}
+
+

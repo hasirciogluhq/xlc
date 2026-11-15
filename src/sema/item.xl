@@ -1,0 +1,135 @@
+// The items of the semantic analysis: every declaration of the module interned into the Sema's
+// own arenas, so that one representation serves the collected declarations and the instances the
+// analysis synthesizes (a generic instance is the declaration with its types substituted). The
+// shape mirrors the flat AST record of the same name; the differences are:
+//
+// - names, paths and generic parameters live in the Sema's string table (`Types.bytes`),
+// - every type is an index into the `Types` arena (interned from the AST on collection),
+// - bodies, initializers and macro token lists stay indices into the module's flat AST, which
+//   lives for the whole compilation; instances share them with their origin.
+//
+// A type parameter substitution rewrites only the type fields, so a copied declaration is the
+// declaration with new types and everything else shared.
+from "std" import String, Vec
+from "../lang/ast/ast" import XSpan, XStr
+from "./types" import Types
+
+/// The modifiers of one item (the flat `XItem`).
+export struct SItem {
+    exported: u32
+    exportC: u32
+    declared: u32
+    registered: u32
+    registerRole: XStr
+    decl: i32 ///< SDecl index
+}
+
+/// One parameter; the shape of the flat `XParam` with the type interned.
+export struct SParam {
+    name: XStr
+    ty: i32
+    isSelf: u32
+    isPack: u32
+    typedSelf: u32
+    hasType: u32
+    span: XSpan
+}
+
+/// One field; the shape of the flat `XField` with the type interned.
+export struct SField {
+    name: XStr
+    ty: i32
+    attrsFirst: u32 ///< XAttr arena of the flat AST
+    attrsCount: u32
+    span: XSpan
+}
+
+/// One variant of a payload enum's union.
+export struct SSumVariant {
+    name: XStr
+    payloadFirst: u32 ///< Types arena
+    payloadCount: u32
+}
+
+/// One member of an enum.
+export struct SEnumMember {
+    name: XStr
+    value: i32 ///< expr index in the flat AST, -1 = auto-numbered
+    hasPayload: u32
+    payloadFirst: u32 ///< Types arena
+    payloadCount: u32
+    attrsFirst: u32
+    attrsCount: u32
+    span: XSpan
+}
+
+/// One imported or re-exported name.
+export struct SImportName {
+    name: XStr
+    alias: XStr
+    span: XSpan
+}
+
+/// One declaration record: the union of the fields the fifteen C++ declaration structs carry,
+/// tagged by `kind` (the `XD_*` constants of the flat AST). Methods of a class, interface or impl
+/// are Fn records in the same declaration arena, ranged over by `methodsFirst/Count`.
+export struct SDecl {
+    kind: i32
+    name: XStr
+    nameSpan: XSpan
+    attrsFirst: u32 ///< XAttr arena of the flat AST
+    attrsCount: u32
+    span: XSpan
+    genericFirst: u32 ///< Sema string table
+    genericCount: u32
+    paramsFirst: u32 ///< SParam arena
+    paramsCount: u32
+    hasRet: u32
+    ret: i32 ///< Types index
+    hasBody: u32
+    body: i32 ///< flat AST block index
+    isVirtual: u32
+    isOverride: u32
+    ty: i32 ///< Types index (Global/Const, TypeAlias target)
+    hasType: u32
+    isConst: u32
+    init: i32 ///< flat AST expr index
+    fieldsFirst: u32 ///< SField arena
+    fieldsCount: u32
+    opaque: u32
+    isUnion: u32
+    isPayload: u32
+    variantsFirst: u32 ///< SSumVariant arena
+    variantsCount: u32
+    methodsFirst: u32 ///< SDecl arena, kind Fn
+    methodsCount: u32
+    baseHas: u32
+    baseFirst: u32 ///< Sema string table
+    baseCount: u32
+    ifacePathFirst: u32 ///< Sema string table
+    ifacePathCount: u32
+    ifaceArgsFirst: u32 ///< Types arena
+    ifaceArgsCount: u32
+    implTarget: i32 ///< Types index
+    hasUnderlying: u32
+    underlying: i32 ///< Types index
+    membersFirst: u32 ///< SEnumMember arena
+    membersCount: u32
+    macroParamsFirst: u32 ///< XMacroParam arena of the flat AST
+    macroParamsCount: u32
+    macroBodyFirst: u32 ///< XTok arena of the flat AST
+    macroBodyCount: u32
+    module: XStr
+    moduleSpan: XSpan
+    alias: XStr
+    namesFirst: u32 ///< SImportName arena
+    namesCount: u32
+    exceptFirst: u32 ///< SImportName arena
+    exceptCount: u32
+    macroArgsFirst: u32 ///< XTokList arena of the flat AST
+    macroArgsCount: u32
+    call: i32 ///< flat AST expr index
+    targetPathFirst: u32 ///< Sema string table
+    targetPathCount: u32
+    targetSpan: XSpan
+}

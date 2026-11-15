@@ -1,0 +1,262 @@
+// Type resolution (plan 2.5): `Named` -> Struct/Class/Interface/Enum, alias expansion (E0704 on a
+// cycle), generic arguments (E0724) and the alias-substitution path. The xlang source of
+// sema/types.cpp; the functions take the owning `Sema` explicitly.
+//
+// `resolve` returns the index of the resolved type in the module's `Types` arena, or -1 after
+// reporting. The input index is never rewritten: resolution copies.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XD_TYPE_ALIAS, XD_STRUCT, XD_CLASS, XD_INTERFACE, XD_ENUM
+from "../lang/ast/ast" import XStr
+from "./sema" import Sema, SY_STRUCT, SY_CLASS, SY_INTERFACE, SY_ENUM, SY_ALIAS, EntityRef
+from "./types" import Types, T_VOID, T_INT, T_POINTER, T_ARRAY, T_ENUM, T_STRUCT, T_CLASS,
+    T_INTERFACE, T_SLICE, T_TUPLE, T_FN_PTR, T_NAMED
+from "./flat" import eqText
+from "./module_scope" import lookupEntity, lookupQualified, entityByQName
+from "./subst" import TypeEnv, substituteType, instantiateDecl
+from "./instances" import instantiate
+
+/// `a.b.c` from path segments between `first` and `first+count` of the Sema string table.
+fn joinDotted(s: *Sema, first: u32, count: u32) -> String {
+    local out = String()
+    for i in 0..count as usize {
+        if i != 0 { out.append(".") }
+        out.append(s.text(*s.types.strs.get(first + i as u32)))
+    }
+    return out
+}
+
+/// The type parameters of a declaration as owned strings.
+fn genericParams(s: *Sema, item: i32) -> Vec<String> {
+    local out = Vec<String>()
+    local range = s.genericParamsOf(item)
+    for i in 0..range.1 as usize {
+        out.push(s.textS(*s.types.strs.get(range.0 + i as u32)))
+    }
+    return out
+}
+
+/// Resolves `idx`; -1 after reporting. `depth` caps the alias recursion.
+export fn resolve(s: *Sema, idx: i32) -> i32 {
+    return resolveDepth(s, idx, 0)
+}
+
+fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
+    if idx < 0 { return -1 }
+    local t = s.types.get(idx)
+    switch {
+        case t.kind == T_POINTER || t.kind == T_ARRAY || t.kind == T_SLICE {
+            local inner = resolveDepth(s, t.elem, depth)
+            if inner < 0 { return -1 }
+            if t.kind == T_POINTER { return s.types.makePointer(inner) }
+            if t.kind == T_SLICE { return s.types.makeSlice(inner, t.isMutable != 0) }
+            return s.types.makeArray(inner, t.length as i32)
+        }
+        case t.kind == T_TUPLE {
+            local args = Vec<i32>()
+            for i in 0..t.argsCount as usize {
+                local r = resolveDepth(s, (t.argsFirst + i) as i32, depth)
+                if r < 0 { return -1 }
+                args.push(r)
+            }
+            local out = s.types.makeTuple(args)
+            (*s.types.at(out)).span = t.span
+            return out
+        }
+        case t.kind == T_FN_PTR {
+            local params = Vec<i32>()
+            for i in 0..t.paramsCount as usize {
+                local r = resolveDepth(s, (t.paramsFirst + i) as i32, depth)
+                if r < 0 { return -1 }
+                params.push(r)
+            }
+            local ret = resolveDepth(s, t.ret, depth)
+            if ret < 0 { return -1 }
+            local out = s.types.makeFnPtr(params, ret)
+            (*s.types.at(out)).span = t.span
+            return out
+        }
+        case t.kind != T_NAMED { return idx }
+        default { }
+    }
+
+    // A `Named` reference: one segment, two segments, or already qualified.
+    local ref: EntityRef
+    ref.owner = nil
+    ref.sym = -1
+    ref.name = XStr { off: 0, len: 0 }
+    ref.foundAs = XStr { off: 0, len: 0 }
+    local segs = t.pathCount
+    if segs == 1 {
+        local name = s.text(*s.types.strs.get(t.pathFirst))
+        // A name already qualified by `qualify` (a substituted generic argument) names its module.
+        if containsSep(name) {
+            ref = entityByQName(s, name)
+        } else {
+            ref = lookupEntity(s, name)
+        }
+    } else if segs == 2 {
+        local path = Vec<String>()
+        path.push(s.textS(*s.types.strs.get(t.pathFirst)))
+        path.push(s.textS(*s.types.strs.get(t.pathFirst + 1)))
+        ref = lookupQualified(s, path.get(0).asStr(), path.get(1).asStr())
+        if ref.sym < 0 && ref.owner == nil && !s.hasCompilation() {
+            return idx // standalone: `alias.Name` stays unresolved
+        }
+    } else {
+        return idx
+    }
+    local shown = joinDotted(s, t.pathFirst, t.pathCount)
+    if ref.sym < 0 {
+        s.error("E0706", t.span, format("unknown type `{}`", shown.asStr()).asStr(),
+                "not declared in this module")
+        return -1
+    }
+    local owner = ref.owner != nil ? ref.owner : s
+    if t.argsCount != 0 && (*owner.symbols.get(ref.sym as usize)).kind == SY_ALIAS {
+        // `Alias<A, B>`: the target with its parameters replaced, resolved in the alias's module.
+        local params = genericParams(owner, owner.itemOf(ref.sym))
+        if params.length() != t.argsCount as usize {
+            owner.error("E0724", t.span,
+                format("`{}` takes {} type argument(s), {} given", shown.asStr(), params.length(),
+                       t.argsCount).asStr(),
+                "write one type per type parameter")
+            return -1
+        }
+        local env = new TypeEnv()
+        for i in 0..params.length() {
+            local r = resolveDepth(s, (t.argsFirst + i) as i32, depth)
+            if r < 0 { return -1 }
+            env.put(params.get(i).asStr(), r)
+        }
+        local targetDecl = owner.declOf(owner.itemOf(ref.sym))
+        if !owner.aliasInProgressPush(ref.name) {
+            owner.error("E0704", t.span,
+                format("type alias `{}` refers to itself", shown.asStr()).asStr(), "cyclic alias")
+            return -1
+        }
+        local target = resolveDepth(owner,
+            substituteType(owner, (*targetDecl).ty, env), depth)
+        owner.aliasInProgressPop(ref.name)
+        if target < 0 { return -1 }
+        (*s.types.at(target)).span = t.span
+        return target
+    }
+    if t.argsCount != 0 {
+        // `Name<A, B>`: an instance of a generic struct or class.
+        local item = owner.itemOf(ref.sym)
+        if item < 0 || genericParams(owner, item).length() == 0 {
+            owner.error("E0724", t.span, format("`{}` takes no type arguments", shown.asStr()).asStr(),
+                        "remove the `<...>`")
+            return -1
+        }
+        local args = Vec<i32>()
+        for i in 0..t.argsCount as usize {
+            local r = resolveDepth(s, (t.argsFirst + i) as i32, depth)
+            if r < 0 { return -1 }
+            args.push(r)
+        }
+        local inst = instantiate(owner, ref, args.clone(), t.span)
+        if inst.sym < 0 { return -1 }
+        local q = instanceQname(owner, inst)
+        local out = s.types.makeAggregate(kindOfSymbol(owner, inst.sym),
+                                          singlePath(q.asStr()), args.clone())
+        (*s.types.at(out)).span = t.span
+        local symKind = (*owner.symbols.get(inst.sym as usize)).kind
+        if symKind == SY_ENUM {
+            // A generic value enum keeps its underlying type, computed once for the instance.
+            local decl = owner.declOf(owner.itemOf(inst.sym))
+            local under = resolveDepth(owner, decl.underlying, depth)
+            if under < 0 { return -1 }
+            (*s.types.at(out)).elem = under
+        }
+        return out
+    }
+    local item = owner.itemOf(ref.sym)
+    if item >= 0 && genericParams(owner, item).length() != 0 {
+        local n = genericParams(owner, item).length()
+        owner.error("E0724", t.span,
+            format("`{}` is generic and takes {} type argument(s), none given", shown.asStr(), n).asStr(),
+            format("write the arguments: `{}<...>`", shown.asStr()).asStr())
+        return -1
+    }
+    local symKind = (*owner.symbols.get(ref.sym as usize)).kind
+    if symKind == SY_ALIAS {
+        local params = genericParams(owner, item)
+        if params.length() != 0 {
+            owner.error("E0724", t.span,
+                format("`{}` takes {} type argument(s), none given", shown.asStr(), params.length()).asStr(),
+                "write `<...>` with one type per type parameter")
+            return -1
+        }
+        if !owner.aliasInProgressPush(ref.name) {
+            owner.error("E0704", t.span,
+                format("type alias `{}` refers to itself", shown.asStr()).asStr(), "cyclic alias")
+            return -1
+        }
+        local targetDecl = owner.declOf(item)
+        local target = resolveDepth(owner, targetDecl.ty, depth)
+        owner.aliasInProgressPop(ref.name)
+        if target < 0 { return -1 }
+        (*s.types.at(target)).span = t.span
+        return target
+    }
+    if symKind == SY_STRUCT || symKind == SY_CLASS || symKind == SY_INTERFACE {
+        local q = qualifyOf(owner, ref)
+        local out = s.types.makeAggregate(kindOfSymbol(owner, ref.sym),
+                                          singlePath(q.asStr()), Vec<i32>())
+        (*s.types.at(out)).span = t.span
+        return out
+    }
+    if symKind == SY_ENUM {
+        local decl = owner.declOf(item)
+        local under = resolveDepth(owner, decl.underlying, depth)
+        if under < 0 { return -1 }
+        local q = qualifyOf(owner, ref)
+        local out = s.types.makeAggregate(T_ENUM, singlePath(q.asStr()), Vec<i32>())
+        (*s.types.at(out)).elem = under
+        (*s.types.at(out)).span = t.span
+        return out
+    }
+    owner.error("E0706", t.span, format("`{}` is not a type", shown.asStr()).asStr(),
+                "this name is not a type")
+    return -1
+}
+
+/// True when the text carries `::` (an already qualified name).
+fn containsSep(name: str) -> bool {
+    for i in 0..name.len as usize {
+        if name[i] == b':' && i + 1 < name.len && name[i + 1] == b':' { return true }
+    }
+    return false
+}
+
+/// The symbol kind as the type kind of a resolved aggregate.
+fn kindOfSymbol(s: *Sema, sym: i32) -> i32 {
+    local kind = (*s.symbols.get(sym as usize)).kind
+    if kind == SY_CLASS { return T_CLASS }
+    if kind == SY_INTERFACE { return T_INTERFACE }
+    if kind == SY_ENUM { return T_ENUM }
+    return T_STRUCT
+}
+
+/// A one-segment path holding `text`.
+fn singlePath(text: str) -> Vec<String> {
+    local out = Vec<String>()
+    out.push(String(text))
+    return out
+}
+
+/// The qualified name of an entity: `key::name` for an imported module, plain `name` for the root.
+fn qualifyOf(owner: *Sema, ref: EntityRef) -> String {
+    local name = owner.text(ref.name)
+    if owner.moduleKey.length() == 0 || name == "MemoryOrder" { return String(name) }
+    local out = owner.moduleKey.clone()
+    out.append("::")
+    out.append(name)
+    return out
+}
+
+/// The qualified name of an instance reference.
+fn instanceQname(owner: *Sema, ref: EntityRef) -> String {
+    return qualifyOf(owner, ref)
+}
