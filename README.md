@@ -209,23 +209,31 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 ## Layout
 
 ```
-include/xlang/   public headers (lang, sema, hir, mir, analysis, codegen, util)
+include/xlang/   public headers (lang, sema, hir, mir, analysis, codegen, util); backend_c.h is the
+                 frontend C API, codegen/codegen_c.h the LLVM C API
 src/lang/        lexer, preprocessor, macros, parser, AST (all xlang); cpp/ holds the C++ AST,
                  types, config and bridges that the C++ sema still reads, removed with it
 src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR
-src/hir/         HIR dump and reachability pruning
+src/hir/         the flat HIR (abi.xl), its reader of the C++ module (flatten.xl), the dump and the
+                 reachability prune (prune.xl), all xlang
 src/mir/         HIR -> MIR (control-flow graph per function), written in xlang: builder/,
                  model.xl, dump.xl; xl_bridge.cpp/.hpp is the thin C bridge for C++ callers
 src/analysis/    static analyses over MIR, written in xlang (moves.xl, findings.xl): read only,
                  findings sorted by position
-src/codegen/     HIR -> LLVM IR, optimization, object writers, C header
+src/codegen/     the C++ LLVM generator (codegen.cpp, emit.cpp, llvm/) behind codegen_c.h; the xlang
+                 side: llvm.xl (the C API as the output step calls it), header.xl (the C header,
+                 `--emit=header`), native/ macho/ arm64/ isel/ (the native backend)
 src/driver/      linker driver (`link.xl`) and the in-process archiver (`archive.cpp`, LLVM's writer)
 src/util/        source files and diagnostics
 src/main.xl      the CLI entry; `bootstrap.xl` is the same CLI behind a plain C `main`
 src/cli.xl       command line parser and the run it drives
-src/cli/         the C ABI of the backend (`backend.xl`), the output step (`emit.xl`), terminal
-                 color (`console.xl`); `emit.cpp` is the code generation behind `xlcSessionEmit`
-src/backend/     the C++ pipeline behind include/xlang/backend_c.h
+src/cli/         xlang output step: `backend.xl` (the boundary structs and declares), `emit.xl`
+                 (the orchestration), `entry.xl` (entry-point rules), `program.xl` (prune and link
+                 imports), `incremental.xl` (per-module objects and cache), `path.xl` (paths),
+                 `console.xl` (terminal color)
+src/backend/     the C++ session and frontend behind include/xlang/backend_c.h: `session.hpp/.cpp`
+                 (the compilation state), `backend.cpp` (frontend entries), `codegen.cpp` (the
+                 codegen entries of codegen_c.h, and `xlcArchive`)
 test/unit/       frontend/sema/HIR/MIR/analysis unit tests (platform independent)
 test/e2e/        the binary on the host OS: starts, links only the OS, builds and runs programs (platform related)
 ```

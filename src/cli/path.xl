@@ -1,0 +1,53 @@
+// Path helpers of the output step: the separator, the directory and file name of a path, and the
+// stem (the file name without its last extension). Paths are `str` views; the results own their
+// bytes.
+from "std" import String
+from "std/str" import findLast
+
+/// The index of the last path separator in `path`, or -1: `/` everywhere, `\` too on Windows.
+export fn lastSeparator(path: str) -> i64 {
+    local at = findLast(path, "/")
+#if os == "windows"
+    local back = findLast(path, "\\")
+    at = back > at ? back : at
+#endif
+    return at
+}
+
+/// The file name of `path` (everything after the last separator).
+export fn fileNameOf(path: str) -> String {
+    local cut = lastSeparator(path)
+    if cut < 0 {
+        return String(path)
+    }
+    return String(path[cut as usize + 1..])
+}
+
+/// The directory part of `path`, including its trailing separator; empty when there is none.
+export fn dirOf(path: str) -> String {
+    local cut = lastSeparator(path)
+    if cut < 0 {
+        return String()
+    }
+    return String(path[0..cut as usize + 1])
+}
+
+/// The file name of `path` without its last extension (`main.xl` -> `main`).
+export fn stemOf(path: str) -> String {
+    local name = fileNameOf(path)
+    local dot = name.findLast(".")
+    if dot > 0 {
+        return name.slice(0, dot as usize)
+    }
+    return name
+}
+
+/// `dir` and `leaf` joined with the separator of the target (`/`, or `\` on Windows).
+export fn joinPath(dir: str, leaf: str, windows: bool) -> String {
+    local out = String(dir)
+    if out.length() > 0 && !out.endsWith("/") && !(windows && out.endsWith("\\")) {
+        out.append(windows ? "\\" : "/")
+    }
+    out.append(leaf)
+    return out
+}

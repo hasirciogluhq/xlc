@@ -1,0 +1,53 @@
+// The entry-point rules of an output, checked on the flat HIR before any code is generated: an
+// executable needs an `@entry` function (E0739); a static library has none (E0754); an entry with
+// parameters is not allowed in a shared library, nor in a Windows program without `register(args)`
+// (E0755). Port of the former checkEntry in src/cli/emit.cpp.
+from "std" import String, format
+from "../hir/abi" import XlcHirModule, XlcHirFunction, view
+from "../util/source" import Span, spanNone
+from "backend" import XlcSession, XlcSpan, strOf, xstr, xlcSessionDiagnose
+
+/// The span of a function or of "no position", as the boundary carries it.
+export fn boundarySpan(s: Span) -> XlcSpan {
+    return XlcSpan { file: s.file, line: s.line, column: s.column, endLine: s.endLine, endColumn: s.endColumn }
+}
+
+/// Reports one error on the session. `at` is the span of the offending entity.
+fn report(session: *XlcSession, code: str, at: Span, message: String, hint: str) {
+    local span = boundarySpan(at)
+    local text = String(hint)
+    xlcSessionDiagnose(session, strOf(code), &span, xstr(&message), xstr(&text))
+}
+
+/// True when the output may be produced; false after a reported error. `rootName` is the file name
+/// of the program (for the E0739 message), `os` the target OS, `crt` whether `--crt` links the CRT.
+export fn checkEntry(session: *XlcSession, m: *XlcHirModule, emit: str, rootName: str, os: str, crt: bool) -> bool {
+    local entry: *XlcHirFunction = nil
+    for i in 0..m.functionCount as usize {
+        if m.functions[i].isEntry != 0 {
+            entry = &m.functions[i]
+        }
+    }
+    if emit == "exe" && entry == nil {
+        report(session, "E0739", spanNone(),
+               format("`{}` has no entry point: no `@entry` function", rootName),
+               "mark one module-level function `@entry fn main()`, or build the file as a library with `--emit=obj`, `--emit=static` or `--emit=shared`")
+        return false
+    }
+    if entry != nil && emit == "static" {
+        report(session, "E0754", entry.span,
+               format("`@entry` on `{}` in a static library", view(entry.name)),
+               "remove `@entry`: a static library has no entry point, use `@init` for startup work or `@fini` for teardown")
+        return false
+    }
+    local shared = emit == "shared"
+    if entry != nil && entry.paramCount > 0 && (shared || (os == "windows" && !crt && m.argsFunction.len == 0)) {
+        report(session, "E0755", entry.span,
+               format("`@entry` on `{}` takes arguments, which {}", view(entry.name),
+                      shared ? "a shared library does not pass" : "a Windows program gets only from `register(args)`"),
+               shared ? "write `@entry fn name()` with no parameters"
+                      : "link the standard library (it registers the role), or write `register(args) fn name(argc: *i32) -> **u8` that parses the command line")
+        return false
+    }
+    return true
+}

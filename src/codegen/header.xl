@@ -1,0 +1,422 @@
+// `--emit=header`: a C/C++ header for the `export(c)` surface, the `@repr(c)` types and the enums
+// they use (plan 5.7). Port of the former src/codegen/header.cpp. It reads the flat HIR of
+// src/hir/abi.xl. There every type is its source spelling (src/hir/flatten.xl `typeText`), so this
+// file parses the spelling: `*T`, `[]T`, `[]mut T`, `[T; N]`, `fn(A, B) -> R`, `(A, B)`, the scalar
+// names, and a qualified name `a.b.C` whose first component names the type (the C++ `path.front()`).
+//
+// The spelling keeps every array length as a literal (HIR arrays are normalized before codegen),
+// so the declarators need no constant evaluation. Struct sizes come from the semantic phase
+// through the backend (`xlcSessionSizeOf`).
+from "std" import String, Vec, format
+from "std/str" import eq, startsWith, findLast, find
+from "../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirStr, XlcHirEnum, XlcHirAggregate, view, owned
+from "../cli/backend" import XlcSession, strOf, xlcSessionSizeOf
+
+/// The byte at `i` of `s` (the caller keeps `i` below the length).
+fn at(s: str, i: usize) -> u8 {
+    return s.ptr[i]
+}
+
+/// `[` of an array type (`[T; N]`), as opposed to the slice `[]T`.
+fn isArray(t: str) -> bool {
+    return at(t, 0) == b'[' && !startsWith(t, "[]")
+}
+
+/// Whether `t` is an integer scalar name: `i` or `u` followed by the bit count (`i32`, `u8`).
+fn isIntName(t: str) -> bool {
+    if t.len < 2 || (at(t, 0) != b'i' && at(t, 0) != b'u') {
+        return false
+    }
+    for i in 1..t.len {
+        if at(t, i) < b'0' || at(t, i) > b'9' {
+            return false
+        }
+    }
+    return true
+}
+
+/// Whether `c` is part of a scalar or a qualified name.
+fn isNameByte(c: u8) -> bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_' || c == b'.'
+}
+
+/// The index of the bracket that closes the one at `open`; nested brackets are skipped.
+fn closeOf(s: str, open: usize) -> usize {
+    local depth: i32 = 0
+    local i = open
+    while i < s.len {
+        local c = at(s, i)
+        if c == b'(' || c == b'[' {
+            depth += 1
+        }
+        if c == b')' || c == b']' {
+            depth -= 1
+            if depth == 0 {
+                return i
+            }
+        }
+        i += 1
+    }
+    return s.len
+}
+
+/// One past the end of the type spelled at `i`.
+fn typeEnd(s: str, i: usize) -> usize {
+    if at(s, i) == b'*' {
+        return typeEnd(s, i + 1)
+    }
+    if startsWith(s[i..], "[]") {
+        local j = i + 2
+        if startsWith(s[j..], "mut ") {
+            j += 4
+        }
+        return typeEnd(s, j)
+    }
+    if at(s, i) == b'[' || at(s, i) == b'(' {
+        return closeOf(s, i) + 1
+    }
+    if startsWith(s[i..], "fn(") {
+        local j = closeOf(s, i + 2) + 1
+        if startsWith(s[j..], " -> ") {
+            return typeEnd(s, j + 4)
+        }
+        return j
+    }
+    local j = i
+    while j < s.len && isNameByte(at(s, j)) {
+        j += 1
+    }
+    return j
+}
+
+/// The element type of an array spelling `[T; N]`.
+fn arrayElem(t: str) -> str {
+    local inner = t[1..closeOf(t, 0)]
+    local semi = findLast(inner, "; ") as usize
+    return inner[0..semi]
+}
+
+/// The length of an array spelling `[T; N]`, as written.
+fn arrayLen(t: str) -> str {
+    local inner = t[1..closeOf(t, 0)]
+    local semi = findLast(inner, "; ") as usize
+    return inner[semi + 2..]
+}
+
+/// The first component of a qualified name (`a.b.C` -> `a`), the C++ `path.front()`.
+fn frontOf(t: str) -> str {
+    local dot = find(t, ".")
+    if dot < 0 {
+        return t
+    }
+    return t[0..dot as usize]
+}
+
+/// `cIdent`: every byte that is not a letter, a digit or `_` becomes `_`.
+fn cIdent(name: str) -> String {
+    local out = String()
+    for i in 0..name.len {
+        local c = at(name, i)
+        out.push((c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || (c >= b'0' && c <= b'9') || c == b'_' ? c : b'_')
+    }
+    return out
+}
+
+/// The header under construction: the module, the session (for struct sizes), the text so far and
+/// the names already defined (the C++ `emitted` set).
+class HeaderWriter {
+    session: *XlcSession
+    m: *XlcHirModule
+    out: String
+    emitted: Vec<String>
+
+    fn init(self, session: *XlcSession, m: *XlcHirModule) {
+        self.session = session
+        self.m = m
+        self.out = String()
+        self.emitted = Vec<String>()
+    }
+
+    /// The enum named `name`, or nil.
+    fn enumNamed(self, name: str) -> *XlcHirEnum {
+        for i in 0..self.m.enumCount as usize {
+            if eq(view(self.m.enums[i].name), name) {
+                return &self.m.enums[i]
+            }
+        }
+        return nil
+    }
+
+    /// The aggregate named `name`, or nil.
+    fn aggregateNamed(self, name: str) -> *XlcHirAggregate {
+        for i in 0..self.m.aggregateCount as usize {
+            if eq(view(self.m.aggregates[i].name), name) {
+                return &self.m.aggregates[i]
+            }
+        }
+        return nil
+    }
+
+    /// Whether `name` is an interface; its values are fat pointers that C sees as `void`.
+    fn isInterface(self, name: str) -> bool {
+        for i in 0..self.m.interfaceCount as usize {
+            if eq(view(self.m.interfaces[i].name), name) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Marks `name` as defined; false when it already was.
+    fn mark(self, name: str) -> bool {
+        for i in 0..self.emitted.length() {
+            if self.emitted.get(i).equals(name) {
+                return false
+            }
+        }
+        self.emitted.push(String(name))
+        return true
+    }
+
+    /// The C base type of a non-derived spelling (a scalar, or a named type).
+    fn baseName(self, t: str, out: *String) {
+        if eq(t, "bool") {
+            out.append("bool")
+        } else if eq(t, "isize") {
+            out.append("intptr_t")
+        } else if eq(t, "usize") {
+            out.append("uintptr_t")
+        } else if eq(t, "f32") {
+            out.append("float")
+        } else if eq(t, "f64") {
+            out.append("double")
+        } else if isIntName(t) {
+            out.append(format("{}int{}_t", at(t, 0) == b'i' ? "" : "u", t[1..]).asStr())
+        } else if eq(t, "void") || eq(t, "never") || eq(t, "str") || startsWith(t, "[]") || startsWith(t, "(") {
+            out.append("void")
+        } else {
+            local name = frontOf(t)
+            if self.enumNamed(name) != nil {
+                out.append(cIdent(name).asStr())
+            } else if self.isInterface(name) {
+                out.append("void")
+            } else {
+                out.append(format("struct {}", cIdent(name).asStr()).asStr())
+            }
+        }
+    }
+
+    /// The C declarator for `name` of the type spelled `t`, appended to `out`: pointers, arrays and
+    /// function pointers nest the way C reads them.
+    fn declare(self, t: str, name: str, out: *String) {
+        if at(t, 0) == b'*' {
+            local e = t[1..]
+            local inner = format("(*{})", name)
+            if isArray(e) || startsWith(e, "fn(") {
+                self.declare(e, inner.asStr(), out)
+            } else {
+                local star = format("*{}", name)
+                self.declare(e, star.asStr(), out)
+            }
+        } else if isArray(t) {
+            local len = arrayLen(t)
+            local sized = format("{}[{}]", name, len)
+            self.declare(arrayElem(t), sized.asStr(), out)
+        } else if startsWith(t, "fn(") {
+            local close = closeOf(t, 2)
+            local params = self.params(t[3..close])
+            local rest = t[close + 1..]
+            local ret: str = "void"
+            if startsWith(rest, " -> ") {
+                ret = rest[4..]
+            }
+            local fnName = format("(*{})({})", name, params.asStr())
+            self.declare(ret, fnName.asStr(), out)
+        } else {
+            self.baseName(t, out)
+            if name.len > 0 {
+                out.append(" ")
+                out.append(name)
+            }
+        }
+    }
+
+    /// The parameter list of a function spelling: `void` when there are none.
+    fn params(self, list: str) -> String {
+        local out = String()
+        local p: usize = 0
+        while p < list.len {
+            local e = typeEnd(list, p)
+            if p > 0 {
+                out.append(", ")
+            }
+            self.declare(list[p..e], "", &out)
+            p = e + 2
+        }
+        if out.length() == 0 {
+            out.append("void")
+        }
+        return out
+    }
+
+    /// Defines the types the spelling `t` uses (C++ `need`): pointers, arrays and function types
+    /// reach their parts; a named type reaches its definition once.
+    fn need(self, t: str) {
+        if at(t, 0) == b'*' {
+            self.need(t[1..])
+        } else if isArray(t) {
+            self.need(arrayElem(t))
+        } else if startsWith(t, "fn(") {
+            local close = closeOf(t, 2)
+            local p: usize = 3
+            while p < close {
+                local e = typeEnd(t, p)
+                self.need(t[p..e])
+                p = e + 2
+            }
+            local rest = t[close + 1..]
+            if startsWith(rest, " -> ") {
+                self.need(rest[4..])
+            }
+        } else {
+            self.needName(frontOf(t))
+        }
+    }
+
+    /// Defines the enum or aggregate named `name`, once.
+    fn needName(self, name: str) {
+        local e = self.enumNamed(name)
+        if e != nil {
+            if self.mark(name) {
+                self.emitEnum(e)
+            }
+            return
+        }
+        local a = self.aggregateNamed(name)
+        if a != nil && self.mark(name) {
+            self.emitAggregate(a)
+        }
+    }
+
+    /// `typedef` of the underlying type and the enumerators.
+    fn emitEnum(self, e: *XlcHirEnum) {
+        local name = cIdent(view(e.name))
+        self.out.append("typedef ")
+        self.baseName(view(e.underlying), &self.out)
+        self.out.append(format(" {};\n", name.asStr()))
+        self.out.append("enum {\n")
+        for i in 0..e.memberCount as usize {
+            local member = &e.members[i]
+            local value: String = member.text.len > 0 ? owned(member.text) : format("{}", member.value)
+            self.out.append(format("    {}_{} = {},\n", name.asStr(), view(member.name), value.asStr()))
+        }
+        self.out.append("};\n\n")
+    }
+
+    /// The struct definition, its vptr for a class with virtual methods, and a size assertion
+    /// against the layout the semantic phase computed.
+    fn emitAggregate(self, a: *XlcHirAggregate) {
+        for i in 0..a.fieldCount as usize {
+            self.need(view(a.fields[i].typeName))
+        }
+        local name = cIdent(view(a.name))
+        if a.opaque != 0 {
+            self.out.append(format("struct {};\n\n", name.asStr()))
+            return
+        }
+        self.out.append(format("struct {}", name.asStr()))
+        self.out.append(" {\n")
+        if a.isClass != 0 && a.vtableCount > 0 {
+            self.out.append("    void* vptr;\n")
+        }
+        for i in 0..a.fieldCount as usize {
+            local field = &a.fields[i]
+            self.out.append("    ")
+            self.declare(view(field.typeName), view(field.name), &self.out)
+            self.out.append(";\n")
+        }
+        self.out.append("};\n")
+        local size: i64 = 0
+        if xlcSessionSizeOf(self.session, strOf(view(a.name)), &size) == 0 {
+            self.out.append(format("_Static_assert(sizeof(struct {}) == {}, \"layout of {}\");\n", name.asStr(), size, name.asStr()))
+        }
+        self.out.append("\n")
+    }
+
+    /// The parameter list of an exported function, `void` for none.
+    fn paramsOf(self, f: *XlcHirFunction) -> String {
+        local out = String()
+        for i in 0..f.paramCount as usize {
+            if i > 0 {
+                out.append(", ")
+            }
+            self.declare(view(f.locals[i].typeName), view(f.locals[i].name), &out)
+        }
+        if out.length() == 0 {
+            out.append("void")
+        }
+        return out
+    }
+}
+
+/// The symbol of a global or function: its link name, or its name when none is set.
+fn symbolOr(symbol: XlcHirStr, name: XlcHirStr) -> str {
+    return symbol.len > 0 ? view(symbol) : view(name)
+}
+
+/// The C header text of the flat module `m`. `guardName` is the include guard macro.
+export fn headerText(session: *XlcSession, m: *XlcHirModule, guardName: str) -> String {
+    local w = HeaderWriter(session, m)
+    w.out.append(format("/* Generated by xlang. Do not edit. */\n#ifndef {}\n#define {}\n\n", guardName, guardName))
+    w.out.append("#include <stdbool.h>\n#include <stddef.h>\n#include <stdint.h>\n\n")
+    w.out.append("#ifdef __cplusplus\nextern \"C\" {\n#endif\n\n")
+
+    // Types used by the surface, in the order the C++ generator reached them: the `@repr(c)`
+    // aggregates first, then the exported globals, then the exported functions.
+    for i in 0..m.aggregateCount as usize {
+        if m.aggregates[i].reprC != 0 {
+            w.needName(view(m.aggregates[i].name))
+        }
+    }
+    for i in 0..m.globalCount as usize {
+        if m.globals[i].exportC != 0 {
+            w.need(view(m.globals[i].typeName))
+        }
+    }
+    for i in 0..m.functionCount as usize {
+        local f = &m.functions[i]
+        if f.exportC == 0 {
+            continue
+        }
+        w.need(view(f.ret))
+        for k in 0..f.paramCount as usize {
+            w.need(view(f.locals[k].typeName))
+        }
+    }
+
+    for i in 0..m.globalCount as usize {
+        local g = &m.globals[i]
+        if g.exportC != 0 {
+            w.out.append("extern ")
+            w.declare(view(g.typeName), symbolOr(g.symbol, g.name), &w.out)
+            w.out.append(";\n")
+        }
+    }
+    for i in 0..m.functionCount as usize {
+        local f = &m.functions[i]
+        if f.exportC == 0 {
+            continue
+        }
+        if eq(view(f.ret), "never") {
+            w.out.append("_Noreturn ")
+        }
+        w.declare(view(f.ret), symbolOr(f.symbol, f.name), &w.out)
+        w.out.append("(")
+        w.out.append(w.paramsOf(f).asStr())
+        w.out.append(");\n")
+    }
+
+    w.out.append("\n#ifdef __cplusplus\n}\n#endif\n\n")
+    w.out.append(format("#endif /* {} */\n", guardName))
+    return w.out.clone()
+}

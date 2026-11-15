@@ -1,0 +1,148 @@
+// The incremental build (plan 8.1/8.2): one object per source module, named by the content hash of
+// the module, of the modules it imports and of the build configuration. An object already in the
+// cache is not generated again. Port of the former emitIncremental in src/cli/emit.cpp.
+//
+// The hash is FNV-1a over the configuration key (`xlcSessionConfigKey`), the module key, the module
+// text and the hashes of its dependencies; a module that registers names salts every name, because
+// those names are visible everywhere.
+from "std" import String, Vec, format
+from "std/str" import eq, fromParts
+from "std/io/files" import exists, makeDirAll
+from "../hir/abi" import XlcHirModule, view
+from "backend" import XlcSession, XlcModule, XlcStr, xstr, xview, strOf, xlcSessionModuleCount, xlcSessionModule,
+    xlcSessionConfigKey, xlcSessionOptLevel, xlcSessionDiagnose, xlcSessionHasErrors
+from "path" import dirOf, joinPath
+from "../codegen/llvm" import generate, writeArtifact, releaseArtifact
+from "entry" import boundarySpan
+from "../util/source" import spanNone
+
+/// FNV-1a offset basis and prime (64-bit).
+const FNV_BASIS: u64 = 14695981039346656037
+const FNV_PRIME: u64 = 1099511628211
+
+/// One FNV-1a step over `s`, then a separator round (the C++ `mix`).
+fn mix(h: u64, s: str) -> u64 {
+    local x = h
+    for i in 0..s.len {
+        x = (x ^ (s.ptr[i] as u64)) * FNV_PRIME
+    }
+    return (x ^ 0xff) * FNV_PRIME
+}
+
+/// The hash of module `i`, memoized. A module reached again while it is being hashed (an import
+/// cycle) contributes 0, as the C++ `base[&m] = 0` did.
+fn baseHash(i: usize, cfg: str, mods: *Vec<XlcModule>, memo: *Vec<u64>, state: *Vec<u8>) -> u64 {
+    if *state.get(i) != 0 {
+        return *memo.get(i)
+    }
+    state.set(i, 1)
+    memo.set(i, 0)
+    local m = mods.get(i)
+    local h = mix(mix(mix(FNV_BASIS, cfg), xview(m.key)), xview(m.text))
+    for k in 0..m.deps.count as usize {
+        local d = baseHash(m.deps.items[k] as usize, cfg, mods, memo, state)
+        local text = format("{}", d)
+        h = mix(h, text.asStr())
+    }
+    memo.set(i, h)
+    return h
+}
+
+/// The module key with `/` written as `.`, for the object file name.
+fn objectName(key: str) -> String {
+    local out = String()
+    for i in 0..key.len {
+        out.push(key.ptr[i] == b'/' ? b'.' : key.ptr[i])
+    }
+    return out
+}
+
+/// Whether module `key` contributes functions or globals to the flat module `m`.
+fn hasCode(m: *XlcHirModule, key: str) -> bool {
+    if key.len == 0 {
+        return true
+    }
+    for i in 0..m.functionCount as usize {
+        if eq(view(m.functions[i].module), key) {
+            return true
+        }
+    }
+    for i in 0..m.globalCount as usize {
+        if eq(view(m.globals[i].module), key) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Generates and caches one object per module of the program, and returns the object paths in
+/// link order. `emit` is the output kind (it is part of the key), `output` the final output (the
+/// cache sits next to it unless `cacheDir` names one), `stem` the root file stem. False after a
+/// reported failure; `objects` then holds nothing usable.
+export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String, stem: *String, output: *String,
+                          cacheDir: *String, windows: bool, objects: *Vec<String>) -> bool {
+    local cacheRoot: String = cacheDir.length() > 0 ? cacheDir.clone() : joinPath(dirOf(output.asStr()).asStr(), ".xlc-cache", windows)
+    makeDirAll(&cacheRoot)
+
+    local keyText: XlcStr
+    xlcSessionConfigKey(session, xstr(emit), &keyText)
+    local cfg = String(xview(keyText))
+
+    // The module table of the session, in dependency order.
+    local count = xlcSessionModuleCount(session) as usize
+    local mods = Vec<XlcModule>()
+    for i in 0..count {
+        local row: XlcModule
+        xlcSessionModule(session, i as u32, &row)
+        mods.push(row)
+    }
+    local memo = Vec<u64>()
+    local state = Vec<u8>()
+    for i in 0..count {
+        memo.push(0)
+        state.push(0)
+    }
+
+    // Registered names (panic, allocator, ...) are visible everywhere: they salt every module hash.
+    local salt = String()
+    for i in 0..count {
+        if mods.get(i).registered != 0 {
+            local h = baseHash(i, cfg.asStr(), &mods, &memo, &state)
+            salt.append(format("{};", h).asStr())
+        }
+    }
+
+    local ext: str = windows ? ".obj" : ".o"
+    local optLevel = xlcSessionOptLevel(session)
+    for i in 0..count {
+        local row = mods.get(i)
+        local key = xview(row.key)
+        if !hasCode(m, key) {
+            continue
+        }
+        local name = key.len == 0 ? stem.clone() : objectName(key)
+        local leaf = format("{}-{:016x}{}", name.asStr(), mix(baseHash(i, cfg.asStr(), &mods, &memo, &state), salt.asStr()), ext)
+        local obj = joinPath(cacheRoot.asStr(), leaf.asStr(), windows)
+        if !exists(&obj) {
+            local onlyKey = String(key)
+            local artifact = generate(session, &name, emit, true, &onlyKey)
+            if artifact == nil {
+                if xlcSessionHasErrors(session) == 0 {
+                    local span = boundarySpan(spanNone())
+                    local message = format("code generation for module `{}` failed without a diagnostic", name.asStr())
+                    local hint = "internal error: the back end returned no object"
+                    local hintText = strOf(hint)
+                    xlcSessionDiagnose(session, strOf("E0714"), &span, xstr(&message), hintText)
+                }
+                return false
+            }
+            local ok = writeArtifact(artifact, optLevel, "obj", &obj)
+            releaseArtifact(artifact)
+            if !ok {
+                return false
+            }
+        }
+        objects.push(obj)
+    }
+    return xlcSessionHasErrors(session) == 0
+}
