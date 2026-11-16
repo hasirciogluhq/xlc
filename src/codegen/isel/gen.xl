@@ -95,11 +95,15 @@ export class Syms {
     defined: Vec<bool>
     section: Vec<u32>
     offset: Vec<u64>
+    fileLocal: Vec<bool>
+    weak: Vec<bool>        // a weak definition: another object's strong one wins at link time
     index: HashMap<String, u32>
 
     fn init(self) {
         self.names = Vec<String>()
         self.defined = Vec<bool>()
+        self.fileLocal = Vec<bool>()
+        self.weak = Vec<bool>()
         self.section = Vec<u32>()
         self.offset = Vec<u64>()
         self.index = HashMap<String, u32>()
@@ -115,6 +119,8 @@ export class Syms {
         local n: u32 = self.names.length() as u32
         self.names.push(key.clone())
         self.defined.push(false)
+        self.fileLocal.push(false)
+        self.weak.push(false)
         self.section.push(0)
         self.offset.push(0)
         self.index.put(key, n)
@@ -161,6 +167,7 @@ export class Gen {
     liveI: u32
     liveF: u32
     tempTop: u32
+    tempBase: u32         // the floor of the bump area: permanent slots of the prolog sit below it
     tempMax: u32
     loops: Vec<LoopRec>
     epilog: u32
@@ -200,6 +207,7 @@ export class Gen {
         self.liveI = 0
         self.liveF = 0
         self.tempTop = 0
+        self.tempBase = 0
         self.tempMax = 0
         self.epilog = 0
         self.sretOff = -1
@@ -233,6 +241,11 @@ export class Gen {
     /// The link symbol of function `i`.
     fn fnSymbol(self, i: u32) -> str {
         local f: *XlcHirFunction = &self.m.functions[i as usize]
+        // The `@entry` function is reached through the C `main` stub (data.xl), so its own symbol
+        // never competes with `main`.
+        if f.isEntry != 0 {
+            return "xl$entry"
+        }
         return view(f.symbol).len > 0 ? view(f.symbol) : view(f.name)
     }
 
@@ -315,6 +328,7 @@ export class Gen {
         }
         local name = format("xl$str${}", self.lits.length())
         local id: u32 = self.syms.id(name.asStr())
+        self.syms.fileLocal.set(id as usize, true)
         self.syms.define(id, self.cstr, self.cstrLen)
         for k in 0..text.len {
             self.o.addByte(self.cstr, text.ptr[k])

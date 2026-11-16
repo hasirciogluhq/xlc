@@ -13,6 +13,8 @@ madd x0, x1, x2, x3
 add w0, w1, w2
 sub w0, w1, w2
 mul w0, w1, w2
+ldrb w0, [x1, #5]
+strb w0, [x1, #5]
 ldrh w0, [x1, #6]
 strh w0, [x1, #6]
 ldrsb x0, [x1, #3]

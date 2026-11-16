@@ -1,0 +1,325 @@
+// The data of the object and the boot code of the native backend.
+//
+//   globals        `__DATA,__data` (writable) or `__DATA,__const` (`const`): the bytes of the constant
+//                  initializer, with an 8-byte pointer relocation for every address in it
+//   vtables        `vtable.<class>`: the function addresses in slot order; an `@repr(c)` class has
+//                  two leading words (offset-to-top, typeinfo, both 0) and its vptr points past them
+//   itables        `itable.<type>|<interface>`: the implementing functions in the interface's order
+//   unwind table   `xl$unwindTable`: (function, landing pad or 0) address pairs; `xl$unwindPads`
+//                  holds its address and `xl$unwindPadCount` the pair count (`__builtin_unwindPads`)
+//   boot           `_xl_initAll` runs the `@init` functions, `_xl_finiAll` the `@fini` ones in
+//                  reverse; the C `main` runs init, the entry, fini and exits with the entry's
+//                  result (`argc` and `argv` pass through when the entry takes them)
+// The tables and literals are file-local symbols: every object that needs one defines its own copy.
+// @spec https://github.com/apple-oss-distributions/cctools (mach-o/loader.h, arm64/reloc.h)
+from "std" import String, Vec, format
+from "../../hir/abi" import XlcHirModule, XlcHirExpr, XlcHirFieldInit, XlcHirGlobal, view,
+    E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, E_NIL, E_FUNC_REF, E_GLOBAL_REF, E_ADDR_OF, E_FIELD,
+    E_INDEX, E_ARRAY_LIST, E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_TO_INTERFACE, E_CAST
+from "../arm64" import X0, X19, X20, X29, X30, SP, XZR, movReg64, add64Imm, stp64Pre, ldp64Post, stpOff64, ldpOff64, ret
+from "gen" import Gen, DRel
+from "layout" import K_FLOAT
+from "types" import Scalar, KIND_BOOL, scalarOf, canonical
+
+fn node(g: *Gen, i: i32) -> *XlcHirExpr {
+    return &g.m.exprs[i as usize]
+}
+
+/// Overwrites `n` bytes at `at` of section `sec` with the little-endian `v`.
+fn patch(g: *Gen, sec: u32, at: u64, v: u64, n: u32) {
+    local s = g.o.sections.get(sec)
+    for k in 0..n as usize {
+        s.code.set(at as usize + k, ((v >> (k * 8) as u64) & 0xff) as u8)
+    }
+}
+
+/// A pointer to symbol `sym` (plus `addend`) at byte `at` of section `sec`.
+fn pointer(g: *Gen, sec: u32, at: u64, sym: u32, addend: u64) {
+    patch(g, sec, at, addend, 8)
+    g.drels.push(DRel { section: sec, addr: at as u32, sym: sym })
+}
+
+fn floatBits(v: f64, dbl: bool) -> u64 {
+    if dbl {
+        local x: f64 = v
+        return *(&x as *u64)
+    }
+    local y: f32 = v as f32
+    return *(&y as *u32) as u64
+}
+
+fn sizeOf(g: *Gen, ty: str) -> u64 {
+    local size: u64 = 0
+    local align: u64 = 1
+    g.lay.sizeAlign(ty, &size, &align)
+    return size
+}
+
+/// The vtable pointer symbol of class `name` and its addend (16 for an `@repr(c)` class).
+fn storeVtable(g: *Gen, sec: u32, at: u64, name: str) {
+    local l = g.lay.of(name)
+    if l == nil || !l.hasVptr {
+        return
+    }
+    local a = g.lay.aggregate(name)
+    pointer(g, sec, at, g.syms.id(format("vtable.{}", name).asStr()), a != nil && a.reprC != 0 ? 16 : 0)
+}
+
+/// Writes the constant `e` at byte `at` of section `sec`.
+fn writeConst(g: *Gen, sec: u32, at: u64, e: *XlcHirExpr) {
+    local k: i32 = e.kind
+    local ty: str = view(e.typeName)
+    if k == E_INT_CONST || k == E_BOOL_CONST {
+        local sc: Scalar = scalarOf(g.m, ty)
+        if sc.kind == 4 {
+            patch(g, sec, at, floatBits((e.intValue as i64) as f64, sc.bits == 64), sc.bits / 8)
+        } else {
+            local v: u64 = k == E_BOOL_CONST ? e.boolValue as u64 : canonical(e.intValue, sc)
+            patch(g, sec, at, v, sc.kind == KIND_BOOL ? 1 : sc.bits / 8)
+        }
+    } else if k == E_FLOAT_CONST {
+        local sc: Scalar = scalarOf(g.m, ty)
+        patch(g, sec, at, floatBits(e.floatValue, sc.bits == 64), sc.bits / 8)
+    } else if k == E_NIL {
+        return
+    } else if k == E_STR_CONST {
+        pointer(g, sec, at, g.literal(view(e.text)), 0)
+        if ty == "str" {
+            patch(g, sec, at + 8, view(e.text).len as u64, 8)
+        }
+    } else if k == E_FUNC_REF {
+        local fi: i32 = g.findFunction(view(e.text))
+        if fi < 0 {
+            g.fail("an unknown function in a constant")
+            return
+        }
+        pointer(g, sec, at, g.syms.id(g.fnSymbol(fi as u32)), 0)
+    } else if k == E_ADDR_OF {
+        // `&global`, `&global[const]`, `&global.field`
+        local cur: *XlcHirExpr = node(g, e.lhs)
+        local off: u64 = 0
+        while cur.kind != E_GLOBAL_REF {
+            if cur.kind == E_INDEX {
+                local base: *XlcHirExpr = node(g, cur.lhs)
+                off += sizeOf(g, view(cur.typeName)) * node(g, cur.rhs).intValue
+                cur = base
+            } else if cur.kind == E_FIELD && cur.throughPointer == 0 {
+                local base: *XlcHirExpr = node(g, cur.lhs)
+                off += g.lay.fieldOff(view(base.typeName), cur.index)
+                cur = base
+            } else {
+                g.fail("an address constant that is not a global, an element or a field")
+                return
+            }
+        }
+        local gi: i32 = g.findGlobal(view(cur.text))
+        if gi < 0 {
+            g.fail("an unknown global in a constant")
+            return
+        }
+        pointer(g, sec, at, g.syms.id(g.globSymbol(gi as u32)), off)
+    } else if k == E_STRUCT_LIT {
+        storeVtable(g, sec, at, ty)
+        for i in 0..e.fieldCount as usize {
+            local f: *XlcHirFieldInit = &g.m.fields[e.fieldFirst as usize + i]
+            if f.value >= 0 {
+                writeConst(g, sec, at + g.lay.fieldOff(ty, f.index), node(g, f.value))
+            }
+        }
+    } else if k == E_TUPLE_LIT {
+        for i in 0..e.argCount as usize {
+            writeConst(g, sec, at + g.lay.fieldOff(ty, i as u32), &g.m.exprs[g.m.refs[e.argFirst as usize + i] as usize])
+        }
+    } else if k == E_ARRAY_LIST || k == E_ARRAY_REPEAT {
+        local es: u64 = sizeOf(g, g.lay.elemOf(ty).asStr())
+        local n: usize = k == E_ARRAY_LIST ? e.argCount as usize : e.intValue as usize
+        for i in 0..n {
+            local el: *XlcHirExpr = k == E_ARRAY_LIST ? &g.m.exprs[g.m.refs[e.argFirst as usize + i] as usize] : node(g, e.lhs)
+            writeConst(g, sec, at + es * i as u64, el)
+        }
+    } else if k == E_TO_INTERFACE {
+        writeConst(g, sec, at, node(g, e.lhs))
+        pointer(g, sec, at + 8, g.syms.id(format("itable.{}|{}", view(e.text), ty).asStr()), 0)
+    } else if k == E_CAST {
+        local inner: *XlcHirExpr = node(g, e.lhs)
+        if inner.kind == E_INT_CONST {
+            local sc: Scalar = scalarOf(g.m, ty)
+            patch(g, sec, at, canonical(inner.intValue, sc), sc.kind == KIND_BOOL ? 1 : sc.bits / 8)
+        } else {
+            writeConst(g, sec, at, inner)
+        }
+    } else {
+        g.fail("a global initializer that is not a constant")
+    }
+}
+
+/// Defines the globals of this object.
+export fn emitGlobals(g: *Gen) {
+    for gi in 0..g.m.globalCount as usize {
+        local gl: *XlcHirGlobal = &g.m.globals[gi]
+        if gl.declared != 0 || !g.definedHere(view(gl.module)) {
+            continue
+        }
+        local ty: str = view(gl.typeName)
+        local size: u64 = 0
+        local align: u64 = 1
+        g.lay.sizeAlign(ty, &size, &align)
+        local sec: u32 = gl.constant != 0 ? g.dconst : g.ddata
+        g.o.padTo(sec, align < 1 ? 1 : align)
+        local at: u64 = g.o.size(sec)
+        g.syms.define(g.syms.id(g.globSymbol(gi as u32)), sec, at)
+        for k in 0..(size == 0 ? 1 : size) {
+            g.o.addByte(sec, 0)
+        }
+        if gl.init >= 0 {
+            writeConst(g, sec, at, node(g, gl.init))
+        }
+    }
+}
+
+/// A function address slot at byte `at`: relocated, or 0 when the function is unknown.
+fn functionSlot(g: *Gen, at: u64, name: str) {
+    local fi: i32 = g.findFunction(name)
+    if fi >= 0 {
+        pointer(g, g.dconst, at, g.syms.id(g.fnSymbol(fi as u32)), 0)
+    }
+}
+
+/// Defines the vtables and itables of this object.
+export fn emitTables(g: *Gen) {
+    for i in 0..g.m.aggregateCount as usize {
+        local a = &g.m.aggregates[i]
+        if a.isClass == 0 || a.vtableCount == 0 {
+            continue
+        }
+        g.o.padTo(g.dconst, 8)
+        local id: u32 = g.syms.id(format("vtable.{}", view(a.name)).asStr())
+        g.syms.fileLocal.set(id as usize, true)
+        g.syms.define(id, g.dconst, g.o.size(g.dconst))
+        if a.reprC != 0 {
+            g.o.addQuad(g.dconst, 0)
+            g.o.addQuad(g.dconst, 0)
+        }
+        for s in 0..a.vtableCount as usize {
+            local at: u64 = g.o.size(g.dconst)
+            g.o.addQuad(g.dconst, 0)
+            functionSlot(g, at, view(a.vtable[s].function))
+        }
+    }
+    for i in 0..g.m.implCount as usize {
+        local im = &g.m.impls[i]
+        g.o.padTo(g.dconst, 8)
+        local id: u32 = g.syms.id(format("itable.{}|{}", view(im.typeName), view(im.interfaceName)).asStr())
+        g.syms.fileLocal.set(id as usize, true)
+        g.syms.define(id, g.dconst, g.o.size(g.dconst))
+        for s in 0..im.methodCount as usize {
+            local at: u64 = g.o.size(g.dconst)
+            g.o.addQuad(g.dconst, 0)
+            functionSlot(g, at, view(g.m.strings[im.methodFirst as usize + s]))
+        }
+    }
+}
+
+/// Defines the unwind table and the two words that point at it. Run after the functions: the pad
+/// addresses are text offsets.
+export fn emitPadTable(g: *Gen) {
+    g.o.padTo(g.dconst, 8)
+    local table: u32 = g.syms.id("xl$unwindTable")
+    g.syms.fileLocal.set(table as usize, true)
+    g.syms.define(table, g.dconst, g.o.size(g.dconst))
+    for i in 0..g.pads.length() {
+        local p = g.pads.get(i)
+        local at: u64 = g.o.size(g.dconst)
+        g.o.addQuad(g.dconst, 0)
+        g.o.addQuad(g.dconst, 0)
+        pointer(g, g.dconst, at, g.syms.id(g.fnSymbol(p.fnIndex)), 0)
+        if p.pad != 0 {
+            local id: u32 = g.syms.id(format("xl$pad${}", i).asStr())
+            g.syms.fileLocal.set(id as usize, true)
+            g.syms.define(id, g.text, *g.labelPos.get(p.pad as usize) as u64 * 4)
+            pointer(g, g.dconst, at + 8, id, 0)
+        }
+    }
+    g.o.padTo(g.ddata, 8)
+    local pads: u32 = g.syms.id("xl$unwindPads")
+    g.syms.fileLocal.set(pads as usize, true)
+    g.syms.define(pads, g.ddata, g.o.size(g.ddata))
+    g.o.addQuad(g.ddata, 0)
+    pointer(g, g.ddata, g.o.size(g.ddata) - 8, table, 0)
+    local count: u32 = g.syms.id("xl$unwindPadCount")
+    g.syms.fileLocal.set(count as usize, true)
+    g.syms.define(count, g.ddata, g.o.size(g.ddata))
+    g.o.addQuad(g.ddata, g.pads.length() as u64)
+}
+
+/// A boot hook: calls the functions named by `m.strings[first .. first + count]` (reversed when
+/// asked) and returns. Defines the symbol `name`.
+fn emitHook(g: *Gen, name: str, first: u32, count: u32, reversed: bool) {
+    local label: u32 = g.newLabel()
+    g.bind(label)
+    stp64Pre(&g.code, X29, X30, SP, -16)
+    add64Imm(&g.code, X29, SP, 0, false)
+    for i in 0..count as usize {
+        local at: usize = reversed ? count as usize - 1 - i : i
+        local fi: i32 = g.findFunction(view(g.m.strings[first as usize + at]))
+        if fi >= 0 {
+            g.callSym(g.syms.id(g.fnSymbol(fi as u32)))
+        }
+    }
+    ldp64Post(&g.code, X29, X30, SP, 16)
+    ret(&g.code)
+    local id: u32 = g.syms.id(name)
+    g.syms.define(id, g.text, *g.labelPos.get(label as usize) as u64 * 4)
+    // Without an entry this object is a library part: an executable that links it keeps its own
+    // strong hooks, a host without them gets these.
+    g.syms.weak.set(id as usize, !hasEntry(g))
+}
+
+fn hasEntry(g: *Gen) -> bool {
+    for fi in 0..g.m.functionCount as usize {
+        if g.m.functions[fi].isEntry != 0 && g.m.functions[fi].hasBody != 0 {
+            return true
+        }
+    }
+    return false
+}
+
+/// The boot code of a whole-program object: the two hooks and the C `main`.
+export fn emitBoot(g: *Gen) {
+    emitHook(g, "_xl_initAll", g.m.initFirst, g.m.initCount, false)
+    emitHook(g, "_xl_finiAll", g.m.finiFirst, g.m.finiCount, true)
+    for fi in 0..g.m.functionCount as usize {
+        local f = &g.m.functions[fi]
+        if f.isEntry == 0 || f.hasBody == 0 {
+            continue
+        }
+        local takesArgs: bool = f.paramCount > 0
+        local label: u32 = g.newLabel()
+        g.bind(label)
+        stp64Pre(&g.code, X29, X30, SP, -32)
+        add64Imm(&g.code, X29, SP, 0, false)
+        stpOff64(&g.code, X19, X20, SP, 16)
+        if takesArgs {
+            movReg64(&g.code, X19, X0)
+            movReg64(&g.code, X20, 1)
+        }
+        g.callSym(g.syms.id("_xl_initAll"))
+        if takesArgs {
+            movReg64(&g.code, X0, X19)
+            movReg64(&g.code, 1, X20)
+        }
+        g.callSym(g.syms.id(g.fnSymbol(fi as u32)))
+        if view(f.ret) == "void" {
+            movReg64(&g.code, X19, XZR)
+        } else {
+            movReg64(&g.code, X19, X0)
+        }
+        g.callSym(g.syms.id("_xl_finiAll"))
+        movReg64(&g.code, X0, X19)
+        ldpOff64(&g.code, X19, X20, SP, 16)
+        ldp64Post(&g.code, X29, X30, SP, 32)
+        ret(&g.code)
+        g.syms.define(g.syms.id("main"), g.text, *g.labelPos.get(label as usize) as u64 * 4)
+        return
+    }
+}

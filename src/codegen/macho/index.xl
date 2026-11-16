@@ -58,9 +58,13 @@ export class MachoSym {
     defined: bool
     section: u32
     value: u64
+    external: bool    // false: a file-local symbol (`N_SECT` without `N_EXT`)
+    weak: bool        // `N_WEAK_DEF` in `n_desc`: a strong definition elsewhere replaces it
 
     fn init(self, name: str, defined: bool, section: u32, value: u64) {
         self.name = String(name)
+        self.external = true
+        self.weak = false
         self.defined = defined
         self.section = section
         self.value = value
@@ -134,6 +138,23 @@ export class MachoObject {
     fn addDefined(self, name: str, section: u32, offset: u64) -> u32 {
         local spelled = machoName(name)
         self.syms.push(MachoSym(spelled.asStr(), true, section + 1, offset))
+        return (self.syms.length() - 1) as u32
+    }
+
+    /// Adds a defined weak global symbol and returns its index.
+    fn addWeak(self, name: str, section: u32, offset: u64) -> u32 {
+        local spelled = machoName(name)
+        self.syms.push(MachoSym(spelled.asStr(), true, section + 1, offset))
+        self.syms.get(self.syms.length() - 1).weak = true
+        return (self.syms.length() - 1) as u32
+    }
+
+    /// Adds a defined file-local symbol (not visible to the linker's other inputs) and returns its
+    /// index. The name gets the usual `_` prefix.
+    fn addLocal(self, name: str, section: u32, offset: u64) -> u32 {
+        local spelled = machoName(name)
+        self.syms.push(MachoSym(spelled.asStr(), true, section + 1, offset))
+        self.syms.get(self.syms.length() - 1).external = false
         return (self.syms.length() - 1) as u32
     }
 
@@ -373,9 +394,9 @@ export fn writeObject(o: *MachoObject) -> String {
     for i in 0..nsyms {
         local sym: *MachoSym = o.syms.get(i)
         put32(&out, *strx.get(i))
-        out.push((sym.defined ? N_EXT | N_SECT : N_EXT | N_UNDF) as u8)
+        out.push((sym.defined ? (sym.external ? N_EXT | N_SECT : N_SECT) : N_EXT | N_UNDF) as u8)
         out.push((sym.defined ? sym.section : 0) as u8)
-        put16(&out, 0)  // n_desc
+        put16(&out, sym.weak ? 0x80 : 0)  // n_desc: N_WEAK_DEF
         // A defined symbol's value is its virtual address: the section address plus the offset.
         put64(&out, sym.defined ? (*vmaddr.get(sym.section - 1) as u64) + sym.value : 0)
     }

@@ -296,16 +296,25 @@ export class Layouts {
                 }
             }
         }
+        // Offsets in the sorted order; the fields are stored in declaration order, which is what a
+        // HIR field index names.
+        local offs = Vec<u64>()
+        for i in 0..n {
+            offs.push(0)
+        }
         for k in 0..n {
             local idx: usize = *order.get(k)
             local fs: u64 = *sizes.get(idx)
             local fa: u64 = *aligns.get(idx)
             local off: u64 = isUnion ? 0 : alignUp(cursor, fa)
-            out.fields.push(FieldInfo(off, fs, fa, view(a.fields[idx].typeName)))
+            offs.set(idx, off)
             cursor = isUnion ? (cursor > fs ? cursor : fs) : off + fs
             if fa > align {
                 align = fa
             }
+        }
+        for idx in 0..n {
+            out.fields.push(FieldInfo(*offs.get(idx), *sizes.get(idx), *aligns.get(idx), view(a.fields[idx].typeName)))
         }
         out.align = align
         out.size = alignUp(cursor, align)

@@ -1,0 +1,295 @@
+// Statement generation of the native backend.
+//
+// `while` is laid out as `top: cond -> end; body; cont: step; b top; end` (a post-test loop runs the
+// body first and tests after the step). `continue` goes to `cont` (so a `for` step runs), `break`
+// to `end`; the label pair of every enclosing loop is on `g.loops`, `depth` counts outwards.
+// `try` stores the address of its catch block and the machine state in the snapshot local, calls the
+// `unwind` role with op 1 (the unwinder, std/runtime/unwind.xl, records the snapshot), and runs the
+// body; the unwinder lands in the catch block with sp, fp and the callee-saved registers restored
+// from the snapshot, which is why a function with a `try` keeps every local in memory (regs.xl).
+// Snapshot words: 0 catch address, 1 sp, 2 fp, 3..12 x19..x28, 13..20 d8..d15.
+from "../../hir/abi" import XlcHirExpr, XlcHirStmt, view, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE,
+    S_CONTINUE, S_BREAK, S_BLOCK, S_TRY, E_LOCAL_REF
+from "../arm64" import X0, X1, X19, X29, SP, XZR, b, adr, movReg64, add64Imm, stpOff64, stpOffD, str64Imm
+from "../arm64/float" import fmovReg, fmovFromGp
+from "call" import callUnwind
+from "conv" import word, resultClass, hfaCount, hfaMember
+from "emit" import loadTyped, storeTyped, loadFloat, storeFloat, addOff
+from "expr" import genScalar, genFloat, genPlace, genInto, genCond, isCallLike, storeVptr
+from "gen" import Gen, Place, LoopRec
+from "layout" import K_VOID, K_NEVER, K_INT, K_FLOAT
+from "mem" import zeroMem, copyMem
+from "regs" import LK_REG, LK_SLOT, LK_MEM
+from "types" import scalarOf
+
+fn node(g: *Gen, i: i32) -> *XlcHirExpr {
+    return &g.m.exprs[i as usize]
+}
+
+/// Generates the statements `first .. first + count`.
+export fn genStmts(g: *Gen, first: u32, count: u32) {
+    for i in 0..count as usize {
+        genStmt(g, &g.m.stmts[first as usize + i])
+    }
+}
+
+/// A local declaration: its initializer, or zero (and the vptr of a class).
+fn genLocal(g: *Gen, s: *XlcHirStmt) {
+    local i: u32 = s.localId
+    local ty: str = view(g.f.locals[i as usize].typeName)
+    local k: u32 = g.lay.kind(ty)
+    if g.lay.isMem(ty) {
+        local size: u64 = 0
+        local align: u64 = 1
+        g.lay.sizeAlign(ty, &size, &align)
+        local p = Place { reg: SP, off: *g.fr.off.get(i as usize) as i64 }
+        if s.value >= 0 {
+            genInto(g, node(g, s.value), p)
+        } else {
+            zeroMem(g, p, size)
+            storeVptr(g, ty, p)
+        }
+    } else if k == K_FLOAT {
+        local f: u32 = g.allocF()
+        if s.value >= 0 {
+            genFloat(g, node(g, s.value), f)
+        } else {
+            fmovFromGp(&g.code, true, f, XZR)
+        }
+        g.storeLocalF(f, i)
+        g.freeF(f)
+    } else {
+        if s.value >= 0 {
+            local t: u32 = g.allocI()
+            genScalar(g, node(g, s.value), t)
+            g.storeLocalI(t, i)
+            g.freeI(t)
+        } else {
+            g.storeLocalI(XZR, i)
+        }
+    }
+}
+
+fn genAssign(g: *Gen, s: *XlcHirStmt) {
+    local target: *XlcHirExpr = node(g, s.target)
+    local value: *XlcHirExpr = node(g, s.value)
+    local ty: str = view(target.typeName)
+    local k: u32 = g.lay.kind(ty)
+    if g.lay.isMem(ty) {
+        // The value is built in its own slot and copied: a literal or a constructor zeroes its
+        // destination before reading its operands, so `p = V(p.x + 1, p.y)` must not build in `p`.
+        local top: u32 = g.tempTop
+        local size: u64 = 0
+        local align: u64 = 1
+        g.lay.sizeAlign(ty, &size, &align)
+        local slot: Place = Place { reg: SP, off: g.tempSlot(size, align) as i64 }
+        genInto(g, value, slot)
+        local a: u32 = g.allocI()
+        local p: Place = genPlace(g, target, a)
+        copyMem(g, p, slot, size)
+        g.freeI(a)
+        g.tempTop = top
+        return
+    }
+    if target.kind == E_LOCAL_REF && *g.fr.kind.get(target.localId as usize) != LK_MEM {
+        if k == K_FLOAT {
+            local f: u32 = g.allocF()
+            genFloat(g, value, f)
+            g.storeLocalF(f, target.localId)
+            g.freeF(f)
+        } else {
+            local t: u32 = g.allocI()
+            genScalar(g, value, t)
+            g.storeLocalI(t, target.localId)
+            g.freeI(t)
+        }
+        return
+    }
+    if k == K_FLOAT {
+        local f: u32 = g.allocF()
+        genFloat(g, value, f)
+        local a: u32 = g.allocI()
+        local p: Place = genPlace(g, target, a)
+        storeFloat(&g.code, f, p.reg, p.off, scalarOf(g.m, ty).bits == 64)
+        g.freeI(a)
+        g.freeF(f)
+    } else {
+        local t: u32 = g.allocI()
+        genScalar(g, value, t)
+        local a: u32 = g.allocI()
+        local p: Place = genPlace(g, target, a)
+        storeTyped(&g.code, t, p.reg, p.off, scalarOf(g.m, ty))
+        g.freeI(a)
+        g.freeI(t)
+    }
+}
+
+fn genReturn(g: *Gen, s: *XlcHirStmt) {
+    if s.value >= 0 {
+        local e: *XlcHirExpr = node(g, s.value)
+        local ty: str = view(g.f.ret)
+        local k: u32 = g.lay.kind(ty)
+        if k == K_FLOAT {
+            local f: u32 = g.allocF()
+            genFloat(g, e, f)
+            fmovReg(&g.code, scalarOf(g.m, ty).bits == 64, 0, f)
+            g.freeF(f)
+        } else if k == K_INT {
+            local t: u32 = g.allocI()
+            genScalar(g, e, t)
+            movReg64(&g.code, X0, t)
+            g.freeI(t)
+        } else if g.lay.isMem(ty) {
+            local rc: u32 = resultClass(g, ty, g.cabi)
+            if rc == 2 {
+                local t: u32 = g.allocI()
+                loadTyped(&g.code, t, SP, g.sretOff as i64, word())
+                genInto(g, e, Place { reg: t, off: 0 })
+                g.freeI(t)
+            } else {
+                local size: u64 = 0
+                local align: u64 = 1
+                g.lay.sizeAlign(ty, &size, &align)
+                local slot: u32 = g.tempSlot(size < 8 ? 8 : size, 8)
+                genInto(g, e, Place { reg: SP, off: slot as i64 })
+                if rc == 0 {
+                    loadTyped(&g.code, X0, SP, slot as i64, word())
+                    if size > 8 {
+                        loadTyped(&g.code, X1, SP, (slot + 8) as i64, word())
+                    }
+                } else {
+                    local m: u32 = hfaMember(g, ty)
+                    for j in 0..hfaCount(g, ty) {
+                        loadFloat(&g.code, j, SP, (slot + j * m) as i64, m == 8)
+                    }
+                }
+            }
+        } else {
+            genExprStmt(g, e)
+        }
+    }
+    b(&g.code, 0)
+    g.fixup(g.epilog)
+}
+
+/// An expression evaluated for its effects.
+fn genExprStmt(g: *Gen, e: *XlcHirExpr) {
+    local ty: str = view(e.typeName)
+    local k: u32 = g.lay.kind(ty)
+    if k == K_VOID || k == K_NEVER {
+        if isCallLike(e.kind) {
+            g.callHook(g, e, 0, 0, nil)
+        } else {
+            g.fail("a void expression the native backend does not lower")
+        }
+    } else if g.lay.isMem(ty) {
+        local size: u64 = 0
+        local align: u64 = 1
+        g.lay.sizeAlign(ty, &size, &align)
+        genInto(g, e, Place { reg: SP, off: g.tempSlot(size, align) as i64 })
+    } else if k == K_FLOAT {
+        local f: u32 = g.allocF()
+        genFloat(g, e, f)
+        g.freeF(f)
+    } else {
+        local t: u32 = g.allocI()
+        genScalar(g, e, t)
+        g.freeI(t)
+    }
+}
+
+fn genWhile(g: *Gen, s: *XlcHirStmt) {
+    local top: u32 = g.newLabel()
+    local cont: u32 = g.newLabel()
+    local end: u32 = g.newLabel()
+    g.bind(top)
+    if s.postTest == 0 {
+        genCond(g, node(g, s.value), end, false)
+    }
+    g.loops.push(LoopRec { cont: cont, brk: end })
+    genStmts(g, s.bodyFirst, s.bodyCount)
+    g.loops.pop()
+    g.bind(cont)
+    // A `break` or `continue` in the step leaves or restarts this loop.
+    g.loops.push(LoopRec { cont: top, brk: end })
+    genStmts(g, s.stepFirst, s.stepCount)
+    g.loops.pop()
+    if s.postTest != 0 {
+        genCond(g, node(g, s.value), top, true)
+    } else {
+        b(&g.code, 0)
+        g.fixup(top)
+    }
+    g.bind(end)
+}
+
+fn genTry(g: *Gen, s: *XlcHirStmt) {
+    local catchL: u32 = g.newLabel()
+    local endL: u32 = g.newLabel()
+    local base: i64 = *g.fr.off.get(s.localId as usize) as i64
+    local t: u32 = g.allocI()
+    local a: u32 = g.allocI()
+    addOff(&g.code, a, SP, base)
+    adr(&g.code, t, 0)
+    g.fixup(catchL)
+    storeTyped(&g.code, t, a, 0, word())
+    add64Imm(&g.code, t, SP, 0, false)
+    storeTyped(&g.code, t, a, 8, word())
+    storeTyped(&g.code, X29, a, 16, word())
+    for j in 0..5 as u32 {
+        stpOff64(&g.code, 19 + 2 * j, 20 + 2 * j, a, (24 + 16 * j) as i32)
+    }
+    for j in 0..4 as u32 {
+        stpOffD(&g.code, 8 + 2 * j, 9 + 2 * j, a, (104 + 16 * j) as i32)
+    }
+    g.freeI(a)
+    g.freeI(t)
+    callUnwind(g, 1, s.localId as i32, s.msgLocal as i32)
+    genStmts(g, s.bodyFirst, s.bodyCount)
+    b(&g.code, 0)
+    g.fixup(endL)
+    g.bind(catchL)
+    genStmts(g, s.elseFirst, s.elseCount)
+    g.bind(endL)
+}
+
+/// Generates one statement. The bump area of temporaries is released after each one.
+export fn genStmt(g: *Gen, s: *XlcHirStmt) {
+    local top: u32 = g.tempTop
+    local k: i32 = s.kind
+    if k == S_LOCAL {
+        genLocal(g, s)
+    } else if k == S_ASSIGN {
+        genAssign(g, s)
+    } else if k == S_RETURN {
+        genReturn(g, s)
+    } else if k == S_EXPR {
+        genExprStmt(g, node(g, s.value))
+    } else if k == S_IF {
+        local elseL: u32 = g.newLabel()
+        genCond(g, node(g, s.value), elseL, false)
+        genStmts(g, s.bodyFirst, s.bodyCount)
+        if s.elseCount > 0 {
+            local endL: u32 = g.newLabel()
+            b(&g.code, 0)
+            g.fixup(endL)
+            g.bind(elseL)
+            genStmts(g, s.elseFirst, s.elseCount)
+            g.bind(endL)
+        } else {
+            g.bind(elseL)
+        }
+    } else if k == S_WHILE {
+        genWhile(g, s)
+    } else if k == S_CONTINUE || k == S_BREAK {
+        local at: usize = g.loops.length() - 1 - s.depth as usize
+        local l: *LoopRec = g.loops.get(at)
+        b(&g.code, 0)
+        g.fixup(k == S_BREAK ? l.brk : l.cont)
+    } else if k == S_BLOCK {
+        genStmts(g, s.bodyFirst, s.bodyCount)
+    } else if k == S_TRY {
+        genTry(g, s)
+    }
+    g.tempTop = top
+}

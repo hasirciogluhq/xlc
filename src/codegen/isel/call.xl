@@ -1,0 +1,438 @@
+// Call-like expressions of the native backend: direct, virtual, itable and indirect calls, the
+// `syscall` builtin, `new` and `T(args)` (the allocation and the `init` call), and the atomics.
+// `installCalls` hangs the generator on `Gen.callHook`, the seam expr.xl calls through (xlang has no
+// cyclic imports).
+//
+// A call is staged: every argument is evaluated, left to right, into a frame slot (an aggregate is
+// built in a fresh copy there, which is what "the callee owns its argument" means). Only then are the
+// live temporaries saved (they sit in registers the call clobbers), the argument registers loaded
+// from the slots, the stack arguments stored below `sp`, and the call made. The result is moved into
+// the destination register before the live temporaries come back. Conventions: conv.xl.
+//
+// `syscall` (macOS arm64): the number in x16, the arguments in x0.., `svc #0x80`; the kernel
+// reports an error with the carry flag set and the positive errno in x0, which becomes the `-errno`
+// the language returns.
+// Atomics use the LSE instructions of ARMv8.1 (arm64/atomic.xl); every one is sequentially
+// consistent, a weaker `MemoryOrder` is not distinguished.
+// @spec https://github.com/apple-oss-distributions/xnu (bsd/dev/arm/systemcalls.c)
+from "std" import Vec
+from "../../hir/abi" import XlcHirExpr, XlcHirFieldInit, view, E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL,
+    E_CALL_ITABLE, E_SYSCALL, E_NEW, E_CONSTRUCT, E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG, E_ATOMIC_CAS,
+    E_ATOMIC_ADD, E_FENCE, E_ASM
+from "../arm64" import X0, X8, X16, SP, XZR, CC, movReg64, add64Imm, sub64Imm, sub64Reg, cbz64, bCond, blr, svc
+from "../arm64/float" import fmovReg
+from "../arm64/atomic" import ldar, stlr, swpal, ldaddal, casal, dmbIsh
+from "asm" import genAsm
+from "conv" import AC_X, AC_D, AC_STACK, AC_XPAIR, AC_HFA, ArgLoc, Conv, classify, hfaCount, hfaMember, resultClass, word
+from "emit" import movConst, addOff, loadTyped, storeTyped, loadFloat, storeFloat, normalizeReg
+from "expr" import genScalar, genFloat, genInto, genPlace, storeAny, storeVptr
+from "gen" import Gen, Place
+from "layout" import K_VOID, K_NEVER, K_INT, K_FLOAT
+from "mem" import zeroMem, copyMem
+from "types" import Scalar, KIND_BOOL, scalarOf
+
+/// One argument of a call: an expression, or (`e` nil) a word already staged at frame slot `slot`.
+struct ArgSrc {
+    e: *XlcHirExpr
+    slot: u32
+}
+
+fn node(g: *Gen, i: i32) -> *XlcHirExpr {
+    return &g.m.exprs[i as usize]
+}
+
+fn arg(g: *Gen, e: *XlcHirExpr, i: usize) -> *XlcHirExpr {
+    return &g.m.exprs[g.m.refs[e.argFirst as usize + i] as usize]
+}
+
+/// The arguments of `e` as call sources.
+fn argsOf(g: *Gen, e: *XlcHirExpr, srcs: *Vec<ArgSrc>) {
+    for i in 0..e.argCount as usize {
+        srcs.push(ArgSrc { e: arg(g, e, i), slot: 0 })
+    }
+}
+
+/// Stores integer register `r` in a fresh frame slot and returns the slot.
+fn stageWord(g: *Gen, r: u32) -> u32 {
+    local slot: u32 = g.tempSlot(8, 8)
+    storeTyped(&g.code, r, SP, slot as i64, word())
+    return slot
+}
+
+/// The whole call sequence. `kind` is E_CALL (`callee` = the function index), E_CALL_VIRTUAL
+/// (`vindex` = the vtable slot, the first source is `self`), E_CALL_ITABLE (`extra` = the slot that
+/// holds the itable address, the first source is the data word) or E_CALL_INDIRECT (`extra` = the slot
+/// of the function address). An integer or pointer result lands in `d`, a float in `f`, an aggregate
+/// at `p`.
+fn doCall(g: *Gen, kind: i32, callee: i32, vindex: u32, retTy: str, cabi: bool, srcs: *Vec<ArgSrc>,
+          extra: u32, d: u32, f: u32, p: *Place) {
+    local savedTop: u32 = g.tempTop
+    local slots = Vec<u32>()
+    local locs = Vec<ArgLoc>()
+    local conv = Conv { nx: 0, nd: 0, ns: 0 }
+    for i in 0..srcs.length() {
+        local s: *ArgSrc = srcs.get(i)
+        local ty: str = s.e == nil ? "*u8" : view(s.e.typeName)
+        locs.push(classify(g, ty, cabi, &conv))
+        if s.e == nil {
+            slots.push(s.slot)
+            continue
+        }
+        local k: u32 = g.lay.kind(ty)
+        local slot: u32 = 0
+        if g.lay.isMem(ty) {
+            local size: u64 = 0
+            local align: u64 = 1
+            g.lay.sizeAlign(ty, &size, &align)
+            slot = g.tempSlot(size, align)
+            genInto(g, s.e, Place { reg: SP, off: slot as i64 })
+        } else if k == K_FLOAT {
+            slot = g.tempSlot(8, 8)
+            local r: u32 = g.allocF()
+            genFloat(g, s.e, r)
+            storeFloat(&g.code, r, SP, slot as i64, scalarOf(g.m, ty).bits == 64)
+            g.freeF(r)
+        } else {
+            slot = g.tempSlot(8, 8)
+            local r: u32 = g.allocI()
+            genScalar(g, s.e, r)
+            storeTyped(&g.code, r, SP, slot as i64, word())
+            g.freeI(r)
+        }
+        slots.push(slot)
+    }
+    local rk: u32 = g.lay.kind(retTy)
+    local rmem: bool = g.lay.isMem(retTy)
+    local rc: u32 = rmem ? resultClass(g, retTy, cabi) : 0
+    g.spillLive()
+    if rmem && rc == 2 {
+        if p == nil {
+            g.fail("an aggregate result with no destination")
+            return
+        }
+        addOff(&g.code, X8, p.reg, p.off)
+    }
+    // Stack arguments sit below the body's `sp` for the duration of the call; every slot offset
+    // below is shifted by the bump. A landing pad restores its own `sp` from `x29` (func.xl).
+    local bump: u32 = ((conv.ns * 8) + 15) & ~15
+    if bump > 4095 {
+        g.fail("a call with too many stack arguments")
+        return
+    }
+    if bump > 0 {
+        sub64Imm(&g.code, SP, SP, bump, false)
+    }
+    for i in 0..locs.length() {
+        local l: *ArgLoc = locs.get(i)
+        local at: i64 = (*slots.get(i) + bump) as i64
+        if l.cls == AC_X {
+            if l.ptr {
+                addOff(&g.code, l.reg, SP, at)
+            } else {
+                loadTyped(&g.code, l.reg, SP, at, word())
+            }
+        } else if l.cls == AC_D {
+            loadFloat(&g.code, l.reg, SP, at, l.dbl)
+        } else if l.cls == AC_XPAIR {
+            for j in 0..l.count {
+                loadTyped(&g.code, l.reg + j, SP, at + (j * 8) as i64, word())
+            }
+        } else if l.cls == AC_HFA {
+            for j in 0..l.count {
+                loadFloat(&g.code, l.reg + j, SP, at + (j * l.member) as i64, l.dbl)
+            }
+        } else if l.member == 1 {
+            for j in 0..l.count {
+                loadTyped(&g.code, X16, SP, at + (j * 8) as i64, word())
+                storeTyped(&g.code, X16, SP, ((l.stack + j) * 8) as i64, word())
+            }
+        } else {
+            if l.ptr {
+                addOff(&g.code, X16, SP, at)
+            } else {
+                loadTyped(&g.code, X16, SP, at, word())
+            }
+            storeTyped(&g.code, X16, SP, (l.stack * 8) as i64, word())
+        }
+    }
+    if kind == E_CALL {
+        g.callSym(g.syms.id(g.fnSymbol(callee as u32)))
+    } else if kind == E_CALL_VIRTUAL {
+        // `self` is the first integer argument, x0: its first word is the vtable.
+        loadTyped(&g.code, X16, X0, 0, word())
+        loadTyped(&g.code, X16, X16, (vindex * 8) as i64, word())
+        blr(&g.code, X16)
+    } else if kind == E_CALL_ITABLE {
+        loadTyped(&g.code, X16, SP, (extra + bump) as i64, word())
+        loadTyped(&g.code, X16, X16, (vindex * 8) as i64, word())
+        blr(&g.code, X16)
+    } else {
+        loadTyped(&g.code, X16, SP, (extra + bump) as i64, word())
+        blr(&g.code, X16)
+    }
+    if bump > 0 {
+        add64Imm(&g.code, SP, SP, bump, false)
+    }
+    // The result, out of the registers a reload may overwrite.
+    local small: u32 = 0
+    local size: u64 = 0
+    if rmem && rc != 2 {
+        local align: u64 = 1
+        g.lay.sizeAlign(retTy, &size, &align)
+        small = g.tempSlot(size < 8 ? 8 : size, 8)
+        if rc == 0 {
+            storeTyped(&g.code, X0, SP, small as i64, word())
+            if size > 8 {
+                storeTyped(&g.code, 1, SP, (small + 8) as i64, word())
+            }
+        } else {
+            local m: u32 = hfaMember(g, retTy)
+            for j in 0..hfaCount(g, retTy) {
+                storeFloat(&g.code, j, SP, (small + j * m) as i64, m == 8)
+            }
+        }
+    }
+    local skipI: u32 = 255
+    local skipF: u32 = 255
+    if rk == K_INT {
+        skipI = d
+        if cabi {
+            normalizeReg(&g.code, d, X0, scalarOf(g.m, retTy))
+        } else if d != X0 {
+            movReg64(&g.code, d, X0)
+        }
+    } else if rk == K_FLOAT {
+        skipF = f
+        fmovReg(&g.code, scalarOf(g.m, retTy).bits == 64, f, 0)
+    }
+    g.reloadLive(skipI, skipF)
+    if small != 0 && p != nil {
+        copyMem(g, *p, Place { reg: SP, off: small as i64 }, size)
+    }
+    g.tempTop = savedTop
+}
+
+/// `d = syscall(number, args...)`.
+fn genSyscall(g: *Gen, e: *XlcHirExpr, d: u32) {
+    local n: usize = e.argCount as usize
+    if n < 1 || n > 7 {
+        g.fail("`syscall` takes a number and up to six arguments")
+        return
+    }
+    local top: u32 = g.tempTop
+    local slots = Vec<u32>()
+    for i in 0..n {
+        local r: u32 = g.allocI()
+        genScalar(g, arg(g, e, i), r)
+        slots.push(stageWord(g, r))
+        g.freeI(r)
+    }
+    g.spillLive()
+    for i in 1..n {
+        loadTyped(&g.code, (i - 1) as u32, SP, *slots.get(i) as i64, word())
+    }
+    loadTyped(&g.code, X16, SP, *slots.get(0) as i64, word())
+    svc(&g.code, 0x80)
+    bCond(&g.code, CC, 2)
+    sub64Reg(&g.code, X0, XZR, X0)
+    if d != X0 {
+        movReg64(&g.code, d, X0)
+    }
+    g.reloadLive(d, 255)
+    g.tempTop = top
+}
+
+/// Runs the `init` function `name` on the object whose address is in register `obj`.
+fn callInit(g: *Gen, name: str, obj: u32, e: *XlcHirExpr) {
+    local idx: i32 = g.findFunction(name)
+    if idx < 0 {
+        g.fail("an unknown `init` function")
+        return
+    }
+    local top: u32 = g.tempTop
+    local srcs = Vec<ArgSrc>()
+    srcs.push(ArgSrc { e: nil, slot: stageWord(g, obj) })
+    argsOf(g, e, &srcs)
+    local cf = &g.m.functions[idx as usize]
+    doCall(g, E_CALL, idx, 0, "void", cf.exportC != 0 || cf.declared != 0, &srcs, 0, 0, 0, nil)
+    g.tempTop = top
+}
+
+/// `new T(...)`: the memory from the `alloc` role (or the placement address), then, unless it is
+/// nil, zeroed, the vptr stored, the `init` run and the field initializers written. The pointer is
+/// the result in `d`.
+fn genNew(g: *Gen, e: *XlcHirExpr, d: u32) {
+    local ty: str = view(e.targetName)
+    local size: u64 = 0
+    local align: u64 = 1
+    g.lay.sizeAlign(ty, &size, &align)
+    if e.lhs >= 0 {
+        genScalar(g, node(g, e.lhs), d)
+    } else {
+        local idx: i32 = g.findFunction(view(g.m.allocFunction))
+        if idx < 0 {
+            g.fail("`new` has no registered `alloc` function")
+            return
+        }
+        local top: u32 = g.tempTop
+        local srcs = Vec<ArgSrc>()
+        local t: u32 = g.allocI()
+        movConst(&g.code, t, size)
+        srcs.push(ArgSrc { e: nil, slot: stageWord(g, t) })
+        movConst(&g.code, t, align)
+        srcs.push(ArgSrc { e: nil, slot: stageWord(g, t) })
+        g.freeI(t)
+        local cf = &g.m.functions[idx as usize]
+        doCall(g, E_CALL, idx, 0, "*u8", cf.exportC != 0 || cf.declared != 0, &srcs, 0, d, 0, nil)
+        g.tempTop = top
+    }
+    local done: u32 = g.newLabel()
+    cbz64(&g.code, d, 0)
+    g.fixup(done)
+    zeroMem(g, Place { reg: d, off: 0 }, size)
+    storeVptr(g, ty, Place { reg: d, off: 0 })
+    if view(e.text).len > 0 {
+        callInit(g, view(e.text), d, e)
+    }
+    for i in 0..e.fieldCount as usize {
+        local fi: *XlcHirFieldInit = &g.m.fields[e.fieldFirst as usize + i]
+        if fi.value >= 0 {
+            storeAny(g, node(g, fi.value), Place { reg: d, off: g.lay.fieldOff(ty, fi.index) as i64 })
+        }
+    }
+    g.bind(done)
+}
+
+/// The atomics. `d` receives a loaded or old value.
+fn genAtomic(g: *Gen, e: *XlcHirExpr, d: u32) {
+    local ptr: *XlcHirExpr = node(g, e.lhs)
+    local elem: str = g.lay.elemOf(view(ptr.typeName)).asStr()
+    local sc: Scalar = scalarOf(g.m, elem)
+    local bytes: u32 = sc.kind == KIND_BOOL ? 1 : sc.bits / 8
+    local size: u32 = bytes == 1 ? 0 : bytes == 2 ? 1 : bytes == 4 ? 2 : 3
+    local a: u32 = g.allocI()
+    genScalar(g, ptr, a)
+    if e.kind == E_ATOMIC_LOAD {
+        ldar(&g.code, size, d, a)
+        normalizeReg(&g.code, d, d, sc)
+    } else if e.kind == E_ATOMIC_STORE {
+        local v: u32 = g.allocI()
+        genScalar(g, node(g, e.rhs), v)
+        stlr(&g.code, size, v, a)
+        g.freeI(v)
+    } else if e.kind == E_ATOMIC_CAS {
+        local expected: u32 = g.allocI()
+        genScalar(g, node(g, e.rhs), expected)
+        local desired: u32 = g.allocI()
+        genScalar(g, arg(g, e, 0), desired)
+        casal(&g.code, size, expected, desired, a)
+        normalizeReg(&g.code, d, expected, sc)
+        g.freeI(desired)
+        g.freeI(expected)
+    } else {
+        local v: u32 = g.allocI()
+        genScalar(g, node(g, e.rhs), v)
+        if e.kind == E_ATOMIC_XCHG {
+            swpal(&g.code, size, v, d, a)
+        } else {
+            ldaddal(&g.code, size, v, d, a)
+        }
+        normalizeReg(&g.code, d, d, sc)
+        g.freeI(v)
+    }
+    g.freeI(a)
+}
+
+/// The generator of every call-like expression; see `CallHook`.
+fn genCallLike(g: *Gen, e: *XlcHirExpr, d: u32, f: u32, p: *Place) {
+    local k: i32 = e.kind
+    local retTy: str = view(e.typeName)
+    local top: u32 = g.tempTop
+    local srcs = Vec<ArgSrc>()
+    if k == E_CALL {
+        local idx: i32 = g.findFunction(view(e.text))
+        if idx < 0 {
+            g.fail("a call of an unknown function")
+            return
+        }
+        local cf = &g.m.functions[idx as usize]
+        argsOf(g, e, &srcs)
+        doCall(g, E_CALL, idx, 0, retTy, cf.exportC != 0 || cf.declared != 0, &srcs, 0, d, f, p)
+    } else if k == E_CALL_VIRTUAL {
+        argsOf(g, e, &srcs)
+        doCall(g, E_CALL_VIRTUAL, -1, e.index, retTy, false, &srcs, 0, d, f, p)
+    } else if k == E_CALL_ITABLE {
+        // The interface value `{ data, itable }` is read once, before the arguments.
+        local table: u32 = g.tempSlot(8, 8)
+        local data: u32 = g.tempSlot(8, 8)
+        local a: u32 = g.allocI()
+        local pl: Place = genPlace(g, node(g, e.lhs), a)
+        local t: u32 = g.allocI()
+        loadTyped(&g.code, t, pl.reg, pl.off, word())
+        storeTyped(&g.code, t, SP, data as i64, word())
+        loadTyped(&g.code, t, pl.reg, pl.off + 8, word())
+        storeTyped(&g.code, t, SP, table as i64, word())
+        g.freeI(t)
+        g.freeI(a)
+        srcs.push(ArgSrc { e: nil, slot: data })
+        argsOf(g, e, &srcs)
+        doCall(g, E_CALL_ITABLE, -1, e.index, retTy, false, &srcs, table, d, f, p)
+    } else if k == E_CALL_INDIRECT {
+        local r: u32 = g.allocI()
+        genScalar(g, node(g, e.lhs), r)
+        local fnSlot: u32 = stageWord(g, r)
+        g.freeI(r)
+        argsOf(g, e, &srcs)
+        doCall(g, E_CALL_INDIRECT, -1, 0, retTy, false, &srcs, fnSlot, d, f, p)
+    } else if k == E_SYSCALL {
+        genSyscall(g, e, d)
+    } else if k == E_NEW {
+        genNew(g, e, d)
+    } else if k == E_CONSTRUCT {
+        if view(e.text).len > 0 {
+            local a: u32 = g.allocI()
+            addOff(&g.code, a, p.reg, p.off)
+            callInit(g, view(e.text), a, e)
+            g.freeI(a)
+        }
+    } else if k == E_FENCE {
+        dmbIsh(&g.code)
+    } else if k == E_ASM {
+        genAsm(g, e)
+    } else {
+        genAtomic(g, e, d)
+    }
+    g.tempTop = top
+}
+
+/// Calls the `unwind` role: `unwind(op, &snap, &msg)` with the addresses of two locals (-1 = null).
+export fn callUnwind(g: *Gen, op: u32, snap: i32, msg: i32) {
+    local idx: i32 = g.findFunction(view(g.m.unwindFunction))
+    if idx < 0 {
+        g.fail("`try` has no registered `unwind` function")
+        return
+    }
+    local top: u32 = g.tempTop
+    local srcs = Vec<ArgSrc>()
+    local t: u32 = g.allocI()
+    movConst(&g.code, t, op as u64)
+    srcs.push(ArgSrc { e: nil, slot: stageWord(g, t) })
+    for k in 0..2 {
+        local id: i32 = k == 0 ? snap : msg
+        if id >= 0 {
+            g.localAddr(t, id as u32)
+        } else {
+            movConst(&g.code, t, 0)
+        }
+        srcs.push(ArgSrc { e: nil, slot: stageWord(g, t) })
+    }
+    g.freeI(t)
+    local cf = &g.m.functions[idx as usize]
+    doCall(g, E_CALL, idx, 0, "void", cf.exportC != 0 || cf.declared != 0, &srcs, 0, 0, 0, nil)
+    g.tempTop = top
+}
+
+/// Installs the call generator on `g`.
+export fn installCalls(g: *Gen) {
+    g.callHook = genCallLike
+}

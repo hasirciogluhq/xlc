@@ -1,0 +1,170 @@
+// One function of the native backend: prolog, parameters, body, epilog, the out-of-line panic
+// blocks and the landing pad.
+//
+//   stp x29, x30, [sp, #-16]!     the frame record; x29 points at it
+//   mov x29, sp
+//   sub sp, sp, #total            two patched words (low 12 bits, then the rest shifted by 12)
+//   str x19.. / d8..  [sp + ...]  the callee-saved registers the function uses (regs.xl)
+//   ... parameters to their homes, body ...
+// epilog:
+//   ldr x19.. / d8..  [sp + ...]
+//   mov sp, x29
+//   ldp x29, x30, [sp], #16
+//   ret
+//   cold blocks: `panic(message)` out of line, so the good path of a check falls through
+//   landing pad: entered by the unwinder with the frame's x29 (std/runtime/unwind.xl `jumpPad`)
+//     sub sp, x29, #total         the same two patched words, rebuilding the body's sp
+//     ... the cleanups, then unwind(2) ...
+// The pad table gets one (function address, pad address or 0) entry for every function: the unwinder
+// looks a return address up by the nearest function start below it.
+from "std" import Vec
+from "../../hir/abi" import XlcHirFunction, view
+from "../arm64" import X0, X8, X16, X29, X30, SP, XZR, movReg64, add64Imm, sub64Imm, stp64Pre, ldp64Post, ret, brk
+from "call" import callUnwind
+from "conv" import AC_X, AC_D, AC_STACK, AC_XPAIR, AC_HFA, Conv, classify, word, resultClass, hfaCount
+from "emit" import loadTyped, storeTyped, loadFloat, storeFloat, addOff, normalizeReg
+from "gen" import Gen, Cold, PadRec, LoopRec
+from "layout" import K_INT, K_FLOAT
+from "regs" import assignFrame, LK_REG
+from "stmt" import genStmts
+from "types" import scalarOf
+
+fn alignUp(v: u32, a: u32) -> u32 {
+    return (v + a - 1) & ~(a - 1)
+}
+
+/// Writes the frame size into the two words at `at` that `forPad` made: `sub sp, sp, #n` pairs in
+/// the prolog, `sub sp, x29, #n` in the pad.
+fn patchFrame(g: *Gen, at: u32, total: u32, fromFp: bool) {
+    local tmp = Vec<u32>()
+    sub64Imm(&tmp, SP, fromFp ? X29 : SP, total & 0xfff, false)
+    sub64Imm(&tmp, SP, SP, total >> 12, true)
+    g.code.set(at as usize, *tmp.get(0))
+    g.code.set(at as usize + 1, *tmp.get(1))
+}
+
+/// Moves the incoming parameters to their homes.
+fn genParams(g: *Gen, f: *XlcHirFunction) {
+    local conv = Conv { nx: 0, nd: 0, ns: 0 }
+    for i in 0..f.paramCount {
+        local ty: str = view(f.locals[i as usize].typeName)
+        local loc = classify(g, ty, g.cabi, &conv)
+        local k: u32 = g.lay.kind(ty)
+        if loc.cls == AC_X {
+            // A C caller extends a narrow integer to 32 bits only.
+            if g.cabi && !loc.ptr && k == K_INT {
+                normalizeReg(&g.code, loc.reg, loc.reg, scalarOf(g.m, ty))
+            }
+            g.storeLocalI(loc.reg, i)
+        } else if loc.cls == AC_D {
+            g.storeLocalF(loc.reg, i)
+        } else if loc.cls == AC_STACK {
+            local off: i64 = 16 + (loc.stack * 8) as i64
+            if loc.member == 1 {
+                // A by-value aggregate: the local is the address of the words in the caller's frame.
+                addOff(&g.code, X16, X29, off)
+                g.storeLocalI(X16, i)
+            } else if k == K_FLOAT {
+                loadFloat(&g.code, 16, X29, off, loc.dbl)
+                g.storeLocalF(16, i)
+            } else {
+                loadTyped(&g.code, X16, X29, off, word())
+                if g.cabi && !loc.ptr && k == K_INT {
+                    normalizeReg(&g.code, X16, X16, scalarOf(g.m, ty))
+                }
+                g.storeLocalI(X16, i)
+            }
+        } else {
+            // A C aggregate in registers: a permanent frame copy, whose address is the local.
+            local slot: u32 = g.tempSlot((loc.count * 8) as u64, 8)
+            if loc.cls == AC_XPAIR {
+                for j in 0..loc.count {
+                    storeTyped(&g.code, loc.reg + j, SP, (slot + j * 8) as i64, word())
+                }
+            } else {
+                for j in 0..loc.count {
+                    storeFloat(&g.code, loc.reg + j, SP, (slot + j * loc.member) as i64, loc.dbl)
+                }
+            }
+            addOff(&g.code, X16, SP, slot as i64)
+            g.storeLocalI(X16, i)
+        }
+    }
+}
+
+/// Generates function `fi`, which has a body.
+export fn genFunction(g: *Gen, fi: u32) {
+    local f: *XlcHirFunction = &g.m.functions[fi as usize]
+    g.f = f
+    g.fi = fi
+    g.fr = assignFrame(g.m, &g.lay, f)
+    g.liveI = 0
+    g.liveF = 0
+    g.tempTop = 0
+    g.tempBase = 0
+    g.tempMax = 0
+    g.loops = Vec<LoopRec>()
+    g.cold = Vec<Cold>()
+    g.cabi = f.exportC != 0 || f.declared != 0
+    g.sretOff = -1
+    g.padLabel = f.unwindCount > 0 ? g.newLabel() : 0
+    g.epilog = g.newLabel()
+
+    g.bind(fi)
+    stp64Pre(&g.code, X29, X30, SP, -16)
+    add64Imm(&g.code, X29, SP, 0, false)
+    g.prologAt = g.code.length() as u32
+    sub64Imm(&g.code, SP, SP, 0, false)
+    sub64Imm(&g.code, SP, SP, 0, true)
+    for i in 0..g.fr.saved.length() {
+        storeTyped(&g.code, *g.fr.saved.get(i), SP, (i * 8) as i64, word())
+    }
+    for j in 0..g.fr.savedFloat.length() {
+        storeFloat(&g.code, *g.fr.savedFloat.get(j), SP, ((g.fr.saved.length() + j) * 8) as i64, true)
+    }
+    local rk: str = view(f.ret)
+    if g.lay.isMem(rk) && resultClass(g, rk, g.cabi) == 2 {
+        g.sretOff = g.tempSlot(8, 8) as i32
+        storeTyped(&g.code, X8, SP, g.sretOff as i64, word())
+    }
+    genParams(g, f)
+    g.tempBase = g.tempTop
+    genStmts(g, f.bodyFirst, f.bodyCount)
+
+    g.bind(g.epilog)
+    for i in 0..g.fr.saved.length() {
+        loadTyped(&g.code, *g.fr.saved.get(i), SP, (i * 8) as i64, word())
+    }
+    for j in 0..g.fr.savedFloat.length() {
+        loadFloat(&g.code, *g.fr.savedFloat.get(j), SP, ((g.fr.saved.length() + j) * 8) as i64, true)
+    }
+    add64Imm(&g.code, SP, X29, 0, false)
+    ldp64Post(&g.code, X29, X30, SP, 16)
+    ret(&g.code)
+
+    for i in 0..g.cold.length() {
+        g.bind(g.cold.get(i).label)
+        g.panicCall(g.cold.get(i).message.asStr())
+    }
+    local padAt: u32 = 0
+    if g.padLabel != 0 {
+        g.bind(g.padLabel)
+        padAt = g.code.length() as u32
+        sub64Imm(&g.code, SP, X29, 0, false)
+        sub64Imm(&g.code, SP, SP, 0, true)
+        g.tempTop = g.tempBase
+        genStmts(g, f.unwindFirst, f.unwindCount)
+        callUnwind(g, 2, -1, -1)
+        brk(&g.code, 1)
+    }
+    g.pads.push(PadRec { fnIndex: fi, pad: g.padLabel })
+    local total: u32 = alignUp(g.fr.spillEnd + g.tempMax, 16)
+    if total >= 0x1000000 {
+        g.fail("a frame of 16 MiB or more")
+        return
+    }
+    patchFrame(g, g.prologAt, total, false)
+    if g.padLabel != 0 {
+        patchFrame(g, padAt, total, true)
+    }
+}

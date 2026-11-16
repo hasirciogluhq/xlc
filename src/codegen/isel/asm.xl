@@ -1,0 +1,372 @@
+// `__builtin_asm` of the native backend: a small arm64 assembler for the subset the stdlib uses
+// (the context-switch, unwinder and CPU helpers) and the operand binding around it.
+//
+// Operands: `in("x0") v` loads `v` into x0 before the template runs, `in(reg) v` into a register of
+// the assembler's choice; `out(reg) place` / `inout(reg) place` store that register into `place`
+// afterwards. `{k}` in the template names the register of operand k. Every live temporary is saved
+// around the template (it may write any register); the callee-saved registers are the template's
+// own responsibility.
+// Instructions: nop yield wfe wfi sev isb dmb dsb ret, mov (register, sp, immediate), ldr and str
+// of an x or d register with an unsigned offset, ldp and stp of two x or d registers, add and sub
+// (immediate or register), and, orr, eor (register), br, blr, svc, brk.
+// @spec https://developer.arm.com/documentation/ddi0602/latest (A64 instruction set)
+from "std" import String, Vec, format
+from "std/str" import fromParts
+from "../../hir/abi" import XlcHirExpr, XlcHirAsmOperand, view, E_LOCAL_REF
+from "../arm64" import SP, XZR, movReg64, add64Imm, sub64Imm, add64Reg, sub64Reg, and64Reg, orr64Reg, eor64Reg,
+    ldpOff64, stpOff64, ldpOffD, stpOffD, br, blr, svc, brk, ret, nop
+from "emit" import movConst, loadTyped, storeTyped, loadFloat, storeFloat
+from "expr" import genScalar, genPlace
+from "gen" import Gen, Place
+from "conv" import word
+from "types" import scalarOf
+
+/// A parsed register operand: `n` is the number (-1 = not a register), `cls` 0 = x, 1 = d, 2 = sp,
+/// 3 = xzr.
+struct Reg {
+    n: i32
+    cls: u32
+}
+
+fn isDigit(c: u8) -> bool {
+    return c >= b'0' && c <= b'9'
+}
+
+/// The text of `s` without leading and trailing blanks.
+fn trim(s: str) -> str {
+    local a: usize = 0
+    local b: usize = s.len
+    while a < b && (s.ptr[a] == b' ' || s.ptr[a] == b'\t') {
+        a += 1
+    }
+    while b > a && (s.ptr[b - 1] == b' ' || s.ptr[b - 1] == b'\t') {
+        b -= 1
+    }
+    return fromParts(&s.ptr[a], b - a)
+}
+
+fn parseReg(s: str) -> Reg {
+    local bad = Reg { n: -1, cls: 0 }
+    if s == "sp" {
+        return Reg { n: 31, cls: 2 }
+    }
+    if s == "xzr" {
+        return Reg { n: 31, cls: 3 }
+    }
+    if s.len < 2 || (s.ptr[0] != b'x' && s.ptr[0] != b'd') {
+        return bad
+    }
+    local v: i32 = 0
+    for i in 1..s.len {
+        if !isDigit(s.ptr[i]) {
+            return bad
+        }
+        v = v * 10 + (s.ptr[i] - b'0') as i32
+    }
+    if v > 30 {
+        return bad
+    }
+    return Reg { n: v, cls: s.ptr[0] == b'x' ? 0 : 1 }
+}
+
+/// `#imm` (decimal, `0x` hexadecimal, optionally negative); false when `s` is not an immediate.
+fn parseImm(s: str, out: *i64) -> bool {
+    if s.len < 2 || s.ptr[0] != b'#' {
+        return false
+    }
+    local at: usize = 1
+    local neg: bool = false
+    if s.ptr[at] == b'-' {
+        neg = true
+        at += 1
+    }
+    local base: i64 = 10
+    if s.len > at + 2 && s.ptr[at] == b'0' && s.ptr[at + 1] == b'x' {
+        base = 16
+        at += 2
+    }
+    local v: i64 = 0
+    for i in at..s.len {
+        local c: u8 = s.ptr[i]
+        local digit: i64 = isDigit(c) ? (c - b'0') as i64 : (c >= b'a' && c <= b'f') ? (c - b'a') as i64 + 10 : 99
+        if digit >= base {
+            return false
+        }
+        v = v * base + digit
+    }
+    *out = neg ? -v : v
+    return true
+}
+
+/// `[xN]` or `[xN, #imm]`.
+fn parseMem(s: str, base: *Reg, off: *i64) -> bool {
+    if s.len < 4 || s.ptr[0] != b'[' || s.ptr[s.len - 1] != b']' {
+        return false
+    }
+    local inner: str = fromParts(&s.ptr[1], s.len - 2)
+    local comma: usize = inner.len
+    for i in 0..inner.len {
+        if inner.ptr[i] == b',' {
+            comma = i
+            break
+        }
+    }
+    *base = parseReg(trim(fromParts(inner.ptr, comma)))
+    *off = 0
+    if comma < inner.len {
+        return parseImm(trim(fromParts(&inner.ptr[comma + 1], inner.len - comma - 1)), off)
+    }
+    return base.n >= 0
+}
+
+/// Splits the operand text of one instruction at the commas outside brackets.
+fn splitOperands(s: str) -> Vec<String> {
+    local out = Vec<String>()
+    local depth: i32 = 0
+    local start: usize = 0
+    for i in 0..s.len {
+        local c: u8 = s.ptr[i]
+        if c == b'[' {
+            depth += 1
+        } else if c == b']' {
+            depth -= 1
+        } else if c == b',' && depth == 0 {
+            out.push(String(trim(fromParts(&s.ptr[start], i - start))))
+            start = i + 1
+        }
+    }
+    if start < s.len {
+        out.push(String(trim(fromParts(&s.ptr[start], s.len - start))))
+    }
+    return out
+}
+
+/// Assembles one line into `g.code`; false (reported) when it is outside the subset.
+fn assembleLine(g: *Gen, line: str) -> bool {
+    local text: str = trim(line)
+    if text.len == 0 {
+        return true
+    }
+    local sp: usize = text.len
+    for i in 0..text.len {
+        if text.ptr[i] == b' ' || text.ptr[i] == b'\t' {
+            sp = i
+            break
+        }
+    }
+    local mn: str = fromParts(text.ptr, sp)
+    local rest: str = sp < text.len ? trim(fromParts(&text.ptr[sp], text.len - sp)) : ""
+    local ops = splitOperands(rest)
+    if mn == "nop" {
+        nop(&g.code)
+    } else if mn == "yield" {
+        g.code.push(0xd503203f)
+    } else if mn == "wfe" {
+        g.code.push(0xd503205f)
+    } else if mn == "wfi" {
+        g.code.push(0xd503207f)
+    } else if mn == "sev" {
+        g.code.push(0xd503209f)
+    } else if mn == "isb" {
+        g.code.push(0xd5033fdf)
+    } else if mn == "dmb" {
+        g.code.push(0xd5033bbf)
+    } else if mn == "dsb" {
+        g.code.push(0xd5033b9f)
+    } else if mn == "ret" {
+        ret(&g.code)
+    } else if (mn == "br" || mn == "blr") && ops.length() == 1 {
+        local r: Reg = parseReg(ops.get(0).asStr())
+        if r.n < 0 {
+            return badLine(g, line)
+        }
+        if mn == "br" { br(&g.code, r.n as u32) } else { blr(&g.code, r.n as u32) }
+    } else if (mn == "svc" || mn == "brk") && ops.length() == 1 {
+        local v: i64 = 0
+        if !parseImm(ops.get(0).asStr(), &v) {
+            return badLine(g, line)
+        }
+        if mn == "svc" { svc(&g.code, v as u32) } else { brk(&g.code, v as u32) }
+    } else if mn == "mov" && ops.length() == 2 {
+        local d: Reg = parseReg(ops.get(0).asStr())
+        local s: Reg = parseReg(ops.get(1).asStr())
+        local v: i64 = 0
+        if d.n < 0 || d.cls == 1 {
+            return badLine(g, line)
+        }
+        if s.n >= 0 && s.cls != 1 {
+            if d.cls == 2 || s.cls == 2 {
+                add64Imm(&g.code, d.n as u32, s.n as u32, 0, false)
+            } else {
+                movReg64(&g.code, d.n as u32, s.n as u32)
+            }
+        } else if parseImm(ops.get(1).asStr(), &v) {
+            movConst(&g.code, d.n as u32, v as u64)
+        } else {
+            return badLine(g, line)
+        }
+    } else if (mn == "ldr" || mn == "str") && ops.length() == 2 {
+        local t: Reg = parseReg(ops.get(0).asStr())
+        local base = Reg { n: -1, cls: 0 }
+        local off: i64 = 0
+        if t.n < 0 || !parseMem(ops.get(1).asStr(), &base, &off) || base.n < 0 {
+            return badLine(g, line)
+        }
+        if t.cls == 1 {
+            if mn == "ldr" { loadFloat(&g.code, t.n as u32, base.n as u32, off, true) } else { storeFloat(&g.code, t.n as u32, base.n as u32, off, true) }
+        } else {
+            if mn == "ldr" { loadTyped(&g.code, t.n as u32, base.n as u32, off, word()) } else { storeTyped(&g.code, t.n as u32, base.n as u32, off, word()) }
+        }
+    } else if (mn == "ldp" || mn == "stp") && ops.length() == 3 {
+        local a: Reg = parseReg(ops.get(0).asStr())
+        local b: Reg = parseReg(ops.get(1).asStr())
+        local base = Reg { n: -1, cls: 0 }
+        local off: i64 = 0
+        if a.n < 0 || b.n < 0 || !parseMem(ops.get(2).asStr(), &base, &off) || base.n < 0 {
+            return badLine(g, line)
+        }
+        if a.cls == 1 {
+            if mn == "ldp" { ldpOffD(&g.code, a.n as u32, b.n as u32, base.n as u32, off as i32) } else { stpOffD(&g.code, a.n as u32, b.n as u32, base.n as u32, off as i32) }
+        } else {
+            if mn == "ldp" { ldpOff64(&g.code, a.n as u32, b.n as u32, base.n as u32, off as i32) } else { stpOff64(&g.code, a.n as u32, b.n as u32, base.n as u32, off as i32) }
+        }
+    } else if (mn == "add" || mn == "sub" || mn == "and" || mn == "orr" || mn == "eor") && ops.length() == 3 {
+        local d: Reg = parseReg(ops.get(0).asStr())
+        local n: Reg = parseReg(ops.get(1).asStr())
+        local m: Reg = parseReg(ops.get(2).asStr())
+        local v: i64 = 0
+        if d.n < 0 || n.n < 0 || d.cls == 1 {
+            return badLine(g, line)
+        }
+        if (mn == "add" || mn == "sub") && parseImm(ops.get(2).asStr(), &v) && v >= 0 && v < 4096 {
+            if mn == "add" { add64Imm(&g.code, d.n as u32, n.n as u32, v as u32, false) } else { sub64Imm(&g.code, d.n as u32, n.n as u32, v as u32, false) }
+        } else if m.n >= 0 && m.cls != 1 {
+            if mn == "add" { add64Reg(&g.code, d.n as u32, n.n as u32, m.n as u32) }
+            else if mn == "sub" { sub64Reg(&g.code, d.n as u32, n.n as u32, m.n as u32) }
+            else if mn == "and" { and64Reg(&g.code, d.n as u32, n.n as u32, m.n as u32) }
+            else if mn == "orr" { orr64Reg(&g.code, d.n as u32, n.n as u32, m.n as u32) }
+            else { eor64Reg(&g.code, d.n as u32, n.n as u32, m.n as u32) }
+        } else {
+            return badLine(g, line)
+        }
+    } else {
+        return badLine(g, line)
+    }
+    return true
+}
+
+fn badLine(g: *Gen, line: str) -> bool {
+    g.fail(format("an arm64 `asm` instruction outside the supported subset: `{}`", trim(line)).asStr())
+    return false
+}
+
+/// The register number of an operand that names one (`"x0"`), -1 for `reg`.
+fn namedReg(op: *XlcHirAsmOperand, g: *Gen) -> i32 {
+    local r: Reg = parseReg(view(op.reg))
+    return r.cls == 0 ? r.n : -1
+}
+
+/// Generates the `__builtin_asm` expression `e`.
+export fn genAsm(g: *Gen, e: *XlcHirExpr) {
+    local top: u32 = g.tempTop
+    local n: usize = e.operandCount as usize
+    local slots = Vec<u32>()
+    local regs = Vec<u32>()
+    local used: u32 = 0
+    for i in 0..n {
+        local op: *XlcHirAsmOperand = &g.m.operands[e.operandFirst as usize + i]
+        local r: i32 = namedReg(op, g)
+        if r >= 0 {
+            used |= (1 as u32) << r as u32
+        }
+        regs.push(r >= 0 ? r as u32 : 255)
+    }
+    // `reg` operands take x9..x15 and x10.. in turn, skipping what a named operand uses.
+    local next: u32 = 9
+    for i in 0..n {
+        if *regs.get(i) == 255 {
+            while next < 16 && (used & ((1 as u32) << next)) != 0 {
+                next += 1
+            }
+            regs.set(i, next)
+            used |= (1 as u32) << next
+            next += 1
+        }
+        slots.push(0)
+    }
+    // Inputs are evaluated first, each into its own slot.
+    for i in 0..n {
+        local op: *XlcHirAsmOperand = &g.m.operands[e.operandFirst as usize + i]
+        if op.kind != 1 && op.value >= 0 {
+            local r: u32 = g.allocI()
+            genScalar(g, &g.m.exprs[op.value as usize], r)
+            slots.set(i, g.tempSlot(8, 8))
+            storeTyped(&g.code, r, SP, *slots.get(i) as i64, word())
+            g.freeI(r)
+        }
+    }
+    g.spillLive()
+    for i in 0..n {
+        local op: *XlcHirAsmOperand = &g.m.operands[e.operandFirst as usize + i]
+        if op.kind != 1 {
+            loadTyped(&g.code, *regs.get(i), SP, *slots.get(i) as i64, word())
+        }
+    }
+    // The template with `{k}` replaced by the register of operand k.
+    local t: str = view(e.text)
+    local text = String()
+    local i: usize = 0
+    while i < t.len {
+        local c: u8 = t.ptr[i]
+        if c == b'{' && i + 1 < t.len && isDigit(t.ptr[i + 1]) {
+            local j: usize = i + 1
+            local k: usize = 0
+            while j < t.len && isDigit(t.ptr[j]) {
+                k = k * 10 + (t.ptr[j] - b'0') as usize
+                j += 1
+            }
+            if j < t.len && t.ptr[j] == b'}' && k < n {
+                text.append(format("x{}", *regs.get(k)).asStr())
+                i = j + 1
+                continue
+            }
+        }
+        text.push(c)
+        i += 1
+    }
+    local line: usize = 0
+    local s: str = text.asStr()
+    for p in 0..s.len + 1 {
+        if p == s.len || s.ptr[p] == b'\n' {
+            assembleLine(g, fromParts(&s.ptr[line], p - line))
+            line = p + 1
+        }
+    }
+    // Outputs leave their registers before anything else can reuse them.
+    for i in 0..n {
+        local op: *XlcHirAsmOperand = &g.m.operands[e.operandFirst as usize + i]
+        if op.kind != 0 {
+            slots.set(i, g.tempSlot(8, 8))
+            storeTyped(&g.code, *regs.get(i), SP, *slots.get(i) as i64, word())
+        }
+    }
+    g.reloadLive(255, 255)
+    for i in 0..n {
+        local op: *XlcHirAsmOperand = &g.m.operands[e.operandFirst as usize + i]
+        if op.kind != 0 && op.value >= 0 {
+            local v: *XlcHirExpr = &g.m.exprs[op.value as usize]
+            local r: u32 = g.allocI()
+            loadTyped(&g.code, r, SP, *slots.get(i) as i64, word())
+            if v.kind == E_LOCAL_REF {
+                g.storeLocalI(r, v.localId)
+            } else {
+                local a: u32 = g.allocI()
+                local pl: Place = genPlace(g, v, a)
+                storeTyped(&g.code, r, pl.reg, pl.off, scalarOf(g.m, view(v.typeName)))
+                g.freeI(a)
+            }
+            g.freeI(r)
+        }
+    }
+    g.tempTop = top
+}

@@ -551,7 +551,9 @@ fn exprNode(f: *Flat, raw: *void) -> i32 {
 
     // The struct-literal fields: one arena entry per field, the value flattened in place.
     local fieldCount = vecCount(raw, XE_FIELDS, ELEM_FIELD_INIT)
-    local fieldFirst: u32 = f.fields.length() as u32
+    // The values are flattened first: a nested literal appends its own fields to the arena, so the
+    // fields of this node are pushed afterwards, side by side.
+    local pending = Vec<XlcHirFieldInit>()
     for i in 0..fieldCount as usize {
         local fi = elemAt(raw, XE_FIELDS, i, ELEM_FIELD_INIT) as usize
         local v = rdPtr(fi as *void, XFI_VALUE)
@@ -559,7 +561,11 @@ fn exprNode(f: *Flat, raw: *void) -> i32 {
         entry.name = cxxStr(fi as *void)
         entry.index = rdU32(fi as *void, XFI_INDEX)
         entry.value = v != 0 ? exprNode(f, v as *void) : -1
-        f.fields.push(entry)
+        pending.push(entry)
+    }
+    local fieldFirst: u32 = f.fields.length() as u32
+    for i in 0..pending.length() {
+        f.fields.push(*pending.get(i))
     }
 
     // The `__builtin_asm` operands and clobbers.
@@ -616,12 +622,32 @@ fn exprNode(f: *Flat, raw: *void) -> i32 {
         }
         case kind == E_CAST { e.implicit = rdU8(raw, XE_IMPLICIT) != 0 ? 1 : 0 }
         case kind == E_INDEX || kind == E_SLICE || kind == E_BINARY { e.checked = rdU8(raw, XE_CHECKED) != 0 ? 1 : 0 }
-        case kind == E_FIELD { e.throughPointer = rdU8(raw, XE_THROUGH_POINTER) != 0 ? 1 : 0 }
+        case kind == E_FIELD {
+            e.throughPointer = rdU8(raw, XE_THROUGH_POINTER) != 0 ? 1 : 0
+            e.index = rdU32(raw, XE_INDEX)
+        }
         case kind == E_NEW { e.registered = rdU8(raw, XE_REGISTERED) != 0 ? 1 : 0 }
         case kind == E_ASM {
             e.nomem = rdU8(raw, XE_NOMEM) != 0 ? 1 : 0
             e.noreturn = rdU8(raw, XE_NORETURN) != 0 ? 1 : 0
         }
+    }
+    // Fields that share a kind with a case above (a `switch` runs the first match only).
+    if kind == E_CALL_VIRTUAL || kind == E_CALL_ITABLE || kind == E_FIELD {
+        e.index = rdU32(raw, XE_INDEX)
+    }
+    if kind == E_FIELD {
+        e.throughPointer = rdU8(raw, XE_THROUGH_POINTER) != 0 ? 1 : 0
+    }
+    if kind == E_BINARY {
+        e.checked = rdU8(raw, XE_CHECKED) != 0 ? 1 : 0
+    }
+    if kind == E_NEW {
+        e.registered = rdU8(raw, XE_REGISTERED) != 0 ? 1 : 0
+    }
+    if kind == E_ASM {
+        e.nomem = rdU8(raw, XE_NOMEM) != 0 ? 1 : 0
+        e.noreturn = rdU8(raw, XE_NORETURN) != 0 ? 1 : 0
     }
     e.lhs = lhs
     e.rhs = rhs

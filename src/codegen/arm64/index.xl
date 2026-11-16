@@ -301,7 +301,7 @@ export fn str32Imm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
 
 /// `ldrb Rt, [Rn, #off]` — imm12 in units of 1.
 export fn ldrbImm(out: *Vec<u32>, rt: u32, rn: u32, byteOff: u32) {
-    out.push(0x38400000 | (byteOff << 10) | (rn << 5) | rt)
+    out.push(0x39400000 | (byteOff << 10) | (rn << 5) | rt)
 }
 
 /// `strb Rt, [Rn, #off]`.

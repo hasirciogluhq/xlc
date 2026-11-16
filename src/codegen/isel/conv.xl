@@ -1,0 +1,157 @@
+// The calling conventions of the native backend (macOS arm64).
+//
+// xlang convention (every function that is not `export(c)` or `declare`d):
+//   integer-class values (integers, bool, pointers, enums)      x0..x7, then the stack
+//   floats                                                      d0..d7, then the stack
+//   aggregates (`str`, slices, arrays, tuples, structs)         the address of a copy the caller made
+//   result: x0 or d0; an aggregate result is written through the address in x8 (sret)
+//   stack arguments: one 8-byte slot each, in order, from the callee's `[x29 + 16]`
+// C convention (AAPCS64 with the Apple changes; `export(c)` and `declare`d functions):
+//   an aggregate of at most 16 bytes travels in one or two x registers, one that is a homogeneous
+//   float aggregate (HFA, up to four members of one float type) in consecutive d registers, a
+//   larger one as the address of a copy; the result follows the same classes (a large aggregate
+//   through x8). A narrow integer argument is extended by the caller to 32 bits only, so a C
+//   callee normalizes its parameters again (func.xl).
+// Not done (reported by `fail`): an aggregate argument of the C convention that no longer fits
+// the registers, and the Apple packing of stack arguments smaller than 8 bytes.
+// @spec https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
+// @spec https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
+from "layout" import K_FLOAT, K_STRUCT
+from "gen" import Gen
+from "types" import Scalar, KIND_INT, scalarOf
+
+/// Where an argument or parameter goes.
+export const AC_X: u32 = 0      // one x register (an integer-class value or the address of a copy)
+export const AC_D: u32 = 1      // one d register
+export const AC_STACK: u32 = 2  // one 8-byte stack slot
+export const AC_XPAIR: u32 = 3  // a C aggregate of 1..2 words in consecutive x registers
+export const AC_HFA: u32 = 4    // a C float aggregate in consecutive d registers
+
+export struct ArgLoc {
+    cls: u32
+    reg: u32      // the first register (AC_X, AC_D, AC_XPAIR, AC_HFA)
+    count: u32    // registers used by AC_XPAIR and AC_HFA
+    stack: u32    // the slot index of AC_STACK
+    ptr: bool     // the value is the address of an aggregate copy
+    dbl: bool     // a float member is 8 bytes (AC_D, AC_HFA)
+    member: u32   // AC_HFA: the byte size of one member
+}
+
+/// The next free register of each class and the next stack slot.
+export struct Conv {
+    nx: u32
+    nd: u32
+    ns: u32
+}
+
+/// The number of members of the homogeneous float aggregate `ty`, 0 when it is none.
+export fn hfaCount(g: *Gen, ty: str) -> u32 {
+    if g.lay.kind(ty) != K_STRUCT {
+        return 0
+    }
+    local l = g.lay.of(ty)
+    if l == nil || l.hasVptr {
+        return 0
+    }
+    local n: usize = l.fields.length()
+    if n < 1 || n > 4 {
+        return 0
+    }
+    for i in 0..n {
+        local fi = l.fields.get(i)
+        if g.lay.kind(fi.typeName.asStr()) != K_FLOAT || !fi.typeName.equals(l.fields.get(0).typeName.asStr()) {
+            return 0
+        }
+    }
+    return n as u32
+}
+
+/// The byte size of one member of an HFA, from its first field.
+export fn hfaMember(g: *Gen, ty: str) -> u32 {
+    local l = g.lay.of(ty)
+    return scalarOf(g.m, l.fields.get(0).typeName.asStr()).bits / 8
+}
+
+fn stack(c: *Conv) -> ArgLoc {
+    c.ns += 1
+    return ArgLoc { cls: AC_STACK, reg: 0, count: 1, stack: c.ns - 1, ptr: false, dbl: false, member: 0 }
+}
+
+/// A C aggregate that no longer fits the registers: its words go to the stack, 8-byte aligned
+/// (`member` = 1 marks the by-value form; AAPCS64 B.4, C.13).
+fn byValueOnStack(c: *Conv, size: u64) -> ArgLoc {
+    local words: u32 = ((size + 7) / 8) as u32
+    c.ns += words
+    return ArgLoc { cls: AC_STACK, reg: 0, count: words, stack: c.ns - words, ptr: false, dbl: false, member: 1 }
+}
+
+/// Classifies one argument or parameter of type `ty` and advances the cursor.
+export fn classify(g: *Gen, ty: str, cabi: bool, c: *Conv) -> ArgLoc {
+    local k: u32 = g.lay.kind(ty)
+    if k == K_FLOAT {
+        local dbl: bool = scalarOf(g.m, ty).bits == 64
+        if c.nd < 8 {
+            c.nd += 1
+            return ArgLoc { cls: AC_D, reg: c.nd - 1, count: 1, stack: 0, ptr: false, dbl: dbl, member: 0 }
+        }
+        return stack(c)
+    }
+    if g.lay.isMem(ty) {
+        local size: u64 = 0
+        local align: u64 = 1
+        g.lay.sizeAlign(ty, &size, &align)
+        local h: u32 = cabi ? hfaCount(g, ty) : 0
+        if h > 0 {
+            if c.nd + h > 8 {
+                c.nd = 8
+                return byValueOnStack(c, size)
+            }
+            local m: u32 = hfaMember(g, ty)
+            c.nd += h
+            return ArgLoc { cls: AC_HFA, reg: c.nd - h, count: h, stack: 0, ptr: false, dbl: m == 8, member: m }
+        }
+        if cabi && size > 0 && size <= 16 {
+            local words: u32 = ((size + 7) / 8) as u32
+            if c.nx + words > 8 {
+                c.nx = 8
+                return byValueOnStack(c, size)
+            }
+            c.nx += words
+            return ArgLoc { cls: AC_XPAIR, reg: c.nx - words, count: words, stack: 0, ptr: false, dbl: false, member: 0 }
+        }
+        // The address of a copy.
+        if c.nx < 8 {
+            c.nx += 1
+            return ArgLoc { cls: AC_X, reg: c.nx - 1, count: 1, stack: 0, ptr: true, dbl: false, member: 0 }
+        }
+        local s: ArgLoc = stack(c)
+        s.ptr = true
+        return s
+    }
+    if c.nx < 8 {
+        c.nx += 1
+        return ArgLoc { cls: AC_X, reg: c.nx - 1, count: 1, stack: 0, ptr: false, dbl: false, member: 0 }
+    }
+    return stack(c)
+}
+
+/// The 64-bit unsigned scalar: the type of a whole-word slot access.
+export fn word() -> Scalar {
+    return Scalar { kind: KIND_INT, bits: 64, signed: false }
+}
+
+/// How a result of type `ty` comes back in the C convention: 0 = the registers x0/x1 (an aggregate
+/// of at most 16 bytes), 1 = d0.. (an HFA), 2 = through x8 (sret). An xlang function always uses 2
+/// for an aggregate.
+export fn resultClass(g: *Gen, ty: str, cabi: bool) -> u32 {
+    if !cabi {
+        return 2
+    }
+    if hfaCount(g, ty) > 0 {
+        return 1
+    }
+    local size: u64 = 0
+    local align: u64 = 1
+    g.lay.sizeAlign(ty, &size, &align)
+    return size > 0 && size <= 16 ? 0 : 2
+}

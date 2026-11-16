@@ -175,6 +175,7 @@ fn floatPool(g: *Gen, bits: u64) -> u32 {
     local name = format("xl$flt${:016x}", bits)
     local id: u32 = g.syms.id(name.asStr())
     if !*g.syms.defined.get(id as usize) {
+        g.syms.fileLocal.set(id as usize, true)
         g.o.padTo(g.dconst, 8)
         g.syms.define(id, g.dconst, g.o.size(g.dconst))
         g.o.addQuad(g.dconst, bits)
@@ -212,7 +213,7 @@ export fn genPlace(g: *Gen, e: *XlcHirExpr, d: u32) -> Place {
     if k == E_LOCAL_REF {
         local i: u32 = e.localId
         local lk: u32 = *g.fr.kind.get(i as usize)
-        if lk == LK_REG {
+        if lk == LK_REG && !*g.fr.via.get(i as usize) {
             g.fail("the address of a register-resident local")
             return Place { reg: SP, off: 0 }
         }

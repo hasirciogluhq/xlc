@@ -14,8 +14,15 @@ from "../macho" import MachoObject, writeObject
 /// module uses something the selector does not lower.
 export fn emitNativeObj(m: *XlcHirModule, hasOnly: bool, only: str, output: *String) -> bool {
     local o = MachoObject()
-    select(m, &o, hasOnly, only)
+    if !select(m, &o, hasOnly, only) {
+        return false
+    }
     local bytes = writeObject(&o)
+    if output.asStr() == "-" {
+        // `-o -` streams the object to stdout.
+        fprint(1, bytes.asStr())
+        return true
+    }
     if !fsWrite(output.cstr(), bytes.asStr()) {
         fprint(2, "error: cannot write the object file\n")
         return false

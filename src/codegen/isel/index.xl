@@ -1,749 +1,94 @@
-// The instruction selector of the native macOS backend: walks the flat HIR module (hir/abi.xl)
-// and emits arm64 machine code into a Mach-O object (macho.xl) through the arm64.xl encoder.
+// The instruction selector of the native macOS backend: walks the flat HIR module (hir/abi.xl) and
+// emits arm64 machine code and data into a Mach-O object (macho/index.xl).
 //
-// Scheme: a naive stack machine with no register allocation yet. Every expression evaluates into
-// the scratch register `x9` in canonical form (types.xl): integers sign- or zero-extended from their
-// width, booleans 0 or 1. A binary operation spills its left operand through a 16-byte slot below
-// the stack pointer. Locals live in frame-pointer-relative 8-byte slots holding canonical values.
-// Integer semantics follow the LLVM path (src/codegen/llvm/expressions.cpp): operations wrap at the
-// width of their type, a shift count at or above the width yields 0 (or the sign for `>>` of a
-// signed value), `/` and `%` are signed or unsigned by the operand type.
+//   gen.xl      the state, symbols, labels, temporary registers
+//   layout.xl   sizes, alignments, field offsets          regs.xl   the frame and the local homes
+//   expr.xl     expressions                               stmt.xl   statements
+//   call.xl     calls, `syscall`, `new`, atomics          asm.xl    `__builtin_asm`
+//   conv.xl     the calling conventions                   func.xl   one function
+//   data.xl     globals, tables, boot code
 //
-// Calls use the Apple arm64 convention for scalars: the first eight integer arguments in `x0`-`x7`,
-// the result in `x0`. Internal calls patch through labels, external calls through `BRANCH26`
-// relocations; the callee symbol is the C-spelled `_name`. The `@entry` function is exposed as the C
-// `main` through a stub that runs `_xl_initAll`, the entry and `_xl_finiAll`, so `cc` links the
-// object into an executable.
-from "std" import String, Vec, format
-from "std/runtime" import panic
-from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, view, owned,
-    E_INT_CONST, E_BOOL_CONST, E_STR_CONST, E_LOCAL_REF, E_UNARY, E_BINARY, E_CAST, E_CALL, E_SELECT, E_SYSCALL,
-    S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE, S_CONTINUE, S_BREAK, S_BLOCK
-from "../arm64" import X0, X16, X19, X29, X30, SP, XZR, EQ, NE, CC, CS, HI, LS, LT, LE, GT, GE,
-    movReg64, loadConst64, movz64, add64Imm, sub64Imm, add64Reg, sub64Reg, mul64, sdiv64, udiv64,
-    msub64, mvn64, cmp64Reg, cmp64Imm, cset64, csel64, sbfm64, ubfm64, and64Reg, orr64Reg, eor64Reg,
-    lsl64Reg, lsr64Reg, asr64Reg, ldur64, stur64, ldr64Imm, str64Imm, stp64Pre, ldp64Post, b, bl,
-    bCond, cbz64, cbnz64, ret, svc, brk, adrp
-from "../macho" import MachoObject, TEXT_FLAGS, RELOC_BRANCH26, RELOC_PAGE21, RELOC_PAGEOFF12
-from "types" import Scalar, KIND_OTHER, KIND_INT, KIND_BOOL, KIND_PTR, KIND_FLOAT, scalarOf, canonical
+// `select` generates every function that has a body and belongs to this object, then the data, then
+// resolves the branches and writes the symbol table: defined symbols first, then the undefined ones.
+// @spec https://developer.arm.com/documentation/ddi0487/latest
+from "std" import String, Vec
+from "../../hir/abi" import XlcHirModule, XlcHirFunction, view
+from "../macho" import MachoObject
+from "call" import installCalls
+from "data" import emitGlobals, emitTables, emitPadTable, emitBoot
+from "func" import genFunction
+from "gen" import Gen, Fixup, Rel, DRel
 
-const SCRATCH: u32 = 9    // x9: the result of every expression, and the right operand
-const SCRATCH2: u32 = 10  // x10: the left operand, popped back from the expression stack
-const SCRATCH3: u32 = 11  // x11: a second temporary (quotients, shifted values, slot addresses)
-
-/// A branch whose target word index is not known yet: patch the immediate of the word at `at`
-/// to reach `label` once `bind` records it.
-@repr(c)
-struct Fixup {
-    at: u32
-    label: u32
-}
-
-/// A call to a symbol outside this module: a `BRANCH26` relocation against the C-spelled name.
-@repr(c)
-struct RelReq {
-    addr: u32     // byte offset of the `bl` inside the text section
-    extIndex: u32 // index into `externals`
-}
-
-/// A symbol the selector emits itself (the `main` stub, `_xl_initAll`, `_xl_finiAll`): its name
-/// and the label bound to its first word.
-class DefSym {
-    name: String
-    label: u32
-
-    fn init(self, name: str, label: u32) {
-        self.name = String(name)
-        self.label = label
+/// Resolves every pending branch: the immediate reaches from the branch word to its label.
+fn patchAll(g: *Gen) {
+    for i in 0..g.fixups.length() {
+        local f: *Fixup = g.fixups.get(i)
+        local off: i32 = (*g.labelPos.get(f.label as usize) as i32) - (f.at as i32)
+        local w: u32 = *g.code.get(f.at as usize)
+        if (w & 0xfe000000) == 0xb4000000 || (w & 0xff000000) == 0x54000000 {
+            // cbz, cbnz, b.cond: the 19-bit signed distance at bits 5..23.
+            g.code.set(f.at as usize, w | (((off & 0x7ffff) as u32) << 5))
+        } else if (w & 0x9f000000) == 0x10000000 {
+            // adr: the byte distance, low two bits at 29..30, the rest at 5..23.
+            local bytes: u32 = ((off * 4) & 0x1fffff) as u32
+            g.code.set(f.at as usize, w | ((bytes & 3) << 29) | ((bytes >> 2) << 5))
+        } else {
+            // b, bl: the 26-bit signed distance at bits 0..25.
+            g.code.set(f.at as usize, w | ((off & 0x3ffffff) as u32))
+        }
     }
 }
 
-/// One string literal in `__cstring`: its symbol name and byte offset inside the section.
-class StrLit {
-    name: String
-    offset: u64
-
-    fn init(self, name: str, offset: u64) {
-        self.name = String(name)
-        self.offset = offset
-    }
-}
-
-/// A page-relative relocation against a string literal: `adrp` (PAGE21) or the `add` after it
-/// (PAGEOFF12), at byte `addr` of the text.
-@repr(c)
-struct StrReloc {
-    addr: u32
-    lit: u32
-    rtype: u32
-}
-
-class Isel {
-    m: *XlcHirModule
-    o: *MachoObject
-    text: u32
-    cstr: u32             // the `__cstring` section: NUL-terminated string literals
-    code: Vec<u32>        // the text of every emitted function, one word per instruction
-    fixups: Vec<Fixup>
-    labelPos: Vec<u32>    // word index per bound label; labels `0..functionCount` are the entries
-    labels: u32           // the next label id to hand out
-    loopTop: u32          // the label of the innermost loop's condition
-    loopEnd: u32          // the label after the innermost loop's body
-    epilog: u32           // the label of the current function's epilogue
-    externals: Vec<String>
-    rels: Vec<RelReq>
-    stubs: Vec<DefSym>    // the symbols the selector emits itself, after the functions
-    lits: Vec<StrLit>
-    litRels: Vec<StrReloc>
-    cstrLen: u64          // the bytes appended to `__cstring` so far
-
-    fn init(self, m: *XlcHirModule, o: *MachoObject) {
-        self.cstrLen = 0
-        self.m = m
-        self.o = o
-        self.text = o.addSection("__text", TEXT_FLAGS, 2)
-        // S_CSTRING_LITERALS (mach-o/loader.h): the linker merges identical literals.
-        self.cstr = o.addSection("__cstring", 0x2, 0)
-        self.code = Vec<u32>()
-        self.fixups = Vec<Fixup>()
-        self.labelPos = Vec<u32>()
-        // The first `functionCount` labels are the function entries, bound as they are emitted.
-        self.labels = m.functionCount
-        self.loopTop = 0
-        self.loopEnd = 0
-        self.epilog = 0
-        self.externals = Vec<String>()
-        self.rels = Vec<RelReq>()
-        self.stubs = Vec<DefSym>()
-        self.lits = Vec<StrLit>()
-        self.litRels = Vec<StrReloc>()
-    }
-
-    /// Appends the bytes of a `*u8` literal to `__cstring` with a NUL and records it. The symbol
-    /// that names it is defined in `select`, once the symbol table has its order. Returns the
-    /// literal's index.
-    fn literal(self, text: str) -> u32 {
-        local index: u32 = self.lits.length() as u32
-        local name: String = String("xl$str$")
-        name.append(format("{}", index).asStr())
-        self.lits.push(StrLit(name.asStr(), self.cstrLen))
-        for k in 0..text.len {
-            self.o.addByte(self.cstr, text.ptr[k])
-        }
-        self.o.addByte(self.cstr, 0)
-        self.cstrLen += text.len as u64 + 1
-        return index
-    }
-
-    /// Emits `adrp Rd, sym@PAGE` and `add Rd, Rd, sym@PAGEOFF` for literal `lit` into `SCRATCH`:
-    /// the two relocations patch the page distance and the offset in the page, the immediates
-    /// stay zero in the object (DDI 0487 ADRP; Apple's arm64 relocation types).
-    fn literalAddress(self, lit: u32) {
-        adrp(&self.code, SCRATCH, 0)
-        self.litRels.push(StrReloc { addr: ((self.code.length() - 1) as u32) * 4, lit: lit, rtype: RELOC_PAGE21 })
-        add64Imm(&self.code, SCRATCH, SCRATCH, 0, false)
-        self.litRels.push(StrReloc { addr: ((self.code.length() - 1) as u32) * 4, lit: lit, rtype: RELOC_PAGEOFF12 })
-    }
-
-    /// A fresh label id.
-    fn newLabel(self) -> u32 {
-        local id: u32 = self.labels
-        self.labels += 1
-        return id
-    }
-
-    /// Binds `label` to the next word that will be appended.
-    fn bind(self, label: u32) {
-        while self.labelPos.length() <= label as usize {
-            self.labelPos.push(0)
-        }
-        self.labelPos.set(label, self.code.length() as u32)
-    }
-
-    /// Marks the word just appended as a branch to `label`, to patch after emission.
-    fn fixup(self, label: u32) {
-        self.fixups.push(Fixup { at: (self.code.length() - 1) as u32, label: label })
-    }
-
-    /// Resolves every pending branch: the immediate reaches from the branch word to its label.
-    fn patchAll(self) {
-        for i in 0..self.fixups.length() {
-            local f: *Fixup = self.fixups.get(i)
-            local off: i32 = (*self.labelPos.get(f.label) as i32) - (f.at as i32)
-            local w: u32 = *self.code.get(f.at)
-            local op: u32 = w & 0xfe000000
-            if op == 0xb4000000 || op == 0xb5000000 {
-                // cbz/cbnz: the 19-bit signed distance sits at bits 5..23.
-                self.code.set(f.at, w | (((off & 0x7ffff) as u32) << 5))
-            } else if (w & 0xff000000) == 0x54000000 {
-                // b.cond: the same 19-bit field at bits 5..23, the condition in bits 0..3.
-                self.code.set(f.at, w | (((off & 0x7ffff) as u32) << 5))
-            } else {
-                // b/bl: the 26-bit signed distance sits at bits 0..25.
-                self.code.set(f.at, w | ((off & 0x3ffffff) as u32))
-            }
-        }
-    }
-
-    /// The byte offset of local `i`'s slot below the frame pointer: local 0 at `[fp, #-8]`.
-    fn slot(self, i: u32) -> i32 {
-        return -8 * ((i + 1) as i32)
-    }
-
-    /// Loads local `i` into `r`. `ldur` reaches 256 bytes below the frame pointer; further slots
-    /// are addressed through `x11`.
-    fn loadSlot(self, r: u32, i: u32) {
-        local off: i32 = self.slot(i)
-        if off >= -256 {
-            ldur64(&self.code, r, X29, off)
-        } else {
-            sub64Imm(&self.code, SCRATCH3, X29, (-off) as u32, false)
-            ldr64Imm(&self.code, r, SCRATCH3, 0)
-        }
-    }
-
-    /// Stores `r` into local `i`'s slot.
-    fn storeSlot(self, r: u32, i: u32) {
-        local off: i32 = self.slot(i)
-        if off >= -256 {
-            stur64(&self.code, r, X29, off)
-        } else {
-            sub64Imm(&self.code, SCRATCH3, X29, (-off) as u32, false)
-            str64Imm(&self.code, r, SCRATCH3, 0)
-        }
-    }
-
-    /// The frame size for `localCount` slots, rounded to the 16-byte stack alignment.
-    fn frameSize(self, localCount: u32) -> i32 {
-        local bytes: i32 = (localCount * 8) as i32
-        return (bytes + 15) / 16 * 16
-    }
-
-    /// The index of the defined function named `name`, or -1 when the callee is external.
-    fn findFunction(self, name: str) -> i32 {
-        local n: String = String(name)
-        local m: *XlcHirModule = self.m
-        for i in 0..m.functionCount as usize {
-            local f: *XlcHirFunction = &m.functions[i]
-            if f.hasBody != 0 && (n.equals(view(f.symbol)) || n.equals(view(f.name))) {
-                return i as i32
-            }
-        }
-        return -1
-    }
-
-    /// The index of an external symbol name, deduplicated; the name is C-spelled (`_` prefix).
-    fn extIndex(self, name: str) -> u32 {
-        for i in 0..self.externals.length() {
-            if self.externals.get(i).equals(name) {
-                return i as u32
-            }
-        }
-        self.externals.push(String(name))
-        return (self.externals.length() - 1) as u32
-    }
-
-    /// The scalar of an expression's type.
-    fn scalarOfExpr(self, e: *XlcHirExpr) -> Scalar {
-        return scalarOf(self.m, view(e.typeName))
-    }
-
-    /// Re-establishes the canonical form of `r` after an operation that may leave the width of
-    /// scalar `s`: sign-extend (`sbfm`) or zero-extend (`ubfm`) the low `bits` bits; a bool keeps
-    /// bit 0. Pointers and 64-bit integers are already whole.
-    fn normalize(self, r: u32, s: Scalar) {
-        if s.kind == KIND_BOOL {
-            ubfm64(&self.code, r, r, 0, 0)
-        } else if s.kind == KIND_INT && s.bits < 64 {
-            if s.signed {
-                sbfm64(&self.code, r, r, 0, s.bits - 1)
-            } else {
-                ubfm64(&self.code, r, r, 0, s.bits - 1)
-            }
-        }
-    }
-
-    /// Pushes `SCRATCH` onto the expression stack: one aligned 16-byte slot below `sp`.
-    fn push(self) {
-        sub64Imm(&self.code, SP, SP, 16, false)
-        stur64(&self.code, SCRATCH, SP, 0)
-    }
-
-    /// Pops the expression stack into `r`.
-    fn pop(self, r: u32) {
-        ldur64(&self.code, r, SP, 0)
-        add64Imm(&self.code, SP, SP, 16, false)
-    }
-
-    /// Emits one function: the prolog, the body, the epilogue. The entry is label `fi`.
-    fn function(self, fi: u32, f: *XlcHirFunction) {
-        self.bind(fi)
-        // Prolog: the frame record Apple requires at `x29`, then room for the locals.
-        stp64Pre(&self.code, X29, X30, SP, -16)
-        add64Imm(&self.code, X29, SP, 0, false)  // mov x29, sp
-        local frame: i32 = self.frameSize(f.localCount)
-        if frame > 0 {
-            sub64Imm(&self.code, SP, SP, frame as u32, false)
-        }
-        // The first `paramCount` locals arrive in x0..x7, canonicalized from their declared width
-        // (the caller only extends narrow arguments to 32 bits), then spilled to their slots.
-        if f.paramCount > 8 {
-            panic(String("isel: more than eight parameters").cstr())
-        }
-        for i in 0..f.paramCount as usize {
-            local s: Scalar = scalarOf(self.m, view(f.locals[i].typeName))
-            if s.kind == KIND_OTHER || s.kind == KIND_FLOAT {
-                panic(String("isel: parameter of a non-scalar type").cstr())
-            }
-            self.normalize(i as u32, s)
-            self.storeSlot(i as u32, i as u32)
-        }
-        self.epilog = self.newLabel()
-        self.stmtRange(f.bodyFirst, f.bodyCount)
-        self.bind(self.epilog)
-        add64Imm(&self.code, SP, X29, 0, false)  // mov sp, x29
-        ldp64Post(&self.code, X29, X30, SP, 16)
-        ret(&self.code)
-    }
-
-    /// The C `main` of the executable: `_xl_initAll`, the entry, `_xl_finiAll`, then the entry's
-    /// result as the exit status. The result waits in `x19` (callee-saved) across the teardown;
-    /// the pair save keeps `sp` 16-byte aligned at every call.
-    fn mainStub(self, entryLabel: u32, voidEntry: bool, initL: u32, finiL: u32) {
-        local l: u32 = self.newLabel()
-        self.bind(l)
-        stp64Pre(&self.code, X19, X30, SP, -16)
-        bl(&self.code, 0)
-        self.fixup(initL)
-        bl(&self.code, 0)
-        self.fixup(entryLabel)
-        if voidEntry {
-            movz64(&self.code, X0, 0, 0)
-        }
-        movReg64(&self.code, X19, X0)
-        bl(&self.code, 0)
-        self.fixup(finiL)
-        movReg64(&self.code, X0, X19)
-        ldp64Post(&self.code, X19, X30, SP, 16)
-        ret(&self.code)
-        self.stubs.push(DefSym("main", l))
-    }
-
-    /// An empty boot hook: `_xl_initAll` or `_xl_finiAll`, one `ret`.
-    fn emptyHook(self, name: str) -> u32 {
-        local l: u32 = self.newLabel()
-        self.bind(l)
-        ret(&self.code)
-        self.stubs.push(DefSym(name, l))
-        return l
-    }
-
-    fn stmtRange(self, first: u32, count: u32) {
-        for i in 0..count as usize {
-            self.stmt(&self.m.stmts[first as usize + i])
-        }
-    }
-
-    fn stmt(self, s: *XlcHirStmt) {
-        switch {
-            case s.kind == S_LOCAL {
-                if s.value >= 0 {
-                    self.expr(&self.m.exprs[s.value as usize])
-                    self.storeSlot(SCRATCH, s.localId)
-                }
-            }
-            case s.kind == S_ASSIGN {
-                local t: *XlcHirExpr = &self.m.exprs[s.target as usize]
-                if t.kind != E_LOCAL_REF {
-                    panic(String("isel: assign to a non-local target").cstr())
-                }
-                self.expr(&self.m.exprs[s.value as usize])
-                self.storeSlot(SCRATCH, t.localId)
-            }
-            case s.kind == S_RETURN {
-                if s.value >= 0 {
-                    self.expr(&self.m.exprs[s.value as usize])
-                    movReg64(&self.code, X0, SCRATCH)
-                }
-                b(&self.code, 0)
-                self.fixup(self.epilog)
-            }
-            case s.kind == S_EXPR {
-                self.expr(&self.m.exprs[s.value as usize])
-            }
-            case s.kind == S_BLOCK {
-                self.stmtRange(s.bodyFirst, s.bodyCount)
-            }
-            case s.kind == S_IF {
-                self.expr(&self.m.exprs[s.value as usize])
-                local elseL: u32 = self.newLabel()
-                cbz64(&self.code, SCRATCH, 0)
-                self.fixup(elseL)
-                self.stmtRange(s.bodyFirst, s.bodyCount)
-                if s.elseCount > 0 {
-                    local endL: u32 = self.newLabel()
-                    b(&self.code, 0)
-                    self.fixup(endL)
-                    self.bind(elseL)
-                    self.stmtRange(s.elseFirst, s.elseCount)
-                    self.bind(endL)
-                } else {
-                    self.bind(elseL)
-                }
-            }
-            case s.kind == S_WHILE {
-                local top: u32 = self.newLabel()
-                local end: u32 = self.newLabel()
-                local oldTop: u32 = self.loopTop
-                local oldEnd: u32 = self.loopEnd
-                self.loopTop = top
-                self.loopEnd = end
-                if s.postTest != 0 {
-                    // do-while: the body runs first, the test decides whether to go around.
-                    self.bind(top)
-                    self.stmtRange(s.bodyFirst, s.bodyCount)
-                    if s.stepCount > 0 {
-                        self.stmtRange(s.stepFirst, s.stepCount)
-                    }
-                    self.expr(&self.m.exprs[s.value as usize])
-                    cbnz64(&self.code, SCRATCH, 0)
-                    self.fixup(top)
-                } else {
-                    self.bind(top)
-                    self.expr(&self.m.exprs[s.value as usize])
-                    cbz64(&self.code, SCRATCH, 0)
-                    self.fixup(end)
-                    self.stmtRange(s.bodyFirst, s.bodyCount)
-                    if s.stepCount > 0 {
-                        self.stmtRange(s.stepFirst, s.stepCount)
-                    }
-                    b(&self.code, 0)
-                    self.fixup(top)
-                }
-                self.bind(end)
-                self.loopTop = oldTop
-                self.loopEnd = oldEnd
-            }
-            case s.kind == S_CONTINUE {
-                b(&self.code, 0)
-                self.fixup(self.loopTop)
-            }
-            case s.kind == S_BREAK {
-                b(&self.code, 0)
-                self.fixup(self.loopEnd)
-            }
-            case true {
-                panic(String("isel: unsupported statement kind").cstr())
-            }
-        }
-    }
-
-    /// Emits one expression; the result lands in `SCRATCH` in canonical form.
-    fn expr(self, e: *XlcHirExpr) {
-        switch {
-            case e.kind == E_INT_CONST {
-                local s: Scalar = self.scalarOfExpr(e)
-                if s.kind == KIND_FLOAT {
-                    panic(String("isel: float constants are not lowered yet").cstr())
-                }
-                loadConst64(&self.code, SCRATCH, canonical(e.intValue, s))
-            }
-            case e.kind == E_BOOL_CONST {
-                loadConst64(&self.code, SCRATCH, e.boolValue as u64)
-            }
-            case e.kind == E_LOCAL_REF {
-                self.loadSlot(SCRATCH, e.localId)
-            }
-            case e.kind == E_UNARY {
-                local op: String = owned(e.unaryOp)
-                self.expr(&self.m.exprs[e.lhs as usize])
-                if op.equals("-") {
-                    sub64Reg(&self.code, SCRATCH, XZR, SCRATCH)
-                    self.normalize(SCRATCH, self.scalarOfExpr(e))
-                } else if op.equals("!") || op.equals("~") {
-                    // Bitwise NOT for both spellings, as the LLVM path does (`CreateNot`); on a
-                    // bool the normalization keeps bit 0, which is the logical NOT.
-                    mvn64(&self.code, SCRATCH, SCRATCH)
-                    self.normalize(SCRATCH, self.scalarOfExpr(e))
-                } else {
-                    panic(String("isel: unsupported unary operator").cstr())
-                }
-            }
-            case e.kind == E_BINARY {
-                self.binary(e)
-            }
-            case e.kind == E_CAST {
-                self.cast(e)
-            }
-            case e.kind == E_SELECT {
-                self.expr(&self.m.exprs[e.lhs as usize])
-                local elseL: u32 = self.newLabel()
-                local endL: u32 = self.newLabel()
-                cbz64(&self.code, SCRATCH, 0)
-                self.fixup(elseL)
-                self.expr(&self.m.exprs[e.rhs as usize])
-                b(&self.code, 0)
-                self.fixup(endL)
-                self.bind(elseL)
-                self.expr(&self.m.exprs[self.m.refs[e.argFirst as usize] as usize])
-                self.bind(endL)
-            }
-            case e.kind == E_CALL {
-                self.call(e)
-            }
-            case e.kind == E_SYSCALL {
-                self.syscall(e)
-            }
-            case true {
-                panic(String("isel: unsupported expression kind").cstr())
-            }
-        }
-    }
-
-    /// Evaluates the `argCount` arguments of `e` left to right, each pushed on the expression stack.
-    fn pushArgs(self, e: *XlcHirExpr) {
-        for i in 0..e.argCount as usize {
-            self.expr(&self.m.exprs[self.m.refs[e.argFirst as usize + i] as usize])
-            self.push()
-        }
-    }
-
-    /// A binary operation. `&&` and `||` short-circuit; the other operators evaluate both operands,
-    /// the left one into `x10` and the right one into `x9`, and combine them by the operand type.
-    fn binary(self, e: *XlcHirExpr) {
-        local op: String = owned(e.binaryOp)
-        if op.equals("&&") || op.equals("||") {
-            // The left value is already canonical 0/1: it is the result when it short-circuits.
-            local endL: u32 = self.newLabel()
-            self.expr(&self.m.exprs[e.lhs as usize])
-            if op.equals("&&") {
-                cbz64(&self.code, SCRATCH, 0)
-            } else {
-                cbnz64(&self.code, SCRATCH, 0)
-            }
-            self.fixup(endL)
-            self.expr(&self.m.exprs[e.rhs as usize])
-            self.bind(endL)
-            return
-        }
-        local t: Scalar = self.scalarOfExpr(&self.m.exprs[e.lhs as usize])
-        if t.kind == KIND_FLOAT {
-            panic(String("isel: floating-point operators are not lowered yet").cstr())
-        }
-        if t.kind == KIND_OTHER {
-            panic(String("isel: operator on a non-scalar operand").cstr())
-        }
-        local r: Scalar = self.scalarOfExpr(e)
-        self.expr(&self.m.exprs[e.lhs as usize])
-        self.push()
-        self.expr(&self.m.exprs[e.rhs as usize])
-        self.pop(SCRATCH2)
-        // `SCRATCH2` holds the left operand, `SCRATCH` the right one.
-        if op.equals("+") {
-            add64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
-            self.normalize(SCRATCH, r)
-        } else if op.equals("-") {
-            sub64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
-            self.normalize(SCRATCH, r)
-        } else if op.equals("*") {
-            mul64(&self.code, SCRATCH, SCRATCH2, SCRATCH)
-            self.normalize(SCRATCH, r)
-        } else if op.equals("/") || op.equals("%") {
-            self.divide(op.equals("%"), t, e.checked != 0)
-            self.normalize(SCRATCH, r)
-        } else if op.equals("&") {
-            and64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
-        } else if op.equals("|") {
-            orr64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
-        } else if op.equals("^") {
-            eor64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
-        } else if op.equals("<<") || op.equals(">>") {
-            self.shift(op.equals("<<"), t)
-            self.normalize(SCRATCH, t)
-        } else {
-            self.compare(&op, t)
-        }
-    }
-
-    /// `SCRATCH = SCRATCH2 / SCRATCH` (or `%`), signed when the operand type is. A checked division
-    /// by zero traps with `brk #0`; the stdlib's panic path is not reachable from the native
-    /// backend yet. The remainder is `a - (a / b) * b` with `msub`.
-    fn divide(self, remainder: bool, t: Scalar, checked: bool) {
-        if checked {
-            cbnz64(&self.code, SCRATCH, 2)
-            brk(&self.code, 0)
-        }
-        local q: u32 = remainder ? SCRATCH3 : SCRATCH
-        if t.signed {
-            sdiv64(&self.code, q, SCRATCH2, SCRATCH)
-        } else {
-            udiv64(&self.code, q, SCRATCH2, SCRATCH)
-        }
-        if remainder {
-            msub64(&self.code, SCRATCH, SCRATCH3, SCRATCH, SCRATCH2)
-        }
-    }
-
-    /// `SCRATCH = SCRATCH2 << SCRATCH` or `>>`. The hardware takes the count modulo 64; a count of
-    /// 64 or more is clamped the way LLVM's select does: a left shift and an unsigned right shift
-    /// give 0, a signed right shift fills with the sign (a shift by 63 of the canonical value).
-    fn shift(self, left: bool, t: Scalar) {
-        if left {
-            lsl64Reg(&self.code, SCRATCH3, SCRATCH2, SCRATCH)
-            cmp64Imm(&self.code, SCRATCH, 64)
-            csel64(&self.code, SCRATCH, XZR, SCRATCH3, CS)
-        } else if t.signed {
-            movz64(&self.code, SCRATCH3, 63, 0)
-            cmp64Imm(&self.code, SCRATCH, 64)
-            csel64(&self.code, SCRATCH, SCRATCH3, SCRATCH, CS)
-            asr64Reg(&self.code, SCRATCH, SCRATCH2, SCRATCH)
-        } else {
-            lsr64Reg(&self.code, SCRATCH3, SCRATCH2, SCRATCH)
-            cmp64Imm(&self.code, SCRATCH, 64)
-            csel64(&self.code, SCRATCH, XZR, SCRATCH3, CS)
-        }
-    }
-
-    /// `SCRATCH = SCRATCH2 <op> SCRATCH` as a bool: the condition codes follow the operand type,
-    /// signed (`LT`, `GT`, ...) or unsigned (`CC`, `HI`, ...), as in the LLVM path.
-    fn compare(self, op: *String, t: Scalar) {
-        cmp64Reg(&self.code, SCRATCH2, SCRATCH)
-        local cond: u32 = EQ
-        if op.equals("==") {
-            cond = EQ
-        } else if op.equals("!=") {
-            cond = NE
-        } else if op.equals("<") {
-            cond = t.signed ? LT : CC
-        } else if op.equals("<=") {
-            cond = t.signed ? LE : LS
-        } else if op.equals(">") {
-            cond = t.signed ? GT : HI
-        } else if op.equals(">=") {
-            cond = t.signed ? GE : CS
-        } else {
-            panic(String("isel: unsupported binary operator").cstr())
-        }
-        cset64(&self.code, SCRATCH, cond)
-    }
-
-    /// `lhs as T`: a bool is `lhs != 0`; an integer is re-normalized to its width (truncation or
-    /// the extension its source type implies, which the canonical form already holds); a pointer
-    /// and an integer convert bit for bit.
-    fn cast(self, e: *XlcHirExpr) {
-        local source: Scalar = self.scalarOfExpr(&self.m.exprs[e.lhs as usize])
-        local to: Scalar = self.scalarOfExpr(e)
-        if source.kind == KIND_FLOAT || to.kind == KIND_FLOAT {
-            panic(String("isel: floating-point casts are not lowered yet").cstr())
-        }
-        self.expr(&self.m.exprs[e.lhs as usize])
-        if to.kind == KIND_BOOL {
-            cmp64Imm(&self.code, SCRATCH, 0)
-            cset64(&self.code, SCRATCH, NE)
-        } else if to.kind == KIND_INT {
-            self.normalize(SCRATCH, to)
-        } else if to.kind != KIND_PTR {
-            panic(String("isel: cast to a non-scalar type").cstr())
-        }
-    }
-
-    /// A direct call: the arguments pushed, popped into `x0`..`x7`, `bl`, then the result of the
-    /// declared return type canonicalized (the callee may leave the upper bits of a narrow result
-    /// unspecified).
-    fn call(self, e: *XlcHirExpr) {
-        if e.argCount > 8 {
-            panic(String("isel: more than eight call arguments").cstr())
-        }
-        self.pushArgs(e)
-        local i: i32 = e.argCount as i32 - 1
-        while i >= 0 {
-            self.pop(i as u32)
-            i -= 1
-        }
-        local name: str = view(e.text)
-        local callee: i32 = self.findFunction(name)
-        bl(&self.code, 0)
-        if callee >= 0 {
-            self.fixup(callee as u32)
-        } else {
-            // An external symbol: C spelling, resolved by the linker.
-            local underscore: String = String("_")
-            underscore.append(name)
-            self.rels.push(RelReq { addr: ((self.code.length() - 1) as u32) * 4, extIndex: self.extIndex(underscore.asStr()) })
-        }
-        movReg64(&self.code, SCRATCH, X0)
-        self.normalize(SCRATCH, self.scalarOfExpr(e))
-    }
-
-    /// `syscall(number, args...)` on macOS arm64: the number in `x16`, the arguments in `x0`..`x5`,
-    /// `svc #0x80`. XNU reports an error with the carry flag set and `x0` holding the errno; the
-    /// `b.cc` skips the `neg` that turns it into the `-errno` the language returns. `x1` is written
-    /// by the kernel too, which is harmless: no value is held in a register across an expression.
-    fn syscall(self, e: *XlcHirExpr) {
-        if e.argCount < 1 || e.argCount > 7 {
-            panic(String("isel: syscall takes a number and up to six arguments").cstr())
-        }
-        self.pushArgs(e)
-        local i: i32 = e.argCount as i32 - 1
-        while i >= 0 {
-            // Argument 0 is the number (x16); argument i >= 1 is x(i-1).
-            self.pop(i == 0 ? X16 : (i - 1) as u32)
-            i -= 1
-        }
-        svc(&self.code, 0x80)
-        bCond(&self.code, CC, 2)
-        sub64Reg(&self.code, X0, XZR, X0)
-        movReg64(&self.code, SCRATCH, X0)
-    }
-}
-
-/// Selects the whole module into `o`: every function with a body becomes one defined symbol in
-/// `__text`, every external call an undefined symbol and a `BRANCH26` relocation. An `@entry`
-/// function gets the C `main` stub; `_xl_initAll` and `_xl_finiAll` are always defined (empty).
-export fn select(m: *XlcHirModule, o: *MachoObject) {
-    local g: Isel = Isel(m, o)
+/// Selects the module into `o`. With `hasOnly`, only the functions and globals of module `only`
+/// are defined and the rest stays external; otherwise the whole program is defined, boot code
+/// included. False (reported) when something could not be lowered.
+export fn select(m: *XlcHirModule, o: *MachoObject, hasOnly: bool, only: str) -> bool {
+    local g: Gen = Gen(m, o, hasOnly, only)
+    installCalls(&g)
     for fi in 0..m.functionCount as usize {
         local f: *XlcHirFunction = &m.functions[fi]
-        if f.hasBody != 0 {
-            g.function(fi as u32, f)
+        if f.hasBody != 0 && g.definedHere(view(f.module)) {
+            genFunction(&g, fi as u32)
+            g.syms.define(g.syms.id(g.fnSymbol(fi as u32)), g.text, *g.labelPos.get(fi) as u64 * 4)
         }
     }
-    if m.initCount > 0 || m.finiCount > 0 {
-        panic(String("isel: @init and @fini functions are not lowered yet").cstr())
+    if !hasOnly {
+        emitBoot(&g)
     }
-    local initL: u32 = g.emptyHook("xl_initAll")
-    local finiL: u32 = g.emptyHook("xl_finiAll")
-    for fi in 0..m.functionCount as usize {
-        local f: *XlcHirFunction = &m.functions[fi]
-        if f.hasBody != 0 && f.isEntry != 0 {
-            if f.paramCount > 0 {
-                panic(String("isel: an @entry function with parameters is not lowered yet").cstr())
-            }
-            g.mainStub(fi as u32, view(f.ret) == "void", initL, finiL)
-        }
-    }
-    g.patchAll()
+    emitGlobals(&g)
+    emitTables(&g)
+    emitPadTable(&g)
+    patchAll(&g)
     for i in 0..g.code.length() {
         o.addWord(g.text, *g.code.get(i))
     }
-    // The defined symbols, in emission order; the entry label is the word index of the function.
-    for fi in 0..m.functionCount as usize {
-        local f: *XlcHirFunction = &m.functions[fi]
-        if f.hasBody != 0 {
-            o.addDefined(view(f.symbol), g.text, (*g.labelPos.get(fi as u32) as u64) * 4)
+    // The symbol table: the defined symbols, then the undefined ones.
+    local n: usize = g.syms.names.length()
+    local mapped = Vec<u32>()
+    for i in 0..n {
+        mapped.push(0)
+    }
+    for i in 0..n {
+        if *g.syms.defined.get(i) {
+            local name: str = g.syms.names.get(i).asStr()
+            local sec: u32 = *g.syms.section.get(i)
+            local off: u64 = *g.syms.offset.get(i)
+            mapped.set(i, *g.syms.fileLocal.get(i) ? o.addLocal(name, sec, off)
+                        : *g.syms.weak.get(i) ? o.addWeak(name, sec, off) : o.addDefined(name, sec, off))
         }
     }
-    for i in 0..g.stubs.length() {
-        local d: *DefSym = g.stubs.get(i)
-        o.addDefined(d.name.asStr(), g.text, (*g.labelPos.get(d.label) as u64) * 4)
-    }
-    // The undefined symbols, then the relocations against them (the symbol table wants every
-    // defined symbol before the first undefined one).
-    for i in 0..g.externals.length() {
-        o.addUndefined(g.externals.get(i).asStr())
+    for i in 0..n {
+        if !*g.syms.defined.get(i) {
+            mapped.set(i, o.addUndefined(g.syms.names.get(i).asStr()))
+        }
     }
     for i in 0..g.rels.length() {
-        local r: *RelReq = g.rels.get(i)
-        o.addReloc(g.text, r.addr, r.extIndex, RELOC_BRANCH26)
+        local r: *Rel = g.rels.get(i)
+        o.addReloc(g.text, r.addr, *mapped.get(r.sym as usize), r.rtype)
     }
+    for i in 0..g.drels.length() {
+        local r: *DRel = g.drels.get(i)
+        o.addDataReloc(r.section, r.addr, *mapped.get(r.sym as usize))
+    }
+    return !g.failed
 }
