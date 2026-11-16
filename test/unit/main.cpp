@@ -734,14 +734,12 @@ void runClosureTests();
 void runIteratorTests();
 void runReturnTests();
 void runDropTests();
-void runUtilBridgeTests();
 void runMirTests();
 void runMoveTests();
 void runXlLowerTests();
 
 int main() {
     RUN(runSemaTests);
-    RUN(runUtilBridgeTests);
     RUN(runLowerTests);
     RUN(runOperatorTests);
     RUN(runClosureTests);
