@@ -28,7 +28,6 @@ includes("xmake/xlang.lua")
 local xlc_modules = {
     {"xlc-util",     {"src/util/**.cpp"}},
     {"xlc-lang",     {"src/lang/**.cpp"}},
-    {"xlc-sema",     {"src/sema/**.cpp"}},
     {"xlc-hir",      {"src/hir/**.cpp"}},
     {"xlc-mir",      {"src/mir/**.cpp"}},
     {"xlc-analysis", {"src/analysis/**.cpp"}},
