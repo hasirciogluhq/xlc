@@ -25,6 +25,7 @@ from "./typing" import exprType, exprTypeName, typeNameOf, resolveBase, argSpecs
 from "./methods" import findMethod, methodsNamed, MethodRef, classLoc
 from "./overload" import PICK_NONE, PICK_AMBIGUOUS, declParamTypes, mangledParams
 from "./helpers" import overloadKey
+from "./interface" import interfaceOf, lowerInterfaceCall
 from "./builtins" import isBuiltinName, lowerBuiltin
 
 /// A call: the callee's form decides the lowering (see the file comment). Returns the HIR
@@ -71,6 +72,9 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
             }
         }
         local recvTy = exprType(l, (*callee).lhs)
+        if interfaceOf(l, recvTy) >= 0 {
+            return lowerInterfaceCall(l, idx, e, (*callee).lhs, interfaceOf(l, recvTy))
+        }
         if recvTy >= 0 {
             local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt(calleeIdx))
             if (*m).found {
@@ -102,7 +106,7 @@ fn reportNoPick(l: *Lowerer, e: *XExpr, name: str, pick: i32) -> i32 {
 
 /// Lowers the arguments of call `e` into `out`, each converted to its parameter type. False when
 /// the count is wrong (E0710) or an argument does not lower.
-fn lowerArgs(l: *Lowerer, e: *XExpr, params: *Vec<i32>, out: *Vec<i32>, name: str) -> bool {
+export fn lowerArgs(l: *Lowerer, e: *XExpr, params: *Vec<i32>, out: *Vec<i32>, name: str) -> bool {
     if (*e).argsCount as usize != (*params).length() {
         l.err("E0710", (*e).span,
             format("`{}` takes {} argument(s), {} given", name, (*params).length(), (*e).argsCount).asStr(),

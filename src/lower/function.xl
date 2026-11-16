@@ -22,7 +22,9 @@ from "../sema/resolve" import resolve
 from "./state" import Lowerer, ScopeEntry, ScopeStack, XlcHirLocalRec,
     SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE, SE_NAMESPACE, SE_EXTERNAL
 from "./builder" import FnBuild, XlcHirGlobalRec
-from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName, lowerArrayLen,
+from "../lang/ast/ast" import XD_ENUM
+from "./typing" import entryOwner
+from "./queries" import lowerLayoutQuery, enumMemberValue, enumMemberValueIn, unaryOpName, binaryOpName, lowerArrayLen,
     isConstValue
 from "./call" import lowerCall
 from "./sum" import sumNamed, sumOfType, lowerSumValue, lowerSumSwitch
@@ -634,9 +636,26 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
         if (*e).kind == XE_TERNARY {
             local cond = lowerExpr(l, (*e).lhs)
-            local thenValue = lowerExpr(l, (*e).rhs)
-            local elseValue = lowerExpr(l, l.s.refAt("expr", (*e).argsFirst as i32))
-            return l.b.select(cond, thenValue, elseValue, exprTypeName(l, idx))
+            // Literal branches take the context type (`local n: u64 = c ? 1 : 0`).
+            // A literal branch takes the type of the other branch, else the context type.
+            local thenIdx = (*e).rhs
+            local elseIdx = l.s.refAt("expr", (*e).argsFirst as i32)
+            local thenLit = isLiteralExpr(l, thenIdx)
+            local elseLit = isLiteralExpr(l, elseIdx)
+            local thenValue = -1
+            local elseValue = -1
+            if thenLit && !elseLit {
+                elseValue = lowerExprWant(l, elseIdx, want)
+                thenValue = lowerExprWant(l, thenIdx, effectiveType(l, elseIdx, want))
+            } else if !thenLit && elseLit {
+                thenValue = lowerExprWant(l, thenIdx, want)
+                elseValue = lowerExprWant(l, elseIdx, effectiveType(l, thenIdx, want))
+            } else {
+                local ctx = thenLit && elseLit ? want : -1
+                thenValue = lowerExprWant(l, thenIdx, ctx)
+                elseValue = lowerExprWant(l, elseIdx, ctx)
+            }
+            return l.b.select(cond, thenValue, elseValue, typeNameOf(l, effectiveType(l, idx, want)))
         }
         if (*e).kind == XE_CALL {
             return lowerCall(l, idx)

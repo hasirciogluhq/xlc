@@ -10,6 +10,7 @@ from "../hir/abi" import E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, 
     E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_TO_INTERFACE
 from "../sema/item" import SDecl
 from "../sema/sema" import Sema
+from "../sema/subst" import TypeEnv
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOfName
 from "./state" import Lowerer
@@ -38,6 +39,11 @@ export fn lowerLayoutQuery(l: *Lowerer, idx: i32, e: *XExpr, which: str) -> i32 
     }
     local tyArg = l.s.refAt("expr", (*e).argsFirst as i32)
     local tyName = l.s.exprTextAt(tyArg)
+    // Inside a generic instance a type parameter names its argument.
+    if l.s.instEnv != nil {
+        local hit = (l.s.instEnv as *TypeEnv).get(tyName)
+        if hit >= 0 { tyName = l.keep(l.s.types.text(hit).asStr()) }
+    }
     local value: u64 = 0
     if which == "offsetOf" {
         if (*e).argsCount < 2 {

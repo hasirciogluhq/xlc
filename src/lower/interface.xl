@@ -1,0 +1,123 @@
+// Interface values of the lowering pass. The xlang twin of the Itable path of
+// sema/lower/call/method.cpp and of `toInterface` in expr/convert.cpp.
+//
+// An interface value is a fat pointer (object pointer + itable). `value.m(args)` on one is
+// `CallItable` with the method's position in the interface declaration as its slot; a struct or
+// class value, or a pointer to one, becomes an interface value with `ToInterface` (the object is
+// referenced, never copied, so a value must be an addressable place).
+//
+// Not ported yet: the E0504 check that an `impl I for T` exists (the impls of other modules are
+// not visible here yet), and a generic interface.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
+from "../hir/abi" import E_CALL_ITABLE, E_TO_INTERFACE
+from "../sema/sema" import Sema
+from "../sema/types" import T_INTERFACE, T_POINTER, T_STRUCT, T_CLASS
+from "../sema/module_scope" import entityByQName
+from "./state" import Lowerer
+from "./typing" import exprType, exprTypeName, typeNameOf, declParamsIn, declRetIn, adoptFrom
+from "./function" import lowerExpr
+from "./call" import lowerArgs
+
+/// The interface type `t` is or points to, -1 when it is neither.
+export fn interfaceOf(l: *Lowerer, t: i32) -> i32 {
+    if t < 0 { return -1 }
+    local rec = l.s.types.get(t)
+    if rec.kind == T_POINTER && rec.elem >= 0 { return interfaceOf(l, rec.elem) }
+    return rec.kind == T_INTERFACE ? t : -1
+}
+
+/// A method of an interface: `owner` declares it, `decl` is its SDecl index, `slot` its position.
+export struct IfaceMethod {
+    owner: *Sema
+    decl: i32
+    slot: u32
+}
+
+/// The method `name` of the interface type `iface`; `decl` is -1 when there is none.
+export fn findIfaceMethod(l: *Lowerer, iface: i32, name: str) -> IfaceMethod {
+    local none = IfaceMethod { owner: l.s, decl: -1, slot: 0 }
+    local ref = entityByQName(l.s, l.s.types.pathOf(l.s.types.get(iface)).asStr())
+    if ref.sym < 0 { return none }
+    local owner = ref.owner != nil ? ref.owner : l.s
+    local di = owner.declOfItem(owner.itemOf(ref.sym))
+    if di < 0 { return none }
+    local d = owner.declAt(di as usize)
+    for i in 0..(*d).methodsCount as usize {
+        local m = (*d).methodsFirst as usize + i
+        if owner.text((*owner.declAt(m)).name) == name {
+            return IfaceMethod { owner: owner, decl: m as i32, slot: i as u32 }
+        }
+    }
+    return none
+}
+
+/// The result type of `value.name(...)` on an interface, -1 when unknown.
+export fn interfaceCallType(l: *Lowerer, iface: i32, name: str) -> i32 {
+    local m = findIfaceMethod(l, iface, name)
+    if m.decl < 0 { return -1 }
+    return declRetIn(l, m.owner, m.decl)
+}
+
+/// `recv.name(args)` where `recv` is an interface value (or a pointer to one): `CallItable`.
+export fn lowerInterfaceCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, iface: i32) -> i32 {
+    local name = l.s.exprTextAt((*e).lhs)
+    local m = findIfaceMethod(l, iface, name)
+    if m.decl < 0 {
+        local msg = format("interface `{}` has no method `{}`", typeNameOf(l, iface), name)
+        l.err("E0709", (*e).span, msg.asStr(), "not declared in the interface")
+        return -1
+    }
+    local params = declParamsIn(l, m.owner, m.decl)
+    local recv = lowerExpr(l, recvIdx)
+    if recv < 0 { return -1 }
+    // A pointer to an interface value calls through the value.
+    if l.s.types.get(exprType(l, recvIdx)).kind == T_POINTER {
+        recv = l.b.deref(recv, typeNameOf(l, iface))
+    }
+    local args = Vec<i32>()
+    if !lowerArgs(l, e, &params, &args, name) { return -1 }
+    local range = l.b.args(args)
+    local out = l.b.expr(E_CALL_ITABLE, exprTypeName(l, idx))
+    local h = l.b.exprAt(out)
+    (*h).text = l.b.str(name)
+    (*h).index = m.slot
+    (*h).lhs = recv
+    (*h).argFirst = range.0
+    (*h).argCount = range.1
+    return out
+}
+
+/// True for an expression that names storage whose address can be taken.
+fn isPlace(l: *Lowerer, idx: i32) -> bool {
+    local e = l.s.exprAt(idx)
+    if (*e).kind == XE_NAME { return true }
+    if (*e).kind == XE_FIELD || (*e).kind == XE_INDEX { return isPlace(l, (*e).lhs) }
+    return (*e).kind == XE_UNARY && (*e).unaryOp == XU_DEREF
+}
+
+/// `value` (lowered from `idx`, of type `src`) converted to the interface type `want`: the
+/// object is referenced through a pointer. Returns -1 after a diagnostic.
+export fn toInterface(l: *Lowerer, idx: i32, value: i32, src: i32, want: i32) -> i32 {
+    local rec = l.s.types.get(src)
+    local pointer = value
+    if rec.kind == T_POINTER {
+        local pointee = l.s.types.get(rec.elem).kind
+        if pointee != T_STRUCT && pointee != T_CLASS { return value }
+    } else if rec.kind == T_STRUCT || rec.kind == T_CLASS {
+        if !isPlace(l, idx) {
+            l.err("E0709", (*l.s.exprAt(idx)).span, "cannot convert a temporary to an interface",
+                "the interface value points at the object; store it in a variable first")
+            return -1
+        }
+        pointer = l.b.addrOf(value, typeNameOf(l, l.s.types.makePointer(src)))
+    } else {
+        return value
+    }
+    local srcType = rec.kind == T_POINTER ? rec.elem : src
+    local out = l.b.expr(E_TO_INTERFACE, typeNameOf(l, want))
+    local h = l.b.exprAt(out)
+    (*h).text = l.b.str(l.s.types.pathOf(l.s.types.get(srcType)).asStr())
+    (*h).lhs = pointer
+    return out
+}

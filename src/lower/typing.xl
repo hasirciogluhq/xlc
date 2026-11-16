@@ -27,6 +27,7 @@ from "./methods" import findMethod, methodsNamed, classLoc
 from "./generics" import genericInstance, constructType
 from "./builtins" import isBuiltinName, builtinType
 from "./propagate" import tryType
+from "./interface" import interfaceOf, interfaceCallType
 
 /// True for an unsuffixed numeric literal, or `-` of one: it takes the type of the other operand.
 export fn isLiteralExpr(l: *Lowerer, idx: i32) -> bool {
@@ -103,8 +104,14 @@ export fn exprType(l: *Lowerer, idx: i32) -> i32 {
     }
     if k == XE_TRY { return tryType(l, e) }
     if k == XE_TERNARY {
+        // A literal branch has the type of the other one.
+        local elseIdx = l.s.refAt("expr", (*e).argsFirst as i32)
+        if isLiteralExpr(l, (*e).rhs) && !isLiteralExpr(l, elseIdx) {
+            local et = exprType(l, elseIdx)
+            if et >= 0 { return et }
+        }
         local t = exprType(l, (*e).rhs)
-        return t >= 0 ? t : exprType(l, l.s.refAt("expr", (*e).argsFirst as i32))
+        return t >= 0 ? t : exprType(l, elseIdx)
     }
     if k == XE_ARRAY_LIST {
         if (*e).argsCount == 0 { return -1 }
@@ -390,6 +397,9 @@ fn callType(l: *Lowerer, e: *XExpr) -> i32 {
     if (*lhs).kind == XE_FIELD {
         local recvTy = exprType(l, (*lhs).lhs)
         if recvTy < 0 { return -1 }
+        if interfaceOf(l, recvTy) >= 0 {
+            return interfaceCallType(l, interfaceOf(l, recvTy), l.s.exprTextAt((*e).lhs))
+        }
         local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt((*e).lhs))
         if !(*m).found { return -1 }
         local decls = methodsNamed((*m).owner, (*m).cdecl, l.s.exprTextAt((*e).lhs))
