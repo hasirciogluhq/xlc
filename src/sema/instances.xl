@@ -4,6 +4,7 @@
 // `E$V`), so instantiating `E` also interns the instance of each part, named `E<i32>$V` after
 // it. The xlang source of sema/instances.cpp.
 from "std" import String, Vec, format
+from "std/io" import eprint
 from "../lang/ast/ast" import XStr, XSpan, XD_FN, XD_STRUCT, XD_CLASS, XD_INTERFACE, XD_IMPL,
     XD_ENUM
 from "./sema" import Sema, EntityRef, InstanceInfo, SY_FN, SY_STRUCT, SY_CLASS, SY_INTERFACE,

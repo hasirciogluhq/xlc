@@ -84,20 +84,20 @@ fn wholeName(l: *Lowerer, sum: Sum) -> str {
     return l.keep(sum.owner.qualify(sum.owner.text((*sum.decl).name)).asStr())
 }
 
-fn tagTypeName(l: *Lowerer, sum: Sum) -> str {
+export fn tagTypeName(l: *Lowerer, sum: Sum) -> str {
     return l.keep(sum.owner.qualify(format("{}$Tag", baseOf(sum)).asStr()).asStr())
 }
 
-fn dataTypeName(l: *Lowerer, sum: Sum) -> str {
+export fn dataTypeName(l: *Lowerer, sum: Sum) -> str {
     return l.keep(sum.owner.qualify(format("{}$Data{}", baseOf(sum), argsOf(sum)).asStr()).asStr())
 }
 
-fn payloadTypeName(l: *Lowerer, sum: Sum, vname: str) -> str {
+export fn payloadTypeName(l: *Lowerer, sum: Sum, vname: str) -> str {
     return l.keep(sum.owner.qualify(format("{}${}{}", baseOf(sum), vname, argsOf(sum)).asStr()).asStr())
 }
 
 /// The type of payload value `i` of variant `v`, resolved in the declaring module and adopted.
-fn payloadType(l: *Lowerer, sum: Sum, v: *SSumVariant, i: u32) -> i32 {
+export fn payloadType(l: *Lowerer, sum: Sum, v: *SSumVariant, i: u32) -> i32 {
     return adoptFrom(l, sum.owner, resolve(sum.owner, ((*v).payloadFirst + i) as i32))
 }
 
@@ -111,7 +111,7 @@ fn variantIndex(sum: Sum, name: str) -> i32 {
 }
 
 /// Index of the variant's field inside `E$Data`: only variants with data have one.
-fn dataIndex(sum: Sum, variant: i32) -> u32 {
+export fn dataIndex(sum: Sum, variant: i32) -> u32 {
     local n: u32 = 0
     for i in 0..variant as usize {
         local v = sum.owner.variants.get(((*sum.decl).variantsFirst + i as u32) as usize)

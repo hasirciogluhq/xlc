@@ -28,14 +28,15 @@ from "./queries" import lowerLayoutQuery, enumMemberValue, enumMemberValueIn, un
     isConstValue
 from "./call" import lowerCall
 from "./sum" import sumNamed, sumOfType, lowerSumValue, lowerSumSwitch
-from "./methods" import classSelfType
+from "./methods" import classSelfType, classLoc, baseLoc, methodsNamed
+from "./own" import needsDrop, registerDrop, moveOut, dropAssign, dropPlace, dropCallOn
 from "./typing" import listFits, exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
     fieldTypeOf
 from "./diagnose" import coerceChecked, checkCast, checkIndex, checkSlice, checkDeref, checkField,
     checkStructLit, checkDuplicateInit, knownField, reportTwoSites
 from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
-from "./builtins" import lowerRawWrite
+from "./builtins" import lowerRawWrite, needsDropTest
 from "./propagate" import lowerPropagate
 from "./iterate" import lowerForEach
 from "../sema/const_eval" import evalConst
@@ -154,33 +155,83 @@ export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: 
             (*e).localId = id
             l.scopes.declare(e)
         }
+        // The function frame: the drops of the parameters it owns, run after the body's own.
+        l.defers.push(Vec<i32>())
+        local prologue = Vec<i32>()
         for i in 0..(*d).paramsCount as usize {
             local p = l.s.paramAt((*d).paramsFirst as usize + i)
             if (*p).isSelf != 0 { continue }
-            local ty = l.typeName(resolve(l.s, (*p).ty))
+            local pt = resolve(l.s, (*p).ty)
+            local ty = l.typeName(pt)
             local id = addLocal(l, l.s.text((*p).name), ty.asStr())
             l.fnParamCount = l.fnParamCount + 1
             local e = new ScopeEntry()
             (*e).kind = SE_LOCAL
             (*e).name = String(l.s.text((*p).name))
-            (*e).ty = resolve(l.s, (*p).ty)
+            (*e).ty = pt
             (*e).localId = id
             l.scopes.declare(e)
+            registerDrop(l, id, pt, true, &prologue)
+        }
+        // A derived `init` first runs the base class's argument-less `init` on `self`.
+        if owner.len > 0 && l.s.text((*d).name) == "init" {
+            local baseCall = baseInitOf(l, owner)
+            if baseCall.length() > 0 {
+                local args = Vec<i32>()
+                args.push(l.b.localRef(l.selfLocal, l.keep(format("*{}", owner).asStr())))
+                local range = l.b.args(args)
+                prologue.push(l.b.exprStmt(l.b.call(l.keep(baseCall.asStr()), range.0, range.1, "void")))
+            }
         }
         // The body.
         if (*d).hasBody != 0 && (*d).body >= 0 {
             local body = lowerBlockInto(l, (*d).body)
             checkReachesEnd(l, d, &body)
-            // The `defer` flags are declared before the first statement (C++ function.cpp).
+            if !endsInJump(l, &body) { emitDefers(l, l.defers.length() - 1, &body) }
+            // The `defer` and drop flags are declared before the first statement (C++ function.cpp).
             for i in 0..l.fnFlags.length() {
                 l.fnBody.push(l.b.localStmt(*l.fnFlags.get(i), "", "bool", l.b.boolConst(false, "bool")))
             }
+            for i in 0..prologue.length() { l.fnBody.push(*prologue.get(i)) }
             for i in 0..body.length() {
                 l.fnBody.push(*body.get(i))
             }
         }
+        l.defers.pop()
         endFunction(l, item)
     }
+
+/// The fixed answer of an `if` condition that is `__builtin_needsDrop<T>()` or its negation: 1
+/// true, 0 false, -1 when the condition is not such a test.
+fn dropTestOf(l: *Lowerer, cond: i32) -> i32 {
+    local e = l.s.exprAt(cond)
+    if (*e).kind == XE_UNARY && (*e).unaryOp == XU_NOT {
+        local inner = dropTestOf(l, (*e).lhs)
+        return inner < 0 ? -1 : 1 - inner
+    }
+    if (*e).kind != XE_CALL || (*l.s.exprAt((*e).lhs)).kind != XE_NAME { return -1 }
+    if l.s.exprTextAt((*e).lhs) != "__builtin_needsDrop" { return -1 }
+    local answer = needsDropTest(l, e)
+    return answer < 0 ? 0 : answer
+}
+
+/// The key of the argument-less `init` of the base class of `cls` (a qualified class name), ""
+/// when it has no base or the base has no such `init`.
+fn baseInitOf(l: *Lowerer, cls: str) -> String {
+    local at = classLoc(l.s, l.s.types.get(classSelfType(l.s, cls)).elem)
+    if at.decl < 0 { return String("") }
+    local base = baseLoc(at.owner, at.decl)
+    if base.decl < 0 { return String("") }
+    for m in methodsNamed(base.owner, base.decl, "init") {
+        local md = base.owner.declAt(m as usize)
+        local plain = true
+        for i in 0..(*md).paramsCount as usize {
+            if (*base.owner.paramAt((*md).paramsFirst as usize + i)).isSelf == 0 { plain = false }
+        }
+        if plain { return format("{}.init", base.owner.qualify(base.owner.text((*base.owner.declAt(base.decl as usize)).name)).asStr()) }
+    }
+    return String("")
+}
 
     /// A top-level function or a class method: dispatches on the declaration.
 export fn runFunctionDecl(l: *Lowerer, item: i32, declIdx: i32, qname: str, localName: str, owner: str) {
@@ -249,7 +300,14 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             }
             local value = lowerExpr(l, (*st).expr)
             if value < 0 { return -1 }
-            // An expression statement: the value is discarded.
+            // An expression statement: the value is discarded; a droppable one is dropped at once.
+            local vt = exprType(l, (*st).expr)
+            if needsDrop(l, vt) {
+                local tyName = typeNameOf(l, vt)
+                local tmp = hiddenLocal(l, "disc", tyName)
+                l.emitted.push(l.b.localStmt(tmp, "", tyName, value))
+                return dropPlace(l, l.b.localRef(tmp, tyName), vt)
+            }
             return l.b.exprStmt(value)
         }
         if (*st).kind == XS_RETURN {
@@ -262,7 +320,7 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             }
             local value = -1
             if (*st).expr >= 0 {
-                value = lowerExprAs(l, (*st).expr, l.fnRetTy)
+                value = moveOut(l, lowerExprAs(l, (*st).expr, l.fnRetTy), l.fnRetTy, false)
             }
             // With defers pending, the value is computed first, into `$retN`, and then the
             // defers run (C++ statement.cpp, Return).
@@ -282,6 +340,14 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             return l.b.returnStmt(value)
         }
         if (*st).kind == XS_IF {
+            // `if __builtin_needsDrop<T>() { } else { }`: only the branch that runs is lowered, so
+            // each branch may use what only that kind of `T` has (`p.clone()` on a class).
+            local fixed = dropTestOf(l, (*st).expr)
+            if fixed >= 0 {
+                if fixed == 1 { return l.b.blockStmt(lowerBlockInto(l, (*st).body)) }
+                if (*st).elseBody >= 0 { return l.b.blockStmt(lowerBlockInto(l, (*st).elseBody)) }
+                return -1
+            }
             local cond = lowerExpr(l, (*st).expr)
             local body = lowerBlockInto(l, (*st).body)
             local elseBody = Vec<i32>()
@@ -345,10 +411,25 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             return l.b.whileStmt(cond, body, true)
         }
         if (*st).kind == XS_DELETE {
-            // `delete p`: drop the value, then free. The registered free function.
+            // `delete p`: the pointer is held once, the pointee dropped, then freed through the
+            // registered `free` (E0501 without one).
+            if l.b.freeFunction.length() == 0 {
+                l.err("E0501", (*st).span, "`delete` has no registered `free` function",
+                    "register one with `register(free) fn name(p: *void)`")
+                return -1
+            }
             local p = lowerExpr(l, (*st).expr)
+            if p < 0 { return -1 }
+            local pt = exprType(l, (*st).expr)
+            local ptrName = typeNameOf(l, pt)
+            local held = hiddenLocal(l, "del", ptrName)
+            l.emitted.push(l.b.localStmt(held, "", ptrName, p))
+            local elem = pt >= 0 && l.s.types.get(pt).kind == T_POINTER ? l.s.types.get(pt).elem : -1
+            if needsDrop(l, elem) {
+                l.emitted.push(l.b.exprStmt(dropCallOn(l, l.b.localRef(held, ptrName), elem)))
+            }
             local args = Vec<i32>()
-            args.push(p)
+            args.push(l.b.cast(l.b.localRef(held, ptrName), "*void", false))
             local range = l.b.args(args)
             return l.b.exprStmt(l.b.call(l.b.freeFunction.asStr(), range.0, range.1, "void"))
         }
@@ -374,7 +455,10 @@ export fn lowerLet(l: *Lowerer, idx: i32) -> i32 {
             if vty < 0 { vty = effectiveType(l, (*st).expr, -1) }
         }
         local tyName = vty < 0 ? "void" : l.keep(l.s.types.text(vty).asStr())
+        value = moveOut(l, value, vty, false)
         local id = addLocal(l, name, tyName)
+        registerDrop(l, id, vty, value >= 0, &l.emitted)
+        // Bound after the initializer: `local x = x` reads the outer `x`.
         local e = new ScopeEntry()
         (*e).kind = SE_LOCAL
         (*e).name = String(name)
@@ -870,7 +954,20 @@ fn lowerAssign(l: *Lowerer, st: *XStmt) -> i32 {
         if (*st).hasCompoundOp != 0 {
             value = lowerBinaryOf(l, (*st).compoundOp, (*st).target, (*st).expr, want)
         } else {
-            value = lowerExprAs(l, (*st).expr, want)
+            value = moveOut(l, lowerExprAs(l, (*st).expr, want), want, false)
+        }
+        if target < 0 || value < 0 { return -1 }
+        // A droppable target: the old value is dropped once the new one is computed. In a class
+        // `init`, `self.f = v` initializes a field of zeroed memory, so nothing is dropped.
+        local te = l.s.exprAt((*st).target)
+        local raw = l.currentClass.length() > 0 && l.fnDecl != nil && l.s.text((*l.fnDecl).name) == "init" &&
+            (*te).kind == XE_FIELD && (*l.s.exprAt((*te).lhs)).kind == XE_NAME && l.s.exprTextAt((*te).lhs) == "self"
+        if !raw && needsDrop(l, want) {
+            local out = Vec<i32>()
+            dropAssign(l, target, value, want, &out)
+            local last = *out.get(out.length() - 1)
+            for i in 0..out.length() - 1 { l.emitted.push(*out.get(i)) }
+            return last
         }
         return l.b.assign(target, value)
     }
@@ -1184,7 +1281,7 @@ fn lowerFieldInits(l: *Lowerer, e: *XExpr, agg: i32) {
         local ft = fieldTypeOf(l, agg, name)
         local v = -1
         if ft >= 0 {
-            v = lowerExprAs(l, (*f).value, ft)
+            v = moveOut(l, lowerExprAs(l, (*f).value, ft), ft, false)
         } else {
             v = lowerExpr(l, (*f).value)
         }

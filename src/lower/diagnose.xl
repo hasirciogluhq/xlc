@@ -13,7 +13,7 @@ from "../sema/types" import Types, T_VOID, T_NEVER, T_BOOL, T_INT, T_FLOAT, T_PO
 from "../sema/conversion" import implicitConversion, C_OK, C_WARN, C_SIGNEDNESS, C_NEEDS_CAST
 from "./state" import Lowerer
 from "./interface" import toInterface
-from "./typing" import exprType, typeNameOf, fieldPos, aggregateDecl
+from "./typing" import exprType, typeNameOf, fieldPos, aggregateDecl, aggregateOwner
 from "../sema/layout_calc" import attrHasIdent
 from "../util/source" import Span
 from "../util/diagnostics" import Diagnostic, Label, SEV_ERROR
@@ -51,7 +51,8 @@ export fn cCompatible(l: *Lowerer, t: i32) -> bool {
     }
     if k == T_STRUCT {
         local decl = aggregateDecl(l, t)
-        return decl != nil && attrHasIdent(l.s, (*decl).attrsFirst, (*decl).attrsCount, "repr", "c")
+        // The attributes index the arena of the module that declares the struct.
+        return decl != nil && attrHasIdent(aggregateOwner(l, t), (*decl).attrsFirst, (*decl).attrsCount, "repr", "c")
     }
     return false
 }

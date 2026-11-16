@@ -13,6 +13,8 @@ from "../sema/types" import T_INT, T_BOOL, T_POINTER, T_FLOAT, T_FN_PTR, T_ENUM,
 from "./state" import Lowerer
 from "./typing" import exprType, typeNameOf, resolveBase
 from "./function" import lowerExpr, lowerExprAs
+from "./own" import needsDrop, moveOut, dropCallOn
+from "../sema/resolve" import resolve
 
 /// True for a name of the closed `__builtin_` list that this file lowers as an expression.
 export fn isBuiltinName(name: str) -> bool {
@@ -20,7 +22,8 @@ export fn isBuiltinName(name: str) -> bool {
         name == "__builtin_atomicXchg" || name == "__builtin_atomicCas" ||
         name == "__builtin_atomicAdd" || name == "__builtin_read" || name == "__builtin_write" ||
         name == "__builtin_fence" || name == "__builtin_unwindPads" ||
-        name == "__builtin_unwindPadCount" || name == "__builtin_asm"
+        name == "__builtin_unwindPadCount" || name == "__builtin_asm" ||
+        name == "__builtin_needsDrop" || name == "__builtin_drop"
 }
 
 /// The type of a builtin call (a Types index, -1 when unknown): the pointee for a read and the
@@ -28,7 +31,8 @@ export fn isBuiltinName(name: str) -> bool {
 export fn builtinType(l: *Lowerer, e: *XExpr, name: str) -> i32 {
     local t = l.s.types
     if name == "__builtin_fence" || name == "__builtin_asm" || name == "__builtin_write" ||
-        name == "__builtin_atomicStore" { return t.makeVoid() }
+        name == "__builtin_atomicStore" || name == "__builtin_drop" { return t.makeVoid() }
+    if name == "__builtin_needsDrop" { return t.makeBool() }
     if name == "__builtin_unwindPads" { return t.makePointer(t.makeInt(0, false)) }
     if name == "__builtin_unwindPadCount" { return t.makeInt(0, false) }
     if (*e).argsCount == 0 { return -1 }
@@ -46,6 +50,12 @@ export fn lowerBuiltin(l: *Lowerer, idx: i32, e: *XExpr, name: str) -> i32 {
         return -1
     }
     if name == "__builtin_read" { return lowerRawRead(l, e) }
+    if name == "__builtin_drop" { return lowerDrop(l, e) }
+    if name == "__builtin_needsDrop" {
+        local answer = needsDropTest(l, e)
+        if answer < 0 { return -1 }
+        return l.b.boolConst(answer == 1, "bool")
+    }
     if name == "__builtin_unwindPads" || name == "__builtin_unwindPadCount" {
         if (*e).argsCount != 0 {
             l.err("E0710", (*e).span, format("`{}` takes no arguments", name).asStr(),
@@ -143,9 +153,38 @@ export fn lowerRawWrite(l: *Lowerer, e: *XExpr) -> i32 {
     if pt < 0 { return -1 }
     local elem = l.s.types.get(pt).elem
     local p = lowerExpr(l, pArg)
-    local v = lowerExprAs(l, argAt(l, e, 1), elem)
+    local v = moveOut(l, lowerExprAs(l, argAt(l, e, 1), elem), elem, false)
     if p < 0 || v < 0 { return -1 }
     return l.b.assign(l.b.deref(p, typeNameOf(l, elem)), v)
+}
+
+/// `__builtin_needsDrop<T>()` as a compile-time answer: 1 true, 0 false, -1 after E0710. `if` on
+/// it lowers only the branch that runs (see `lowerStmt`).
+export fn needsDropTest(l: *Lowerer, e: *XExpr) -> i32 {
+    local callee = l.s.exprAt((*e).lhs)
+    if (*callee).genericArgsCount != 1 || (*e).argsCount != 0 {
+        l.err("E0710", (*e).span, "`__builtin_needsDrop` takes one type: `__builtin_needsDrop<T>()`",
+            "wrong number of arguments")
+        return -1
+    }
+    local written = l.s.flat.ref(l.s.flat.r.typeRefs, (*callee).genericArgsFirst)
+    return needsDrop(l, resolve(l.s, l.s.types.internAst(written))) ? 1 : 0
+}
+
+/// `__builtin_drop(p)`: runs the drop of the pointee of `p`; nothing when it needs none.
+fn lowerDrop(l: *Lowerer, e: *XExpr) -> i32 {
+    if (*e).argsCount != 1 {
+        l.err("E0710", (*e).span, "`__builtin_drop` takes one pointer", "wrong number of arguments")
+        return -1
+    }
+    local arg = argAt(l, e, 0)
+    local pt = pointerArg(l, arg, "__builtin_drop", "E0709")
+    if pt < 0 { return -1 }
+    local p = lowerExpr(l, arg)
+    if p < 0 { return -1 }
+    local elem = l.s.types.get(pt).elem
+    if !needsDrop(l, elem) { return p }
+    return dropCallOn(l, p, elem)
 }
 
 /// `__builtin_atomicLoad/Store/Xchg/Cas/Add`: the pointee is an integer, `bool` or pointer and

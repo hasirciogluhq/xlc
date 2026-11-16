@@ -79,6 +79,7 @@ export class HirBuilder {
     argsFunction: String
     initFns: Vec<String>
     finiFns: Vec<String>
+    glues: Vec<String>   ///< the drop glue functions made so far (own.xl), once per program
 
     fn init(self) {
         self.fns = Vec<*FnBuild>()
@@ -102,6 +103,7 @@ export class HirBuilder {
         self.argsFunction = String("")
         self.initFns = Vec<String>()
         self.finiFns = Vec<String>()
+        self.glues = Vec<String>()
     }
 
     /// Interns `text` and returns its view. Each string is its own heap block, kept alive by the
@@ -142,6 +144,22 @@ export class HirBuilder {
 
     fn exprAt(self, idx: i32) -> *XlcHirExpr {
         return (self.exprs.data as usize + idx as usize * sizeOf(XlcHirExpr)) as *XlcHirExpr
+    }
+
+    /// A second record equal to `idx` (its children are shared): a place that is read twice.
+    fn clone(self, idx: i32) -> i32 {
+        local copy: XlcHirExpr = *self.exprAt(idx)
+        self.exprs.push(copy)
+        return (self.exprs.length() - 1) as i32
+    }
+
+    /// A local record `name: typeName` of a function built here (drop glue, closures).
+    fn local(self, name: str, typeName: str) -> XlcHirLocal {
+        local rec: XlcHirLocal
+        rec.name = self.str(name)
+        rec.typeName = self.str(typeName)
+        rec.span = self.span
+        return rec
     }
 
     fn intConst(self, value: u64, typeName: str) -> i32 {

@@ -10,7 +10,7 @@
 // Not lowered yet, and reported with E0709 or left as the value call: generic functions and
 // methods (their instances), virtual methods (vtable slots), interface methods, constructors,
 // sum-variant calls, `operator()` on a class value, packs, and the `__builtin_` forms.
-from "std" import String, Vec, format, eprint
+from "std" import String, Vec, format
 from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
 from "../sema/types" import T_POINTER
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL, SE_TYPE
@@ -28,6 +28,7 @@ from "./helpers" import overloadKey
 from "./interface" import interfaceOf, lowerInterfaceCall
 from "./inherent" import lowerInherentCall
 from "./builtins" import isBuiltinName, lowerBuiltin
+from "./own" import needsDrop, moveOut, materializeTemp
 
 /// A call: the callee's form decides the lowering (see the file comment). Returns the HIR
 /// expression index, -1 after a diagnostic.
@@ -118,7 +119,8 @@ export fn lowerArgs(l: *Lowerer, e: *XExpr, params: *Vec<i32>, out: *Vec<i32>, n
     }
     for i in 0..(*e).argsCount as usize {
         local a = l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32)
-        local v = lowerExprAs(l, a, *(*params).get(i))
+        // A droppable argument moves into the callee, which owns its parameters.
+        local v = moveOut(l, lowerExprAs(l, a, *(*params).get(i)), *(*params).get(i), false)
         if v < 0 { return false }
         (*out).push(v)
     }
@@ -201,11 +203,15 @@ fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef
         if base < 0 { return -1 }
         if !isPlace(l, recvIdx) {
             // A temporary receiver (`String(x).slice(..)`) is kept in a hidden local for the
-            // call, so its address can be taken. Its drop belongs to the ownership pass.
+            // call, so its address can be taken; a droppable one is dropped with the block.
             local recvName = typeNameOf(l, recvTy)
-            local tmp = hiddenLocal(l, "recv", recvName)
-            l.emitted.push(l.b.localStmt(tmp, "", recvName, base))
-            base = l.b.localRef(tmp, recvName)
+            if needsDrop(l, recvTy) {
+                base = materializeTemp(l, base, recvTy)
+            } else {
+                local tmp = hiddenLocal(l, "recv", recvName)
+                l.emitted.push(l.b.localStmt(tmp, "", recvName, base))
+                base = l.b.localRef(tmp, recvName)
+            }
         }
         selfArg = l.b.addrOf(base, typeNameOf(l, l.s.types.makePointer(recvTy)))
     }

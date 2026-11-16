@@ -1,0 +1,291 @@
+// Ownership of the xlang lowering pass: which types need drop, their drop glue, the drop flags of
+// locals and temporaries, moves out of locals and the drop of an overwritten value. The xlang twin
+// of sema/lower/own/{drop,moves}.cpp.
+//
+// A droppable local carries a hidden `$liveN` flag (declared `false` at the function head). Its
+// drop is the statement `if $liveN { glue(&x); $liveN = false }`, registered in the innermost
+// defer frame and in the unwind list, so every exit path runs it. A move out of the local is the
+// HIR `Move` node, which clears the flag where the value is read.
+//
+// Drop glue is made on demand, once per type for the whole program (`HirBuilder.glues`):
+//   Cls$dropGlue(p: *Cls)  the user's `drop`, the droppable fields newest first, then the base
+//   E$dropGlue(p: *E)      a payload enum: the payload of the live variant only
+//   $tupleM$dropGlue(p)    a tuple: the droppable elements, last first
+from "std" import String, Vec, format
+from "../hir/abi" import E_LOCAL_REF, E_FIELD, E_INDEX, E_DEREF, E_MOVE, E_MATERIALIZE
+from "../sema/sema" import Sema
+from "../sema/item" import SDecl, SSumVariant
+from "../sema/types" import T_STRUCT, T_CLASS, T_TUPLE
+from "../sema/resolve" import resolve
+from "./state" import Lowerer
+from "./builder" import FnBuild
+from "./methods" import classLoc, methodsNamed, ClassLoc
+from "./typing" import typeNameOf, adoptFrom, classChain
+from "./sum" import Sum, sumOfType, tagTypeName, dataTypeName, payloadTypeName, payloadType, dataIndex
+from "./function" import hiddenLocal
+
+/// True when a value of type `t` (a Types index of this module) owns something to release: a
+/// class with a `drop` method, a field or base that needs drop, a payload enum with such a
+/// payload, a tuple with such an element. Memoized by the type's text; `false` is written before
+/// the recursion, so a type that reaches itself through a pointer terminates.
+export fn needsDrop(l: *Lowerer, t: i32) -> bool {
+    if t < 0 { return false }
+    local k = l.s.types.get(t).kind
+    if k != T_STRUCT && k != T_CLASS && k != T_TUPLE { return false }
+    local key = l.s.types.text(t)
+    for i in 0..l.needsDropCache.length() {
+        if (*l.needsDropCache.get(i)).asStr() == key.asStr() { return *l.needsDropValue.get(i) }
+    }
+    local slot = l.needsDropCache.length()
+    l.needsDropCache.push(key.clone())
+    l.needsDropValue.push(false)
+    local result = computeNeedsDrop(l, t)
+    l.needsDropValue.set(slot, result)
+    return result
+}
+
+fn computeNeedsDrop(l: *Lowerer, t: i32) -> bool {
+    local rec = l.s.types.get(t)
+    if rec.kind == T_TUPLE {
+        for i in 0..rec.argsCount as usize {
+            if needsDrop(l, (rec.argsFirst + i as u32) as i32) { return true }
+        }
+        return false
+    }
+    local sum = sumOfType(l, t)
+    if sum.decl != nil as *SDecl {
+        for v in 0..(*sum.decl).variantsCount as usize {
+            local variant = sum.owner.variants.get(((*sum.decl).variantsFirst + v as u32) as usize)
+            for k in 0..(*variant).payloadCount {
+                if needsDrop(l, payloadType(l, sum, variant, k)) { return true }
+            }
+        }
+        return false
+    }
+    for at in classChain(l, t) {
+        local d = at.owner.declAt(at.decl as usize)
+        if methodsNamed(at.owner, at.decl, "drop").length() > 0 { return true }
+        for i in 0..(*d).fieldsCount as usize {
+            local f = at.owner.fieldAt((*d).fieldsFirst as usize + i)
+            if needsDrop(l, adoptFrom(l, at.owner, resolve(at.owner, (*f).ty))) { return true }
+        }
+    }
+    return false
+}
+
+/// The name of the drop glue of `t`: `Qualified$dropGlue`, or `$tuple<mangled>$dropGlue`.
+export fn dropGlueName(l: *Lowerer, t: i32) -> String {
+    local rec = l.s.types.get(t)
+    if rec.kind == T_TUPLE { return format("$tuple{}$dropGlue", l.s.types.mangle(t).asStr()) }
+    return format("{}$dropGlue", l.s.types.pathOf(rec).asStr())
+}
+
+/// `glue(addr)`: the drop of the value `addr` points at, as a void call. The glue is made on first use.
+export fn dropCallOn(l: *Lowerer, addr: i32, t: i32) -> i32 {
+    local name = dropGlueName(l, t)
+    ensureGlue(l, t, name.asStr())
+    local args = Vec<i32>()
+    args.push(addr)
+    local range = l.b.args(args)
+    return l.b.call(l.keep(name.asStr()), range.0, range.1, "void")
+}
+
+/// The statement that drops the place `place` of type `t`: `glue(&place)`.
+export fn dropPlace(l: *Lowerer, place: i32, t: i32) -> i32 {
+    local ptr = l.keep(format("*{}", typeNameOf(l, t)).asStr())
+    return l.b.exprStmt(dropCallOn(l, l.b.addrOf(place, ptr), t))
+}
+
+/// `if flag { glue(&var); flag = false }`.
+export fn dropStmt(l: *Lowerer, v: u32, flag: u32, t: i32) -> i32 {
+    local body = Vec<i32>()
+    body.push(dropPlace(l, l.b.localRef(v, typeNameOf(l, t)), t))
+    body.push(l.b.assign(l.b.localRef(flag, "bool"), l.b.boolConst(false, "bool")))
+    return l.b.ifStmt(l.b.localRef(flag, "bool"), body, Vec<i32>())
+}
+
+/// The drop flag of local `v`, -1 when it has none.
+export fn flagOf(l: *Lowerer, v: u32) -> i32 {
+    local n = l.dropFlags.length() / 2
+    for i in 0..n {
+        local j = n - 1 - i
+        if *l.dropFlags.get(2 * j) == v as i32 { return *l.dropFlags.get(2 * j + 1) }
+    }
+    return -1
+}
+
+/// Gives local `v` of type `t` a drop flag set to `initialized` (the set goes to `out`) and
+/// registers its drop in the innermost defer frame and the unwind list. A type that needs no drop
+/// gets nothing.
+export fn registerDrop(l: *Lowerer, v: u32, t: i32, initialized: bool, out: *Vec<i32>) {
+    if !needsDrop(l, t) { return }
+    local flag = hiddenLocal(l, "live", "bool")
+    l.fnFlags.push(flag)
+    (*out).push(l.b.assign(l.b.localRef(flag, "bool"), l.b.boolConst(initialized, "bool")))
+    l.dropFlags.push(v as i32)
+    l.dropFlags.push(flag as i32)
+    if l.defers.length() == 0 { return }
+    local cleanup = dropStmt(l, v, flag, t)
+    l.fnUnwind.push(cleanup)
+    (*l.defers.get(l.defers.length() - 1)).push(cleanup)
+}
+
+/// The value `value` of type `t` read where it is consumed (an argument, an initializer, a
+/// returned value, a stored field): a droppable local is moved, so its flag is cleared and its
+/// drop does not run. A field, element or pointee cannot be moved out (E0720) unless `fromSum`
+/// (the payload of a `case` binding, whose owner is consumed as a whole).
+export fn moveOut(l: *Lowerer, value: i32, t: i32, fromSum: bool) -> i32 {
+    if value < 0 || !needsDrop(l, t) { return value }
+    local e = l.b.exprAt(value)
+    local k = (*e).kind
+    if k == E_LOCAL_REF {
+        local flag = flagOf(l, (*e).localId)
+        if flag < 0 { return value }
+        local m = l.b.expr(E_MOVE, typeNameOf(l, t))
+        (*l.b.exprAt(m)).lhs = value
+        (*l.b.exprAt(m)).localId = flag as u32
+        return m
+    }
+    if (k == E_FIELD || k == E_INDEX || k == E_DEREF) && !fromSum {
+        l.s.diag.error("E0720", (*e).span, "cannot move out of a field, element or pointer",
+            "take its address (`&x.f`) or copy it through a `clone()` method")
+        return -1
+    }
+    return value
+}
+
+/// A temporary of type `t` whose address is taken (a method receiver): it is stored in a hidden
+/// `$tmpN` with its own flag, and dropped when the enclosing block ends.
+export fn materializeTemp(l: *Lowerer, value: i32, t: i32) -> i32 {
+    local tyName = typeNameOf(l, t)
+    if !needsDrop(l, t) || l.defers.length() == 0 { return value }
+    local tmp = hiddenLocal(l, "tmp", tyName)
+    local flag = hiddenLocal(l, "live", "bool")
+    l.fnFlags.push(flag)
+    local cleanup = dropStmt(l, tmp, flag, t)
+    l.fnUnwind.push(cleanup)
+    (*l.defers.get(l.defers.length() - 1)).push(cleanup)
+    local m = l.b.expr(E_MATERIALIZE, tyName)
+    local p = l.b.exprAt(m)
+    (*p).lhs = value
+    (*p).localId = tmp
+    (*p).index = flag
+    return m
+}
+
+/// `target = value` where the type needs drop: the new value is computed into `$asgN` first (it
+/// may read the old one), the old value is dropped, then stored; a tracked local is live again.
+export fn dropAssign(l: *Lowerer, target: i32, value: i32, t: i32, out: *Vec<i32>) {
+    local tyName = typeNameOf(l, t)
+    local tmp = hiddenLocal(l, "asg", tyName)
+    (*out).push(l.b.localStmt(tmp, "", tyName, value))
+    local te = l.b.exprAt(target)
+    local flag = (*te).kind == E_LOCAL_REF ? flagOf(l, (*te).localId) : -1
+    if flag >= 0 {
+        (*out).push(dropStmt(l, (*te).localId, flag as u32, t))
+    } else {
+        (*out).push(dropPlace(l, l.b.clone(target), t))
+    }
+    (*out).push(l.b.assign(target, l.b.localRef(tmp, tyName)))
+    if flag >= 0 {
+        (*out).push(l.b.assign(l.b.localRef(flag as u32, "bool"), l.b.boolConst(true, "bool")))
+    }
+}
+
+// ---------------------------------------------------------------------------------- the glue
+
+/// Makes the glue `name` of `t` unless the program has it already.
+fn ensureGlue(l: *Lowerer, t: i32, name: str) {
+    for i in 0..l.b.glues.length() {
+        if (*l.b.glues.get(i)).asStr() == name { return }
+    }
+    l.b.glues.push(String(name))
+    local ptrName = l.keep(format("*{}", typeNameOf(l, t)).asStr())
+    local body = Vec<i32>()
+    local rec = l.s.types.get(t)
+    if rec.kind == T_TUPLE {
+        for j in 0..rec.argsCount as usize {
+            local i = rec.argsCount as usize - 1 - j
+            local et = (rec.argsFirst + i as u32) as i32
+            if !needsDrop(l, et) { continue }
+            local f = l.b.field(l.b.localRef(0, ptrName), l.keep(format("{}", i).asStr()), typeNameOf(l, et), true, i as u32)
+            body.push(dropPlace(l, f, et))
+        }
+    } else if sumOfType(l, t).decl != nil as *SDecl {
+        sumGlue(l, sumOfType(l, t), ptrName, &body)
+    } else {
+        classGlue(l, t, ptrName, &body)
+    }
+    local f = new FnBuild(name)
+    (*f).symbol = String(name)
+    (*f).ret = String("void")
+    (*f).locals.push(l.b.local("p", ptrName))
+    (*f).paramCount = 1
+    local range = l.b.stmtList(&body)
+    (*f).bodyFirst = range.0
+    (*f).bodyCount = range.1
+    (*f).exported = rec.kind != T_TUPLE
+    l.b.addFn(f)
+}
+
+/// A class: its own `drop`, its droppable fields newest first, then the same for each base class
+/// up the chain (the layout puts the base's fields first, so `pos` counts from the root).
+fn classGlue(l: *Lowerer, t: i32, ptrName: str, body: *Vec<i32>) {
+    local chain = classChain(l, t)
+    local firstPos = Vec<u32>()
+    local pos: u32 = 0
+    for at in chain {
+        firstPos.push(pos)
+        pos += (*at.owner.declAt(at.decl as usize)).fieldsCount
+    }
+    for j in 0..chain.length() {
+        local c = chain.length() - 1 - j
+        local at = *chain.get(c)
+        local o = at.owner
+        local d = o.declAt(at.decl as usize)
+        local cq = o.qualify(o.text((*d).name))
+        if methodsNamed(o, at.decl, "drop").length() > 0 {
+            local args = Vec<i32>()
+            args.push(l.b.localRef(0, ptrName))
+            local range = l.b.args(args)
+            (*body).push(l.b.exprStmt(l.b.call(l.keep(format("{}.drop", cq.asStr()).asStr()), range.0, range.1, "void")))
+        }
+        for k in 0..(*d).fieldsCount as usize {
+            local i = (*d).fieldsCount as usize - 1 - k
+            local fd = o.fieldAt((*d).fieldsFirst as usize + i)
+            local ft = adoptFrom(l, o, resolve(o, (*fd).ty))
+            if !needsDrop(l, ft) { continue }
+            local place = l.b.field(l.b.localRef(0, ptrName), l.keep(o.text((*fd).name)), typeNameOf(l, ft), true,
+                *firstPos.get(c) + i as u32)
+            (*body).push(dropPlace(l, place, ft))
+        }
+    }
+}
+
+/// A payload enum: `if p.tag == V { drop(&p.data.V._k) ... } else if ...` over the variants with
+/// a droppable payload; the bytes of the other variants are never read.
+fn sumGlue(l: *Lowerer, sum: Sum, ptrName: str, body: *Vec<i32>) {
+    local tagName = tagTypeName(l, sum)
+    local chain = -1
+    for j in 0..(*sum.decl).variantsCount as usize {
+        local vi = (*sum.decl).variantsCount as usize - 1 - j
+        local v = sum.owner.variants.get(((*sum.decl).variantsFirst + vi as u32) as usize)
+        local vname = l.keep(sum.owner.text((*v).name))
+        local arm = Vec<i32>()
+        for k in 0..(*v).payloadCount {
+            local pt = payloadType(l, sum, v, k)
+            if !needsDrop(l, pt) { continue }
+            local data = l.b.field(l.b.localRef(0, ptrName), "data", dataTypeName(l, sum), true, 1)
+            local payload = l.b.field(data, vname, payloadTypeName(l, sum, vname), false, dataIndex(sum, vi as i32))
+            local value = l.b.field(payload, l.keep(format("_{}", k).asStr()), typeNameOf(l, pt), false, k)
+            arm.push(dropPlace(l, value, pt))
+        }
+        if arm.length() == 0 { continue }
+        local tag = l.b.field(l.b.localRef(0, ptrName), "tag", tagName, true, 0)
+        local test = l.b.binary("==", tag, l.b.intConst(vi as u64, tagName), "bool")
+        local rest = Vec<i32>()
+        if chain >= 0 { rest.push(chain) }
+        chain = l.b.ifStmt(test, arm, rest)
+    }
+    if chain >= 0 { (*body).push(chain) }
+}

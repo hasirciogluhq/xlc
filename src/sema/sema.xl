@@ -399,10 +399,15 @@ export class Sema {
         d.underlying = -1
         d.call = -1
         // Generic parameters.
-        local gFirst = self.types.strs.length() as u32
+        // `str` itself appends a new text to `strs`, so the views are collected first and then
+        // laid out contiguously: exactly one entry per parameter.
+        local gViews = Vec<XStr>()
         for i in 0..(*src).genericCount as usize {
-            self.types.strs.push(self.str(self.flat.strOf(
-                self.flat.pathSeg((*src).genericFirst + i as u32))))
+            gViews.push(self.str(self.flat.strOf(self.flat.pathSeg((*src).genericFirst + i as u32))))
+        }
+        local gFirst = self.types.strs.length() as u32
+        for i in 0..gViews.length() {
+            self.types.strs.push(*gViews.get(i))
         }
         d.genericFirst = gFirst
         d.genericCount = (*src).genericCount

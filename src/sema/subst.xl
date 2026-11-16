@@ -110,7 +110,9 @@ export fn substituteType(s: *Sema, idx: i32, env: *TypeEnv) -> i32 {
 /// shared with the generic. The generic parameters stay (a generic method of an instance stays
 /// generic and is instantiated per call).
 export fn instantiateFn(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
-    local src = s.declAt(declIdx as usize)
+    // A copy: a substitution may intern new declarations, which can move the arena.
+    local held: SDecl = *s.declAt(declIdx as usize)
+    local src = &held
     local d: SDecl
     d = *src
     d.kind = (*src).kind
@@ -151,7 +153,9 @@ fn cloneMethod(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
 
 /// Instantiates a declaration under `env`, renaming it to `newName`. Returns the new SDecl index.
 export fn instantiateDecl(s: *Sema, declIdx: i32, env: *TypeEnv, newName: str) -> i32 {
-    local src = s.declAt(declIdx as usize)
+    // A copy: cloning the methods pushes into `s.decls`, which can move the arena.
+    local held: SDecl = *s.declAt(declIdx as usize)
+    local src = &held
     local kind = (*src).kind
     if kind == XD_FN {
         local out = instantiateFn(s, declIdx, env)

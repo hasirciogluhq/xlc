@@ -61,8 +61,17 @@ is banned.
 
 ## Editing
 
-- File edits use the built-in Read, Edit and Write tools. Bash is for build, run, inspect, and
+- **File edits use the built-in Read, Edit and Write tools, always (hard rule).** This holds for
+  every file: source, docs, tests and scratch files. No `sed`, `awk`, `perl`, `python`, heredoc
+  or shell redirection writes or rewrites text in a file. Bash is for build, run, inspect, and
   moving or deleting whole files.
+- **Why Edit wins.** Edit matches the exact old text and fails loudly when it is missing or not
+  unique, so every change is verified in the same call. `sed` succeeds silently when nothing
+  matches, breaks on quoting and on BSD versus GNU flags, and cannot do multi-line edits safely;
+  the reread to find out what it did costs more tokens than the Edit would have. Several
+  independent Edit calls go in one response, in parallel.
+- The only exception is a mechanical bulk update of the same line in many files (a module
+  rename), where one shell command replaces dozens of identical Edits.
 - Compiler code is C++23 minimum, C++26 where supported, with modern library idioms, RAII, no raw
   owning pointers, and no macros where constexpr or templates work.
 
