@@ -15,6 +15,8 @@ from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_D
 from "../sema/types" import T_POINTER
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL
 from "./function" import lowerExpr, lowerExprAs
+from "./sum" import sumNamed, lowerSumCall
+from "../sema/item" import SDecl
 from "./queries" import lowerLayoutQuery
 from "./typing" import exprType, exprTypeName, typeNameOf, resolveBase, argSpecs, chooseDecl,
     functionDecls
@@ -50,6 +52,12 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         if entry == nil { return lowerNamedCall(l, idx, e, name) }
     }
     if (*callee).kind == XE_FIELD {
+        if (*l.s.exprAt((*callee).lhs)).kind == XE_NAME {
+            local sum = sumNamed(l, l.s.exprTextAt((*callee).lhs))
+            if sum.decl != nil as *SDecl {
+                return lowerSumCall(l, sum, e, l.s.exprTextAt(calleeIdx))
+            }
+        }
         local recvTy = exprType(l, (*callee).lhs)
         if recvTy >= 0 {
             local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt(calleeIdx))

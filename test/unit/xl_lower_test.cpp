@@ -153,6 +153,10 @@ const Sample kLaneASamples[] = {
     {"global-variable", "global counter: i32 = 0\nfn bump() -> i32 {\n    counter += 1\n    return counter\n}\n"},
     {"enum-plain", "enum Color {\n    Red\n    Green\n    Blue\n}\nfn pick() -> Color {\n    return Color.Green\n}\n"},
     {"enum-valued", "enum Small: u8 {\n    A\n    B = 10\n    C\n}\nfn pick() -> Small {\n    return Small.C\n}\n"},
+    // Payload enums: construction and variants without data.
+    {"sum-construct", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn make() -> Shape {\n    return Shape.Circle(3)\n}\n"},
+    {"sum-unit", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn make() -> Shape {\n    return Shape.Dot\n}\n"},
+    {"sum-two-payload", "enum Pair {\n    Both(i32, i32)\n    None\n}\nfn make(a: i32) -> Pair {\n    return Pair.Both(a, 2)\n}\n"},
 };
 
 // Remaining forms: the array `.len`, the `switch` checks on values and defaults.

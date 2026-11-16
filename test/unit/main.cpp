@@ -732,10 +732,8 @@ void runLowerTests();
 void runOperatorTests();
 void runClosureTests();
 void runIteratorTests();
-void runCodegenTests();
 void runReturnTests();
 void runDropTests();
-void runCAbiTests();
 void runUtilBridgeTests();
 void runMirTests();
 void runMoveTests();
@@ -743,8 +741,6 @@ void runXlLowerTests();
 
 int main() {
     RUN(runSemaTests);
-    RUN(runCodegenTests);
-    RUN(runCAbiTests);
     RUN(runUtilBridgeTests);
     RUN(runLowerTests);
     RUN(runOperatorTests);

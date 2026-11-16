@@ -1,0 +1,159 @@
+// Payload enums (sum types) of the xlang lowering pass. The twin of src/sema/lower/sum/sum.cpp.
+//
+// The parser turns `enum E { A(i64), B }` into the struct `E { tag: E$Tag, data: E$Data }`, the tag
+// enum `E$Tag`, the union `E$Data { A: E$A }` and one struct `E$A` per variant with data (see
+// sema/instances.xl). Here a variant is built: `E.B` is `E { tag = 1 }`, `E.A(x)` is
+// `E { tag = 0, data = E$Data { A = E$A { _0 = x } } }`.
+//
+// Lowered: payload enums that are not generic. A generic payload enum (`Option<T>`) needs the
+// instance choice (`sumFor` in the C++ pass) and is not ported yet.
+from "std" import Vec, format
+from "../hir/abi" import XlcHirStr, XlcHirFieldInit, E_STRUCT_LIT
+from "../lang/ast/ast" import XExpr
+from "../sema/sema" import Sema, SY_STRUCT
+from "../sema/item" import SDecl
+from "../sema/resolve" import resolve
+from "./state" import Lowerer
+from "./typing" import typeNameOf
+from "./function" import lowerExprAs
+
+/// A payload enum: the module that owns it and its declaration.
+export struct Sum {
+    owner: *Sema
+    decl: *SDecl
+}
+
+/// The payload enum named `name` in this module, or a Sum with a nil `decl`.
+export fn sumNamed(l: *Lowerer, name: str) -> Sum {
+    local none = Sum { owner: l.s, decl: nil as *SDecl }
+    local sym = l.s.find(name)
+    if sym < 0 || (*l.s.symbols.get(sym as usize)).kind != SY_STRUCT { return none }
+    local item = l.s.declOfItem(l.s.itemOf(sym))
+    if item < 0 { return none }
+    local d = l.s.declOf(item)
+    if (*d).variantsCount == 0 { return none }
+    return Sum { owner: l.s, decl: d }
+}
+
+/// Index of the variant `name`, or -1.
+fn variantIndex(sum: Sum, name: str) -> i32 {
+    for i in 0..(*sum.decl).variantsCount as usize {
+        local v = sum.owner.variants.get(((*sum.decl).variantsFirst + i as u32) as usize)
+        if sum.owner.text((*v).name) == name { return i as i32 }
+    }
+    return -1
+}
+
+/// Index of the variant's field inside `E$Data`: only variants with data have one.
+fn dataIndex(sum: Sum, variant: i32) -> u32 {
+    local n: u32 = 0
+    for i in 0..variant as usize {
+        local v = sum.owner.variants.get(((*sum.decl).variantsFirst + i as u32) as usize)
+        if (*v).payloadCount != 0 { n++ }
+    }
+    return n
+}
+
+/// A struct literal of `typeName` whose fields are `names[i] = values[i]` at position `i`
+/// (`indexes`); the initializers are recorded together, so the literal's range is contiguous.
+fn literal(l: *Lowerer, typeName: str, names: Vec<str>, indexes: Vec<u32>, values: Vec<i32>) -> i32 {
+    local first = l.b.fieldInits.length() as u32
+    for i in 0..names.length() {
+        local rec: XlcHirFieldInit
+        rec.name = XlcHirStr { bytes: nil as *u8, len: 0 }
+        rec.value = *values.get(i)
+        l.b.fieldInits.push(rec)
+        l.b.fieldName(first + i as u32, *names.get(i), *indexes.get(i))
+    }
+    local at = l.b.expr(E_STRUCT_LIT, typeName)
+    local p = l.b.exprAt(at)
+    (*p).fieldFirst = first
+    (*p).fieldCount = names.length() as u32
+    return at
+}
+
+/// The enum value of variant `variant` carrying `values` (one per payload type).
+fn construct(l: *Lowerer, sum: Sum, variant: i32, values: Vec<i32>) -> i32 {
+    local base = sum.owner.text((*sum.decl).name)
+    local whole = l.keep(sum.owner.qualify(base).asStr())
+    local tagName = l.keep(sum.owner.qualify(format("{}$Tag", base).asStr()).asStr())
+    local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
+    local names = Vec<str>()
+    local indexes = Vec<u32>()
+    local inner = Vec<i32>()
+    names.push("tag")
+    indexes.push(0)
+    inner.push(l.b.intConst(variant as u64, tagName))
+    if (*v).payloadCount != 0 {
+        local vname = sum.owner.text((*v).name)
+        local payNames = Vec<str>()
+        local payIndexes = Vec<u32>()
+        for i in 0..values.length() {
+            payNames.push(l.keep(format("_{}", i).asStr()))
+            payIndexes.push(i as u32)
+        }
+        local payload = literal(l, l.keep(sum.owner.qualify(format("{}${}", base, vname).asStr()).asStr()),
+            payNames, payIndexes, values)
+        local dataNames = Vec<str>()
+        local dataIndexes = Vec<u32>()
+        local dataValues = Vec<i32>()
+        dataNames.push(vname)
+        dataIndexes.push(dataIndex(sum, variant))
+        dataValues.push(payload)
+        local data = literal(l, l.keep(sum.owner.qualify(format("{}$Data", base).asStr()).asStr()),
+            dataNames, dataIndexes, dataValues)
+        names.push("data")
+        indexes.push(1)
+        inner.push(data)
+    }
+    return literal(l, whole, names, indexes, inner)
+}
+
+/// `E.B` used as a value: only a variant without data can stand alone (E0706, E0751).
+export fn lowerSumValue(l: *Lowerer, sum: Sum, e: *XExpr, member: str) -> i32 {
+    local variant = variantIndex(sum, member)
+    local ename = sum.owner.text((*sum.decl).name)
+    if variant < 0 {
+        l.err("E0706", (*e).span, format("enum `{}` has no member `{}`", ename, member).asStr(),
+            "unknown member")
+        return -1
+    }
+    local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
+    if (*v).payloadCount != 0 {
+        l.err("E0751", (*e).span,
+            format("variant `{}.{}` carries {} value(s)", ename, member, (*v).payloadCount).asStr(),
+            format("write `{}.{}(...)` with its values", ename, member).asStr())
+        return -1
+    }
+    return construct(l, sum, variant, Vec<i32>())
+}
+
+/// `E.A(x, y)`: every argument converts to the payload type at its position (E0706, E0751).
+export fn lowerSumCall(l: *Lowerer, sum: Sum, call: *XExpr, member: str) -> i32 {
+    local variant = variantIndex(sum, member)
+    local ename = sum.owner.text((*sum.decl).name)
+    if variant < 0 {
+        l.err("E0706", (*call).span, format("enum `{}` has no member `{}`", ename, member).asStr(),
+            "unknown member")
+        return -1
+    }
+    local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
+    if (*call).argsCount != (*v).payloadCount {
+        l.err("E0751", (*call).span,
+            format("variant `{}.{}` takes {} value(s), {} given", ename, member, (*v).payloadCount,
+                (*call).argsCount).asStr(),
+            "the number of values must match the variant's payload")
+        return -1
+    }
+    local values = Vec<i32>()
+    local ok = true
+    for i in 0..(*call).argsCount as usize {
+        local arg = l.s.refAt("expr", ((*call).argsFirst + i as u32) as i32)
+        local want = resolve(l.s, ((*v).payloadFirst + i as u32) as i32)
+        local value = lowerExprAs(l, arg, want)
+        if value < 0 { ok = false }
+        values.push(value)
+    }
+    if !ok { return -1 }
+    return construct(l, sum, variant, values)
+}

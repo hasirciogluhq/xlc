@@ -25,6 +25,7 @@ from "./builder" import FnBuild, XlcHirGlobalRec
 from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName, lowerArrayLen,
     isConstValue
 from "./call" import lowerCall
+from "./sum" import sumNamed, lowerSumValue
 from "./methods" import classSelfType
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
@@ -537,6 +538,10 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
             if (*l.s.exprAt((*e).lhs)).kind == XE_NAME {
                 local en = l.s.exprTextAt((*e).lhs)
                 local sym = l.s.find(en)
+                local sum = sumNamed(l, en)
+                if sum.decl != nil as *SDecl {
+                    return lowerSumValue(l, sum, e, l.s.exprTextAt(idx))
+                }
                 if sym >= 0 && (*l.s.symbols.get(sym as usize)).kind == SY_ENUM {
                     local decl = l.s.declOfItem(l.s.itemOf(sym))
                     if decl < 0 { return -1 }
