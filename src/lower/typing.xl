@@ -23,6 +23,7 @@ from "./state" import Lowerer, ScopeEntry, SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_
 from "./overload" import ARG_EXPR, ARG_INT, ARG_FLOAT, ARG_STR, ARG_NIL, PICK_NONE, pickOverload,
     declParamTypes, declRetType
 from "./methods" import findMethod, methodsNamed, classDeclIndex
+from "./generics" import genericInstance
 
 /// True for an unsuffixed numeric literal, or `-` of one: it takes the type of the other operand.
 export fn isLiteralExpr(l: *Lowerer, idx: i32) -> bool {
@@ -310,6 +311,12 @@ fn callType(l: *Lowerer, e: *XExpr) -> i32 {
         local entry = l.lookupName(callee)
         if entry == nil || (*entry).kind != SE_FUNCTION { return -1 }
         local decls = functionDecls(l, entry)
+        if decls.length() == 1 && (*l.s.declAt(*decls.get(0) as usize)).genericCount > 0 {
+            local inst = genericInstance(l, e, entry)
+            if inst.sym < 0 { return -1 }
+            local owner = inst.owner != nil ? inst.owner : l.s
+            return declRetType(owner, owner.declOf(owner.itemOf(inst.sym)))
+        }
         return declaredResult(l, &decls, e)
     }
     if (*lhs).kind == XE_FIELD {

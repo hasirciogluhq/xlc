@@ -37,6 +37,8 @@ fn genericParams(s: *Sema, item: i32) -> Vec<String> {
 
 /// Resolves `idx`; -1 after reporting. `depth` caps the alias recursion.
 export fn resolve(s: *Sema, idx: i32) -> i32 {
+    // Inside the body of a generic instance the type parameters name their arguments.
+    if s.instEnv != nil { return resolveDepth(s, substituteType(s, idx, s.instEnv as *TypeEnv), 0) }
     return resolveDepth(s, idx, 0)
 }
 

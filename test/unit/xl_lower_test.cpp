@@ -157,6 +157,13 @@ const Sample kLaneASamples[] = {
     {"sum-construct", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn make() -> Shape {\n    return Shape.Circle(3)\n}\n"},
     {"sum-unit", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn make() -> Shape {\n    return Shape.Dot\n}\n"},
     {"sum-two-payload", "enum Pair {\n    Both(i32, i32)\n    None\n}\nfn make(a: i32) -> Pair {\n    return Pair.Both(a, 2)\n}\n"},
+    // Generic functions: inferred and written type arguments, one instance per argument list.
+    {"generic-infer", "fn id<T>(x: T) -> T {\n    return x\n}\nfn main() -> i32 {\n    return id(3)\n}\n"},
+    {"generic-written", "fn id<T>(x: T) -> T {\n    return x\n}\nfn main() -> i64 {\n    return id<i64>(3)\n}\n"},
+    {"generic-two-instances",
+     "fn id<T>(x: T) -> T {\n    return x\n}\n"
+     "fn main() -> i32 {\n    local a = id(true)\n    return id(2)\n}\n"},
+    {"generic-pointer-param", "fn load<T>(p: *T) -> T {\n    return *p\n}\nfn main(p: *u8) -> u8 {\n    return load(p)\n}\n"},
     {"sum-switch-bind",
      "enum Shape {\n    Circle(i64)\n    Dot\n}\n"
      "fn area(s: Shape) -> i64 {\n    switch s {\n        case Shape.Circle(r) {\n            return r\n        }\n"

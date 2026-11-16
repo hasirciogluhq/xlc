@@ -1,13 +1,67 @@
-// Lowering of generic instances and impls (placeholders pending the port of the C++ instance
-// and impl passes). The driver calls these; they currently perform no work beyond the parts
-// already covered.
+// Lowering of generic instances (C++ item/driver.cpp, `lowerPendingInstances`). An instance is a
+// declaration cloned by sema/subst.xl: its signature has the arguments substituted, its body is
+// the generic's body. The body is lowered with the type parameters bound (`Sema.instEnv`, applied
+// first by `resolve`), so every type the body writes names the arguments.
+//
+// Lowered: instances of generic functions, structs, classes and payload enums (their parts).
+// Not lowered yet: generic methods of instances (`pendingMethods`) and generic impls.
+from "std" import String, Vec
+from "../sema/sema" import Sema
+from "../sema/subst" import TypeEnv
 from "./state" import Lowerer
+from "./items" import lowerInstanceItem
 
 export fn lowerInstancesTouch() { return }
 
-/// Placeholder: lowering of pending generic instances and lazy methods.
+/// The declaration kinds of the flat AST.
+const XD_FN: i32 = 0
+const XD_STRUCT: i32 = 2
+const XD_CLASS: i32 = 3
+const XD_ENUM: i32 = 6
+
+/// The local name of a generic's instance without its arguments: `f<i32>` -> `f`, `E<i32>$V` -> `E`.
+fn genericBase(name: str) -> str {
+    for i in 0..name.len as usize {
+        if name[i] == b'<' || name[i] == b'$' { return name[0..i] }
+    }
+    return name
+}
+
+/// The env that binds the type parameters of the generic behind instance `inst` (an index into
+/// `instanceInfos`) to its arguments; nil when the generic is not found.
+fn envOf(s: *Sema, inst: usize) -> *TypeEnv {
+    local info = s.instanceInfos.get(inst)
+    local name = s.text(*s.instanceNames.get(inst))
+    local sym = s.find(genericBase(name))
+    if sym < 0 { return nil }
+    local params = s.genericParamsOf(s.itemOf(sym))
+    local env = new TypeEnv()
+    for i in 0..(*info).argsCount as usize {
+        if i >= params.1 as usize { break }
+        env.put(s.text(*s.types.strs.get(params.0 + i as u32)), *s.instanceArgs.get((*info).argsFirst as usize + i))
+    }
+    return env
+}
+
+/// Lowers the instances requested so far, and those their bodies request, until none is pending.
 export fn lowerPendingInstances(l: *Lowerer) -> bool {
-    return false
+    local any = false
+    while l.s.pendingInstances.length() > 0 {
+        local batch = l.s.pendingInstances.clone()
+        l.s.pendingInstances = Vec<i32>()
+        for b in 0..batch.length() {
+            any = true
+            local item = *batch.get(b)
+            local inst = l.s.itemInstanceOf(item)
+            if inst < 0 { continue }
+            l.s.instEnv = envOf(l.s, inst as usize) as *void
+            l.s.currentInstance = String(l.s.text(*l.s.instanceNames.get(inst as usize)))
+            lowerInstanceItem(l, item)
+            l.s.instEnv = nil
+            l.s.currentInstance = String("")
+        }
+    }
+    return any
 }
 
 /// Placeholder: lowering of the module's impl declarations.

@@ -121,6 +121,7 @@ export class Sema {
     pendingInstances: Vec<i32> ///< SItem indices not lowered yet
     itemInstance: Vec<i32>    ///< for every instance item, its index in `instanceNames` (-1 else)
     currentInstance: String   ///< local name of the instance whose body is lowered
+    instEnv: *void            ///< `*TypeEnv` of the generic body being lowered (nil outside one); `resolve` applies it first
 
     // Method instances (`Box<i32>.get`), their keys and the queue the lowering pass drains.
     methodInstDecls: Vec<i32> ///< SDecl indices of the cloned methods
@@ -187,6 +188,7 @@ export class Sema {
         self.pendingInstances = Vec<i32>()
         self.itemInstance = Vec<i32>()
         self.currentInstance = String()
+        self.instEnv = nil
         self.defineValues = Vec<i32>()
         self.defineNames = Vec<XStr>()
         self.defineInProgress = Vec<XStr>()

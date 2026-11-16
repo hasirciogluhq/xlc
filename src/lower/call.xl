@@ -16,6 +16,8 @@ from "../sema/types" import T_POINTER
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL
 from "./function" import lowerExpr, lowerExprAs
 from "./sum" import sumNamed, lowerSumCall
+from "./generics" import genericInstance
+from "./overload" import declRetType
 from "../sema/item" import SDecl
 from "./queries" import lowerLayoutQuery
 from "./typing" import exprType, exprTypeName, typeNameOf, resolveBase, argSpecs, chooseDecl,
@@ -41,6 +43,9 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         local entry = l.lookupName(name)
         if entry != nil && (*entry).kind == SE_FUNCTION {
             local decls = functionDecls(l, entry)
+            if decls.length() == 1 && (*l.s.declAt(*decls.get(0) as usize)).genericCount > 0 {
+                return lowerGenericCall(l, idx, e, entry)
+            }
             if decls.length() > 1 { return lowerOverloadCall(l, idx, e, entry, &decls) }
             if decls.length() == 1 {
                 return lowerDirectCall(l, idx, e, entry, *decls.get(0))
@@ -114,6 +119,25 @@ fn lowerDirectCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, d: i32)
     if !lowerArgs(l, e, &params, &args, name) { return -1 }
     local range = l.b.args(args)
     return l.b.call((*entry).qname.asStr(), range.0, range.1, exprTypeName(l, idx))
+}
+
+/// A generic function: the instance the written or inferred type arguments name is called under
+/// its instance name (`f<i32>`); the arguments convert to the instance's parameter types.
+fn lowerGenericCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry) -> i32 {
+    local name = l.s.exprTextAt((*e).lhs)
+    local inst = genericInstance(l, e, entry)
+    if inst.sym < 0 {
+        l.err("E0404", (*e).span, format("no `{}` fits this call", name).asStr(), "check the arguments")
+        return -1
+    }
+    local owner = inst.owner != nil ? inst.owner : l.s
+    local d = owner.declOf(owner.itemOf(inst.sym))
+    local params = declParamTypes(owner, d)
+    local args = Vec<i32>()
+    if !lowerArgs(l, e, &params, &args, name) { return -1 }
+    local range = l.b.args(args)
+    local key = owner.qualify(owner.text(inst.name))
+    return l.b.call(key.asStr(), range.0, range.1, typeNameOf(l, declRetType(owner, d)))
 }
 
 /// An overloaded function: the overload the arguments pick is called under its own key, the

@@ -1,0 +1,155 @@
+// Calls of generic functions (C++ call/overload.cpp: `unifyParam`, `genericCandidates`). The
+// type arguments are written (`f<i32>(x)`) or inferred from the argument types; the instance is
+// made by `instantiate` (sema/instances.xl) and queued for `lowerPendingInstances`.
+//
+// Inference unifies each parameter type with the type of its argument: a bare type parameter
+// binds (a second binding must be the same type), pointers, slices, arrays and tuples recurse,
+// `Name<A, B>` matches an instance of the same generic and recurses into its arguments, and any
+// other parameter takes an argument that is the same type or converts to it.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_STRING_LITERAL
+from "../sema/sema" import Sema, EntityRef
+from "../sema/subst" import TypeEnv
+from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_TUPLE
+from "../sema/resolve" import resolve
+from "../sema/instances" import instantiate
+from "../sema/conversion" import implicitConversion, C_OK, C_WARN
+from "./state" import Lowerer, ScopeEntry
+from "./typing" import exprType
+
+/// True when `name` is one of the generic parameters `names`.
+fn isParam(names: *Vec<String>, name: str) -> bool {
+    for i in 0..(*names).length() {
+        if (*(*names).get(i)).asStr() == name { return true }
+    }
+    return false
+}
+
+/// The generic an instance type was made from and its arguments, or false when `actual` is no
+/// instance. `base` receives the generic's local name.
+fn instanceArgsOf(l: *Lowerer, actual: i32, base: *String) -> Vec<i32> {
+    local out = Vec<i32>()
+    local sym = l.s.find(l.s.types.text(actual).asStr())
+    if sym < 0 { return out }
+    local inst = l.s.itemInstanceOf(l.s.itemOf(sym))
+    if inst < 0 { return out }
+    local info = l.s.instanceInfos.get(inst as usize)
+    local text = l.s.text(*l.s.instanceNames.get(inst as usize))
+    local cut = 0 as usize
+    while cut < text.len as usize && text[cut] != b'<' { cut++ }
+    (*base) = String(text[0..cut])
+    for i in 0..(*info).argsCount as usize {
+        out.push(*l.s.instanceArgs.get((*info).argsFirst as usize + i))
+    }
+    return out
+}
+
+/// Binds the parameters in `names` by matching the parameter type `pat` against `actual`.
+fn unify(l: *Lowerer, pat: i32, actual: i32, names: *Vec<String>, env: *TypeEnv) -> bool {
+    local p = l.s.types.get(pat)
+    if p.kind == T_NAMED && p.pathCount == 1 && p.argsCount == 0 {
+        local name = l.s.text(*l.s.types.strs.get(p.pathFirst))
+        if isParam(names, name) {
+            local bound = env.get(name)
+            if bound >= 0 { return l.s.types.same(bound, actual) }
+            env.put(name, actual)
+            return true
+        }
+    }
+    local a = l.s.types.get(actual)
+    if p.kind == T_POINTER || p.kind == T_SLICE || p.kind == T_ARRAY {
+        if a.kind != p.kind { return false }
+        return unify(l, p.elem, a.elem, names, env)
+    }
+    if p.kind == T_TUPLE {
+        if a.kind != T_TUPLE || a.argsCount != p.argsCount { return false }
+        for i in 0..p.argsCount as usize {
+            if !unify(l, (p.argsFirst + i as u32) as i32, (a.argsFirst + i as u32) as i32, names, env) { return false }
+        }
+        return true
+    }
+    if p.kind == T_NAMED && p.argsCount > 0 {
+        local base = String("")
+        local args = instanceArgsOf(l, actual, &base)
+        local want = l.s.text(*l.s.types.strs.get(p.pathFirst + p.pathCount - 1))
+        if args.length() != p.argsCount as usize || base.asStr() != want { return false }
+        for i in 0..args.length() {
+            if !unify(l, (p.argsFirst + i as u32) as i32, *args.get(i), names, env) { return false }
+        }
+        return true
+    }
+    local concrete = resolve(l.s, pat)
+    if concrete < 0 { return false }
+    if l.s.types.same(concrete, actual) { return true }
+    local r = implicitConversion(l.s.types, actual, concrete, false, l.s.pointerBits)
+    return r.status == C_OK || r.status == C_WARN
+}
+
+/// The type of argument `a` before the parameter type is known (C++ `preLowerArgs`): the default
+/// type of a literal, else the expression's own type; -1 when unknown.
+fn preType(l: *Lowerer, a: i32) -> i32 {
+    local e = l.s.exprAt(a)
+    if (*e).kind == XE_INT_LITERAL {
+        return (*e).intValue > 2147483647 ? l.s.types.makeInt(64, true) : l.s.types.makeInt(32, true)
+    }
+    if (*e).kind == XE_FLOAT_LITERAL { return l.s.types.makeFloat(64) }
+    if (*e).kind == XE_STRING_LITERAL { return l.s.types.makeStr() }
+    return exprType(l, a)
+}
+
+/// The instance of the generic function `entry` that call `e` names, or an EntityRef with
+/// `sym < 0` when none: no type arguments could be written or inferred (E0724 when a parameter
+/// stays unbound) or the arity differs.
+export fn genericInstance(l: *Lowerer, e: *XExpr, entry: *ScopeEntry) -> EntityRef {
+    local none: EntityRef
+    none.owner = nil
+    none.sym = -1
+    local owner = (*entry).owner != nil ? (*entry).owner : l.s
+    local local_ = (*entry).name.asStr()
+    local sym = owner.find(local_)
+    if sym < 0 { return none }
+    local item = owner.itemOf(sym)
+    local names = Vec<String>()
+    local gp = owner.genericParamsOf(item)
+    for i in 0..gp.1 as usize {
+        names.push(String(owner.text(*owner.types.strs.get(gp.0 + i as u32))))
+    }
+    if names.length() == 0 { return none }
+    local d = owner.declOf(item)
+    local fixed = Vec<i32>() ///< the parameter types, `self` excluded
+    for i in 0..(*d).paramsCount as usize {
+        local p = owner.paramAt((*d).paramsFirst as usize + i)
+        if (*p).isSelf == 0 { fixed.push((*p).ty) }
+    }
+    if fixed.length() != (*e).argsCount as usize { return none }
+    local targs = Vec<i32>()
+    local callee = l.s.exprAt((*e).lhs)
+    if (*callee).genericArgsCount > 0 {
+        if (*callee).genericArgsCount as usize != names.length() { return none }
+        for i in 0..names.length() {
+            local written = l.s.flat.ref(l.s.flat.r.typeRefs, (*callee).genericArgsFirst + i as u32)
+            targs.push(resolve(l.s, l.s.types.internAst(written)))
+        }
+    } else {
+        local env = new TypeEnv()
+        for i in 0..fixed.length() {
+            local actual = preType(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32))
+            if actual < 0 || !unify(l, *fixed.get(i), actual, &names, env) { return none }
+        }
+        for i in 0..names.length() {
+            local bound = env.get((*names.get(i)).asStr())
+            if bound < 0 {
+                l.err("E0724", (*e).span, format("cannot infer `{}`", (*names.get(i)).asStr()).asStr(),
+                    format("write the type arguments: `{}<...>(...)`", local_).asStr())
+                return none
+            }
+            targs.push(bound)
+        }
+    }
+    local gref: EntityRef
+    gref.owner = owner
+    gref.sym = sym
+    gref.name = *owner.symNames.get(sym as usize)
+    gref.foundAs = gref.name
+    return instantiate(l.s, gref, targs, (*e).span)
+}

@@ -75,6 +75,12 @@ export fn substituteType(s: *Sema, idx: i32, env: *TypeEnv) -> i32 {
         }
         return idx
     }
+    // A leaf (integer, float, bool, str, void, ...) has no child to rewrite and `rebuild` would
+    // drop its width and signedness.
+    if t.kind != T_NAMED && t.kind != T_POINTER && t.kind != T_ARRAY && t.kind != T_SLICE &&
+       t.kind != T_TUPLE && t.kind != T_FN_PTR {
+        return idx
+    }
     // Rebuild the record with its children substituted.
     local elem = t.elem
     if elem >= 0 { elem = substituteType(s, elem, env) }
@@ -97,7 +103,7 @@ export fn substituteType(s: *Sema, idx: i32, env: *TypeEnv) -> i32 {
 /// shared with the generic. The generic parameters stay (a generic method of an instance stays
 /// generic and is instantiated per call).
 export fn instantiateFn(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
-    local src = s.declOf(declIdx)
+    local src = s.declAt(declIdx as usize)
     local d: SDecl
     d = *src
     d.kind = (*src).kind
@@ -127,7 +133,7 @@ export fn instantiateFn(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
 /// type parameter keeps its own meaning.
 fn cloneMethod(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
     local own = env.clone()
-    local src = s.declOf(declIdx)
+    local src = s.declAt(declIdx as usize)
     for i in 0..(*src).genericCount as usize {
         own.remove(s.text(*s.types.strs.get((*src).genericFirst + i as u32)))
     }
@@ -138,11 +144,11 @@ fn cloneMethod(s: *Sema, declIdx: i32, env: *TypeEnv) -> i32 {
 
 /// Instantiates a declaration under `env`, renaming it to `newName`. Returns the new SDecl index.
 export fn instantiateDecl(s: *Sema, declIdx: i32, env: *TypeEnv, newName: str) -> i32 {
-    local src = s.declOf(declIdx)
+    local src = s.declAt(declIdx as usize)
     local kind = (*src).kind
     if kind == XD_FN {
         local out = instantiateFn(s, declIdx, env)
-        (*s.declOf(out)).name = s.str(newName)
+        (*s.declAt(out as usize)).name = s.str(newName)
         return out
     }
     local d: SDecl

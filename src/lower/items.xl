@@ -311,3 +311,18 @@ export fn run(l: *Lowerer) {
 export fn finish(l: *Lowerer) {
         l.scopes.pop()
     }
+
+/// One instance item made by `instantiate`: lowered like the declaration it was cloned from, with
+/// the type parameters bound by the caller (`Sema.instEnv`).
+export fn lowerInstanceItem(l: *Lowerer, item: i32) {
+    local declIdx = l.s.declOfItem(item)
+    if declIdx < 0 { return }
+    local d = l.s.declOf(item)
+    if (*d).kind == XD_ENUM {
+        lowerEnum(l, item, declIdx)
+    } else if (*d).kind == XD_STRUCT || (*d).kind == XD_CLASS {
+        lowerAggregate(l, item, declIdx)
+    } else if (*d).kind == XD_FN {
+        lowerTopFn(l, item, declIdx)
+    }
+}

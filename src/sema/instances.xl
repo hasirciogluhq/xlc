@@ -115,7 +115,7 @@ export fn instantiate(s: *Sema, generic: EntityRef, args: Vec<i32>, at: XSpan) -
     local inst = instantiateDecl(owner, owner.declOfItem(item), env, localName.asStr())
     local instItem = owner.internItemOf(inst)
     local sym = internInstance(owner, instItem, localName.asStr(), origin.asStr(), args.clone(), at)
-    local d = owner.declOf(inst)
+    local d = owner.declAt(inst as usize)
     if (*d).kind == XD_STRUCT && (*d).variantsCount != 0 {
         // A payload enum is one type made of several items: `E`, `E$Tag`, `E$Data` and one
         // `E$Variant` per variant with data. An instance of `E` is built out of the instances of
@@ -153,7 +153,7 @@ export fn instantiate(s: *Sema, generic: EntityRef, args: Vec<i32>, at: XSpan) -
 /// The union item of a payload enum instance: one field per variant with data, typed with the
 /// part's instance name.
 fn synthUnionOf(s: *Sema, inst: i32, name: str) -> i32 {
-    local d = s.declOf(inst)
+    local d = s.declAt(inst as usize)
     local nd: SDecl
     nd = *d
     nd.name = s.str(name)
@@ -189,7 +189,7 @@ fn synthUnionOf(s: *Sema, inst: i32, name: str) -> i32 {
 /// The payload struct of one variant of a payload enum instance: fields `_0..` typed with the
 /// substituted payload types.
 fn synthPayloadOf(s: *Sema, inst: i32, name: str, variantName: XStr) -> i32 {
-    local d = s.declOf(inst)
+    local d = s.declAt(inst as usize)
     local nd: SDecl
     nd = *d
     nd.name = s.str(name)
@@ -243,7 +243,7 @@ fn argsOf(name: str) -> String {
 /// for the lowering pass. Returns the symbol index.
 export fn internInstance(s: *Sema, item: i32, localName: str, origin: str, args: Vec<i32>,
                          at: XSpan) -> i32 {
-    local d = s.declOf(s.declOfItem(item))
+    local d = s.declOf(item)
     local kind = SY_FN
     if (*d).kind == XD_CLASS {
         kind = SY_CLASS
@@ -283,7 +283,7 @@ export fn internInstance(s: *Sema, item: i32, localName: str, origin: str, args:
 /// Instantiates a method of a class instance: `Box<i32>.get`. Returns the index of the method
 /// instance in the Sema's `methodInstDecls`, or the existing one.
 export fn instantiateMethod(s: *Sema, generic: i32, cls: str, clsQ: str, args: Vec<i32>) -> i32 {
-    local gd = s.declOf(generic)
+    local gd = s.declAt(generic as usize)
     local key = format("{}.{}<", clsQ, s.text((*gd).name))
     for i in 0..args.length() {
         if i != 0 { key.append(", ") }
