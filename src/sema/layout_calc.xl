@@ -190,6 +190,21 @@ export fn layoutOfName(s: *Sema, name: str, at: XSpan) -> i32 {
     for i in 0..s.layoutNames.length() {
         if s.text(*s.layoutNames.get(i)) == name { return *s.layoutValues.get(i) }
     }
+    // A type of another module (`key::Name`): laid out there, the layout copied into this cache.
+    for i in 0..name.len as usize {
+        if name[i] == b':' && i + 1 < name.len as usize && name[i + 1] == b':' {
+            local ref = entityByQName(s, name)
+            if ref.sym >= 0 && ref.owner != nil && ref.owner != s {
+                local found = layoutOfName(ref.owner, ref.owner.text(ref.foundAs), at)
+                if found < 0 { return -1 }
+                local copied = pushLayout(s, *ref.owner.layoutCache.get(found as usize))
+                s.layoutNames.push(s.str(name))
+                s.layoutValues.push(copied)
+                return copied
+            }
+            break
+        }
+    }
     local sym = s.find(name)
     if sym < 0 {
         s.error("E0706", at, format("unknown type `{}`", name).asStr(), "not declared in this module")

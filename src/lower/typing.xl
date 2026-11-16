@@ -28,6 +28,7 @@ from "./generics" import genericInstance, constructType
 from "./builtins" import isBuiltinName, builtinType
 from "./propagate" import tryType
 from "./interface" import interfaceOf, interfaceCallType
+from "./inherent" import inherentRetType
 
 /// True for an unsuffixed numeric literal, or `-` of one: it takes the type of the other operand.
 export fn isLiteralExpr(l: *Lowerer, idx: i32) -> bool {
@@ -401,7 +402,7 @@ fn callType(l: *Lowerer, e: *XExpr) -> i32 {
             return interfaceCallType(l, interfaceOf(l, recvTy), l.s.exprTextAt((*e).lhs))
         }
         local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt((*e).lhs))
-        if !(*m).found { return -1 }
+        if !(*m).found { return inherentRetType(l, recvTy, l.s.exprTextAt((*e).lhs)) }
         local decls = methodsNamed((*m).owner, (*m).cdecl, l.s.exprTextAt((*e).lhs))
         return declaredResult(l, (*m).owner, &decls, e)
     }

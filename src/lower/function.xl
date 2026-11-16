@@ -108,9 +108,12 @@ export fn endFunction(l: *Lowerer, item: i32) {
             (*f).exported = (*it).exported != 0 || (*it).exportC != 0 || (*it).registered != 0
             (*f).exportC = (*it).exportC != 0
             (*f).registered = (*it).registered != 0
-            (*f).isEntry = l.s.text((*it).registerRole) == "entry"
-            (*f).isInit = l.s.text((*it).registerRole) == "init"
-            (*f).isFini = l.s.text((*it).registerRole) == "fini"
+            // The module-level hooks `@entry`, `@init` and `@fini` (never a method).
+            local fd = l.fnDecl
+            local plain = fd != nil && l.currentClass.length() == 0
+            (*f).isEntry = plain && l.s.findAttr((*fd).attrsFirst, (*fd).attrsCount, "entry") >= 0
+            (*f).isInit = plain && l.s.findAttr((*fd).attrsFirst, (*fd).attrsCount, "init") >= 0
+            (*f).isFini = plain && l.s.findAttr((*fd).attrsFirst, (*fd).attrsCount, "fini") >= 0
             // The role functions are set by the role pass before the bodies (roles.xl).
             if (*f).isInit {
                 l.b.initFns.push(l.fnName.clone())
@@ -132,6 +135,7 @@ export fn addLocal(l: *Lowerer, name: str, typeName: str) -> u32 {
 
     /// A function with a body: parameters, prologue, the body statements and the drops.
 export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: str, owner: str) {
+        l.fnDecl = d
         local ret = l.typeName(resolve(l.s, (*d).ret))
         if (*d).hasRet == 0 { ret = String("void") }
         l.fnRetTy = (*d).hasRet == 0 ? l.s.types.makeVoid() : resolve(l.s, (*d).ret)

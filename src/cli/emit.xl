@@ -86,6 +86,8 @@ export fn emitProgram(session: *Session, plan: *EmitPlan) -> bool {
     // read after that prune, so it describes exactly what is generated.
     pruneProgram(session, plan.emit.asStr(), plan.inputs.length() > 0)
     local module = session.hirModule()
+    // A program with errors has holes in its HIR: nothing is generated from it.
+    if session.hasErrors() { return false }
 
     local rootName = fileNameOf(plan.root.asStr())
     local stem = stemOf(plan.root.asStr())

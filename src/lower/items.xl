@@ -62,6 +62,7 @@ export fn lowerBatch(l: *Lowerer) {
             local d = l.s.declOf(item)
             local gp = l.s.genericParamsOf(item)
             if gp.1 > 0 { continue } // a generic declaration is lowered per instance
+            if l.s.itemInstanceOf(item) >= 0 { continue } // an instance is lowered with its env
             if isGenericEnumPart(l.s, d) { continue }
             if (*d).kind == XD_IMPL { continue } // the module's impls are in lowerImpls
             if (*d).kind == XD_ENUM {
@@ -84,6 +85,7 @@ export fn lowerBatch(l: *Lowerer) {
             local d = l.s.declOf(item)
             if (*d).kind != XD_CLASS { continue }
             if l.s.genericParamsOf(item).1 > 0 { continue }
+            if l.s.itemInstanceOf(item) >= 0 { continue }
             lowerMethods(l, item, declIdx)
         }
     }
@@ -324,6 +326,8 @@ export fn lowerInstanceItem(l: *Lowerer, item: i32) {
         lowerEnum(l, item, declIdx)
     } else if (*d).kind == XD_STRUCT || (*d).kind == XD_CLASS {
         lowerAggregate(l, item, declIdx)
+        // The methods of a class instance, lowered with the instance's env.
+        if (*d).kind == XD_CLASS { lowerMethods(l, item, declIdx) }
     } else if (*d).kind == XD_FN {
         lowerTopFn(l, item, declIdx)
     }

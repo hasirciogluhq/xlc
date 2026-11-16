@@ -1,0 +1,96 @@
+// Calls of the methods of a struct. `impl T { fn name(self: *T, ...) }` is parsed into the
+// module-level function `T.name` whose first parameter is the explicit `self`, so `value.name(args)`
+// on a struct is the call `T.name(&value, args)` of an ordinary function (parser `parseImpl`).
+//
+// Only a name with one declaration is lowered here; an overloaded or generic method is left to
+// the caller (-2).
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
+from "../sema/types" import T_STRUCT, T_CLASS, T_POINTER
+from "../sema/module_scope" import entityByQName
+from "../util/source" import Span
+from "./state" import Lowerer, SE_FUNCTION
+from "./typing" import exprType, exprTypeName, typeNameOf, functionDecls, entryOwner, declParamsIn, declRetIn
+from "./function" import lowerExpr, hiddenLocal
+from "./call" import lowerArgs
+
+/// True for an expression that names storage whose address can be taken.
+fn isPlace(l: *Lowerer, idx: i32) -> bool {
+    local e = l.s.exprAt(idx)
+    if (*e).kind == XE_NAME { return true }
+    if (*e).kind == XE_FIELD || (*e).kind == XE_INDEX { return isPlace(l, (*e).lhs) }
+    return (*e).kind == XE_UNARY && (*e).unaryOp == XU_DEREF
+}
+
+/// The function `T.name` a call on a struct value names, -1 when the struct has none. `recvTy`
+/// is the receiver's type (a struct or a pointer to one).
+export fn inherentEntry(l: *Lowerer, recvTy: i32, name: str) -> i32 {
+    if recvTy < 0 { return -1 }
+    local base = recvTy
+    if l.s.types.get(base).kind == T_POINTER { base = l.s.types.get(base).elem }
+    if base < 0 { return -1 }
+    local kind = l.s.types.get(base).kind
+    if kind != T_STRUCT && kind != T_CLASS { return -1 }
+    local qname = format("{}.{}", l.s.types.pathOf(l.s.types.get(base)).asStr(), name)
+    local ref = entityByQName(l.s, qname.asStr())
+    return ref.sym < 0 ? -1 : 0
+}
+
+/// The result type of `recv.name(...)` on a struct, -1 when it is not a struct function.
+export fn inherentRetType(l: *Lowerer, recvTy: i32, name: str) -> i32 {
+    if inherentEntry(l, recvTy, name) < 0 { return -1 }
+    local base = recvTy
+    if l.s.types.get(base).kind == T_POINTER { base = l.s.types.get(base).elem }
+    local qname = format("{}.{}", l.s.types.pathOf(l.s.types.get(base)).asStr(), name)
+    local ref = entityByQName(l.s, qname.asStr())
+    local at = Span { file: 0, line: 0, column: 0, endLine: 0, endColumn: 0 }
+    local entry = l.entryOf(ref, qname.asStr(), at)
+    if (*entry).kind != SE_FUNCTION { return -1 }
+    local decls = functionDecls(l, entry)
+    if decls.length() != 1 { return -1 }
+    return declRetIn(l, entryOwner(l, entry), *decls.get(0))
+}
+
+/// `recv.name(args)` on a struct: the call of `T.name` with the receiver's address first. -2 when
+/// the struct has no such function or it needs the overload or generic machinery.
+export fn lowerInherentCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, recvTy: i32) -> i32 {
+    local name = l.s.exprTextAt((*e).lhs)
+    if inherentEntry(l, recvTy, name) < 0 { return -2 }
+    local base = recvTy
+    local viaPointer = l.s.types.get(base).kind == T_POINTER
+    if viaPointer { base = l.s.types.get(base).elem }
+    local qname = format("{}.{}", l.s.types.pathOf(l.s.types.get(base)).asStr(), name)
+    local ref = entityByQName(l.s, qname.asStr())
+    local at = Span { file: 0, line: 0, column: 0, endLine: 0, endColumn: 0 }
+    local entry = l.entryOf(ref, qname.asStr(), at)
+    if (*entry).kind != SE_FUNCTION { return -2 }
+    local decls = functionDecls(l, entry)
+    if decls.length() != 1 { return -2 }
+    local owner = entryOwner(l, entry)
+    if (*owner.declAt(*decls.get(0) as usize)).genericCount > 0 { return -2 }
+    local params = declParamsIn(l, owner, *decls.get(0))
+    if params.length() == 0 { return -2 }
+
+    local selfArg = lowerExpr(l, recvIdx)
+    if selfArg < 0 { return -1 }
+    if !viaPointer {
+        local baseName = typeNameOf(l, base)
+        if !isPlace(l, recvIdx) {
+            // A temporary receiver is kept in a hidden local for the call.
+            local tmp = hiddenLocal(l, "recv", baseName)
+            l.emitted.push(l.b.localStmt(tmp, "", baseName, selfArg))
+            selfArg = l.b.localRef(tmp, baseName)
+        }
+        selfArg = l.b.addrOf(selfArg, typeNameOf(l, l.s.types.makePointer(base)))
+    }
+    // The first parameter is `self`; the arguments of the call convert to the rest.
+    local rest = Vec<i32>()
+    for i in 1..params.length() { rest.push(*params.get(i)) }
+    local args = Vec<i32>()
+    args.push(selfArg)
+    local tail = Vec<i32>()
+    if !lowerArgs(l, e, &rest, &tail, name) { return -1 }
+    for i in 0..tail.length() { args.push(*tail.get(i)) }
+    local range = l.b.args(args)
+    return l.b.call((*entry).qname.asStr(), range.0, range.1, exprTypeName(l, idx))
+}

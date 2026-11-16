@@ -14,7 +14,7 @@ from "std" import String, Vec, format
 from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
 from "../sema/types" import T_POINTER
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL, SE_TYPE
-from "./function" import lowerExpr, lowerExprAs
+from "./function" import lowerExpr, lowerExprAs, hiddenLocal
 from "./sum" import sumNamed, lowerSumCall
 from "./generics" import genericInstance, constructType
 from "./overload" import declRetType
@@ -26,6 +26,7 @@ from "./methods" import findMethod, methodsNamed, MethodRef, classLoc
 from "./overload" import PICK_NONE, PICK_AMBIGUOUS, declParamTypes, mangledParams
 from "./helpers" import overloadKey
 from "./interface" import interfaceOf, lowerInterfaceCall
+from "./inherent" import lowerInherentCall
 from "./builtins" import isBuiltinName, lowerBuiltin
 
 /// A call: the callee's form decides the lowering (see the file comment). Returns the HIR
@@ -86,6 +87,8 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
                 }
                 return lowerMethodCall(l, idx, e, (*callee).lhs, m)
             }
+            local inherent = lowerInherentCall(l, idx, e, (*callee).lhs, recvTy)
+            if inherent != -2 { return inherent }
         }
     }
     return lowerValueCall(l, idx, e)
@@ -194,13 +197,16 @@ fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef
     if l.s.types.get(recvTy).kind == T_POINTER {
         selfArg = lowerExpr(l, recvIdx)
     } else {
-        if !isPlace(l, recvIdx) {
-            l.err("E0709", (*e).span, "a method needs an addressable receiver",
-                "store the value in a variable first")
-            return -1
-        }
         local base = lowerExpr(l, recvIdx)
         if base < 0 { return -1 }
+        if !isPlace(l, recvIdx) {
+            // A temporary receiver (`String(x).slice(..)`) is kept in a hidden local for the
+            // call, so its address can be taken. Its drop belongs to the ownership pass.
+            local recvName = typeNameOf(l, recvTy)
+            local tmp = hiddenLocal(l, "recv", recvName)
+            l.emitted.push(l.b.localStmt(tmp, "", recvName, base))
+            base = l.b.localRef(tmp, recvName)
+        }
         selfArg = l.b.addrOf(base, typeNameOf(l, l.s.types.makePointer(recvTy)))
     }
     if selfArg < 0 { return -1 }

@@ -45,6 +45,11 @@ export fn sumNamed(l: *Lowerer, name: str) -> Sum {
     return want
 }
 
+/// Same as `sumOfType`, for callers that have their own `sumOfType`.
+export fn sumOfTypeIn(l: *Lowerer, t: i32) -> Sum {
+    return sumOfType(l, t)
+}
+
 /// The payload enum (or instance of a generic one) that type `t` of this module is.
 export fn sumOfType(l: *Lowerer, t: i32) -> Sum {
     local at = classLoc(l.s, t)

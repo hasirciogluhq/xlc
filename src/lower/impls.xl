@@ -25,7 +25,7 @@ from "./items" import fnKeySeen, paramTypes
 
 /// The qualified name of the interface an `impl I for T` names, "" when it is not found.
 fn interfaceName(l: *Lowerer, d: *SDecl) -> String {
-    local name = l.s.text(l.s.flat.pathSeg((*d).ifacePathFirst))
+    local name = l.s.text(*l.s.types.strs.get((*d).ifacePathFirst))
     local ref = lookupEntity(l.s, name)
     if ref.sym < 0 { return String("") }
     local owner = ref.owner != nil ? ref.owner : l.s
@@ -76,7 +76,7 @@ fn lowerImpl(l: *Lowerer, item: i32, d: *SDecl) {
     if isInterface {
         ifaceQ = interfaceName(l, d)
         if ifaceQ.asStr().len == 0 {
-            local msg = format("`{}` is not an interface", l.s.text(l.s.flat.pathSeg((*d).ifacePathFirst)))
+            local msg = format("`{}` is not an interface", l.s.text(*l.s.types.strs.get((*d).ifacePathFirst)))
             l.err("E0706", (*d).span, msg.asStr(), "not declared as an interface")
             return
         }

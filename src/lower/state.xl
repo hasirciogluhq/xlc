@@ -146,6 +146,7 @@ export class Lowerer {
 
     // The function under construction.
     fnRetTy: i32   ///< Types index of the return type (void when none)
+    fnDecl: *SDecl ///< the declaration of the function under construction (its `@entry`/`@init`/`@fini`)
     sumWant: i32   ///< the type the expression being lowered is expected to have (picks a generic enum instance)
     fnName: String
     fnSymbol: String
@@ -192,6 +193,7 @@ export class Lowerer {
         self.starImport = false
         self.checkedSafety = true
         self.fnRetTy = -1
+        self.fnDecl = nil
         self.sumWant = -1
         self.fnName = String("")
         self.fnSymbol = String("")
