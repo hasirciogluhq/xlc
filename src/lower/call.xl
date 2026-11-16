@@ -10,7 +10,7 @@
 // Not lowered yet, and reported with E0709 or left as the value call: generic functions and
 // methods (their instances), virtual methods (vtable slots), interface methods, constructors,
 // sum-variant calls, `operator()` on a class value, packs, and the `__builtin_` forms.
-from "std" import String, Vec, format
+from "std" import String, Vec, format, eprint
 from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
 from "../sema/types" import T_POINTER
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL, SE_TYPE

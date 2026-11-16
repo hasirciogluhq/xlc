@@ -73,8 +73,9 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
                 if r < 0 { return -1 }
                 params.push(r)
             }
-            local ret = resolveDepth(s, t.ret, depth)
-            if ret < 0 { return -1 }
+            // No `-> T` is `void`: it stays -1.
+            local ret = t.ret < 0 ? -1 : resolveDepth(s, t.ret, depth)
+            if ret < 0 && t.ret >= 0 { return -1 }
             local out = s.types.makeFnPtr(params, ret)
             (*s.types.at(out)).span = t.span
             return out
