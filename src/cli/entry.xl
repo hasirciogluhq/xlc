@@ -5,23 +5,16 @@
 from "std" import String, format
 from "../hir/abi" import XlcHirModule, XlcHirFunction, view
 from "../util/source" import Span, spanNone
-from "backend" import XlcSession, XlcSpan, strOf, xstr, xlcSessionDiagnose
-
-/// The span of a function or of "no position", as the boundary carries it.
-export fn boundarySpan(s: Span) -> XlcSpan {
-    return XlcSpan { file: s.file, line: s.line, column: s.column, endLine: s.endLine, endColumn: s.endColumn }
-}
+from "../session/session" import Session
 
 /// Reports one error on the session. `at` is the span of the offending entity.
-fn report(session: *XlcSession, code: str, at: Span, message: String, hint: str) {
-    local span = boundarySpan(at)
-    local text = String(hint)
-    xlcSessionDiagnose(session, strOf(code), &span, xstr(&message), xstr(&text))
+fn report(session: *Session, code: str, at: Span, message: String, hint: str) {
+    session.diagnose(code, at, message.asStr(), hint)
 }
 
 /// True when the output may be produced; false after a reported error. `rootName` is the file name
 /// of the program (for the E0739 message), `os` the target OS, `crt` whether `--crt` links the CRT.
-export fn checkEntry(session: *XlcSession, m: *XlcHirModule, emit: str, rootName: str, os: str, crt: bool) -> bool {
+export fn checkEntry(session: *Session, m: *XlcHirModule, emit: str, rootName: str, os: str, crt: bool) -> bool {
     local entry: *XlcHirFunction = nil
     for i in 0..m.functionCount as usize {
         if m.functions[i].isEntry != 0 {

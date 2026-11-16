@@ -1,0 +1,65 @@
+// What the compilation does around one parse: the syntax errors the parser recorded become E0002
+// diagnostics, and every `@allow(CODE...)` on a statement, a declaration or a method opens a
+// scope in which those warnings are silenced.
+from "std" import Vec
+from "../lang/ast/ast" import XSpan, XAA_IDENT
+from "../lang/parser/parser" import CParseResult
+from "../sema/flat" import Flat
+from "../sema/sema" import Sema
+from "../util/source" import Span
+from "../util/diagnostics" import DiagnosticEngine, Diagnostic, Label, SEV_ERROR
+
+/// The engine's `Span` of a flat AST span (the two records have the same fields).
+export fn spanOfFlat(flat: *Flat, s: XSpan) -> Span {
+    return Span { file: s.file, line: s.line, column: s.column, endLine: s.endLine, endColumn: s.endColumn }
+}
+
+/// Reports the syntax errors recorded in `r` (E0002, or the code the parser gave the error).
+export fn reportParseErrors(diag: *DiagnosticEngine, r: *CParseResult, file: u32) {
+    local flat = Flat(*r)
+    for i in 0..r.errCount as usize {
+        local e = r.errs[i]
+        local d: Diagnostic
+        local code = flat.strOf(e.code)
+        d.code = diag.txt(code.len == 0 ? "E0002" : code)
+        d.severity = SEV_ERROR
+        d.message = diag.txt(flat.strOf(e.message))
+        d.detail = diag.txt(flat.strOf(e.detail))
+        d.fix = diag.txt(flat.strOf(e.fix))
+        d.labelsFirst = diag.labels.length() as i32
+        for j in 0..e.labelsCount as usize {
+            local l = r.errLabels[e.labelsFirst as usize + j]
+            diag.labels.push(Label { span: spanOfFlat(&flat, l.span), text: diag.txt(flat.strOf(l.text)) })
+        }
+        d.labelsCount = (diag.labels.length() as u32) - (d.labelsFirst as u32)
+        diag.report(d)
+    }
+}
+
+/// Opens the scope of one node's `@allow(...)` attributes: its identifier arguments are codes.
+fn scopeOf(diag: *DiagnosticEngine, flat: *Flat, first: u32, count: u32, scope: Span) {
+    for i in 0..count as usize {
+        local a = flat.attrAt((first + i as u32) as i32)
+        if flat.strOf((*a).name) != "allow" { continue }
+        local codes = Vec<str>()
+        for j in 0..(*a).argsCount as usize {
+            local arg = &flat.r.attrArgs[(*a).argsFirst as usize + j]
+            if flat.strOf((*arg).key).len == 0 && (*arg).kind == XAA_IDENT {
+                codes.push(flat.strOf((*arg).text))
+            }
+        }
+        diag.addAllowScope(scope, &codes)
+    }
+}
+
+/// Registers every `@allow` scope of the module: statements, declarations and methods.
+export fn registerAllowScopes(diag: *DiagnosticEngine, flat: *Flat, sema: *Sema) {
+    for i in 0..flat.r.stmtCount as usize {
+        local s = flat.stmtAt(i as i32)
+        scopeOf(diag, flat, (*s).attrsFirst, (*s).attrsCount, spanOfFlat(flat, (*s).span))
+    }
+    for i in 0..flat.r.declCount as usize {
+        local d = flat.declAt(i as i32)
+        scopeOf(diag, flat, (*d).attrsFirst, (*d).attrsCount, spanOfFlat(flat, (*d).span))
+    }
+}

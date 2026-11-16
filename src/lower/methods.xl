@@ -5,29 +5,62 @@
 // Only the module's own declarations are searched; a base class of another module is a known gap.
 from "std" import String, Vec
 from "../sema/sema" import Sema
-from "../sema/module_scope" import lookupEntity
+from "../sema/module_scope" import lookupEntity, entityByQName
 from "../sema/item" import SDecl
 from "../sema/types" import T_CLASS, T_STRUCT
+from "../sema/resolve" import resolve
+from "../lang/ast/ast" import XD_IMPL
+
+/// Where a class or struct is declared: the module `owner` and the SDecl index `decl` in it
+/// (-1 when it is not found). A type of an imported module is spelled `key::Name`.
+export struct ClassLoc {
+    owner: *Sema
+    decl: i32
+}
+
+/// True when the type name carries `::` (a name already qualified by its module).
+fn isQualified(name: str) -> bool {
+    for i in 0..name.len as usize {
+        if name[i] == b':' && i + 1 < name.len as usize && name[i + 1] == b':' { return true }
+    }
+    return false
+}
+
+/// The declaration of the class or struct named `name` as seen from module `s`.
+fn locate(s: *Sema, name: str) -> ClassLoc {
+    local out = ClassLoc { owner: s, decl: -1 }
+    local ref = isQualified(name) ? entityByQName(s, name) : lookupEntity(s, name)
+    if ref.sym < 0 { return out }
+    out.owner = ref.owner != nil ? ref.owner : s
+    out.decl = out.owner.declOfItem(out.owner.itemOf(ref.sym))
+    return out
+}
+
+/// The class or struct `ty` (a Types index of `s`), `decl` -1 when it is none.
+export fn classLoc(s: *Sema, ty: i32) -> ClassLoc {
+    local none = ClassLoc { owner: s, decl: -1 }
+    if ty < 0 { return none }
+    local rec = s.types.get(ty)
+    if rec.kind != T_STRUCT && rec.kind != T_CLASS { return none }
+    return locate(s, s.types.pathOf(rec).asStr())
+}
 
 /// The SDecl index of the class or struct `ty` (a Types index), -1 when it has none here.
 export fn classDeclIndex(s: *Sema, ty: i32) -> i32 {
-    if ty < 0 { return -1 }
-    local rec = s.types.get(ty)
-    if rec.kind != T_STRUCT && rec.kind != T_CLASS { return -1 }
-    local ref = lookupEntity(s, s.types.pathOf(rec).asStr())
-    if ref.sym < 0 { return -1 }
-    return s.declOfItem(s.itemOf(ref.sym))
+    return classLoc(s, ty).decl
 }
 
-/// The SDecl index of the base class of the declaration `d`, -1 when it has no base or the base
-/// is not declared here. The base is written as a path in the flat AST, as `lowerAggregate`
-/// reads it.
+/// The base class of the declaration `d` of `owner` (found from `owner`'s scope), `decl` -1 when
+/// it has no base. The base is written as a path in the flat AST, as `lowerAggregate` reads it.
+export fn baseLoc(owner: *Sema, d: i32) -> ClassLoc {
+    local decl = owner.declAt(d as usize)
+    if (*decl).baseCount == 0 { return ClassLoc { owner: owner, decl: -1 } }
+    return locate(owner, owner.text(owner.flat.pathSeg((*decl).baseFirst)))
+}
+
+/// The SDecl index of the base class of the declaration `d`, -1 when it has no base.
 export fn baseDeclIndex(s: *Sema, d: i32) -> i32 {
-    local decl = s.declAt(d as usize)
-    if (*decl).baseCount == 0 { return -1 }
-    local ref = lookupEntity(s, s.text(s.flat.pathSeg((*decl).baseFirst)))
-    if ref.sym < 0 { return -1 }
-    return s.declOfItem(s.itemOf(ref.sym))
+    return baseLoc(s, d).decl
 }
 
 /// The methods of the declaration `d` named `name`, as SDecl indices in declaration order.
@@ -47,6 +80,7 @@ export fn methodsNamed(s: *Sema, d: i32, name: str) -> Vec<i32> {
 /// direct one.
 export class MethodRef {
     found: bool
+    owner: *Sema ///< the module that declares the class (`decl` and `cdecl` index its arena)
     decl: i32
     cdecl: i32
     cls: String
@@ -54,6 +88,7 @@ export class MethodRef {
 
     fn init(self) {
         self.found = false
+        self.owner = nil
         self.decl = -1
         self.cdecl = -1
         self.cls = String("")
@@ -64,22 +99,53 @@ export class MethodRef {
 /// The method `name` of the class or struct `ty`, searched through its base classes.
 export fn findMethod(s: *Sema, ty: i32, name: str) -> *MethodRef {
     local out = new MethodRef()
-    local d = classDeclIndex(s, ty)
+    local at = classLoc(s, ty)
     local depth = 0
-    while d >= 0 && depth < 32 {
-        local found = methodsNamed(s, d, name)
+    while at.decl >= 0 && depth < 32 {
+        local o = at.owner
+        local found = methodsNamed(o, at.decl, name)
         if found.length() > 0 {
             local m = *found.get(0)
-            local decl = s.declAt(m as usize)
+            local decl = o.declAt(m as usize)
             (*out).found = true
+            (*out).owner = o
             (*out).decl = m
-            (*out).cdecl = d
-            (*out).cls = s.qualify(s.text((*s.declAt(d as usize)).name))
+            (*out).cdecl = at.decl
+            (*out).cls = o.qualify(o.text((*o.declAt(at.decl as usize)).name))
             (*out).isVirtual = (*decl).isVirtual != 0 || (*decl).isOverride != 0
             return out
         }
-        d = baseDeclIndex(s, d)
+        at = baseLoc(o, at.decl)
         depth = depth + 1
+    }
+    return findInherent(s, ty, name, out)
+}
+
+/// The method `name` of an `impl T { }` block (no interface) whose target is the struct or class
+/// `ty`: such a method is the function `T.name`, `cdecl` is the impl declaration (its methods are
+/// ranged like a class's). The impl lives in the module that declares `T`.
+fn findInherent(s: *Sema, ty: i32, name: str, out: *MethodRef) -> *MethodRef {
+    local at = classLoc(s, ty)
+    if at.decl < 0 { return out }
+    local o = at.owner
+    local typeQ = o.qualify(o.text((*o.declAt(at.decl as usize)).name))
+    for i in 0..o.items.length() {
+        local item = i as i32
+        local di = o.declOfItem(item)
+        if di < 0 { continue }
+        local d = o.declAt(di as usize)
+        if (*d).kind != XD_IMPL || (*d).ifacePathCount > 0 { continue }
+        local target = resolve(o, (*d).implTarget)
+        if target < 0 || o.types.pathOf(o.types.get(target)).asStr() != typeQ.asStr() { continue }
+        local found = methodsNamed(o, di, name)
+        if found.length() == 0 { continue }
+        (*out).found = true
+        (*out).owner = o
+        (*out).decl = *found.get(0)
+        (*out).cdecl = di
+        (*out).cls = typeQ.clone()
+        (*out).isVirtual = false
+        return out
     }
     return out
 }

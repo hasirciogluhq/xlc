@@ -146,6 +146,7 @@ export class Lowerer {
 
     // The function under construction.
     fnRetTy: i32   ///< Types index of the return type (void when none)
+    sumWant: i32   ///< the type the expression being lowered is expected to have (picks a generic enum instance)
     fnName: String
     fnSymbol: String
     fnRet: String
@@ -191,6 +192,7 @@ export class Lowerer {
         self.starImport = false
         self.checkedSafety = true
         self.fnRetTy = -1
+        self.sumWant = -1
         self.fnName = String("")
         self.fnSymbol = String("")
         self.fnRet = String("void")
@@ -361,6 +363,12 @@ export class Lowerer {
             if (*self.extraNames.get(i)).asStr() == name {
                 return *self.extraEntries.get(i)
             }
+        }
+        // An imported entity (function, global, define, type): found through the module's name
+        // table on first use, then cached.
+        local ref = lookupEntity(self.s, name)
+        if ref.sym >= 0 {
+            return self.extraEntry(name, self.entryOf(ref, name, Span { file: 0, line: 0, column: 0, endLine: 0, endColumn: 0 }))
         }
         return nil
     }

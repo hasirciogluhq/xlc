@@ -7,7 +7,7 @@
 // the xlang pass does not have yet (an operator function, an interface value, an inherited field)
 // returns true and reports nothing: those forms are not checked here.
 from "std" import String, format
-from "../lang/ast/ast" import XExpr, XSpan
+from "../lang/ast/ast" import XExpr, XSpan, XE_NAME, XE_STRING_LITERAL
 from "../sema/types" import Types, T_VOID, T_NEVER, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR,
     T_ARRAY, T_ENUM, T_STRUCT, T_CLASS, T_INTERFACE, T_STR, T_SLICE, T_TUPLE
 from "../sema/conversion" import implicitConversion, C_OK, C_WARN, C_SIGNEDNESS, C_NEEDS_CAST
@@ -107,6 +107,20 @@ export fn coerceChecked(l: *Lowerer, idx: i32, value: i32, src: i32, want: i32) 
     // Interface boxing is not ported: the value is left as it is.
     if l.s.types.get(want).kind == T_INTERFACE || degradesSlice(l.s.types, src, want) {
         return value
+    }
+    local lit = l.s.exprAt(idx)
+    local wk = l.s.types.get(want).kind
+    if wk == T_POINTER || wk == T_FN_PTR {
+        // `nil` is any pointer; a string literal is a `*u8` / `*i8` (the address of its bytes).
+        if (*lit).kind == XE_NAME && l.s.exprTextAt(idx) == "nil" {
+            return l.b.nil(typeNameOf(l, want))
+        }
+        if (*lit).kind == XE_STRING_LITERAL && wk == T_POINTER {
+            local elem = l.s.types.get(l.s.types.get(want).elem)
+            if elem.kind == T_INT && elem.bits == 8 {
+                return l.b.strConst(l.s.exprTextAt(idx), typeNameOf(l, want))
+            }
+        }
     }
     local r = implicitConversion(l.s.types, src, want, l.unsafeDepth > 0, l.s.pointerBits)
     local at = (*l.s.exprAt(idx)).span

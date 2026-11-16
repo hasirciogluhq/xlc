@@ -501,6 +501,21 @@ export class DiagnosticEngine {
         return self.errors != 0
     }
 
+    /// A diagnostic with two marked places (a first and a second definition, binding or
+    /// registration) and a fix; the severity comes from the registry.
+    fn twoSites(self, code: str, message: str, first: Span, firstText: str, second: Span, secondText: str, fix: str) {
+        local d: Diagnostic
+        d.code = self.txt(code)
+        d.severity = SEV_ERROR
+        d.message = self.txt(message)
+        d.fix = self.txt(fix)
+        d.labelsFirst = self.labels.length() as i32
+        if first.valid() { self.labels.push(Label { span: first, text: self.txt(firstText) }) }
+        if second.valid() { self.labels.push(Label { span: second, text: self.txt(secondText) }) }
+        d.labelsCount = (self.labels.length() as u32) - (d.labelsFirst as u32)
+        self.report(d)
+    }
+
     /// Builder for the common error shape.
     fn error(self, code: str, span: Span, message: str, label: str) {
         local d: Diagnostic

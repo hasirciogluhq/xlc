@@ -1,0 +1,138 @@
+// The `?` operator of the lowering pass. The xlang twin of sema/lower/expr/propagate.cpp.
+//
+// `e?` evaluates `e`, a payload enum with a success variant and a failure variant, and either
+// yields the success value or returns the failure from the function. The shapes are found
+// structurally (no name is known to the compiler):
+//   - two variants, the first with one value and the second with at most one: the first is the
+//     success (`Ok(T)` / `Err(E)`, `Some(T)` / `None`);
+//   - two variants, the first without data and the second with one value: the second is the
+//     success (`None` / `Some(T)`).
+// The function must return an enum of such a shape whose failure carries the same type.
+//
+// An expression cannot return, so the lowering is hoisted: the statements
+//     local $try = e;  if $try is failure { return Failure($try.payload) }  local $ok = $try.payload
+// are put in front of the statement being lowered (`l.emitted`) and `$ok` stands where `e?` was.
+//
+// Not ported yet: the `?` inside a `defer` (E0761), the drop of `$ok` and the move out of `$try`
+// (ownership pass), the right side of `&&`/`||` and a `?:` branch (a hoist onto that path), and a
+// generic payload enum such as `Option<T>` (needs the instance choice of `sumFor`).
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr
+from "../sema/item" import SDecl
+from "../sema/types" import T_NAMED, T_ENUM, T_STRUCT
+from "../sema/resolve" import resolve
+from "./state" import Lowerer
+from "./typing" import exprType, typeNameOf, resolveBase
+from "./sum" import Sum, sumNamed, construct, tagIs, payloadRead
+from "./function" import lowerExpr, hiddenLocal, emitDefers
+
+/// The success and the failure variant of a two-variant enum; `fail` is -1 when the enum has
+/// no `?` shape.
+struct Shape {
+    value: i32
+    fail: i32
+}
+
+/// The payload count of variant `i` of `sum`.
+fn payloadCount(sum: Sum, i: i32) -> u32 {
+    return (*sum.owner.variants.get(((*sum.decl).variantsFirst + i as u32) as usize)).payloadCount
+}
+
+fn shapeOf(sum: Sum) -> Shape {
+    local none = Shape { value: -1, fail: -1 }
+    if (*sum.decl).variantsCount != 2 { return none }
+    local a = payloadCount(sum, 0)
+    local b = payloadCount(sum, 1)
+    if a == 1 && b <= 1 { return Shape { value: 0, fail: 1 } }
+    if a == 0 && b == 1 { return Shape { value: 1, fail: 0 } }
+    return none
+}
+
+/// The payload enum a type names, or a Sum with a nil `decl` (unknown, not an enum, generic).
+fn sumOfType(l: *Lowerer, t: i32) -> Sum {
+    local none = Sum { owner: l.s, decl: nil as *SDecl }
+    local base = resolveBase(l, t)
+    if base < 0 { return none }
+    local rec = l.s.types.get(base)
+    if rec.kind != T_NAMED && rec.kind != T_STRUCT && rec.kind != T_ENUM { return none }
+    return sumNamed(l, l.s.types.pathOf(rec).asStr())
+}
+
+/// The Types index of the payload of variant `variant` of `sum`.
+fn payloadType(sum: Sum, variant: i32) -> i32 {
+    local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
+    return resolve(sum.owner, (*v).payloadFirst as i32)
+}
+
+/// The type of `e?`: the success payload of the operand's enum, -1 when unknown.
+export fn tryType(l: *Lowerer, e: *XExpr) -> i32 {
+    local sum = sumOfType(l, exprType(l, (*e).lhs))
+    if sum.decl == nil as *SDecl { return -1 }
+    local shape = shapeOf(sum)
+    return shape.value < 0 ? -1 : payloadType(sum, shape.value)
+}
+
+/// `e?`: the hoisted lowering described above. Returns the local that holds the success value,
+/// -1 after a diagnostic.
+export fn lowerPropagate(l: *Lowerer, idx: i32, e: *XExpr) -> i32 {
+    local operand = (*e).lhs
+    local selfTy = exprType(l, operand)
+    if selfTy < 0 { return -1 }
+    local sum = sumOfType(l, selfTy)
+    local shape = sum.decl == nil as *SDecl ? Shape { value: -1, fail: -1 } : shapeOf(sum)
+    local selfName = typeNameOf(l, selfTy)
+    if shape.value < 0 {
+        local msg = format("`?` needs a `Result`-like or `Option`-like enum, found `{}`", selfName)
+        l.err("E0762", (*l.s.exprAt(operand)).span, msg.asStr(),
+            "its variants are a success with one value and a failure (`Ok(T)`/`Err(E)`, `Some(T)`/`None`)")
+        return -1
+    }
+    local ret = sumOfType(l, l.fnRetTy)
+    local retShape = ret.decl == nil as *SDecl ? Shape { value: -1, fail: -1 } : shapeOf(ret)
+    if retShape.value < 0 {
+        local msg = format("`?` returns the failure, but the function returns `{}`", typeNameOf(l, l.fnRetTy))
+        l.err("E0763", (*e).span, msg.asStr(),
+            "the function must return a `Result`-like or `Option`-like enum too")
+        return -1
+    }
+    local failCount = payloadCount(sum, shape.fail)
+    if failCount != payloadCount(ret, retShape.fail) || (failCount != 0 &&
+        l.s.types.text(payloadType(sum, shape.fail)).asStr() !=
+        l.s.types.text(payloadType(ret, retShape.fail)).asStr()) {
+        local msg = format("`?` cannot return the failure of `{}` from a function returning `{}`",
+            selfName, typeNameOf(l, l.fnRetTy))
+        l.err("E0763", (*e).span, msg.asStr(),
+            "the failure must carry the same type in both (there is no conversion)")
+        return -1
+    }
+    local value = lowerExpr(l, operand)
+    if value < 0 { return -1 }
+    local held = hiddenLocal(l, "try", selfName)
+    l.emitted.push(l.b.localStmt(held, "", selfName, value))
+
+    // if $try.tag == failure { return Failure($try.payload) }
+    local carried = Vec<i32>()
+    if failCount != 0 { carried.push(payloadRead(l, sum, held, selfName, shape.fail, 0)) }
+    local leaveValue = construct(l, ret, retShape.fail, carried)
+    local body = Vec<i32>()
+    local pending = false
+    for f in 0..l.defers.length() {
+        if (*l.defers.get(f)).length() > 0 { pending = true }
+    }
+    if pending {
+        // The returned value is computed before the deferred statements run.
+        local retName = typeNameOf(l, l.fnRetTy)
+        local keep = hiddenLocal(l, "ret", retName)
+        body.push(l.b.localStmt(keep, "", retName, leaveValue))
+        leaveValue = l.b.localRef(keep, retName)
+        emitDefers(l, 0, &body)
+    }
+    body.push(l.b.returnStmt(leaveValue))
+    l.emitted.push(l.b.ifStmt(tagIs(l, sum, held, selfName, shape.fail), body, Vec<i32>()))
+
+    // local $ok = $try.payload
+    local okName = typeNameOf(l, payloadType(sum, shape.value))
+    local ok = hiddenLocal(l, "ok", okName)
+    l.emitted.push(l.b.localStmt(ok, "", okName, payloadRead(l, sum, held, selfName, shape.value, 0)))
+    return l.b.localRef(ok, okName)
+}

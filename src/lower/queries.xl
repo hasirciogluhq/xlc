@@ -9,6 +9,7 @@ from "../hir/abi" import E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, 
     E_EXTERNAL, E_GLOBAL_REF, E_UNARY, E_BINARY, E_CAST, E_INDEX, E_FIELD, E_ADDR_OF, E_ARRAY_LIST,
     E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_TO_INTERFACE
 from "../sema/item" import SDecl
+from "../sema/sema" import Sema
 from "../sema/const_eval" import evalConst
 from "../sema/layout_calc" import layoutOfName
 from "./state" import Lowerer
@@ -91,15 +92,20 @@ fn primLayout(tyName: str, which: str) -> u64 {
 /// The value of the member `member` of the enum declared by `d`, numbered as the C++ enumMember
 /// does: a written value (a constant expression), else one more than the member before it.
 export fn enumMemberValue(l: *Lowerer, d: *SDecl, member: str) -> i64 {
+        return enumMemberValueIn(l.s, d, member)
+    }
+
+/// The value of `member` of the enum `d` declared in module `s` (evaluated there).
+export fn enumMemberValueIn(s: *Sema, d: *SDecl, member: str) -> i64 {
         local next: i64 = 0
         for i in 0..(*d).membersCount as usize {
-            local m = l.s.memberAt((*d).membersFirst as usize + i)
+            local m = s.memberAt((*d).membersFirst as usize + i)
             local value = next
             if (*m).value >= 0 {
-                local c = evalConst(l.s, (*m).value)
-                if c >= 0 { value = (*l.s.consts.get(c as usize)).intValue.lo as i64 }
+                local c = evalConst(s, (*m).value)
+                if c >= 0 { value = (*s.consts.get(c as usize)).intValue.lo as i64 }
             }
-            if l.s.text((*m).name) == member { return value }
+            if s.text((*m).name) == member { return value }
             next = value + 1
         }
         return 0

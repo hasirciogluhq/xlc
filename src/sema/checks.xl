@@ -56,7 +56,7 @@ fn checkExpr(s: *Sema, exprIdx: i32) {
     if exprIdx < 0 { return }
     local e = s.exprAt(exprIdx)
     if (*e).kind == XE_CAST || (*e).kind == XE_NEW || (*e).kind == XE_STRUCT_LITERAL {
-        checkType(s, (*e).typeIdx)
+        checkType(s, s.types.internAst((*e).typeIdx))
     }
     if (*e).lhs >= 0 { checkExpr(s, (*e).lhs) }
     if (*e).rhs >= 0 { checkExpr(s, (*e).rhs) }
@@ -80,11 +80,11 @@ fn checkClosure(s: *Sema, closureIdx: i32) {
         local p = (s.flat.r.params as usize + ((*c).paramsFirst + i as u32) as usize *
             sizeOf(XParam)) as *XParam
         if (*p).hasType != 0 {
-            checkType(s, (*p).typeIdx)
+            checkType(s, s.types.internAst((*p).typeIdx))
         }
     }
     if (*c).hasRet != 0 {
-        checkType(s, (*c).ret)
+        checkType(s, s.types.internAst((*c).ret))
     }
     checkStatements(s, (*c).body)
 }
@@ -97,7 +97,7 @@ fn checkStatements(s: *Sema, blockIdx: i32) {
         local stmtIdx = s.refAt("stmt", ((*b).stmtsFirst + i as u32) as i32)
         local st = s.stmtAt(stmtIdx)
         if (*st).hasType != 0 {
-            checkType(s, (*st).typeIdx)
+            checkType(s, s.types.internAst((*st).typeIdx))
         }
         if (*st).target >= 0 { checkExpr(s, (*st).target) }
         if (*st).expr >= 0 { checkExpr(s, (*st).expr) }
@@ -108,7 +108,7 @@ fn checkStatements(s: *Sema, blockIdx: i32) {
 
 /// `staticAssert(cond, message?)`.
 fn checkStaticAssert(s: *Sema, declIdx: i32) {
-    local d = s.declOf(declIdx)
+    local d = s.declAt(declIdx as usize)
     if (*d).call < 0 { return }
     checkStaticAssertCall(s, (*d).call)
 }
@@ -147,13 +147,13 @@ fn checkStaticAssertCall(s: *Sema, callIdx: i32) {
 
 /// The layout of one aggregate is computed (and its diagnostics reported) here.
 fn checkAggregate(s: *Sema, declIdx: i32) {
-    local d = s.declOf(declIdx)
+    local d = s.declAt(declIdx as usize)
     layoutOfName(s, s.text((*d).name), (*d).nameSpan)
 }
 
 /// True when the `fn` declaration takes a parameter pack.
 fn isPackFn(s: *Sema, declIdx: i32) -> bool {
-    local d = s.declOf(declIdx)
+    local d = s.declAt(declIdx as usize)
     if (*d).kind != XD_FN { return false }
     for i in 0..(*d).paramsCount as usize {
         local p = s.params.get(((*d).paramsFirst + i as u32) as usize)
@@ -165,7 +165,7 @@ fn isPackFn(s: *Sema, declIdx: i32) -> bool {
 /// A pack function is checked here for its declaration and its uses of the pack; its body is
 /// checked per element count, when a call instantiates it.
 fn checkPackFn(s: *Sema, declIdx: i32) {
-    local d = s.declOf(declIdx)
+    local d = s.declAt(declIdx as usize)
     local packSeen = false
     for i in 0..(*d).paramsCount as usize {
         local p = s.params.get(((*d).paramsFirst + i as u32) as usize)
@@ -197,7 +197,7 @@ fn checkPackFn(s: *Sema, declIdx: i32) {
 
 /// Parameter packs are supported on free functions only.
 fn checkNoPackMethod(s: *Sema, declIdx: i32) {
-    local d = s.declOf(declIdx)
+    local d = s.declAt(declIdx as usize)
     for i in 0..(*d).paramsCount as usize {
         local p = s.params.get(((*d).paramsFirst + i as u32) as usize)
         if (*p).isPack != 0 {
@@ -214,7 +214,7 @@ export fn analyze(s: *Sema) {
     for i in 0..s.items.length() {
         local declIdx = s.declOfItem(i as i32)
         if declIdx < 0 { continue }
-        local d = s.declOf(declIdx)
+        local d = s.declAt(declIdx as usize)
         if (*d).kind == XD_ENUM {
             // A generic enum is checked per instance, when it is instantiated.
             if (*d).genericCount == 0 {
@@ -235,8 +235,8 @@ export fn analyze(s: *Sema) {
             if fromConfigHas(s, s.text((*d).name)) { continue }
             // A define is evaluated once here, which fills the cache and reports E0707.
             local item = s.itemOf(s.find(s.text((*d).name)))
-            if item >= 0 && (*s.declOf(declIdx)).init >= 0 {
-                evalConst(s, (*s.declOf(declIdx)).init)
+            if item >= 0 && (*s.declAt(declIdx as usize)).init >= 0 {
+                evalConst(s, (*s.declAt(declIdx as usize)).init)
             }
         } else if (*d).kind == XD_GLOBAL {
             if (*d).hasType != 0 {
@@ -267,7 +267,7 @@ export fn analyze(s: *Sema) {
                 local enumItem = genericEnumOf(s, s.text((*d).name))
                 if enumItem >= 0 {
                     local ed = s.declOfItem(enumItem)
-                    if ed >= 0 && (*s.declOf(ed)).genericCount != 0 { continue }
+                    if ed >= 0 && (*s.declAt(ed as usize)).genericCount != 0 { continue }
                 }
             }
             for f in 0..(*d).fieldsCount as usize {
@@ -278,7 +278,7 @@ export fn analyze(s: *Sema) {
                 for m in 0..(*d).methodsCount as usize {
                     local md = ((*d).methodsFirst + m as u32) as i32
                     checkNoPackMethod(s, md)
-                    local mdecl = s.declOf(md)
+                    local mdecl = s.declAt(md as usize)
                     // A generic method has no body to check until an instance is made.
                     if (*mdecl).hasBody != 0 && (*mdecl).genericCount == 0 {
                         checkStatements(s, (*mdecl).body)
@@ -292,7 +292,7 @@ export fn analyze(s: *Sema) {
             for m in 0..(*d).methodsCount as usize {
                 local md = ((*d).methodsFirst + m as u32) as i32
                 checkNoPackMethod(s, md)
-                local mdecl = s.declOf(md)
+                local mdecl = s.declAt(md as usize)
                 if (*mdecl).hasBody != 0 {
                     checkStatements(s, (*mdecl).body)
                 }

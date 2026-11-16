@@ -81,8 +81,46 @@ export struct InstanceInfo {
     parentOwner: i32  ///< the module that owns `parent`, -1 for this module
 }
 
+/// The modules of one compilation as every module's Sema sees them: the other Semas by module
+/// key (the root's key is ""), and the `register`ed names of the whole program. The compilation
+/// driver (src/session/compilation.xl) fills it; a standalone module has none (`peers == nil`).
+export class Peers {
+    semas: Vec<*Sema>
+    regNames: Vec<String>   ///< `register`ed names, parallel to `regOwners`
+    regOwners: Vec<*Sema>
+
+    fn init(self) {
+        self.semas = Vec<*Sema>()
+        self.regNames = Vec<String>()
+        self.regOwners = Vec<*Sema>()
+    }
+
+    /// The Sema of the module `key`, or nil.
+    fn byKey(self, key: str) -> *Sema {
+        for i in 0..self.semas.length() {
+            if (*(*self.semas.get(i))).moduleKey.asStr() == key { return *self.semas.get(i) }
+        }
+        return nil
+    }
+
+    /// The module that registered `name`, or nil.
+    fn registeredOwner(self, name: str) -> *Sema {
+        for i in 0..self.regNames.length() {
+            if (*self.regNames.get(i)).asStr() == name { return *self.regOwners.get(i) }
+        }
+        return nil
+    }
+}
+
 /// The semantic analysis of one module.
 export class Sema {
+    peers: *Peers          ///< the other modules of the compilation (nil for a standalone module)
+    // What this module exports (filled by the driver): the name others import, the key of the
+    // module that defines it (the namespace target when `exportNs`), and its name there.
+    exportNames: Vec<String>
+    exportKeys: Vec<String>
+    exportLocals: Vec<String>
+    exportNs: Vec<bool>
     flat: *Flat
     types: *Types
     diag: *DiagnosticEngine
@@ -189,6 +227,11 @@ export class Sema {
         self.itemInstance = Vec<i32>()
         self.currentInstance = String()
         self.instEnv = nil
+        self.peers = nil
+        self.exportNames = Vec<String>()
+        self.exportKeys = Vec<String>()
+        self.exportLocals = Vec<String>()
+        self.exportNs = Vec<bool>()
         self.defineValues = Vec<i32>()
         self.defineNames = Vec<XStr>()
         self.defineInProgress = Vec<XStr>()
@@ -483,6 +526,7 @@ export class Sema {
         d.macroBodyCount = (*src).macroBodyCount
         d.module = self.str(self.flat.strOf((*src).module))
         d.moduleSpan = (*src).moduleSpan
+        d.form = (*src).form
         d.alias = self.str(self.flat.strOf((*src).alias))
         // Import and re-export names.
         local nFirst = self.importNames.length() as u32
@@ -661,6 +705,14 @@ export class Sema {
 
     // ------------------------------------------------------------------ name table
 
+    /// Binds `local` to an entity (`name` in module `moduleKey`) or, when `isNamespace`, to the
+    /// whole module `moduleKey`.
+    fn bindImport(self, bound: str, isNamespace: bool, moduleKey: str, name: str, at: Span) {
+        self.importBindingNames.push(self.str(bound))
+        self.importBindings.push(ImportBinding { isNamespace: isNamespace, moduleKey: self.str(moduleKey),
+            name: self.str(name), span: at })
+    }
+
     /// The index of the symbol called `name`, or -1.
     fn find(self, name: str) -> i32 {
         // The names are interned in this Sema's own table, not in the flat AST's bytes.
@@ -782,30 +834,9 @@ export class Sema {
     fn reportDuplicate(self, first: i32, second: i32) {
         local d1 = self.declOf((*self.symbols.get(first as usize)).item)
         local d2 = self.declOf(second)
-        local diag: Diagnostic
-        diag.code = self.diag.txt("E0401")
-        // The engine's `error` carries one label; the two-site form goes through `report`.
-        local labels = Vec<Label>()
-        labels.push(Label { span: self.span(d1.nameSpan), text: self.diag.txt("first definition") })
-        labels.push(Label { span: self.span(d2.nameSpan), text: self.diag.txt("second definition") })
-        local d = Diagnostic {
-            code: self.diag.txt("E0401"),
-            severity: 2,
-            message: self.diag.txt(format("{} is defined twice", self.text(d2.name)).asStr()),
-            labelsFirst: -1,
-            labelsCount: 0,
-            notesFirst: -1,
-            notesCount: 0,
-            detail: self.diag.txt(""),
-            reason: self.diag.txt(""),
-            fix: self.diag.txt("rename one of them"),
-            suppressed: 0,
-            keyFile: 0,
-            keyLine: 0,
-            keyColumn: 0,
-        }
-        if labels.length() == 99999 { return }
-        self.diag.report(d)
+        self.diag.twoSites("E0401", format("{} is defined twice", self.text(d2.name)).asStr(),
+            self.span(d1.nameSpan), "first definition", self.span(d2.nameSpan), "second definition",
+            "rename one of them")
     }
 
     /// Names of the type parameters of a `fn`, `struct`, `class`, `alias`, `interface` or `enum`;

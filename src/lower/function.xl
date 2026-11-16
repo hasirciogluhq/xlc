@@ -25,16 +25,19 @@ from "./builder" import FnBuild, XlcHirGlobalRec
 from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName, lowerArrayLen,
     isConstValue
 from "./call" import lowerCall
-from "./sum" import sumNamed, lowerSumValue, lowerSumSwitch
+from "./sum" import sumNamed, sumOfType, lowerSumValue, lowerSumSwitch
 from "./methods" import classSelfType
-from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
+from "./typing" import listFits, exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
     fieldTypeOf
 from "./diagnose" import coerceChecked, checkCast, checkIndex, checkSlice, checkDeref, checkField,
     checkStructLit, checkDuplicateInit, knownField, reportTwoSites
 from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_WARN
+from "./builtins" import lowerRawWrite
+from "./propagate" import lowerPropagate
+from "./iterate" import lowerForEach
 from "../sema/const_eval" import evalConst
-from "../sema/const_value" import CV_INT
+from "../sema/const_value" import CV_INT, CV_FLOAT, CV_BOOL, CV_STRING
 from "../sema/layout_calc" import layoutOfName
 
 /// The statement kinds of the flat AST (the `XS_*` constants of ast.xl, mirrored).
@@ -233,6 +236,11 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             return lowerLocalConst(l, idx)
         }
         if (*st).kind == XS_EXPR {
+            local se = l.s.exprAt((*st).expr)
+            if (*se).kind == XE_CALL && (*l.s.exprAt((*se).lhs)).kind == XE_NAME &&
+               l.s.exprTextAt((*se).lhs) == "__builtin_write" {
+                return lowerRawWrite(l, se)
+            }
             local value = lowerExpr(l, (*st).expr)
             if value < 0 { return -1 }
             // An expression statement: the value is discarded.
@@ -308,6 +316,9 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
         }
         if (*st).kind == XS_FOR {
             return lowerCFor(l, st)
+        }
+        if (*st).kind == XS_FOR_EACH {
+            return lowerForEach(l, idx, st)
         }
         if (*st).kind == XS_FOR_RANGE {
             return lowerForRange(l, idx, st)
@@ -487,6 +498,7 @@ export fn lowerExprWant(l: *Lowerer, idx: i32, want: i32) -> i32 {
     /// The expression walk of `lowerExprWant` (the node kinds, one branch each).
 fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
         local e = l.s.exprAt(idx)
+        l.sumWant = want
         if (*e).kind == XE_INT_LITERAL {
             if want >= 0 && isFloatType(l, want) {
                 return l.b.floatConst((*e).intValue as f64, typeNameOf(l, want))
@@ -510,7 +522,7 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
             return l.b.intConst((*e).intValue, exprTypeName(l,idx))
         }
         if (*e).kind == XE_NAME {
-            return lowerName(l, idx)
+            return lowerName(l, idx, want)
         }
         if (*e).kind == XE_BINARY {
             return lowerBinary(l, idx, e, want)
@@ -537,15 +549,26 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
             // `Enum.Member` is the member's constant, typed as the enum (C++ fieldExpr).
             if (*l.s.exprAt((*e).lhs)).kind == XE_NAME {
                 local en = l.s.exprTextAt((*e).lhs)
-                local sym = l.s.find(en)
                 local sum = sumNamed(l, en)
                 if sum.decl != nil as *SDecl {
                     return lowerSumValue(l, sum, e, l.s.exprTextAt(idx))
                 }
-                if sym >= 0 && (*l.s.symbols.get(sym as usize)).kind == SY_ENUM {
-                    local decl = l.s.declOfItem(l.s.itemOf(sym))
-                    if decl < 0 { return -1 }
-                    return l.b.intConst(enumMemberValue(l, l.s.declOf(decl), l.s.exprTextAt(idx)) as u64, en)
+                local head = l.lookupName(en)
+                if head != nil && (*head).kind == SE_TYPE {
+                    // The builtin `MemoryOrder` has no declaration: its members are numbered in
+                    // this order (sema/symbols).
+                    if (*head).item < 0 {
+                        local member = l.s.exprTextAt(idx)
+                        local order: u64 = member == "relaxed" ? 0 : member == "acquire" ? 1
+                            : member == "release" ? 2 : member == "acqRel" ? 3 : 4
+                        return l.b.intConst(order, en)
+                    }
+                    local eo = entryOwner(l, head)
+                    local decl = eo.declOfItem((*head).item)
+                    if decl >= 0 && (*eo.declAt(decl as usize)).kind == XD_ENUM {
+                        return l.b.intConst(enumMemberValueIn(eo, eo.declAt(decl as usize),
+                            l.s.exprTextAt(idx)) as u64, l.keep((*head).qname.asStr()))
+                    }
                 }
             }
             local base = lowerExpr(l, (*e).lhs)
@@ -581,6 +604,17 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
             if l.checkedSafety { (*l.b.exprAt(sl)).checked = 1 }
             return sl
         }
+        if (*e).kind == XE_ARRAY_LIST && listFits(l, idx, want) {
+            // A list written for an array type: every element takes the element type.
+            local elem = l.s.types.get(want).elem
+            local typed = Vec<i32>()
+            for i in 0..(*e).argsCount as usize {
+                local v = lowerExprAs(l, l.s.refAt("expr", ((*e).argsFirst + i as u32) as i32), elem)
+                if v < 0 { return -1 }
+                typed.push(v)
+            }
+            return l.b.arrayList(typed, typeNameOf(l, want))
+        }
         if (*e).kind == XE_ARRAY_LIST || (*e).kind == XE_TUPLE_LITERAL {
             local items = lowerArgList(l, e)
             if (*e).kind == XE_ARRAY_LIST {
@@ -606,6 +640,9 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
         if (*e).kind == XE_CALL {
             return lowerCall(l, idx)
+        }
+        if (*e).kind == XE_TRY {
+            return lowerPropagate(l, idx, e)
         }
         l.err("E0500", (*e).span, "this expression form is not lowered yet",
             "the xlang lowering pass is still being ported")
@@ -696,7 +733,7 @@ export fn lowerBinaryOf(l: *Lowerer, op: i32, lhsExpr: i32, rhsExpr: i32, want: 
     }
 
     /// A name: a local, a global, a function or a constant.
-export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
+export fn lowerName(l: *Lowerer, idx: i32, want: i32) -> i32 {
         local name = l.s.exprTextAt(idx)
         local entry = l.lookupName(name)
         if entry == nil {
@@ -717,12 +754,24 @@ export fn lowerName(l: *Lowerer, idx: i32) -> i32 {
             return l.b.funcRef((*entry).qname.asStr(), tyName)
         }
         if (*entry).kind == SE_CONSTANT {
-            // A define constant folds to its value.
-            local value = l.constOfName(name)
-            if value >= 0 {
-                local cv = *l.s.consts.get(value as usize)
-                return l.b.intConst((*cv).intValue.lo, tyName)
+            // A define constant (this module's or an import's) folds to its value.
+            local value = evalConst(l.s, idx)
+            if value < 0 { return -1 }
+            local cv = *l.s.consts.get(value as usize)
+            // A numeric define is typed like a literal: it takes the type the context expects.
+            if want >= 0 && (*cv).kind == CV_INT && isFloatType(l, want) {
+                return l.b.floatConst((*cv).intValue.lo as f64, typeNameOf(l, want))
             }
+            if want >= 0 && (*cv).kind == CV_INT && isIntType(l, want) {
+                return l.b.intConst((*cv).intValue.lo, typeNameOf(l, want))
+            }
+            if want >= 0 && (*cv).kind == CV_FLOAT && isFloatType(l, want) {
+                return l.b.floatConst((*cv).floatValue, typeNameOf(l, want))
+            }
+            if (*cv).kind == CV_FLOAT { return l.b.floatConst((*cv).floatValue, tyName) }
+            if (*cv).kind == CV_BOOL { return l.b.boolConst((*cv).boolValue, tyName) }
+            if (*cv).kind == CV_STRING { return l.b.strConst((*cv).text.asStr(), tyName) }
+            return l.b.intConst((*cv).intValue.lo, tyName)
         }
         l.err("E0706", (*l.s.exprAt(idx)).span,
             format("`{}` has no lowered form here", name).asStr(), "not a value")
@@ -891,7 +940,7 @@ export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
     local t = exprType(l, (*st).expr)
     local k = t < 0 ? -1 : l.s.types.get(t).kind
     if t >= 0 {
-        local sum = sumNamed(l, typeNameOf(l, t))
+        local sum = sumOfType(l, t)
         if sum.decl != nil as *SDecl { return lowerSumSwitch(l, st, sum, t) }
     }
     if k != T_INT && k != T_BOOL && k != T_ENUM {

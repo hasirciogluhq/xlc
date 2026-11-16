@@ -7,33 +7,58 @@
 from "std" import String, Vec, format
 from "../lang/ast/ast" import XExpr, XType, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL,
     XE_STRING_LITERAL, XE_BYTE_LITERAL, XE_NAME, XE_UNARY, XE_BINARY, XE_CALL, XE_INDEX, XE_SLICE,
-    XE_FIELD, XE_CAST, XE_ARRAY_LIST, XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW, XE_TERNARY,
+    XE_FIELD, XE_CAST, XE_ARRAY_LIST, XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW, XE_TERNARY, XE_TRY,
     XE_MACRO_CALL,
     XU_NOT, XU_DEREF, XU_ADDROF, XB_EQ, XB_NE, XB_LT, XB_LE, XB_GT, XB_GE, XB_AND, XB_OR,
     XB_SHL, XB_SHR
 from "../sema/types" import Types, T_VOID, T_BOOL, T_INT, T_FLOAT, T_POINTER, T_FN_PTR, T_ARRAY,
     T_ENUM, T_STRUCT, T_CLASS, T_STR, T_SLICE, T_TUPLE
 from "../sema/resolve" import resolve
+from "../sema/sema" import Sema
 from "../sema/conversion" import commonBinaryType, C_OK
 from "../sema/module_scope" import lookupEntity
 from "../sema/item" import SDecl
 from "../sema/const_eval" import evalConst
 from "../sema/const_value" import CV_INT, CV_FLOAT, CV_BOOL, CV_STRING
-from "./state" import Lowerer, ScopeEntry, SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT
+from "./state" import Lowerer, ScopeEntry, SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_CONSTANT, SE_TYPE
 from "./overload" import ARG_EXPR, ARG_INT, ARG_FLOAT, ARG_STR, ARG_NIL, PICK_NONE, pickOverload,
     declParamTypes, declRetType
-from "./methods" import findMethod, methodsNamed, classDeclIndex
-from "./generics" import genericInstance
+from "./methods" import findMethod, methodsNamed, classLoc
+from "./generics" import genericInstance, constructType
+from "./builtins" import isBuiltinName, builtinType
+from "./propagate" import tryType
 
 /// True for an unsuffixed numeric literal, or `-` of one: it takes the type of the other operand.
 export fn isLiteralExpr(l: *Lowerer, idx: i32) -> bool {
     local e = l.s.exprAt(idx)
     if (*e).kind == XE_INT_LITERAL || (*e).kind == XE_FLOAT_LITERAL { return true }
+    if (*e).kind == XE_NAME { return isNumericDefine(l, idx) }
+    // Arithmetic of literals, and a ternary whose branches are literals, are literals too.
+    if (*e).kind == XE_BINARY {
+        local op = (*e).binaryOp
+        if op == XB_AND || op == XB_OR || (op >= XB_EQ && op <= XB_GE) { return false }
+        return isLiteralExpr(l, (*e).lhs) && isLiteralExpr(l, (*e).rhs)
+    }
+    if (*e).kind == XE_TERNARY {
+        return isLiteralExpr(l, (*e).rhs) && isLiteralExpr(l, l.s.refAt("expr", (*e).argsFirst as i32))
+    }
     if (*e).kind == XE_UNARY && (*e).unaryOp == 0 {
         local inner = l.s.exprAt((*e).lhs)
+        if (*inner).kind == XE_NAME { return isNumericDefine(l, (*e).lhs) }
         return (*inner).kind == XE_INT_LITERAL || (*inner).kind == XE_FLOAT_LITERAL
     }
     return false
+}
+
+/// True for a name of a `define` constant with an integer or float value: it is typed like a
+/// literal (it takes the type of the context).
+fn isNumericDefine(l: *Lowerer, idx: i32) -> bool {
+    local entry = l.lookupName(l.s.exprTextAt(idx))
+    if entry == nil || (*entry).kind != SE_CONSTANT { return false }
+    local v = evalConst(l.s, idx)
+    if v < 0 { return false }
+    local k = (*l.s.consts.get(v as usize)).kind
+    return k == CV_INT || k == CV_FLOAT
 }
 
 /// True for a float literal, or `-` of one.
@@ -76,6 +101,7 @@ export fn exprType(l: *Lowerer, idx: i32) -> i32 {
         local inner = resolve(l.s, l.s.types.internAst((*e).typeIdx))
         return inner < 0 ? -1 : l.s.types.makePointer(inner)
     }
+    if k == XE_TRY { return tryType(l, e) }
     if k == XE_TERNARY {
         local t = exprType(l, (*e).rhs)
         return t >= 0 ? t : exprType(l, l.s.refAt("expr", (*e).argsFirst as i32))
@@ -127,6 +153,7 @@ export fn isFloatType(l: *Lowerer, t: i32) -> bool {
 /// integer literal takes a numeric `want`, a float literal a float `want`; anything else has its
 /// type with no context (`exprType`).
 export fn effectiveType(l: *Lowerer, idx: i32, want: i32) -> i32 {
+    if listFits(l, idx, want) { return want }
     if want >= 0 && isLiteralExpr(l, idx) {
         if isFloatLiteralExpr(l, idx) {
             if isFloatType(l, want) { return want }
@@ -135,6 +162,14 @@ export fn effectiveType(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
     }
     return exprType(l, idx)
+}
+
+/// True when `idx` is an array list `[a, b, c]` and `want` an array type of that many elements:
+/// the list is written for that type, so its elements take the element type.
+export fn listFits(l: *Lowerer, idx: i32, want: i32) -> bool {
+    if want < 0 || (*l.s.exprAt(idx)).kind != XE_ARRAY_LIST { return false }
+    if l.s.types.get(want).kind != T_ARRAY { return false }
+    return arrayLength(l, want) == (*l.s.exprAt(idx)).argsCount as i64
 }
 
 /// The pointee of a pointer (`*T` gives `T`), or the type itself.
@@ -155,7 +190,10 @@ fn nameType(l: *Lowerer, idx: i32) -> i32 {
     }
     if (*entry).kind == SE_LOCAL { return (*entry).ty }
     if (*entry).kind == SE_GLOBAL {
-        return (*entry).ty < 0 ? -1 : resolve(l.s, (*entry).ty)
+        if (*entry).ty < 0 { return -1 }
+        // The declared type lives in the arena of the module that declares the global.
+        local owner = entryOwner(l, entry)
+        return adoptFrom(l, owner, resolve(owner, (*entry).ty))
     }
     if (*entry).kind == SE_CONSTANT {
         local v = evalConst(l.s, idx)
@@ -169,7 +207,11 @@ fn nameType(l: *Lowerer, idx: i32) -> i32 {
 fn constType(l: *Lowerer, v: i32) -> i32 {
     local cv = *l.s.consts.get(v as usize)
     if (*cv).kind == CV_INT {
-        local wide = (*cv).intValue.lo > 2147483647 || (*cv).intValue.hi != 0
+        // i32 when the signed value fits: hi is 0 for a non-negative value, all ones for a negative.
+        local lo = (*cv).intValue.lo
+        local fits = (*cv).intValue.hi == 0 ? lo <= 2147483647
+            : (*cv).intValue.hi == 0xFFFFFFFFFFFFFFFF && (lo as i64) >= -2147483648
+        local wide = !fits
         return wide ? l.s.types.makeInt(64, true) : l.s.types.makeInt(32, true)
     }
     if (*cv).kind == CV_FLOAT { return l.s.types.makeFloat(64) }
@@ -258,10 +300,11 @@ export fn argSpecs(l: *Lowerer, e: *XExpr) -> *ArgSpecs {
 /// generic candidates yet, so such a call is left to the caller's fallback.
 export fn functionDecls(l: *Lowerer, entry: *ScopeEntry) -> Vec<i32> {
     local out = Vec<i32>()
+    local owner = entryOwner(l, entry)
     for i in 0..(*entry).overloads.length() {
-        local d = l.s.declOfItem(*(*entry).overloads.get(i))
+        local d = owner.declOfItem(*(*entry).overloads.get(i))
         if d < 0 { return Vec<i32>() }
-        if (*entry).overloads.length() > 1 && (*l.s.declAt(d as usize)).genericCount > 0 {
+        if (*entry).overloads.length() > 1 && (*owner.declAt(d as usize)).genericCount > 0 {
             return Vec<i32>()
         }
         out.push(d)
@@ -269,32 +312,54 @@ export fn functionDecls(l: *Lowerer, entry: *ScopeEntry) -> Vec<i32> {
     return out
 }
 
+/// The module that declares the entity `entry` names: the importer's own, or the imported one.
+export fn entryOwner(l: *Lowerer, entry: *ScopeEntry) -> *Sema {
+    return (*entry).owner != nil ? (*entry).owner : l.s
+}
+
+/// A type of `owner`'s arena as a type of this module's arena.
+export fn adoptFrom(l: *Lowerer, owner: *Sema, t: i32) -> i32 {
+    return owner == l.s || t < 0 ? t : l.s.types.adopt(owner.types, t)
+}
+
+/// The parameter types of declaration `d` of `owner`, resolved there and adopted here.
+export fn declParamsIn(l: *Lowerer, owner: *Sema, d: i32) -> Vec<i32> {
+    local out = declParamTypes(owner, owner.declAt(d as usize))
+    for i in 0..out.length() { out.set(i, adoptFrom(l, owner, *out.get(i))) }
+    return out
+}
+
+/// The return type of declaration `d` of `owner`, adopted into this module's arena.
+export fn declRetIn(l: *Lowerer, owner: *Sema, d: i32) -> i32 {
+    return adoptFrom(l, owner, declRetType(owner, owner.declAt(d as usize)))
+}
+
 /// The parameter types of each declaration in `decls`, in order: the candidates of the choice.
-export fn paramsOfDecls(l: *Lowerer, decls: *Vec<i32>) -> Vec<Vec<i32>> {
+export fn paramsOfDecls(l: *Lowerer, owner: *Sema, decls: *Vec<i32>) -> Vec<Vec<i32>> {
     local out = Vec<Vec<i32>>()
     for i in 0..(*decls).length() {
-        out.push(declParamTypes(l.s, l.s.declAt(*(*decls).get(i) as usize)))
+        out.push(declParamsIn(l, owner, *(*decls).get(i)))
     }
     return out
 }
 
 /// The index in `decls` that call `args` picks, or `PICK_NONE` / `PICK_AMBIGUOUS` (see
 /// overload.xl).
-export fn chooseDecl(l: *Lowerer, decls: *Vec<i32>, args: *ArgSpecs) -> i32 {
-    local cands = paramsOfDecls(l, decls)
+export fn chooseDecl(l: *Lowerer, owner: *Sema, decls: *Vec<i32>, args: *ArgSpecs) -> i32 {
+    local cands = paramsOfDecls(l, owner, decls)
     return pickOverload(l.s, &cands, &((*args).kinds), &((*args).types))
 }
 
 /// The result type of a call that picks one of `decls`: the only declaration's, or the chosen
 /// overload's. -1 when there is none or the overloads do not decide.
-fn declaredResult(l: *Lowerer, decls: *Vec<i32>, e: *XExpr) -> i32 {
+fn declaredResult(l: *Lowerer, owner: *Sema, decls: *Vec<i32>, e: *XExpr) -> i32 {
     if (*decls).length() == 0 { return -1 }
     local pick = 0
     if (*decls).length() > 1 {
-        pick = chooseDecl(l, decls, argSpecs(l, e))
+        pick = chooseDecl(l, owner, decls, argSpecs(l, e))
         if pick < 0 { return -1 }
     }
-    return declRetType(l.s, l.s.declAt(*(*decls).get(pick as usize) as usize))
+    return declRetIn(l, owner, *(*decls).get(pick as usize))
 }
 
 /// The result of a call: a function name gives its declared return type (its chosen overload
@@ -308,24 +373,27 @@ fn callType(l: *Lowerer, e: *XExpr) -> i32 {
             return l.s.types.makeInt(0, false) // usize: the C++ pass folds them to a usize constant
         }
         if callee == "syscall" { return l.s.types.makeInt(64, true) }
+        if isBuiltinName(callee) { return builtinType(l, e, callee) }
         local entry = l.lookupName(callee)
+        if entry != nil && (*entry).kind == SE_TYPE { return constructType(l, e, entry) }
         if entry == nil || (*entry).kind != SE_FUNCTION { return -1 }
         local decls = functionDecls(l, entry)
-        if decls.length() == 1 && (*l.s.declAt(*decls.get(0) as usize)).genericCount > 0 {
+        local eo = entryOwner(l, entry)
+        if decls.length() == 1 && (*eo.declAt(*decls.get(0) as usize)).genericCount > 0 {
             local inst = genericInstance(l, e, entry)
             if inst.sym < 0 { return -1 }
             local owner = inst.owner != nil ? inst.owner : l.s
-            return declRetType(owner, owner.declOf(owner.itemOf(inst.sym)))
+            return adoptFrom(l, owner, declRetType(owner, owner.declOf(owner.itemOf(inst.sym))))
         }
-        return declaredResult(l, &decls, e)
+        return declaredResult(l, eo, &decls, e)
     }
     if (*lhs).kind == XE_FIELD {
         local recvTy = exprType(l, (*lhs).lhs)
         if recvTy < 0 { return -1 }
         local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt((*e).lhs))
         if !(*m).found { return -1 }
-        local decls = methodsNamed(l.s, (*m).cdecl, l.s.exprTextAt((*e).lhs))
-        return declaredResult(l, &decls, e)
+        local decls = methodsNamed((*m).owner, (*m).cdecl, l.s.exprTextAt((*e).lhs))
+        return declaredResult(l, (*m).owner, &decls, e)
     }
     return -1
 }
@@ -382,17 +450,23 @@ fn sliceType(l: *Lowerer, idx: i32) -> i32 {
 
 /// The declaration of the struct or class `ty` (a Types index), nil when it is none.
 export fn aggregateDecl(l: *Lowerer, ty: i32) -> *SDecl {
-    local d = classDeclIndex(l.s, ty)
-    if d < 0 { return nil }
-    return l.s.declAt(d as usize)
+    local at = classLoc(l.s, ty)
+    if at.decl < 0 { return nil }
+    return at.owner.declAt(at.decl as usize)
+}
+
+/// The module that declares the struct or class `ty` (this one when it is none).
+export fn aggregateOwner(l: *Lowerer, ty: i32) -> *Sema {
+    return classLoc(l.s, ty).owner
 }
 
 /// The position of field `name` in the struct or class `ty`, -1 when there is none.
 export fn fieldPos(l: *Lowerer, ty: i32, name: str) -> i32 {
     local decl = aggregateDecl(l, ty)
     if decl == nil { return -1 }
+    local o = aggregateOwner(l, ty)
     for i in 0..(*decl).fieldsCount as usize {
-        if l.s.text((*l.s.fieldAt((*decl).fieldsFirst as usize + i)).name) == name { return i as i32 }
+        if o.text((*o.fieldAt((*decl).fieldsFirst as usize + i)).name) == name { return i as i32 }
     }
     return -1
 }
@@ -408,7 +482,8 @@ export fn fieldTypeOf(l: *Lowerer, ty: i32, name: str) -> i32 {
     local i = fieldPos(l, ty, name)
     if i < 0 { return -1 }
     local decl = aggregateDecl(l, ty)
-    return resolve(l.s, (*l.s.fieldAt((*decl).fieldsFirst as usize + i as usize)).ty)
+    local o = aggregateOwner(l, ty)
+    return adoptFrom(l, o, resolve(o, (*o.fieldAt((*decl).fieldsFirst as usize + i as usize)).ty))
 }
 
 /// The constant length of the array type `t` (C++ `Lowerer::arrayLength`), or -1 when its length

@@ -13,18 +13,19 @@
 from "std" import String, Vec, format
 from "../lang/ast/ast" import XExpr, XE_NAME, XE_FIELD, XE_INDEX, XE_UNARY, XU_DEREF
 from "../sema/types" import T_POINTER
-from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL
+from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL, SE_TYPE
 from "./function" import lowerExpr, lowerExprAs
 from "./sum" import sumNamed, lowerSumCall
-from "./generics" import genericInstance
+from "./generics" import genericInstance, constructType
 from "./overload" import declRetType
 from "../sema/item" import SDecl
 from "./queries" import lowerLayoutQuery
 from "./typing" import exprType, exprTypeName, typeNameOf, resolveBase, argSpecs, chooseDecl,
-    functionDecls
-from "./methods" import findMethod, methodsNamed, MethodRef
+    functionDecls, entryOwner, adoptFrom, declParamsIn, declRetIn
+from "./methods" import findMethod, methodsNamed, MethodRef, classLoc
 from "./overload" import PICK_NONE, PICK_AMBIGUOUS, declParamTypes, mangledParams
 from "./helpers" import overloadKey
+from "./builtins" import isBuiltinName, lowerBuiltin
 
 /// A call: the callee's form decides the lowering (see the file comment). Returns the HIR
 /// expression index, -1 after a diagnostic.
@@ -40,10 +41,11 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         }
         // `syscall(nr, args...)` is the HIR syscall form, not a call.
         if name == "syscall" { return lowerSyscall(l, idx, e) }
+        if isBuiltinName(name) { return lowerBuiltin(l, idx, e, name) }
         local entry = l.lookupName(name)
         if entry != nil && (*entry).kind == SE_FUNCTION {
             local decls = functionDecls(l, entry)
-            if decls.length() == 1 && (*l.s.declAt(*decls.get(0) as usize)).genericCount > 0 {
+            if decls.length() == 1 && (*entryOwner(l, entry).declAt(*decls.get(0) as usize)).genericCount > 0 {
                 return lowerGenericCall(l, idx, e, entry)
             }
             if decls.length() > 1 { return lowerOverloadCall(l, idx, e, entry, &decls) }
@@ -53,6 +55,11 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         }
         if entry != nil && ((*entry).kind == SE_LOCAL || (*entry).kind == SE_GLOBAL) {
             return lowerValueCall(l, idx, e)
+        }
+        if entry != nil && (*entry).kind == SE_TYPE {
+            local cls = constructType(l, e, entry)
+            if cls >= 0 { return lowerConstruct(l, e, cls) }
+            return -1
         }
         if entry == nil { return lowerNamedCall(l, idx, e, name) }
     }
@@ -114,7 +121,7 @@ fn lowerArgs(l: *Lowerer, e: *XExpr, params: *Vec<i32>, out: *Vec<i32>, name: st
 /// A function with one declaration: its arguments convert to the declared parameter types.
 fn lowerDirectCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, d: i32) -> i32 {
     local name = l.s.exprTextAt((*e).lhs)
-    local params = declParamTypes(l.s, l.s.declAt(d as usize))
+    local params = declParamsIn(l, entryOwner(l, entry), d)
     local args = Vec<i32>()
     if !lowerArgs(l, e, &params, &args, name) { return -1 }
     local range = l.b.args(args)
@@ -133,20 +140,22 @@ fn lowerGenericCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry) -> i32
     local owner = inst.owner != nil ? inst.owner : l.s
     local d = owner.declOf(owner.itemOf(inst.sym))
     local params = declParamTypes(owner, d)
+    for i in 0..params.length() { params.set(i, adoptFrom(l, owner, *params.get(i))) }
     local args = Vec<i32>()
     if !lowerArgs(l, e, &params, &args, name) { return -1 }
     local range = l.b.args(args)
     local key = owner.qualify(owner.text(inst.name))
-    return l.b.call(key.asStr(), range.0, range.1, typeNameOf(l, declRetType(owner, d)))
+    return l.b.call(key.asStr(), range.0, range.1, typeNameOf(l, adoptFrom(l, owner, declRetType(owner, d))))
 }
 
 /// An overloaded function: the overload the arguments pick is called under its own key, the
 /// name with the chosen parameter types (`name$i32`), the key the declaration was lowered under.
 fn lowerOverloadCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, decls: *Vec<i32>) -> i32 {
     local name = l.s.exprTextAt((*e).lhs)
-    local pick = chooseDecl(l, decls, argSpecs(l, e))
+    local eo = entryOwner(l, entry)
+    local pick = chooseDecl(l, eo, decls, argSpecs(l, e))
     if pick < 0 { return reportNoPick(l, e, name, pick) }
-    local params = declParamTypes(l.s, l.s.declAt(*(*decls).get(pick as usize) as usize))
+    local params = declParamsIn(l, eo, *(*decls).get(pick as usize))
     local args = Vec<i32>()
     if !lowerArgs(l, e, &params, &args, name) { return -1 }
     local range = l.b.args(args)
@@ -160,9 +169,10 @@ fn lowerOverloadCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, decls
 /// class has several methods of that name (the C++ `methodCandidates`).
 fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef) -> i32 {
     local name = l.s.exprTextAt((*e).lhs)
-    local decls = methodsNamed(l.s, (*m).cdecl, name)
+    local mo = (*m).owner
+    local decls = methodsNamed(mo, (*m).cdecl, name)
     for i in 0..decls.length() {
-        if (*l.s.declAt(*decls.get(i) as usize)).genericCount > 0 {
+        if (*mo.declAt(*decls.get(i) as usize)).genericCount > 0 {
             l.err("E0709", (*e).span,
                 format("generic method `{}` is not lowered by the xlang pass yet", name).asStr(),
                 "call it through the C++ pass")
@@ -171,10 +181,10 @@ fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef
     }
     local pick = 0
     if decls.length() > 1 {
-        pick = chooseDecl(l, &decls, argSpecs(l, e))
+        pick = chooseDecl(l, mo, &decls, argSpecs(l, e))
         if pick < 0 { return reportNoPick(l, e, name, pick) }
     }
-    local params = declParamTypes(l.s, l.s.declAt(*decls.get(pick as usize) as usize))
+    local params = declParamsIn(l, mo, *decls.get(pick as usize))
     local recvTy = exprType(l, recvIdx)
     local selfArg = -1
     if l.s.types.get(recvTy).kind == T_POINTER {
@@ -203,6 +213,41 @@ fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef
         key = overloadKey(qualified.asStr(), &mangled)
     }
     return l.b.call(key.asStr(), range.0, range.1, exprTypeName(l, idx))
+}
+
+/// `T(args)` / `Vec<i32>(args)`: the construction of class type `cls` (a Types index of this
+/// module), calling its `init` (chosen by the arguments when it is overloaded). A class without
+/// `init` takes no arguments (E0710).
+fn lowerConstruct(l: *Lowerer, e: *XExpr, cls: i32) -> i32 {
+    local at = classLoc(l.s, cls)
+    local tyName = typeNameOf(l, cls)
+    local name = l.s.types.text(cls).asStr()
+    local decls = methodsNamed(at.owner, at.decl, "init")
+    local args = Vec<i32>()
+    local key = String("")
+    if decls.length() == 0 {
+        if (*e).argsCount != 0 {
+            l.err("E0710", (*e).span,
+                format("`{}` has no `init`; it takes no arguments", name).asStr(),
+                "write an `init` method to take arguments")
+            return -1
+        }
+    } else {
+        local pick = 0
+        if decls.length() > 1 {
+            pick = chooseDecl(l, at.owner, &decls, argSpecs(l, e))
+            if pick < 0 { return reportNoPick(l, e, name, pick) }
+        }
+        local params = declParamsIn(l, at.owner, *decls.get(pick as usize))
+        if !lowerArgs(l, e, &params, &args, name) { return -1 }
+        local qualified = format("{}.init", name)
+        key = qualified.clone()
+        if decls.length() > 1 {
+            local mangled = mangledParams(l.s, &params)
+            key = overloadKey(qualified.asStr(), &mangled)
+        }
+    }
+    return l.b.construct(key.asStr(), args, tyName)
 }
 
 /// A call to a name that no scope binds: kept as a call to the name, as the lowering always did

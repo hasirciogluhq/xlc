@@ -130,7 +130,7 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
         for i in 0..params.length() {
             local r = resolveDepth(s, (t.argsFirst + i) as i32, depth)
             if r < 0 { return -1 }
-            env.put(params.get(i).asStr(), r)
+            env.put(params.get(i).asStr(), toOwner(s, owner, r))
         }
         local targetDecl = owner.declOf(owner.itemOf(ref.sym))
         if !owner.aliasInProgressPush(ref.name) {
@@ -142,6 +142,7 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
             substituteType(owner, (*targetDecl).ty, env), depth)
         owner.aliasInProgressPop(ref.name)
         if target < 0 { return -1 }
+        target = fromOwner(s, owner, target)
         (*s.types.at(target)).span = t.span
         return target
     }
@@ -159,7 +160,9 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
             if r < 0 { return -1 }
             args.push(r)
         }
-        local inst = instantiate(owner, ref, args.clone(), t.span)
+        local ownerArgs = Vec<i32>()
+        for i in 0..args.length() { ownerArgs.push(toOwner(s, owner, *args.get(i))) }
+        local inst = instantiate(owner, ref, ownerArgs, t.span)
         if inst.sym < 0 { return -1 }
         local q = instanceQname(owner, inst)
         local out = s.types.makeAggregate(kindOfSymbol(owner, inst.sym),
@@ -171,7 +174,7 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
             local decl = owner.declOf(owner.itemOf(inst.sym))
             local under = resolveDepth(owner, decl.underlying, depth)
             if under < 0 { return -1 }
-            (*s.types.at(out)).elem = under
+            (*s.types.at(out)).elem = fromOwner(s, owner, under)
         }
         return out
     }
@@ -201,6 +204,7 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
         local target = resolveDepth(owner, targetDecl.ty, depth)
         owner.aliasInProgressPop(ref.name)
         if target < 0 { return -1 }
+        target = fromOwner(s, owner, target)
         (*s.types.at(target)).span = t.span
         return target
     }
@@ -214,7 +218,8 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
     if symKind == SY_ENUM {
         local decl = owner.declOf(item)
         // An enum without `: T` is an `i32` (the C++ default).
-        local under = decl.hasUnderlying == 0 ? s.types.makeInt(32, true) : resolveDepth(owner, decl.underlying, depth)
+        local under = decl.hasUnderlying == 0 ? s.types.makeInt(32, true)
+                      : fromOwner(s, owner, resolveDepth(owner, decl.underlying, depth))
         if under < 0 { return -1 }
         local q = qualifyOf(owner, ref)
         local out = s.types.makeAggregate(T_ENUM, singlePath(q.asStr()), Vec<i32>())
@@ -225,6 +230,16 @@ fn resolveDepth(s: *Sema, idx: i32, depth: i32) -> i32 {
     owner.error("E0706", t.span, format("`{}` is not a type", shown.asStr()).asStr(),
                 "this name is not a type")
     return -1
+}
+
+/// The type `r` of module `s` in the arena of `owner` (the module that owns the entity being
+/// resolved), and back: every module has its own arena.
+fn toOwner(s: *Sema, owner: *Sema, r: i32) -> i32 {
+    return owner == s ? r : owner.types.adopt(s.types, r)
+}
+
+fn fromOwner(s: *Sema, owner: *Sema, r: i32) -> i32 {
+    return owner == s || r < 0 ? r : s.types.adopt(owner.types, r)
 }
 
 /// True when the text carries `::` (an already qualified name).

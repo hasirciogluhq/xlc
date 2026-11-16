@@ -121,6 +121,7 @@ export struct SDecl {
     macroBodyCount: u32
     module: XStr
     moduleSpan: XSpan
+    form: u32 ///< XIMP_* (Import) or XEF_* (ExportFrom)
     alias: XStr
     namesFirst: u32 ///< SImportName arena
     namesCount: u32

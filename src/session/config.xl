@@ -1,0 +1,338 @@
+// The build configuration of one compilation: the target, the optimization level, the
+// definitions (`-D`) and the builtin ones the sources read through `#if` and `define`
+// (`os`, `arch`, `pointerWidth`, `endian`, `debug`, `optLevel`). The command line fills a
+// `BuildConfig` (src/cli.xl); the compilation, the frontend and the incremental cache key read it.
+from "std" import String, Vec, format
+from "std/str" import toI64, toLowerAscii, compare
+
+/// The kinds of a definition's value.
+export const CV_BOOL: i32 = 0
+export const CV_INT: i32 = 1
+export const CV_STRING: i32 = 2
+
+/// The value of one definition: `-DNAME`, `-DNAME=1`, `-DNAME="text"`.
+export class ConfigValue {
+    kind: i32
+    intValue: i64   ///< the integer, or 0/1 for a bool
+    text: String    ///< the string
+
+    fn init(self, kind: i32, intValue: i64, text: str) {
+        self.kind = kind
+        self.intValue = intValue
+        self.text = String(text)
+    }
+}
+
+/// `NAME` (true), `true`, `false`, `"text"`, a decimal or `0x` integer, else the text itself.
+export fn parseValue(text: str) -> *ConfigValue {
+    if text.len == 0 || text == "true" {
+        return new ConfigValue(CV_BOOL, 1, "")
+    }
+    if text == "false" {
+        return new ConfigValue(CV_BOOL, 0, "")
+    }
+    if text.len >= 2 && text[0] == b'"' && text[text.len as usize - 1] == b'"' {
+        local inner = text[1..text.len as usize - 1]
+        return new ConfigValue(CV_STRING, 0, inner)
+    }
+    local negative = text[0] == b'-'
+    local digits = String(negative ? text[1..text.len as usize] : text)
+    local body = digits.asStr()
+    if body.len > 2 && body[0] == b'0' && (body[1] == b'x' || body[1] == b'X') {
+        local value: i64 = 0
+        local ok = true
+        for c in body[2..body.len as usize] {
+            local d: i64 = c >= b'0' && c <= b'9' ? (c - b'0') as i64
+                         : c >= b'a' && c <= b'f' ? (c - b'a' + 10) as i64
+                         : c >= b'A' && c <= b'F' ? (c - b'A' + 10) as i64 : -1
+            if d < 0 {
+                ok = false
+                break
+            }
+            value = value * 16 + d
+        }
+        if ok {
+            local signed = negative ? -value : value
+            return new ConfigValue(CV_INT, signed, "")
+        }
+    }
+    local n: i64 = 0
+    if digits.length() > 0 && toI64(&digits, &n) {
+        local signed = negative ? -n : n
+        return new ConfigValue(CV_INT, signed, "")
+    }
+    return new ConfigValue(CV_STRING, 0, text)
+}
+
+/// The value as the sources and `--print-cfg` spell it: `true`, `42`, `"text"`.
+export fn valueText(v: *ConfigValue) -> String {
+    if v.kind == CV_BOOL {
+        return String(v.intValue != 0 ? "true" : "false")
+    }
+    if v.kind == CV_INT {
+        return format("{}", v.intValue)
+    }
+    return format("\"{}\"", v.text.asStr())
+}
+
+/// The target of the build: `triple` as given (or the host's), and the parts the sources see.
+export class Target {
+    triple: String
+    os: String      ///< linux, macos, windows
+    arch: String    ///< x86_64, aarch64
+    pointerWidth: i64
+    endian: String
+
+    fn init(self) {
+        self.triple = String("")
+        self.os = String("")
+        self.arch = String("")
+        self.pointerWidth = 64
+        self.endian = String("little")
+    }
+}
+
+/// True when `part` occurs in `text`.
+fn has(text: str, part: str) -> bool {
+    if part.len > text.len {
+        return false
+    }
+    for i in 0..(text.len - part.len + 1) as usize {
+        if text[i..i + part.len as usize] == part {
+            return true
+        }
+    }
+    return false
+}
+
+/// Parses a target triple (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, ...); false when
+/// the architecture or the OS is not one of x86_64/aarch64 on linux/macos/windows.
+export fn parseTarget(triple: str, out: *Target) -> bool {
+    local lower = toLowerAscii(triple)
+    local text = lower.asStr()
+    local dash = text.len as usize
+    for i in 0..text.len as usize {
+        if text[i] == b'-' {
+            dash = i
+            break
+        }
+    }
+    local archPart = text[0..dash]
+    if archPart == "x86_64" || archPart == "amd64" || archPart == "x64" {
+        out.arch = String("x86_64")
+    } else if archPart == "aarch64" || archPart == "arm64" {
+        out.arch = String("aarch64")
+    } else {
+        return false
+    }
+    if has(text, "darwin") || has(text, "macos") || has(text, "apple") {
+        out.os = String("macos")
+    } else if has(text, "linux") {
+        out.os = String("linux")
+    } else if has(text, "windows") || has(text, "win32") || has(text, "mingw") {
+        out.os = String("windows")
+    } else {
+        return false
+    }
+    out.triple = String(triple)
+    out.pointerWidth = 64
+    out.endian = String("little")
+    return true
+}
+
+/// The host's target: what `xlc` runs on.
+export fn hostTarget() -> Target {
+    local t = Target()
+#if arch == "aarch64"
+    t.arch = String("aarch64")
+#else
+    t.arch = String("x86_64")
+#endif
+#if os == "macos"
+    t.os = String("macos")
+    t.triple = format("{}-apple-darwin", t.arch.asStr())
+#elif os == "windows"
+    t.os = String("windows")
+    t.triple = format("{}-pc-windows-msvc", t.arch.asStr())
+#else
+    t.os = String("linux")
+    t.triple = format("{}-unknown-linux-gnu", t.arch.asStr())
+#endif
+    return t
+}
+
+/// The builtin definitions, in the order of `resolved`.
+fn builtinName(i: i32) -> str {
+    return i == 0 ? "os" : i == 1 ? "arch" : i == 2 ? "pointerWidth" : i == 3 ? "endian" : i == 4 ? "debug" : "optLevel"
+}
+
+/// True for `os`, `arch`, `pointerWidth`, `endian`, `debug` and `optLevel`.
+fn isBuiltin(name: str) -> bool {
+    for i in 0..6 {
+        if builtinName(i) == name {
+            return true
+        }
+    }
+    return false
+}
+
+/// Everything the command line decides for the compiler proper.
+export class BuildConfig {
+    target: Target
+    optLevel: i64
+    debug: bool
+    cpu: String
+    mangle: String
+    safety: String
+    layoutScheme: String
+    layoutHistory: String
+    crt: bool
+    defineNames: Vec<String>    ///< `-D` definitions, in the order given
+    defineValues: Vec<*ConfigValue>
+
+    fn init(self) {
+        self.target = hostTarget()
+        self.optLevel = 0
+        self.cpu = String("")
+        self.mangle = String("")
+        self.safety = String("")
+        self.layoutScheme = String("")
+        self.layoutHistory = String("")
+        self.defineNames = Vec<String>()
+        self.defineValues = Vec<*ConfigValue>()
+    }
+
+    /// The `-D` definition called `name`, or -1.
+    fn defineIndex(self, name: str) -> i32 {
+        for i in 0..self.defineNames.length() {
+            if (*self.defineNames.get(i)).asStr() == name {
+                return i as i32
+            }
+        }
+        return -1
+    }
+
+    /// Sets `-DNAME[=VALUE]`; false for an empty name.
+    fn define(self, spec: str) -> bool {
+        local eq = spec.len as usize
+        for i in 0..spec.len as usize {
+            if spec[i] == b'=' {
+                eq = i
+                break
+            }
+        }
+        local name = spec[0..eq]
+        if name.len == 0 {
+            return false
+        }
+        local value = parseValue(eq == spec.len as usize ? "" : spec[eq + 1..spec.len as usize])
+        local at = self.defineIndex(name)
+        if at >= 0 {
+            self.defineValues.set(at as usize, value)
+        } else {
+            self.defineNames.push(String(name))
+            self.defineValues.push(value)
+        }
+        return true
+    }
+
+    /// `-UNAME`: removes a definition; true when it was a `-D` one or does not exist, false when
+    /// `name` is a builtin definition (which cannot be undefined).
+    fn undefine(self, name: str) -> bool {
+        local at = self.defineIndex(name)
+        if at >= 0 {
+            self.defineNames.remove(at as usize)
+            self.defineValues.remove(at as usize)
+            return true
+        }
+        return !isBuiltin(name)
+    }
+
+    /// The value of the definition `name`: a `-D` one first, then the builtins; nil when unknown.
+    fn lookup(self, name: str) -> *ConfigValue {
+        local at = self.defineIndex(name)
+        if at >= 0 {
+            return *self.defineValues.get(at as usize)
+        }
+        if name == "os" {
+            return new ConfigValue(CV_STRING, 0, self.target.os.asStr())
+        }
+        if name == "arch" {
+            return new ConfigValue(CV_STRING, 0, self.target.arch.asStr())
+        }
+        if name == "pointerWidth" {
+            return new ConfigValue(CV_INT, self.target.pointerWidth, "")
+        }
+        if name == "endian" {
+            return new ConfigValue(CV_STRING, 0, self.target.endian.asStr())
+        }
+        if name == "debug" {
+            local flag: i64 = self.debug ? 1 : 0
+            return new ConfigValue(CV_BOOL, flag, "")
+        }
+        if name == "optLevel" {
+            return new ConfigValue(CV_INT, self.optLevel, "")
+        }
+        return nil
+    }
+
+    /// Every definition the sources can read, sorted by name (the order `--print-cfg` shows).
+    fn resolved(self, names: *Vec<String>, values: *Vec<*ConfigValue>) {
+        for b in 0..6 {
+            names.push(String(builtinName(b)))
+            values.push(self.lookup(builtinName(b)))
+        }
+        for i in 0..self.defineNames.length() {
+            local at = -1
+            for j in 0..names.length() {
+                if (*names.get(j)).asStr() == (*self.defineNames.get(i)).asStr() {
+                    at = j as i32
+                }
+            }
+            if at >= 0 {
+                values.set(at as usize, *self.defineValues.get(i))
+            } else {
+                names.push((*self.defineNames.get(i)).clone())
+                values.push(*self.defineValues.get(i))
+            }
+        }
+        sortByName(names, values)
+    }
+
+    /// The incremental cache key of this configuration for the output `emit`.
+    fn key(self, version: str, emit: str) -> String {
+        local out = format("xlc-{}|{}|{}|{}|O{}|{}|{}|{}|{}|{}|{}", version, self.target.triple.asStr(),
+            self.target.os.asStr(), self.target.arch.asStr(), self.optLevel, self.debug ? "g" : "-",
+            self.cpu.asStr(), self.mangle.asStr(), self.safety.asStr(), self.layoutScheme.asStr(), emit)
+        local names = Vec<String>()
+        local values = Vec<*ConfigValue>()
+        for i in 0..self.defineNames.length() {
+            names.push((*self.defineNames.get(i)).clone())
+            values.push(*self.defineValues.get(i))
+        }
+        sortByName(&names, &values)
+        for i in 0..names.length() {
+            out.append("|D:")
+            out.append((*names.get(i)).asStr())
+            out.append("=")
+            out.append(valueText(*values.get(i)).asStr())
+        }
+        return out
+    }
+}
+
+/// Orders `names` and `values` (parallel) by name; the lists are short, so an insertion sort.
+fn sortByName(names: *Vec<String>, values: *Vec<*ConfigValue>) {
+    for i in 1..(*names).length() {
+        local j = i
+        while j > 0 && compare((*(*names).get(j - 1)).asStr(), (*(*names).get(j)).asStr()) > 0 {
+            local n = (*(*names).get(j)).clone()
+            local v = *(*values).get(j)
+            (*names).set(j, (*(*names).get(j - 1)).clone())
+            (*values).set(j, *(*values).get(j - 1))
+            (*names).set(j - 1, n)
+            (*values).set(j - 1, v)
+            j--
+        }
+    }
+}

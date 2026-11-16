@@ -1,11 +1,10 @@
 // The lowered program as the output step reads it. The session's HIR is pruned to what the roots
-// reach (src/hir/prune.xl, plan 24), the pruned module is handed back to the session, and the
-// `@library` imports of what is left are added to the link.
+// reach (src/hir/prune.xl, plan 24), and the `@library` imports of what is left are added to the
+// link.
 from "std" import Vec, String
-from "../hir/flatten" import Flat, flattenModule
 from "../hir/prune" import xlcHirPrune, xlcHirPruneFree
 from "../hir/abi" import XlcHirModule, XlcHirKeep, view, owned
-from "backend" import XlcSession, XlcIndexList, xlcSessionHirModule, xlcSessionKeep
+from "../session/session" import Session
 from "../driver/link" import LinkRequest, Import
 
 /// `KeepExports` of the prune (src/hir/prune.xl): none, `export(c)` only, every export.
@@ -13,19 +12,12 @@ const KEEP_NONE: i32 = 0
 const KEEP_C: i32 = 1
 const KEEP_ALL: i32 = 2
 
-/// A list of indices as the boundary carries it; the list keeps its storage.
-fn indexList(v: *Vec<u32>) -> XlcIndexList {
-    return XlcIndexList { items: v.data, count: v.length() as u32 }
-}
-
 /// Erases every function and global the reachability prune does not reach from the roots. A
 /// library or an object keeps every export (`emit` other than exe); an executable keeps the
 /// `export(c)` functions when it links prebuilt objects (`hasInputs`), and nothing else.
-export fn pruneProgram(session: *XlcSession, emit: str, hasInputs: bool) {
+export fn pruneProgram(session: *Session, emit: str, hasInputs: bool) {
     local keep = emit != "exe" ? KEEP_ALL : hasInputs ? KEEP_C : KEEP_NONE
-    local f = Flat()
-    flattenModule(&f, xlcSessionHirModule(session))
-    local k = xlcHirPrune(&f.m, keep)
+    local k = xlcHirPrune(session.hirModule(), keep)
     local functions = Vec<u32>()
     local globals = Vec<u32>()
     for i in 0..k.functionCount as usize {
@@ -35,7 +27,7 @@ export fn pruneProgram(session: *XlcSession, emit: str, hasInputs: bool) {
         globals.push(k.globals[i])
     }
     xlcHirPruneFree(k)
-    xlcSessionKeep(session, indexList(&functions), indexList(&globals))
+    session.keep(&functions, &globals)
 }
 
 /// Adds the `@library` imports of the flat module `m` to the link (`declare` functions with a

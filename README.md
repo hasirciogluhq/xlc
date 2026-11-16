@@ -1,21 +1,23 @@
 # xlc
 
 `xlc` is the compiler of the [xlang](https://github.com/hasirciogluhq/xlang) language. It is one
-command, like `clang++`: it reads source, writes an object, library, executable, LLVM IR or C
-header, and exits. It does not run programs, manage packages or know a standard library; tools
-built on top of it (the `xlang` CLI) do that and call `xlc`.
+command, like `clang++`: it reads source, writes an object, library, executable or C header, and
+exits. It does not run programs, manage packages or know a standard library; tools built on top of
+it (the `xl` CLI) do that and call `xlc`.
+
+`xlc` is written in xlang. Its only code generator is the native arm64 Mach-O backend
+(`src/codegen/`); the one supported target is macOS on Apple silicon.
 
 ```
-xlc [options] main.xl [prebuilt.o ...] [-o out] [--emit=exe|obj|ir|bc|header|static|shared]
+xlc [options] main.xl [prebuilt.o ...] [-o out] [--emit=exe|obj|header|static|shared]
 ```
 
 | Task | Command |
 | --- | --- |
 | Executable (default) | `xlc main.xl -o main` |
-| Object / IR / bitcode | `xlc main.xl --emit=obj\|ir\|bc` |
+| Object | `xlc main.xl --emit=obj` |
 | Static / shared library, C header | `xlc lib.xl --emit=static\|shared\|header` |
 | Type-check only | `xlc main.xl --check` |
-| Cross-compile | `xlc main.xl --target=x86_64-linux-gnu` |
 | Dumps | `--dump-ast`, `--dump-hir`, `--dump-mir`, `--dump-layout[=Type]`, `--print-cfg` |
 | Explain a diagnostic | `xlc --explain E0501` |
 
@@ -171,22 +173,21 @@ Warnings: `W0770` `next` takes `self` by value (every call works on a copy, the 
 
 ## Build
 
-Requirements: [xmake](https://xmake.io), a C++23 compiler, and LLVM 20 or newer with `llvm-config`
-(static libraries; `$LLVM_CONFIG` overrides the search).
+The repository is an [xl](https://github.com/hasirciogluhq/xlang) package (`xlang.toml`) and needs
+only `xl`, a released `xlc` and the stdlib it pins (`xl lc install`, `xl std install`, `xl pkg
+install`) on a Mac with Apple silicon, and the system `cc` for the final link.
 
 ```
-xmake f -P . -m release && xmake -P .     # build/<plat>/<arch>/release/xlc
-xmake build -P . xlc-tests && xmake run -P . xlc-tests
-test/e2e/run.sh build/<plat>/<arch>/release/xlc
+xl build -o build/xlc                     # the compiler
+xl test                                   # the *.test.xl suites
+test/native/run.sh                        # the arm64 encoders against the system assembler
+test/e2e/run.sh build/xlc                 # the binary on the host
 ```
-
-Run xmake with `-P .` when this repository is checked out as a submodule: xmake otherwise picks
-the outermost `xmake.lua`.
 
 ## Releases
 
-Releases are built by GitHub Actions for macOS (arm64, x64), Linux (arm64, x64) and Windows (x64,
-arm64) from a version tag. The tag must equal `xlc_version` in `xmake.lua`.
+Releases are built by GitHub Actions from a version tag. The tag must equal `XLC_VERSION` in
+`src/session/session.xl`.
 
 | Tag | Release |
 | --- | --- |
@@ -195,7 +196,7 @@ arm64) from a version tag. The tag must equal `xlc_version` in `xmake.lua`.
 
 Assets are `xlc_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) and `checksums.txt` (SHA-256).
 
-To cut a release: set `xlc_version` in `xmake.lua`, commit, then `git tag vX.Y.Z[-rc.N] && git push
+To cut a release: set `XLC_VERSION`, commit, then `git tag vX.Y.Z[-rc.N] && git push
 origin vX.Y.Z[-rc.N]`.
 
 ## Contributing
@@ -209,45 +210,35 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 ## Layout
 
 ```
-include/xlang/   public headers (lang, sema, hir, mir, analysis, codegen, util); backend_c.h is the
-                 frontend C API, codegen/codegen_c.h the LLVM C API
-src/lang/        lexer, preprocessor, macros, parser, AST (all xlang); cpp/ holds the C++ AST,
-                 types, config and bridges that the C++ sema still reads, removed with it
-src/sema/        modules, name tables, constant evaluation, layout, lowering to HIR (C++ reference);
-                 xl_bridge.cpp/.hpp is the C++ side of the xlang lowering pass
-src/lower/       the xlang lowering pass (flat HIR, written in xlang): program.xl is its entry,
-                 state.xl the scopes and the Lowerer, builder.xl the HIR arenas, items.xl the
-                 module items (globals, enums, functions, methods), roles.xl the role
-                 registrations (before the bodies), typing.xl the per-expression types,
-                 function.xl the expression walk and the statement walk (loops, jumps,
-                 assignments, switch, defer, try), stmt.xl the switch if-chain builder,
-                 queries.xl the compile-time queries (layout, enum values, operator spellings,
-                 array length, constant initializers), diagnose.xl the conversion, cast, index,
-                 slice, field, literal and C ABI checks;
-                 call.xl the calls (functions, overloads, methods, function values),
-                 overload.xl the overload keys and the choice among candidates, methods.xl the
-                 class declarations and the method lookup through base classes; the sema it runs
-                 is src/sema/*.xl
-src/hir/         the flat HIR (abi.xl), its reader of the C++ module (flatten.xl), the dump and the
-                 reachability prune (prune.xl), all xlang
-src/mir/         HIR -> MIR (control-flow graph per function), written in xlang: builder/,
-                 model.xl, dump.xl; xl_bridge.cpp/.hpp is the thin C bridge for C++ callers
-src/analysis/    static analyses over MIR, written in xlang (moves.xl, findings.xl): read only,
-                 findings sorted by position
-src/codegen/     the C++ LLVM generator (codegen.cpp, emit.cpp, llvm/) behind codegen_c.h; the xlang
-                 side: llvm.xl (the C API as the output step calls it), header.xl (the C header,
-                 `--emit=header`), native/ macho/ arm64/ isel/ (the native backend)
-src/driver/      linker driver (`link.xl`) and the in-process archiver (`archive.cpp`, LLVM's writer)
+src/lang/        lexer, preprocessor, macros, parser, AST, types, config (all xlang)
+src/sema/        modules, name tables, constant evaluation, layout
+src/lower/       the lowering pass to the flat HIR: program.xl is its entry, state.xl the scopes and
+                 the Lowerer, builder.xl the HIR arenas, items.xl the module items (globals, enums,
+                 functions, methods), roles.xl the role registrations (before the bodies),
+                 typing.xl the per-expression types, function.xl the expression walk and the
+                 statement walk (loops, jumps, assignments, switch, defer, try), stmt.xl the switch
+                 if-chain builder, queries.xl the compile-time queries (layout, enum values,
+                 operator spellings, array length, constant initializers), diagnose.xl the
+                 conversion, cast, index, slice, field, literal and C ABI checks, call.xl the calls
+                 (functions, overloads, methods, function values), overload.xl the overload keys
+                 and the choice among candidates, methods.xl the class declarations and the method
+                 lookup through base classes
+src/hir/         the flat HIR (abi.xl), its dump (dump.xl) and the reachability prune (prune.xl)
+src/mir/         HIR -> MIR (control-flow graph per function): builder/, model.xl, dump.xl
+src/analysis/    static analyses over MIR (moves.xl, findings.xl): read only, findings sorted by
+                 position
+src/codegen/     the code generator: native/ (the entry, writes the object file), isel/ (the
+                 instruction selector: gen, layout, regs, expr, stmt, call, conv, asm, func, data),
+                 arm64/ (the instruction encoders), macho/ (the object file writer), header.xl (the
+                 C header, `--emit=header`)
+src/driver/      the linker driver (`link.xl`): links with `cc`, archives with `libtool`
 src/util/        source files and diagnostics
-src/main.xl      the CLI entry; `bootstrap.xl` is the same CLI behind a plain C `main`
+src/session/     the compilation session: module loading, the multi-module lowering driver
+src/main.xl      the CLI entry
 src/cli.xl       command line parser and the run it drives
-src/cli/         xlang output step: `backend.xl` (the boundary structs and declares), `emit.xl`
-                 (the orchestration), `entry.xl` (entry-point rules), `program.xl` (prune and link
-                 imports), `incremental.xl` (per-module objects and cache), `path.xl` (paths),
-                 `console.xl` (terminal color)
-src/backend/     the C++ session and frontend behind include/xlang/backend_c.h: `session.hpp/.cpp`
-                 (the compilation state), `backend.cpp` (frontend entries), `codegen.cpp` (the
-                 codegen entries of codegen_c.h, and `xlcArchive`)
-test/unit/       frontend/sema/HIR/MIR/analysis unit tests (platform independent)
-test/e2e/        the binary on the host OS: starts, links only the OS, builds and runs programs (platform related)
+src/cli/         the output step: `emit.xl` (the orchestration), `entry.xl` (entry-point rules),
+                 `program.xl` (prune and link imports), `incremental.xl` (per-module objects and
+                 cache), `path.xl` (paths), `console.xl` (terminal color)
+test/native/     the arm64 encoders checked word by word against the system assembler
+test/e2e/        the binary on the host OS: starts, links only the OS, builds and runs programs
 ```

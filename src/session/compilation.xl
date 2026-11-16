@@ -1,0 +1,722 @@
+// The whole-program driver of the semantic phases: it finds and loads the modules of a program
+// (the root, what it imports, the `--import` modules), resolves what each module exports, binds
+// the imported names, collects the `register`ed names and runs the analysis of every module.
+// Lowering the modules to one HIR module is src/session/program.xl.
+//
+//   module paths     `import "m"` is `m.xl` or `m/index.xl` next to the importing module, or inside
+//                    the module root whose name is a prefix of the path (`--module-root NAME=DIR`,
+//                    longest name first); modules found through a root form the library group.
+//   exports          the `export`ed declarations of a module, then `export ... from` re-exports.
+//   imports          every imported name becomes an `ImportBinding` of the importing module.
+//   registrations    a program registration replaces a library one of the same name; two in one
+//                    group are E0502.
+from "std" import String, Vec, format
+from "std/io/files" import exists, isDir
+from "std/io" import eprint
+from "../lang/abi" import CDefine, CMacro, CMacroParam, CToken, V_BOOL, V_INT, V_STRING
+from "../lang/ast/ast" import XSpan, XStr, XD_IMPORT, XD_EXPORT_FROM, XD_IMPL, XD_DEFINE_MACRO,
+    XD_MACRO_CALL, XD_TOP_LEVEL_CALL, XIMP_MODULE, XIMP_STAR, XIMP_STAR_AS, XIMP_NAMES, XEF_STAR,
+    XEF_STAR_AS, XEF_NAMES, XTok, XMacroParam
+from "../lang/frontend/frontend" import xlcFrontendParse
+from "../lang/parser/parser" import CParseResult, ParseBlock, xlcParseFree
+from "../util/source" import SourceManager, Span, spanNone
+from "../util/diagnostics" import DiagnosticEngine
+from "../sema/flat" import Flat
+from "../sema/types" import Types
+from "../sema/sema" import Sema, Peers, ImportBinding
+from "../sema/checks" import analyze
+from "../cli/path" import dirOf, stemOf
+from "./frontend" import spanOfFlat, reportParseErrors, registerAllowScopes
+from "./config" import BuildConfig, ConfigValue, CV_BOOL, CV_INT, CV_STRING
+
+/// One name a module exports: an entity of `module` (named `local` there), or the whole module
+/// when `isNamespace` (`export * as ns from "m"`).
+export class Export {
+    name: String
+    isNamespace: bool
+    module: *Module
+    entity: String
+    span: Span
+
+    fn init(self, name: str, isNamespace: bool, module: *Module, entity: str, span: Span) {
+        self.name = String(name)
+        self.isNamespace = isNamespace
+        self.module = module
+        self.entity = String(entity)
+        self.span = span
+    }
+}
+
+/// One source module of the program: its text, its flat AST, its `Sema` and what it exports.
+/// `key` is "" for the root and the module path (`std/mem`) otherwise.
+export class Module {
+    key: String
+    isLibrary: bool          ///< found through a module root
+    deps: Vec<*Module>       ///< modules it imports or re-exports from
+    mangleName: String       ///< readable name for symbol mangling (`std.mem`, the root's file stem)
+    path: String
+    file: u32
+    parsed: CParseResult
+    flat: Flat
+    types: Types
+    sema: Sema
+    exports: Vec<*Export>
+    exportsDone: bool
+    exportsBusy: bool
+
+    fn init(self) {
+        self.key = String("")
+        self.deps = Vec<*Module>()
+        self.mangleName = String("")
+        self.path = String("")
+        self.exports = Vec<*Export>()
+    }
+
+    /// The index of the export called `name`, or -1.
+    fn exportIndex(self, name: str) -> i32 {
+        for i in 0..self.exports.length() {
+            if (*(*self.exports.get(i))).name.asStr() == name { return i as i32 }
+        }
+        return -1
+    }
+
+    /// True when some item of the module is a `register` declaration.
+    fn hasRegistered(self) -> bool {
+        for i in 0..self.sema.items.length() {
+            if (*self.sema.items.get(i)).registered != 0 { return true }
+        }
+        return false
+    }
+}
+
+/// The import `spec` written in module `from` and the module it names (nil when not found).
+class Target {
+    spec: String
+    importer: String
+    module: *Module
+}
+
+/// Lexically normal form of a path: `.` dropped, `a/..` folded, `/`-separated.
+export fn normalize(path: str) -> String {
+    local parts = Vec<String>()
+    local absolute = path.len > 0 && path[0] == b'/'
+    local start = 0 as usize
+    for i in 0..path.len as usize + 1 {
+        if i == path.len as usize || path[i] == b'/' {
+            local seg = path[start..i]
+            start = i + 1
+            if seg.len == 0 || seg == "." { continue }
+            if seg == ".." && parts.length() > 0 && (*parts.get(parts.length() - 1)).asStr() != ".." {
+                parts.pop()
+                continue
+            }
+            if seg == ".." && absolute { continue }
+            parts.push(String(seg))
+        }
+    }
+    local out = String(absolute ? "/" : "")
+    for i in 0..parts.length() {
+        if i > 0 { out.append("/") }
+        out.append((*parts.get(i)).asStr())
+    }
+    if out.length() == 0 { return String(".") }
+    return out
+}
+
+/// `path` relative to `base` when it lies below it, else false.
+fn relativeTo(path: str, base: str, out: *String) -> bool {
+    if base.len == 0 { return false }
+    local b = normalize(base)
+    local p = path
+    if b.asStr() == "." {
+        *out = String(p)
+        return true
+    }
+    if p.len > b.length() as u64 && p[0..b.length()] == b.asStr() && p[b.length()] == b'/' {
+        *out = String(p[b.length() + 1..p.len as usize])
+        return true
+    }
+    return false
+}
+
+/// `s` without a trailing `.xl`.
+fn withoutExt(s: str) -> str {
+    if s.len > 3 && s[s.len as usize - 3..s.len as usize] == ".xl" { return s[0..s.len as usize - 3] }
+    return s
+}
+
+/// `x/index` -> `x`, `index` -> "".
+fn stripIndex(s: str) -> str {
+    if s == "index" { return "" }
+    if s.len > 6 && s[s.len as usize - 6..s.len as usize] == "/index" { return s[0..s.len as usize - 6] }
+    return s
+}
+
+/// The last `/` segment of a module spec: the default name of `import "std/mem"`.
+fn lastSegment(spec: str) -> str {
+    for i in 0..spec.len as usize {
+        local at = spec.len as usize - 1 - i
+        if spec[at] == b'/' { return spec[at + 1..spec.len as usize] }
+    }
+    return spec
+}
+
+/// The seed macros of one parse: the exported `define` macros of the imported modules, in the
+/// C layout the macro expander reads. The records point into the vectors, which are complete
+/// before any pointer is taken.
+class MacroSeed {
+    macros: Vec<CMacro>
+    params: Vec<CMacroParam>
+    tokens: Vec<CToken>
+    names: Vec<String>
+    firstParam: Vec<usize>
+    firstToken: Vec<usize>
+
+    fn init(self) {
+        self.macros = Vec<CMacro>()
+        self.params = Vec<CMacroParam>()
+        self.tokens = Vec<CToken>()
+        self.names = Vec<String>()
+        self.firstParam = Vec<usize>()
+        self.firstToken = Vec<usize>()
+    }
+
+    /// Adds macro declaration `d` of module `m` (a `define name(params) { body }`).
+    fn add(self, m: *Module, d: usize) {
+        local decl = m.sema.declAt(d)
+        local name = String(m.sema.text((*decl).name))
+        for i in 0..self.names.length() {
+            if (*self.names.get(i)).asStr() == name.asStr() { return }
+        }
+        self.names.push(name)
+        self.firstParam.push(self.params.length())
+        self.firstToken.push(self.tokens.length())
+        local bytes = m.flat.r.bytes
+        for i in 0..(*decl).macroParamsCount as usize {
+            local p = (m.flat.r.macroParams as usize + ((*decl).macroParamsFirst as usize + i) * sizeOf(XMacroParam)) as *XMacroParam
+            self.params.push(CMacroParam { kind: (*p).kind, name: (bytes as usize + (*p).name.off as usize) as *u8,
+                nameLen: (*p).name.len })
+        }
+        for i in 0..(*decl).macroBodyCount as usize {
+            local t = m.flat.tokAt(((*decl).macroBodyFirst + i as u32) as i32)
+            self.tokens.push(CToken { kind: (*t).kind, text: (bytes as usize + (*t).text.off as usize) as *u8,
+                textLen: (*t).text.len, intValue: (*t).intValue, floatValue: (*t).floatValue, line: (*t).line,
+                column: (*t).column, endLine: (*t).endLine, endColumn: (*t).endColumn,
+                newlineBefore: (*t).newlineBefore })
+        }
+        local span = m.sema.span((*decl).nameSpan)
+        self.macros.push(CMacro { name: (*self.names.get(self.names.length() - 1)).ptr,
+            nameLen: name.length() as u32, params: nil, paramCount: (*decl).macroParamsCount, body: nil,
+            bodyLen: (*decl).macroBodyCount, line: span.line, column: span.column, endLine: span.endLine,
+            endColumn: span.endColumn })
+    }
+
+    /// Points every record at its slice; call once, after the last `add`.
+    fn seal(self) {
+        for i in 0..self.macros.length() {
+            local m = self.macros.get(i)
+            (*m).params = (self.params.data as usize + *self.firstParam.get(i) * sizeOf(CMacroParam)) as *CMacroParam
+            (*m).body = (self.tokens.data as usize + *self.firstToken.get(i) * sizeOf(CToken)) as *CToken
+        }
+    }
+}
+
+/// The program being compiled.
+export class Compilation {
+    sources: *SourceManager
+    config: *BuildConfig
+    diag: *DiagnosticEngine
+    rootDir: String
+    rootNames: Vec<String>       ///< module roots: import prefix, longest first
+    rootDirs: Vec<String>
+    implicit: Vec<String>
+    implicitModules: Vec<*Module>
+    paths: Vec<String>           ///< normalized path of every loaded module, parallel to `order`
+    order: Vec<*Module>          ///< dependency order: a module follows the modules it imports
+    root: *Module
+    peers: *Peers
+    targets: Vec<*Target>
+    defineNames: Vec<String>     ///< the definitions the preprocessor sees, storage of `defines`
+    defineValues: Vec<*ConfigValue>
+    defines: Vec<CDefine>
+
+    fn init(self, sources: *SourceManager, config: *BuildConfig, diag: *DiagnosticEngine) {
+        self.sources = sources
+        self.config = config
+        self.diag = diag
+        self.rootDir = String("")
+        self.rootNames = Vec<String>()
+        self.rootDirs = Vec<String>()
+        self.implicit = Vec<String>()
+        self.implicitModules = Vec<*Module>()
+        self.paths = Vec<String>()
+        self.order = Vec<*Module>()
+        self.root = nil
+        self.peers = new Peers()
+        self.targets = Vec<*Target>()
+        self.defineNames = Vec<String>()
+        self.defineValues = Vec<*ConfigValue>()
+        self.defines = Vec<CDefine>()
+        config.resolved(&self.defineNames, &self.defineValues)
+        // The records point into the vectors above, which stay as they are from here on.
+        for i in 0..self.defineNames.length() {
+            local n = self.defineNames.get(i)
+            local v = *self.defineValues.get(i)
+            self.defines.push(CDefine { name: n.ptr, nameLen: n.length() as u32,
+                kind: (*v).kind == CV_BOOL ? V_BOOL : (*v).kind == CV_INT ? V_INT : V_STRING,
+                intValue: (*v).intValue, bytes: (*v).text.ptr, strLen: (*v).text.length() as u32 })
+        }
+    }
+
+    /// `import "NAME/..."` resolves inside `dir` (`--module-root`); the longest name wins.
+    fn addModuleRoot(self, name: str, dir: str) {
+        local at = self.rootNames.length()
+        for i in 0..self.rootNames.length() {
+            if (*self.rootNames.get(i)).length() < name.len as usize {
+                at = i
+                break
+            }
+        }
+        self.rootNames.insert(at, String(name))
+        self.rootDirs.insert(at, String(dir))
+    }
+
+    /// `--import SPEC`: the module is loaded although nothing imports it.
+    fn addImplicitImport(self, spec: str) {
+        self.implicit.push(String(spec))
+    }
+
+    /// The index of the module root whose name is `spec` or a parent of it, or -1.
+    fn rootOf(self, spec: str) -> i32 {
+        for i in 0..self.rootNames.length() {
+            local r = (*self.rootNames.get(i)).asStr()
+            if spec == r { return i as i32 }
+            if spec.len > r.len && spec[0..r.len as usize] == r && spec[r.len as usize] == b'/' { return i as i32 }
+        }
+        return -1
+    }
+
+    fn fileExists(self, path: str) -> bool {
+        local p = String(path)
+        return exists(&p) && !isDir(&p)
+    }
+
+    /// The module key of the file `path` (see the file comment): a module root's keys are import
+    /// paths, the program's own keys are paths below the root file's directory.
+    fn keyFor(self, path: str, isRoot: bool) -> String {
+        if isRoot { return String("") }
+        local p = normalize(path)
+        local rel = String("")
+        for i in 0..self.rootNames.length() {
+            if relativeTo(p.asStr(), (*self.rootDirs.get(i)).asStr(), &rel) {
+                local stem = stripIndex(withoutExt(rel.asStr()))
+                local name = (*self.rootNames.get(i)).asStr()
+                return stem.len == 0 ? String(name) : format("{}/{}", name, stem)
+            }
+        }
+        if relativeTo(p.asStr(), self.rootDir.asStr(), &rel) {
+            return String(stripIndex(withoutExt(rel.asStr())))
+        }
+        return String(stripIndex(withoutExt(p.asStr())))
+    }
+
+    /// The file module `spec` names, written in module `from` (nil for the root); false when it
+    /// does not exist or is ambiguous (reported).
+    fn locate(self, spec: str, importer: *Module, at: Span, out: *String) -> bool {
+        local bases = Vec<String>()
+        local rest = String(spec)
+        local r = self.rootOf(spec)
+        if r >= 0 {
+            bases.push((*self.rootDirs.get(r as usize)).clone())
+            local n = (*self.rootNames.get(r as usize)).length()
+            rest = spec.len as usize == n ? String("") : String(spec[n + 1..spec.len as usize])
+        } else {
+            if importer != nil && importer.path.length() > 0 { bases.push(dirOf(importer.path.asStr())) }
+            if self.rootDir.length() > 0 { bases.push(self.rootDir.clone()) }
+            if bases.length() == 0 { bases.push(String("")) }
+        }
+        for b in 0..bases.length() {
+            local base = (*bases.get(b)).asStr()
+            local sep = base.len == 0 || base[base.len as usize - 1] == b'/' ? "" : "/"
+            local asFile = rest.length() == 0 ? format("{}{}index.xl", base, sep) : format("{}{}{}.xl", base, sep, rest.asStr())
+            local asDir = rest.length() == 0 ? format("{}{}index.xl", base, sep) : format("{}{}{}/index.xl", base, sep, rest.asStr())
+            local f = self.fileExists(asFile.asStr())
+            local d = self.fileExists(asDir.asStr())
+            if f && d && asFile.asStr() != asDir.asStr() {
+                self.diag.error("E0711", at, format("module path `{}` is ambiguous", spec).asStr(),
+                    format("both `{}` and `{}` exist", asFile.asStr(), asDir.asStr()).asStr())
+                return false
+            }
+            if f {
+                *out = asFile
+                return true
+            }
+            if d {
+                *out = asDir
+                return true
+            }
+        }
+        return false
+    }
+
+    /// The module that the import `spec` of module `from` names; loaded on first use.
+    fn importTarget(self, importer: *Module, spec: str, at: Span) -> *Module {
+        for i in 0..self.targets.length() {
+            local t = *self.targets.get(i)
+            if (*t).spec.asStr() == spec && (*t).importer.asStr() == importer.key.asStr() { return (*t).module }
+        }
+        local path = String("")
+        local target: *Module = nil
+        if self.locate(spec, importer, at, &path) {
+            target = self.loadModule(path.asStr(), false, importer.isLibrary || self.rootOf(spec) >= 0)
+        } else if !self.diag.hasErrors() || true {
+            self.diag.error("E0711", at, format("module `{}` not found", spec).asStr(),
+                "no `.xl` file or `index.xl` directory with that path")
+        }
+        local t = new Target()
+        (*t).spec = String(spec)
+        (*t).importer = importer.key.clone()
+        (*t).module = target
+        self.targets.push(t)
+        return target
+    }
+
+    /// The import target recorded for (`spec`, module `fromKey`), or nil.
+    fn targetOf(self, spec: str, fromKey: str) -> *Module {
+        for i in 0..self.targets.length() {
+            local t = *self.targets.get(i)
+            if (*t).spec.asStr() == spec && (*t).importer.asStr() == fromKey { return (*t).module }
+        }
+        return nil
+    }
+
+    /// Adds the exported macros of `dep` (and of what it re-exports) to `seed`.
+    fn collectMacros(self, dep: *Module, seed: *MacroSeed, seen: *Vec<*Module>) {
+        for i in 0..(*seen).length() {
+            if *(*seen).get(i) == dep { return }
+        }
+        (*seen).push(dep)
+        for i in 0..dep.sema.items.length() {
+            local item = dep.sema.items.get(i)
+            local d = dep.sema.declAt((*item).decl as usize)
+            if (*d).kind == XD_DEFINE_MACRO && (*item).exported != 0 {
+                seed.add(dep, (*item).decl as usize)
+            }
+            if (*d).kind == XD_EXPORT_FROM {
+                local t = self.targetOf(dep.sema.text((*d).module), dep.key.asStr())
+                if t != nil { self.collectMacros(t, seed, seen) }
+            }
+        }
+    }
+
+    /// Parses module `m`'s file with the macros of `seed`; syntax errors go to the diagnostics.
+    fn parse(self, file: u32, seed: *MacroSeed) -> CParseResult {
+        seed.seal()
+        local r = xlcFrontendParse(self.sources, file, self.defines.data, self.defines.length() as u32,
+            seed.macros.data, seed.macros.length() as u32, self.diag)
+        return r
+    }
+
+    /// Parses one file on its own (`--dump-ast`): no imports, no seed macros; the syntax errors
+    /// are reported.
+    fn parseFile(self, path: str) -> CParseResult {
+        local p = String(path)
+        local file = self.sources.loadFile(&p)
+        local r = self.parse(file, new MacroSeed())
+        reportParseErrors(self.diag, &r, file)
+        return r
+    }
+
+    /// Loads (or finds) the module at `path`.
+    fn loadModule(self, path: str, isRoot: bool, viaLibrary: bool) -> *Module {
+        local norm = normalize(path)
+        for i in 0..self.paths.length() {
+            if (*self.paths.get(i)).asStr() == norm.asStr() { return *self.order.get(i) }
+        }
+        local m = new Module()
+        m.path = String(path)
+        if isRoot {
+            self.root = m
+            self.rootDir = dirOf(path)
+        }
+        m.key = self.keyFor(path, isRoot)
+        if !isRoot && viaLibrary {
+            for i in 0..self.rootDirs.length() {
+                local rel = String("")
+                if relativeTo(norm.asStr(), (*self.rootDirs.get(i)).asStr(), &rel) { m.isLibrary = true }
+            }
+        }
+        local name = m.key.length() == 0 ? stemOf(path) : m.key.clone()
+        local mangled = String("")
+        for c in name.asStr() { mangled.push(c == b'/' ? b'.' : c) }
+        m.mangleName = mangled
+        local p = String(path)
+        m.file = self.sources.loadFile(&p)
+
+        // Pass 0 (quiet): find the imports, so the exported macros of the dependencies can seed
+        // the real parse.
+        self.diag.beginQuiet()
+        local none = new MacroSeed()
+        local first = self.parse(m.file, none)
+        self.diag.endQuiet()
+        local seed = new MacroSeed()
+        local seen = Vec<*Module>()
+        seen.push(m)
+        // The module is registered before its imports are followed, so a cycle finds it again.
+        self.paths.push(norm.clone())
+        local slot = self.order.length()
+        self.order.push(m)
+        local f0 = Flat(first)
+        for i in 0..first.itemsCount as usize {
+            local item = f0.itemAt(first.itemsFirst + i as u32)
+            local d = f0.declAt((*item).decl)
+            if (*d).kind != XD_IMPORT && (*d).kind != XD_EXPORT_FROM { continue }
+            local dep = self.importTarget(m, f0.strOf((*d).module), spanOfFlat(&f0, (*d).moduleSpan))
+            if dep != nil {
+                self.collectMacros(dep, seed, &seen)
+                local known = false
+                for k in 0..m.deps.length() {
+                    if *m.deps.get(k) == dep { known = true }
+                }
+                if !known { m.deps.push(dep) }
+            }
+        }
+        xlcParseFree(first.block)
+
+        // Pass 1: the real parse, with the imported macros known.
+        m.parsed = self.parse(m.file, seed)
+        reportParseErrors(self.diag, &m.parsed, m.file)
+        m.flat = Flat(m.parsed)
+        m.types = Types(&m.flat)
+        m.sema = Sema(&m.flat, &m.types, self.diag)
+        m.sema.pointerBits = self.config.target.pointerWidth as u32
+        m.sema.hasComp = true
+        m.sema.mangleNone = self.config.mangle.asStr() == "none"
+        m.sema.moduleKey = m.key.clone()
+        m.sema.peers = self.peers
+        self.peers.semas.push(&m.sema)
+        m.sema.internProgram()
+        m.sema.collect()
+        registerAllowScopes(self.diag, &m.flat, &m.sema)
+        // Dependencies were pushed to `order` while they were loaded, i.e. before this module
+        // finished; the dependency order puts a module after its imports.
+        self.order.remove(slot)
+        self.paths.remove(slot)
+        self.order.push(m)
+        self.paths.push(norm.clone())
+        return m
+    }
+
+    /// Loads the root module and everything it imports; call `finish` afterwards.
+    fn loadRoot(self, path: str) -> *Module {
+        return self.loadModule(path, true, false)
+    }
+
+    /// Loads the implicit imports, resolves exports and imports, collects the registered names.
+    fn finish(self) {
+        for i in 0..self.implicit.length() {
+            local spec = (*self.implicit.get(i)).asStr()
+            local path = String("")
+            if self.locate(spec, self.root, spanNone(), &path) {
+                self.implicitModules.push(self.loadModule(path.asStr(), false, self.rootOf(spec) >= 0))
+            } else {
+                self.diag.error("E0711", spanNone(), format("module `{}` not found", spec).asStr(),
+                    "`--import` takes a module path: a `--module-root` name, or a path next to the root file")
+            }
+        }
+        for i in 0..self.order.length() { self.resolveExports(*self.order.get(i)) }
+        for i in 0..self.order.length() { self.linkImports(*self.order.get(i)) }
+        self.collectRegistered()
+    }
+
+    /// Runs the checks of every module.
+    fn analyzeAll(self) {
+        for i in 0..self.order.length() { analyze(&(*(*self.order.get(i))).sema) }
+    }
+
+    /// The names a module exports: its own `export`ed declarations, then the re-exports.
+    fn resolveExports(self, m: *Module) {
+        if m.exportsDone || m.exportsBusy { return }
+        m.exportsBusy = true
+        local s = &m.sema
+        for i in 0..s.items.length() {
+            local item = s.items.get(i)
+            if (*item).exported == 0 && (*item).exportC == 0 && (*item).registered == 0 { continue }
+            local d = s.declAt((*item).decl as usize)
+            if (*d).kind == XD_IMPORT || (*d).kind == XD_EXPORT_FROM || (*d).kind == XD_IMPL ||
+               (*d).kind == XD_MACRO_CALL || (*d).kind == XD_TOP_LEVEL_CALL { continue }
+            local name = s.text((*d).name)
+            self.addExport(m, name, false, m, name, s.span((*d).nameSpan))
+        }
+        for i in 0..s.items.length() {
+            local item = s.items.get(i)
+            local d = s.declAt((*item).decl as usize)
+            if (*d).kind != XD_EXPORT_FROM { continue }
+            local target = self.targetOf(s.text((*d).module), m.key.asStr())
+            if target == nil { continue }
+            self.resolveExports(target)
+            local at = s.span((*d).moduleSpan)
+            if (*d).form == XEF_STAR {
+                for j in 0..target.exports.length() {
+                    local e = *target.exports.get(j)
+                    local skipped = false
+                    for k in 0..(*d).exceptCount as usize {
+                        local x = s.importNames.get((*d).exceptFirst as usize + k)
+                        if s.text((*x).name) == (*e).name.asStr() { skipped = true }
+                    }
+                    if skipped { continue }
+                    self.addExport(m, (*e).name.asStr(), (*e).isNamespace, (*e).module, (*e).entity.asStr(), at)
+                }
+            } else if (*d).form == XEF_STAR_AS {
+                self.addExport(m, s.text((*d).alias), true, target, "", at)
+            } else {
+                for k in 0..(*d).namesCount as usize {
+                    local n = s.importNames.get((*d).namesFirst as usize + k)
+                    local found = target.exportIndex(s.text((*n).name))
+                    if found < 0 {
+                        self.diag.error("E0711", s.span((*n).span),
+                            format("`{}` is not exported by `{}`", s.text((*n).name), s.text((*d).module)).asStr(),
+                            "only `export`ed names can be re-exported")
+                        continue
+                    }
+                    local e = *target.exports.get(found as usize)
+                    local alias = s.text((*n).alias)
+                    self.addExport(m, alias.len == 0 ? s.text((*n).name) : alias, (*e).isNamespace, (*e).module,
+                        (*e).entity.asStr(), s.span((*n).span))
+                }
+            }
+        }
+        m.exportsBusy = false
+        m.exportsDone = true
+        // Mirror the table into the Sema: other modules resolve imports through it.
+        for i in 0..m.exports.length() {
+            local e = *m.exports.get(i)
+            s.exportNames.push((*e).name.clone())
+            s.exportKeys.push((*e).module.key.clone())
+            s.exportLocals.push((*e).entity.clone())
+            s.exportNs.push((*e).isNamespace)
+        }
+    }
+
+    fn addExport(self, m: *Module, name: str, isNs: bool, target: *Module, local_: str, at: Span) {
+        local at0 = m.exportIndex(name)
+        if at0 >= 0 {
+            local old = *m.exports.get(at0 as usize)
+            if (*old).module == target && (*old).entity.asStr() == local_ && (*old).isNamespace == isNs { return }
+            self.diag.twoSites("E0401", format("`{}` is exported twice", name).asStr(), (*old).span, "first export", at,
+                "second export", "resolve with `except`, `as`, or `export * as ns`")
+            return
+        }
+        m.exports.push(new Export(name, isNs, target, local_, at))
+    }
+
+    /// Binds one export of a module as `local` in module `m` (E0401 on a clash).
+    fn bind(self, m: *Module, bound: *Vec<String>, boundAt: *Vec<*Export>, local_: str, e: *Export, at: Span) {
+        local s = &m.sema
+        local own = s.find(local_)
+        if own >= 0 {
+            local d = s.declOf((*s.symbols.get(own as usize)).item)
+            self.diag.twoSites("E0401", format("`{}` is defined here and imported", local_).asStr(),
+                s.span((*d).nameSpan), "local definition", at, "imported here", "rename the import with `as`")
+            return
+        }
+        for i in 0..(*bound).length() {
+            if (*(*bound).get(i)).asStr() != local_ { continue }
+            local old = *(*boundAt).get(i)
+            if (*old).module == (*e).module && (*old).entity.asStr() == (*e).entity.asStr() && (*old).isNamespace == (*e).isNamespace {
+                self.diag.twoSites("W0401", format("`{}` is imported twice as the same entity", local_).asStr(),
+                    (*old).span, "first binding", at, "second binding",
+                    "import it through one path, or silence with `@allow(W0401)`")
+            } else {
+                self.diag.twoSites("E0401", format("different entities are bound to `{}`", local_).asStr(),
+                    (*old).span, "first binding", at, "second binding",
+                    "rename one with `as`, or use `import * as ns from ...`")
+            }
+            return
+        }
+        (*bound).push(String(local_))
+        (*boundAt).push(new Export(local_, (*e).isNamespace, (*e).module, (*e).entity.asStr(), at))
+        s.bindImport(local_, (*e).isNamespace, (*e).module.key.asStr(), (*e).entity.asStr(), at)
+    }
+
+    /// The import bindings of one module.
+    fn linkImports(self, m: *Module) {
+        local s = &m.sema
+        local bound = Vec<String>()
+        local boundAt = Vec<*Export>()
+        for i in 0..s.items.length() {
+            local item = s.items.get(i)
+            local d = s.declAt((*item).decl as usize)
+            if (*d).kind != XD_IMPORT { continue }
+            local spec = s.text((*d).module)
+            local target = self.targetOf(spec, m.key.asStr())
+            if target == nil { continue }
+            self.resolveExports(target)
+            local at = s.span((*d).moduleSpan)
+            if (*d).form == XIMP_MODULE || (*d).form == XIMP_STAR_AS {
+                local alias = s.text((*d).alias)
+                local ns = new Export("", true, target, "", at)
+                self.bind(m, &bound, &boundAt, alias.len == 0 ? lastSegment(spec) : alias, ns, at)
+            } else if (*d).form == XIMP_STAR {
+                for j in 0..target.exports.length() {
+                    local e = *target.exports.get(j)
+                    self.bind(m, &bound, &boundAt, (*e).name.asStr(), e, at)
+                }
+            } else {
+                for k in 0..(*d).namesCount as usize {
+                    local n = s.importNames.get((*d).namesFirst as usize + k)
+                    local found = target.exportIndex(s.text((*n).name))
+                    if found < 0 {
+                        self.diag.error("E0711", s.span((*n).span),
+                            format("`{}` is not exported by `{}`", s.text((*n).name), spec).asStr(),
+                            "only names marked `export` can be imported")
+                        continue
+                    }
+                    local alias = s.text((*n).alias)
+                    self.bind(m, &bound, &boundAt, alias.len == 0 ? s.text((*n).name) : alias,
+                        *target.exports.get(found as usize), s.span((*n).span))
+                }
+            }
+        }
+    }
+
+    /// The `register`ed names of the whole program: a program registration replaces a library
+    /// one of the same name; two in one group are E0502.
+    fn collectRegistered(self) {
+        local fromLibrary = Vec<bool>()
+        local firstAt = Vec<Span>()
+        for i in 0..self.order.length() {
+            local m = *self.order.get(i)
+            local s = &m.sema
+            for k in 0..s.items.length() {
+                local item = s.items.get(k)
+                if (*item).registered == 0 { continue }
+                local d = s.declAt((*item).decl as usize)
+                local name = s.text((*d).name)
+                if s.find(name) < 0 { continue }
+                local at = -1
+                for j in 0..self.peers.regNames.length() {
+                    if (*self.peers.regNames.get(j)).asStr() == name { at = j as i32 }
+                }
+                if at < 0 {
+                    self.peers.regNames.push(String(name))
+                    self.peers.regOwners.push(s)
+                    fromLibrary.push(m.isLibrary)
+                    firstAt.push(s.span((*d).nameSpan))
+                    continue
+                }
+                if *fromLibrary.get(at as usize) != m.isLibrary {
+                    if !m.isLibrary {
+                        self.peers.regOwners.set(at as usize, s)
+                        fromLibrary.set(at as usize, false)
+                    }
+                    continue
+                }
+                self.diag.twoSites("E0502", format("`{}` is registered twice", name).asStr(), *firstAt.get(at as usize),
+                    "first registration", s.span((*d).nameSpan), "second registration",
+                    "register the name once per group: remove one registration, or, if a library already registers it, register the name from your own code instead")
+            }
+        }
+    }
+}
+

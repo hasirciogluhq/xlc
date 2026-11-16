@@ -64,7 +64,3 @@ export fn lowerPendingInstances(l: *Lowerer) -> bool {
     return any
 }
 
-/// Placeholder: lowering of the module's impl declarations.
-export fn lowerImpls(l: *Lowerer) {
-    return
-}

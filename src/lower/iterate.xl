@@ -1,0 +1,103 @@
+// `for x in e` and `for x, i in e` of the lowering pass. The xlang twin of the array/slice/`str`
+// half of sema/lower/stmt/loops.cpp (`lowerForEach`).
+//
+// The iterable is an array, a slice or a `str`. The element is a pointer into the storage (`*T`,
+// so nothing is copied and a write reaches the owner), except for a `str`, which is read-only and
+// yields the byte itself (`u8`). The index is a `usize`. The bound is read once:
+//
+//   { local $arrp = &array            // an array is indexed through its address, never copied
+//     local $n = N                    // a view reads `$seq.len`
+//     local $i = 0
+//     while $i < $n {
+//         local x = &(*$arrp)[$i]     // `x` and `i` live only inside the loop
+//         local i = $i
+//         ...body...
+//     } step { $i = $i + 1 } }
+//
+// Not ported yet: the iterator protocol over a struct or class (`next` / `iter`, E0775..E0777),
+// which needs method lookup on generic instances (see docs-notes/lowering-todo.md).
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStmt
+from "../sema/types" import T_ARRAY, T_STR, T_SLICE
+from "./state" import Lowerer
+from "./typing" import exprType, typeNameOf, arrayLength
+from "./function" import lowerExpr, hiddenLocal, addLocal, bindLocal, loopBody
+
+/// `for x in e`: the statement `idx` (a `XS_FOR_EACH`). Returns the HIR statement, -1 after a
+/// diagnostic.
+export fn lowerForEach(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
+    local iterTy = exprType(l, (*st).expr)
+    if iterTy < 0 { return -1 }
+    local rec = l.s.types.get(iterTy)
+    local isArray = rec.kind == T_ARRAY
+    local isView = rec.kind == T_STR || rec.kind == T_SLICE
+    if !isArray && !isView {
+        local msg = format("`{}` cannot be iterated with `for ... in`", typeNameOf(l, iterTy))
+        l.err("E0709", (*l.s.exprAt((*st).expr)).span, msg.asStr(),
+            "iterate an array, a slice or `str`; a range is `for i in a..b`")
+        return -1
+    }
+    local iterName = typeNameOf(l, iterTy)
+    local elemTy = rec.kind == T_STR ? l.s.types.makeInt(8, false) : rec.elem
+    local byValue = rec.kind == T_STR
+    local elemName = typeNameOf(l, elemTy)
+    local slotTy = byValue ? elemTy : l.s.types.makePointer(elemTy)
+    local slotName = typeNameOf(l, slotTy)
+
+    local source = lowerExpr(l, (*st).expr)
+    if source < 0 { return -1 }
+
+    l.scopes.push()
+    l.defers.push(Vec<i32>())
+    local inner = Vec<i32>()
+    local pos = hiddenLocal(l, "i", "usize")
+    local end = hiddenLocal(l, "n", "usize")
+    local src: u32 = 0
+    local srcName = iterName
+    if isArray {
+        srcName = typeNameOf(l, l.s.types.makePointer(iterTy))
+        src = hiddenLocal(l, "arrp", srcName)
+        inner.push(l.b.localStmt(src, "", srcName, l.b.addrOf(source, srcName)))
+    } else {
+        src = hiddenLocal(l, "seq", srcName)
+        inner.push(l.b.localStmt(src, "", srcName, source))
+    }
+    // The base `[i]` reads through: `(*$arrp)` for an array, the copied view otherwise.
+    local base = isArray ? l.b.deref(l.b.localRef(src, srcName), iterName) : l.b.localRef(src, srcName)
+    local len = isArray ? l.b.intConst(arrayLength(l, iterTy) as u64, "usize")
+        : l.b.field(base, "len", "usize", false, 1)
+    inner.push(l.b.localStmt(end, "", "usize", len))
+    inner.push(l.b.localStmt(pos, "", "usize", l.b.intConst(0, "usize")))
+    local cond = l.b.binary("<", l.b.localRef(pos, "usize"), l.b.localRef(end, "usize"), "bool")
+
+    // The element and the index names live only inside the loop.
+    l.scopes.push()
+    local name = l.s.stmtTextAt(idx)
+    local elem = addLocal(l, name, slotName)
+    local at = l.b.index(isArray ? l.b.deref(l.b.localRef(src, srcName), iterName) : l.b.localRef(src, srcName),
+        l.b.localRef(pos, "usize"), elemName)
+    (*l.b.exprAt(at)).checked = l.checkedSafety ? 1 : 0
+    local slot = byValue ? at : l.b.addrOf(at, slotName)
+    local head = Vec<i32>()
+    head.push(l.b.localStmt(elem, name, slotName, slot))
+    bindLocal(l, name, elem, slotTy)
+    if (*st).namesCount > 0 {
+        local indexName = l.s.flat.strOf(l.s.flat.pathSeg((*st).namesFirst))
+        local shown = addLocal(l, indexName, "usize")
+        head.push(l.b.localStmt(shown, indexName, "usize", l.b.localRef(pos, "usize")))
+        bindLocal(l, indexName, shown, l.s.types.makeInt(0, false))
+    }
+    local body = loopBody(l, l.s.flat.strOf((*st).label), (*st).body)
+    for i in 0..body.length() { head.push(*body.get(i)) }
+    l.scopes.pop()
+
+    local loop = l.b.whileStmt(cond, head, false)
+    local next = l.b.binary("+", l.b.localRef(pos, "usize"), l.b.intConst(1, "usize"), "usize")
+    local step = Vec<i32>()
+    step.push(l.b.assign(l.b.localRef(pos, "usize"), next))
+    l.b.setStep(loop, step)
+    inner.push(loop)
+    l.defers.pop()
+    l.scopes.pop()
+    return l.b.blockStmt(inner)
+}

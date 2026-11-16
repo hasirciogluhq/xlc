@@ -1,0 +1,133 @@
+// `impl` blocks of the lowering pass. The xlang twin of sema/lower/item/impls.cpp.
+//
+//   impl T { fn name(self: *T, ...) }          the function `T.name` (an inherent method)
+//   impl I for T { fn name(self: *T, ...) }    the function `T.I.name` and an HIR impl record
+//
+// `T` and `I` are the qualified names (`std/str/fmtfloat::Cursor`). A call `value.name(...)` on a
+// struct finds the inherent method through `findInherent` (methods.xl); an interface value calls
+// through the impl record (`CallItable`).
+//
+// Not ported yet: generic impls and their per-instance copies (`instantiateImpls`, E0732), the
+// signature comparison of an interface method (E0713 reports only a missing or an extra method)
+// and the duplicate check E0731.
+from "std" import String, Vec, format
+from "../sema/sema" import Sema
+from "../sema/item" import SDecl
+from "../sema/resolve" import resolve
+from "../sema/types" import T_STRUCT, T_CLASS
+from "../sema/module_scope" import lookupEntity
+from "../lang/ast/ast" import XD_IMPL
+from "./state" import Lowerer
+from "./builder" import ImplRec
+from "./helpers" import overloadKey
+from "./function" import lowerFunctionDecl
+from "./items" import fnKeySeen, paramTypes
+
+/// The qualified name of the interface an `impl I for T` names, "" when it is not found.
+fn interfaceName(l: *Lowerer, d: *SDecl) -> String {
+    local name = l.s.text(l.s.flat.pathSeg((*d).ifacePathFirst))
+    local ref = lookupEntity(l.s, name)
+    if ref.sym < 0 { return String("") }
+    local owner = ref.owner != nil ? ref.owner : l.s
+    return owner.qualify(owner.text(ref.name))
+}
+
+/// The methods the interface declaration `iface` (qualified name) lists, as names; empty when
+/// the interface is not found.
+fn interfaceMethods(l: *Lowerer, iface: str) -> Vec<String> {
+    local out = Vec<String>()
+    local ref = lookupEntity(l.s, iface)
+    if ref.sym < 0 { return out }
+    local owner = ref.owner != nil ? ref.owner : l.s
+    local decl = owner.declOfItem(owner.itemOf(ref.sym))
+    if decl < 0 { return out }
+    local d = owner.declAt(decl as usize)
+    for i in 0..(*d).methodsCount as usize {
+        out.push(String(owner.text((*owner.declAt((*d).methodsFirst as usize + i)).name)))
+    }
+    return out
+}
+
+/// Lowers the impls of the module. A generic impl waits for its instances.
+export fn lowerImpls(l: *Lowerer) {
+    for i in 0..l.s.items.length() {
+        local item = i as i32
+        local declIdx = l.s.declOfItem(item)
+        if declIdx < 0 { continue }
+        local d = l.s.declOf(item)
+        if (*d).kind != XD_IMPL { continue }
+        if l.s.genericParamsOf(item).1 > 0 { continue }
+        lowerImpl(l, item, d)
+    }
+}
+
+fn lowerImpl(l: *Lowerer, item: i32, d: *SDecl) {
+    local target = resolve(l.s, (*d).implTarget)
+    if target < 0 { return }
+    local rec = l.s.types.get(target)
+    if rec.kind != T_STRUCT && rec.kind != T_CLASS {
+        local msg = format("`{}` cannot have an `impl`", l.s.types.text(target).asStr())
+        l.err("E0706", (*d).span, msg.asStr(), "only structs and classes have `impl`")
+        return
+    }
+    local typeQ = l.s.types.pathOf(rec)
+    local isInterface = (*d).ifacePathCount > 0
+    local ifaceQ = String("")
+    if isInterface {
+        ifaceQ = interfaceName(l, d)
+        if ifaceQ.asStr().len == 0 {
+            local msg = format("`{}` is not an interface", l.s.text(l.s.flat.pathSeg((*d).ifacePathFirst)))
+            l.err("E0706", (*d).span, msg.asStr(), "not declared as an interface")
+            return
+        }
+    }
+    local prefix = isInterface ? format("{}.{}.", typeQ.asStr(), ifaceQ.asStr()) : format("{}.", typeQ.asStr())
+    local out = new ImplRec(ifaceQ.asStr(), typeQ.asStr())
+    for m in 0..(*d).methodsCount as usize {
+        local mIdx = ((*d).methodsFirst as usize + m) as i32
+        local md = l.s.declAt(mIdx as usize)
+        local name = l.s.text((*md).name)
+        if (*md).genericCount > 0 {
+            if isInterface {
+                l.err("E0733", (*md).nameSpan,
+                    format("generic method `{}` is only supported in a class", name).asStr(),
+                    "move the method into the class")
+            }
+            continue
+        }
+        local key = format("{}{}", prefix.asStr(), name)
+        local overloads = 0
+        for j in 0..(*d).methodsCount as usize {
+            if l.s.text((*l.s.declAt((*d).methodsFirst as usize + j)).name) == name { overloads++ }
+        }
+        if overloads > 1 {
+            local params = paramTypes(l, md)
+            key = overloadKey(key.asStr(), &params)
+        }
+        if fnKeySeen(l, key.asStr()) {
+            l.err("E0401", (*md).nameSpan, format("`{}{}` is defined twice", prefix.asStr(), name).asStr(),
+                "give the overloads different parameter types")
+            continue
+        }
+        l.fnKeys.push(key.clone())
+        lowerFunctionDecl(l, item, mIdx, key.asStr(), key.asStr(), typeQ.asStr())
+    }
+    if isInterface {
+        // The HIR record lists the interface's methods in declaration order; each must exist.
+        local wanted = interfaceMethods(l, ifaceQ.asStr())
+        for w in 0..wanted.length() {
+            local want = (*wanted.get(w)).asStr()
+            local found = false
+            for m in 0..(*d).methodsCount as usize {
+                if l.s.text((*l.s.declAt((*d).methodsFirst as usize + m)).name) == want { found = true }
+            }
+            if !found {
+                local msg = format("`impl {} for {}` is missing `{}`", ifaceQ.asStr(), typeQ.asStr(), want)
+                l.err("E0713", (*d).span, msg.asStr(), "every interface method must be implemented")
+                continue
+            }
+            (*out).methods.push(format("{}{}", prefix.asStr(), want))
+        }
+        l.b.impls.push(out)
+    }
+}

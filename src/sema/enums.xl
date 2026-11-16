@@ -13,6 +13,16 @@ from "./resolve" import resolve
 from "./const_eval" import evalConst
 
 /// The enum declaration whose parameters decide for a part name (`Result$Ok`): the enum itself.
+/// True for the payload struct of one variant of a generic enum (`Option$Some`): it names the
+/// enum's type parameters but has none of its own, so it is checked and lowered per instance.
+export fn isGenericEnumPart(s: *Sema, d: *SDecl) -> bool {
+    if (*d).kind != XD_STRUCT || (*d).isPayload == 0 { return false }
+    local enumItem = genericEnumOf(s, s.text((*d).name))
+    if enumItem < 0 { return false }
+    local ed = s.declOfItem(enumItem)
+    return ed >= 0 && (*s.declAt(ed as usize)).genericCount != 0
+}
+
 export fn genericEnumOf(s: *Sema, name: str) -> i32 {
     local cut = -1
     for i in 0..name.len {
@@ -27,7 +37,7 @@ export fn genericEnumOf(s: *Sema, name: str) -> i32 {
             local item = s.itemOf(whole)
             if item >= 0 {
                 local d = s.declOfItem(item)
-                if d >= 0 && (*s.declOf(d)).kind == XD_STRUCT { return item }
+                if d >= 0 && (*s.declAt(d as usize)).kind == XD_STRUCT { return item }
             }
         }
     }
@@ -48,7 +58,7 @@ export fn enumMember(s: *Sema, enumName: str, member: str, at: XSpan) -> i32 {
     local item = s.itemOf(sym)
     local decl = s.declOfItem(item)
     if decl < 0 { return -1 }
-    local d = s.declOf(decl)
+    local d = s.declAt(decl as usize)
     // The cached values: found by name in `enumNames`.
     local slot = -1
     for i in 0..s.enumNames.length() {
@@ -108,7 +118,7 @@ export fn enumMember(s: *Sema, enumName: str, member: str, at: XSpan) -> i32 {
 
 /// The checks of one enum declaration: underlying type, duplicate members, mistyped values.
 export fn checkEnum(s: *Sema, declIdx: i32) {
-    local d = s.declOf(declIdx)
+    local d = s.declAt(declIdx as usize)
     local under = resolve(s, (*d).underlying)
     if under < 0 { return }
     local ut = s.types.get(under)

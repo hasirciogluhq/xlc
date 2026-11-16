@@ -1,0 +1,368 @@
+// One compilation as the CLI drives it: the configuration, the sources, the diagnostics, the
+// compilation (modules, exports, imports), the lowered program and its analyses. The CLI
+// (src/cli.xl) calls the methods in the order it needs; the output step (src/cli/) reads the
+// lowered HIR module and prunes it.
+//
+// A method that can fail returns false after reporting the failure in its own words (a
+// diagnostic, or an `error:` line); the caller only decides whether to go on.
+from "std" import String, Vec, format
+from "std/io" import print, eprint
+from "std/str" import fromParts
+from "std/io/files" import exists, isDir
+from "../sema/flat" import Flat
+from "../cli/console" import printError, style
+from "../hir/abi" import XlcHirModule, view
+from "../hir/dump" import xlcHirDump, xlcHirDumpFree
+from "../mir/builder/module" import xlcMirBuild
+from "../mir/dump" import dumpModule
+from "../analysis/analysis" import xlcAnalysisRun
+from "../sema/layout" import LayoutHistory, LayoutRecord, formatLayoutRecord, TypeLayout
+from "../sema/layout_calc" import layoutOfName
+from "../lang/ast/ast" import XSpan
+from "../util/diagnostics" import DiagnosticEngine, DiagnosticOptions, FORMAT_TEXT, FORMAT_JSON, LOG_ALL,
+    LOG_ERROR, findDiagnosticInfo, explain, SEV_ERROR, allDiagnosticInfos
+from "../util/source" import SourceManager, Span, spanNone
+from "../cli/path" import dirOf
+from "./config" import BuildConfig
+from "./compilation" import Compilation, Module
+from "./program" import Program, lowerProgram
+
+/// The compiler's version: release tags match it (`vX.Y.Z` or `vX.Y.Z-rc.N`).
+export const XLC_VERSION: str = "1.0.0-rc.12"
+
+/// One source module of the program, as the incremental cache reads it.
+export class ModuleRow {
+    key: String
+    text: str
+    registered: bool
+    deps: Vec<u32>    ///< indices of the modules it imports, in the same list
+}
+
+/// The diagnostic options of the command line.
+export class DiagSettings {
+    allow: Vec<String>
+    deny: Vec<String>
+    warnAll: bool
+    allowAll: bool
+    contextErrors: u64
+    contextWarnings: u64
+    logPath: String
+    format: String       ///< text | json
+    logLevel: String     ///< all | warn | error
+    color: bool
+
+    fn init(self) {
+        self.allow = Vec<String>()
+        self.deny = Vec<String>()
+        self.logPath = String("")
+        self.format = String("text")
+        self.logLevel = String("all")
+    }
+}
+
+/// The settings checked and turned into engine options; false (reported) for a code that is
+/// unknown or an error that cannot be allowed.
+fn diagnosticOptions(s: *DiagSettings, engine: *DiagnosticEngine, out: *DiagnosticOptions) -> bool {
+    local ok = true
+    for i in 0..s.allow.length() {
+        local code = (*s.allow.get(i)).asStr()
+        local info = findDiagnosticInfo(code)
+        if info < 0 {
+            printError(&format("unknown diagnostic code `{}`", code))
+            ok = false
+        } else if (*allDiagnosticInfos())[info].severity == SEV_ERROR {
+            printError(&format("`{}` is an error and cannot be allowed", code))
+            ok = false
+        }
+        out.allow.push(engine.txt(code))
+    }
+    for i in 0..s.deny.length() {
+        local code = (*s.deny.get(i)).asStr()
+        if findDiagnosticInfo(code) < 0 {
+            printError(&format("unknown diagnostic code `{}`", code))
+            ok = false
+        }
+        out.deny.push(engine.txt(code))
+    }
+    out.warnAll = s.warnAll ? 1 : 0
+    out.allowAll = s.allowAll ? 1 : 0
+    out.color = s.color ? 1 : 0
+    out.contextErrors = s.contextErrors as usize
+    out.contextWarnings = s.contextWarnings as usize
+    out.logPath = engine.txt(s.logPath.asStr())
+    out.format = s.format.asStr() == "json" ? FORMAT_JSON : FORMAT_TEXT
+    out.logLevel = s.logLevel.asStr() == "error" ? LOG_ERROR : LOG_ALL
+    return ok
+}
+
+/// `--explain CODE`: the long text of a diagnostic code on stdout; false for an unknown code.
+export fn explainCode(code: str) -> bool {
+    local text = explain(code)
+    if text.length() == 0 {
+        printError(&format("unknown diagnostic code `{}`", code))
+        return false
+    }
+    print(text.asStr())
+    return true
+}
+
+/// The compilation the CLI drives.
+export class Session {
+    config: *BuildConfig
+    sources: SourceManager
+    options: DiagnosticOptions
+    diag: DiagnosticEngine
+    comp: *Compilation
+    program: *Program
+    root: String
+    history: LayoutHistory
+    historyPath: String
+    lowered: bool
+
+    fn init(self, config: *BuildConfig, settings: *DiagSettings) {
+        self.config = config
+        self.sources = SourceManager()
+        self.diag = DiagnosticEngine(&self.sources)
+        self.options = DiagnosticOptions()
+        self.root = String("")
+        self.history = LayoutHistory()
+        self.historyPath = String("")
+        self.comp = new Compilation(&self.sources, config, &self.diag)
+        self.program = nil
+        self.lowered = false
+        if diagnosticOptions(settings, &self.diag, &self.options) {
+            self.diag.configure(&self.options)
+        } else {
+            // The bad codes were reported; the engine keeps its defaults.
+            self.options = DiagnosticOptions()
+        }
+    }
+
+    /// `--dump-ast`: parses `path` on its own and prints its items (the kind and the name of
+    /// each declaration); false when the file has syntax errors or cannot be read.
+    fn dumpAst(self, path: str) -> bool {
+        local p = String(path)
+        if !exists(&p) {
+            printError(&format("cannot read `{}`", path))
+            return false
+        }
+        local r = self.comp.parseFile(path)
+        self.flush()
+        if self.diag.hasErrors() {
+            self.printSummary()
+            return false
+        }
+        local flat = Flat(r)
+        print("program {} items\n", r.itemsCount)
+        for i in 0..r.itemsCount as usize {
+            local item = flat.itemAt(r.itemsFirst + i as u32)
+            local d = flat.declAt((*item).decl)
+            print("  decl kind={} {}\n", (*d).kind, flat.strOf((*d).name))
+        }
+        return true
+    }
+
+    /// `--module-root NAME=DIR`.
+    fn addModuleRoot(self, spec: str) -> bool {
+        local eq = spec.len as usize
+        for i in 0..spec.len as usize {
+            if spec[i] == b'=' {
+                eq = i
+                break
+            }
+        }
+        if eq == 0 || eq >= spec.len as usize - 1 {
+            printError(&format("`--module-root {}` must be NAME=DIR", spec))
+            return false
+        }
+        local dir = String(spec[eq + 1..spec.len as usize])
+        if !isDirectory(&dir) {
+            printError(&format("`--module-root {}`: `{}` is not a directory", spec, dir.asStr()))
+            return false
+        }
+        self.comp.addModuleRoot(spec[0..eq], dir.asStr())
+        return true
+    }
+
+    /// `--import SPEC`.
+    fn addImplicitImport(self, spec: str) -> bool {
+        self.comp.addImplicitImport(spec)
+        return true
+    }
+
+    /// Loads the root module and everything it imports, resolves exports and imports.
+    fn loadRoot(self, path: str) -> bool {
+        local p = String(path)
+        if !fileReadable(&p) {
+            printError(&format("cannot read `{}`", path))
+            return false
+        }
+        // The layout history sits next to the root unless `--layout-history` named a file.
+        self.historyPath = self.config.layoutHistory.length() > 0 ? self.config.layoutHistory.clone()
+            : format("{}xl.layout", dirOf(path).asStr())
+        local failed = self.history.load(&self.historyPath)
+        if failed.length() > 0 {
+            printError(&failed)
+            return false
+        }
+        self.root = String(path)
+        self.comp.loadRoot(path)
+        self.comp.finish()
+        return true
+    }
+
+    /// The checks of every module; they run only on a program without errors so far.
+    fn analyze(self) -> bool {
+        if !self.diag.hasErrors() { self.comp.analyzeAll() }
+        return true
+    }
+
+    /// Lowers once: HIR, then MIR, then the static analyses. Never runs on a program with errors.
+    fn lower(self) -> bool {
+        if self.lowered || self.diag.hasErrors() { return true }
+        self.program = lowerProgram(self.comp)
+        // A body that failed to lower leaves holes (index -1) in the HIR: no MIR from it.
+        if !self.diag.hasErrors() {
+            local mir = xlcMirBuild(&self.program.module)
+            if !self.diag.hasErrors() { xlcAnalysisRun(mir, &self.diag as *u8) }
+        }
+        self.lowered = true
+        return true
+    }
+
+    /// The lowered module (lowering on first use); nil when the program has errors.
+    fn hirModule(self) -> *XlcHirModule {
+        self.lower()
+        if self.program == nil { return nil }
+        return &self.program.module
+    }
+
+    /// Erases every function and global the lists do not name; the lists are indices into the
+    /// current module, ascending. Used once, by the output step's reachability prune.
+    fn keep(self, functions: *Vec<u32>, globals: *Vec<u32>) {
+        if self.program == nil { return }
+        local m = &self.program.module
+        local nf = 0 as usize
+        for k in 0..(*functions).length() {
+            m.functions[nf] = m.functions[*(*functions).get(k) as usize]
+            nf++
+        }
+        m.functionCount = nf as u32
+        local ng = 0 as usize
+        for k in 0..(*globals).length() {
+            m.globals[ng] = m.globals[*(*globals).get(k) as usize]
+            ng++
+        }
+        m.globalCount = ng as u32
+    }
+
+    /// The source modules in dependency order.
+    fn modules(self) -> Vec<ModuleRow> {
+        local out = Vec<ModuleRow>()
+        for i in 0..self.comp.order.length() {
+            local m = *self.comp.order.get(i)
+            local row = ModuleRow { key: m.key.clone(), text: self.sources.file(m.file).text.asStr(),
+                registered: m.hasRegistered(), deps: Vec<u32>() }
+            for d in 0..m.deps.length() {
+                for k in 0..self.comp.order.length() {
+                    if *self.comp.order.get(k) == *m.deps.get(d) { row.deps.push(k as u32) }
+                }
+            }
+            out.push(row)
+        }
+        return out
+    }
+
+    /// The size of the aggregate `name` in the root module, or false when it is not a struct or
+    /// class.
+    fn sizeOf(self, name: str, out: *i64) -> bool {
+        local root = self.comp.root
+        if root == nil { return false }
+        local h = layoutOfName(&root.sema, name, XSpan { file: 0, line: 0, column: 0, endLine: 0, endColumn: 0 })
+        if h < 0 { return false }
+        *out = (*(*root.sema.layoutCache.get(h as usize))).size as i64
+        return true
+    }
+
+    /// The incremental cache key of this configuration for `emit`.
+    fn configKey(self, emit: str) -> String {
+        return self.config.key(XLC_VERSION, emit)
+    }
+
+    /// An error of the output step, in the diagnostics' own shape.
+    fn diagnose(self, code: str, at: Span, message: str, hint: str) {
+        self.diag.error(code, at, message, hint)
+    }
+
+    fn hasErrors(self) -> bool {
+        return self.diag.hasErrors()
+    }
+
+    /// Renders the queued diagnostics on stderr.
+    fn flush(self) {
+        self.diag.flush()
+        if self.diag.output.length() > 0 {
+            eprint("{}", self.diag.output.asStr())
+            self.diag.output = String()
+        }
+    }
+
+    /// The `N error(s), M warning(s)` line.
+    fn printSummary(self) {
+        self.flush()
+        eprint("{}{} error(s), {} warning(s){}\n", style(self.diag.hasErrors() ? "1;31" : "1;33").asStr(),
+            self.diag.errorCount(), self.diag.warningCount(), style("0").asStr())
+    }
+
+    /// `--dump-hir`.
+    fn dumpHir(self) {
+        self.lower()
+        if self.diag.hasErrors() { return }
+        self.flush()
+        local t = xlcHirDump(&self.program.module)
+        print(fromParts(t.bytes, t.len as usize))
+        xlcHirDumpFree(t)
+    }
+
+    /// `--dump-mir`.
+    fn dumpMir(self) {
+        self.lower()
+        if self.diag.hasErrors() { return }
+        self.flush()
+        print(dumpModule(xlcMirBuild(&self.program.module)).asStr())
+    }
+
+    /// `--dump-layout[=TYPE]`, optionally recorded in the history file (`--layout-record`).
+    fn dumpLayout(self, typeName: str, record: bool) {
+        local root = self.comp.root
+        if root == nil { return }
+        local names = Vec<String>()
+        if typeName.len > 0 {
+            names.push(String(typeName))
+        } else {
+            for i in 0..root.sema.aggregateOrder.length() {
+                names.push(String(root.sema.text(*root.sema.aggregateOrder.get(i))))
+            }
+        }
+        for i in 0..names.length() {
+            local name = (*names.get(i)).asStr()
+            local h = layoutOfName(&root.sema, name, XSpan { file: 0, line: 0, column: 0, endLine: 0, endColumn: 0 })
+            if h < 0 { continue }
+            local layout = *root.sema.layoutCache.get(h as usize)
+            local rec = LayoutRecord(name, layout)
+            print(formatLayoutRecord(&rec).asStr())
+            if record { self.history.put(name, layout) }
+        }
+        if record && !self.diag.hasErrors() { self.history.save(&self.historyPath) }
+    }
+}
+
+/// True when `path` is an existing directory.
+fn isDirectory(path: *String) -> bool {
+    return isDir(path)
+}
+
+/// True when `path` is an existing file.
+fn fileReadable(path: *String) -> bool {
+    return exists(path)
+}

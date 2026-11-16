@@ -1,14 +1,16 @@
-// The command line of xlc and the run it drives: the parser, then the backend one stage at a
-// time through the boundary of src/cli/backend.xl, then the output step (src/cli/emit.xl). The
+// The command line of xlc and the run it drives: the parser, then the compilation one stage at a
+// time through a `Session` (src/session/session.xl), then the output step (src/cli/emit.xl). The
 // parser keeps the behavior of the C++ CLI it replaced: `--opt value` and `--opt=value`,
 // attached short values (`-O2`), repeatable lists, `-Wno-CODE` rewritten to `--allow CODE`, and
 // the same defaults.
 from "std" import String, Vec, format
 from "std/io" import print, eprint
 from "std/str" import view, find, startsWith, endsWith, toU64, fromParts
-import * from "cli/backend"
-from "cli/console" import decideColor, STDERR
+from "std/str" import toI64
+from "cli/console" import decideColor, printError, STDERR
 from "cli/emit" import EmitPlan, emitProgram
+from "session/config" import BuildConfig, ConfigValue, parseTarget, valueText
+from "session/session" import Session, DiagSettings, explainCode, XLC_VERSION
 
 // ---- the options ----------------------------------------------------------------------------
 
@@ -339,47 +341,70 @@ export fn printHelp() {
     print("  -h, --help                 Print this help and exit\n")
 }
 
-// ---- the boundary configuration -------------------------------------------------------------
+// ---- the configuration ----------------------------------------------------------------------
 
-/// The arenas a `XlcConfig` points into: keep it alive as long as the config is in use.
-export class ConfigArena {
-    defines: Vec<XlcStr>
-    undefs: Vec<XlcStr>
-    allow: Vec<XlcStr>
-    deny: Vec<XlcStr>
-    cfg: XlcConfig
-
-    fn init(self) {
-        self.defines = Vec<XlcStr>()
-        self.undefs = Vec<XlcStr>()
-        self.allow = Vec<XlcStr>()
-        self.deny = Vec<XlcStr>()
+/// The build configuration of the parsed options; false after an `error:` line for a bad target,
+/// optimization level or definition.
+export fn buildConfig(o: *Opts, out: *BuildConfig) -> bool {
+    if o.target.length() > 0 && !parseTarget(o.target.asStr(), &out.target) {
+        printError(&format("unsupported target `{}` (x86_64/aarch64 on linux/macos/windows)", o.target.asStr()))
+        return false
     }
+    if o.opt.length() > 0 {
+        local level: i64 = 0
+        if !toI64(&o.opt, &level) {
+            printError(&format("invalid optimization level `{}`", o.opt.asStr()))
+            return false
+        }
+        out.optLevel = level
+    }
+    out.debug = o.debug
+    out.cpu = o.cpu.clone()
+    out.mangle = o.mangle.clone()
+    out.safety = o.safety.clone()
+    out.layoutScheme = o.layoutScheme.clone()
+    out.layoutHistory = o.layoutHistory.clone()
+    out.crt = o.crt
+    for def in o.defines {
+        if !out.define(def.asStr()) {
+            printError(&String("empty name in -D"))
+            return false
+        }
+    }
+    for name in o.undefs {
+        if !out.undefine(name.asStr()) {
+            printError(&format("`{}` is a builtin definition and cannot be undefined", name.asStr()))
+            return false
+        }
+    }
+    return true
 }
 
-/// Fills the boundary configuration from the parsed options.
-export fn buildConfig(o: *Opts, arena: *ConfigArena) -> *XlcConfig {
-    arena.cfg.target = xstr(&o.target)
-    arena.cfg.opt = xstr(&o.opt)
-    arena.cfg.debug = o.debug ? 1 : 0
-    arena.cfg.cpu = xstr(&o.cpu)
-    arena.cfg.mangle = xstr(&o.mangle)
-    arena.cfg.safety = xstr(&o.safety)
-    arena.cfg.layoutScheme = xstr(&o.layoutScheme)
-    arena.cfg.layoutHistory = xstr(&o.layoutHistory)
-    arena.cfg.defines = xlist(&o.defines, &arena.defines)
-    arena.cfg.undefs = xlist(&o.undefs, &arena.undefs)
-    arena.cfg.allow = xlist(&o.allow, &arena.allow)
-    arena.cfg.deny = xlist(&o.deny, &arena.deny)
-    arena.cfg.warnAll = o.warnAll ? 1 : 0
-    arena.cfg.allowAll = o.allowAll ? 1 : 0
-    arena.cfg.contextErrors = o.contextErrors
-    arena.cfg.contextWarnings = o.contextWarnings
-    arena.cfg.logPath = xstr(&o.logPath)
-    arena.cfg.diagFormat = xstr(&o.diagFormat)
-    arena.cfg.diagLogLevel = xstr(&o.diagLogLevel)
-    arena.cfg.crt = o.crt ? 1 : 0
-    return &arena.cfg
+/// The diagnostic settings of the parsed options.
+fn diagSettings(o: *Opts, color: bool) -> DiagSettings {
+    local s = DiagSettings()
+    for a in o.allow { s.allow.push(a.clone()) }
+    for d in o.deny { s.deny.push(d.clone()) }
+    s.warnAll = o.warnAll
+    s.allowAll = o.allowAll
+    s.contextErrors = o.contextErrors
+    s.contextWarnings = o.contextWarnings
+    s.logPath = o.logPath.clone()
+    s.format = o.diagFormat.clone()
+    s.logLevel = o.diagLogLevel.clone()
+    s.color = color
+    return s
+}
+
+/// `--print-cfg`: the target and every definition the sources can read.
+fn printConfig(c: *BuildConfig) {
+    print("target = \"{}\"\n", c.target.triple.asStr())
+    local names = Vec<String>()
+    local values = Vec<*ConfigValue>()
+    c.resolved(&names, &values)
+    for i in 0..names.length() {
+        print("{} = {}\n", names.get(i).asStr(), valueText(*values.get(i)).asStr())
+    }
 }
 
 /// The output step's plan from the parsed options: every input but the program root
@@ -423,23 +448,23 @@ export fn run(args: Vec<String>) -> i32 {
         return 2
     }
     // One color decision for the CLI and the backend, before either prints.
-    xlcSetColor(decideColor(STDERR, &o.color) ? 1 : 0)
+    local color = decideColor(STDERR, &o.color)
     if o.version {
-        xlcVersion()
+        print("{}\n", XLC_VERSION)
         return 0
     }
     if o.explain.len > 0 {
-        if xlcExplain(xstr(&o.explain)) != 0 {
-            return 1
-        }
-        return 0
+        return explainCode(o.explain.asStr()) ? 0 : 1
     }
 
-    // The configuration and the arenas it points into live as long as the session does.
-    local arena: ConfigArena = ConfigArena()
-    local cfg = buildConfig(&o, &arena)
+    // The configuration lives as long as the session does.
+    local cfg = new BuildConfig()
+    if !buildConfig(&o, cfg) {
+        return 1
+    }
     if o.printCfg {
-        return xlcPrintCfg(cfg)
+        printConfig(cfg)
+        return 0
     }
     if o.inputs.length() == 0 {
         printHelp()
@@ -453,43 +478,41 @@ export fn run(args: Vec<String>) -> i32 {
     }
     local root = (*o.inputs.get(rootIdx as usize)).clone()
 
-    // `--dump-ast` needs no session: parse one file and print the summary.
+    local settings = diagSettings(&o, color)
+    local session = new Session(cfg, &settings)
+    // `--dump-ast` needs no module graph: parse one file and print its tree.
     if o.dumpAst {
-        return xlcDumpAst(cfg, xstr(&root))
+        return session.dumpAst(root.asStr()) ? 0 : 1
     }
 
-    local session = xlcSessionNew(cfg)
-    if session == nil {
-        return 1
-    }
     local failed = false
     for i in 0..o.moduleRoots.length() {
-        if xlcSessionAddModuleRoot(session, xstr(o.moduleRoots.get(i))) != 0 {
+        if !session.addModuleRoot(o.moduleRoots.get(i).asStr()) {
             failed = true
             break
         }
     }
     if !failed {
         for i in 0..o.imports.length() {
-            if xlcSessionAddImplicitImport(session, xstr(o.imports.get(i))) != 0 {
+            if !session.addImplicitImport(o.imports.get(i).asStr()) {
                 failed = true
                 break
             }
         }
     }
-    if !failed && xlcSessionLoadRoot(session, xstr(&root)) != 0 {
+    if !failed && !session.loadRoot(root.asStr()) {
         failed = true
     }
-    if !failed && xlcSessionAnalyze(session) != 0 {
+    if !failed && !session.analyze() {
         failed = true
     }
     // `--check` promises parse, analyze and lower; the dumps and the emit paths lower on demand,
     // so only `--check` needs the explicit step.
-    if !failed && o.check && xlcSessionLower(session) != 0 {
+    if !failed && o.check && !session.lower() {
         failed = true
     }
     if failed {
-        xlcSessionFree(session)
+        session.flush()
         return 1
     }
 
@@ -499,27 +522,29 @@ export fn run(args: Vec<String>) -> i32 {
     // A failed archive or link is no diagnostic: it is reported as an `error:` line and only
     // fails the exit status.
     local emitFailed = false
-    if xlcSessionHasErrors(session) == 0 {
+    if !session.hasErrors() {
         if o.dumpHir {
-            xlcSessionDumpHir(session)
+            session.dumpHir()
         }
         if o.dumpMir {
-            xlcSessionDumpMir(session)
+            session.dumpMir()
         }
         if emits {
             local plan = emitPlan(&o, rootIdx as usize)
             emitFailed = !emitProgram(session, &plan)
         }
     }
-    if wantsLayout && xlcSessionHasErrors(session) == 0 {
-        xlcSessionDumpLayout(session, xstr(&o.dumpLayout), o.layoutRecord ? 1 : 0)
+    if wantsLayout && !session.hasErrors() {
+        session.dumpLayout(o.dumpLayout.asStr(), o.layoutRecord)
     }
 
     local code: i32 = emitFailed ? 1 : 0
-    if xlcSessionHasErrors(session) != 0 {
-        xlcSessionPrintSummary(session)
+    if session.hasErrors() {
+        session.printSummary()
         code = 1
+    } else {
+        // Warnings of a clean run are still shown.
+        session.flush()
     }
-    xlcSessionFree(session)
     return code
 }

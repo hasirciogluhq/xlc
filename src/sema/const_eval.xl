@@ -106,15 +106,26 @@ fn evalName(s: *Sema, exprIdx: i32) -> i32 {
     local sym = s.find(name)
     if sym < 0 {
         local ref = lookupEntity(s, name)
-        if ref.sym >= 0 && ref.owner != nil && ref.owner != s &&
-                (*ref.owner.symbols.get(ref.sym as usize)).kind == SY_DEFINE {
-            // A define of another module: evaluate it there under its local name.
-            return evalConst(ref.owner, makeRemoteName(ref.owner, ref.owner.text(ref.foundAs),
-                (*e).span))
+        if ref.sym >= 0 && ref.owner != nil && ref.owner != s {
+            return evalRemoteDefine(s, ref.owner, ref.owner.text(ref.foundAs), (*e).span)
         }
     }
+    return evalDefine(s, name, sym, (*e).span)
+}
+
+/// A define of another module: evaluated there under its own name, the value copied into `s`.
+fn evalRemoteDefine(s: *Sema, owner: *Sema, name: str, at: XSpan) -> i32 {
+    local sym = owner.find(name)
+    local value = evalDefine(owner, name, sym, at)
+    if value < 0 { return -1 }
+    s.consts.push(*owner.consts.get(value as usize))
+    return (s.consts.length() - 1) as i32
+}
+
+/// The `define` constant `name` (symbol `sym`, -1 when unknown) of `s`, cached and cycle guarded.
+fn evalDefine(s: *Sema, name: str, sym: i32, at: XSpan) -> i32 {
     if sym < 0 || (*s.symbols.get(sym as usize)).kind != SY_DEFINE {
-        s.notConstant((*e).span, format("`{}` is not a `define` constant", name).asStr())
+        s.notConstant(at, format("`{}` is not a `define` constant", name).asStr())
         return -1
     }
     // The cache.
@@ -123,7 +134,7 @@ fn evalName(s: *Sema, exprIdx: i32) -> i32 {
     }
     for i in 0..s.defineInProgress.length() {
         if s.text(*s.defineInProgress.get(i)) == name {
-            s.error("E0707", (*e).span, format("`define {}` depends on itself", name).asStr(),
+            s.error("E0707", at, format("`define {}` depends on itself", name).asStr(),
                     "cyclic constant")
             return -1
         }
@@ -133,7 +144,7 @@ fn evalName(s: *Sema, exprIdx: i32) -> i32 {
     local decl = s.declOfItem(item)
     local value = -1
     if decl >= 0 {
-        value = evalConst(s, (*s.declOf(decl)).init)
+        value = evalConst(s, (*s.declAt(decl as usize)).init)
     }
     s.defineInProgressPop(s.str(name))
     s.defineNames.push(s.str(name))
@@ -141,14 +152,11 @@ fn evalName(s: *Sema, exprIdx: i32) -> i32 {
     return value
 }
 
-/// A one-statement program naming `name`: the remote evaluation of an imported define.
-fn makeRemoteName(owner: *Sema, name: str, at: XSpan) -> i32 {
-    // The remote Sema evaluates the define's own initializer directly; a name expression is
-    // built only when the value must come from the name table, which `evalName` of the owner
-    // does with `find`. So hand the name back as an index into the owner's table instead.
-    local idx = owner.find(name)
-    if idx >= 0 { return -2 - idx } // unused; remote defines resolve through their own decl
-    return -1
+/// The constant `value` of `owner`'s table as a constant of `s` (the module that asked).
+fn fromOwner(s: *Sema, owner: *Sema, value: i32) -> i32 {
+    if value < 0 || owner == s { return value }
+    s.consts.push(*owner.consts.get(value as usize))
+    return (s.consts.length() - 1) as i32
 }
 
 /// `ns.name` or `Enum.member`.
@@ -160,14 +168,15 @@ fn evalField(s: *Sema, exprIdx: i32) -> i32 {
         if ref.sym >= 0 {
             local owner = ref.owner != nil ? ref.owner : s
             if (*owner.symbols.get(ref.sym as usize)).kind == SY_ENUM {
-                return enumMember(owner, owner.text(ref.foundAs), s.exprTextAt(exprIdx), (*e).span)
+                return fromOwner(s, owner, enumMember(owner, owner.text(ref.foundAs),
+                                                      s.exprTextAt(exprIdx), (*e).span))
             }
         }
         // `ns.name` naming a define of another module
         local q = lookupQualified(s, s.exprTextAt((*e).lhs), s.exprTextAt(exprIdx))
         if q.sym >= 0 && q.owner != nil &&
                 (*q.owner.symbols.get(q.sym as usize)).kind == SY_DEFINE {
-            return evalConst(q.owner, makeRemoteName(q.owner, q.owner.text(q.foundAs), (*e).span))
+            return evalRemoteDefine(s, q.owner, q.owner.text(q.foundAs), (*e).span)
         }
     }
     s.notConstant((*e).span, "only enum members can be read as constants")

@@ -19,7 +19,7 @@ from "std/io" import fprint
 from "std/io/files" import removeFile
 from "std/io/fs" import fsWrite
 from "std/str" import toUpperAscii
-from "backend" import XlcSession, XlcTarget, xlcSessionTarget, xlcSessionHirModule, xlcSessionHasErrors, xlcSessionOptLevel, ownedOf, xstr
+from "../session/session" import Session
 from "path" import stemOf, fileNameOf, dirOf
 from "entry" import checkEntry
 from "program" import pruneProgram, addLinkImports
@@ -28,7 +28,6 @@ from "../driver/link" import LinkRequest, link
 from "../codegen/native" import emitNativeObj
 from "../driver/link" import archive
 from "../codegen/header" import headerText
-from "../hir/flatten" import Flat, flattenModule
 
 /// Everything the output step needs from the command line.
 export class EmitPlan {
@@ -70,36 +69,33 @@ export fn defaultOutput(root: *String, emit: *String, os: *String) -> String {
 
 /// Generates code and archives or links the result. False when anything failed; the failure is
 /// already reported (a diagnostic, or an `error:` line).
-export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
-    local target: XlcTarget
-    xlcSessionTarget(session, &target)
-    local os = ownedOf(target.os)
-    local arch = ownedOf(target.arch)
+export fn emitProgram(session: *Session, plan: *EmitPlan) -> bool {
+    local target = &session.config.target
+    local os = target.os.clone()
+    local arch = target.arch.clone()
     local output = plan.output.length() > 0 ? plan.output.clone() : defaultOutput(&plan.root, &plan.emit, &os)
     local windows = os.asStr() == "windows"
 
     // The one code generator is the native arm64 Mach-O backend (src/codegen/native).
     if os.asStr() != "macos" || arch.asStr() != "aarch64" {
-        local triple = ownedOf(target.triple)
-        fprint(2, format("error: the code generator supports only the arm64-apple-macos target, this build targets {}\n", triple.asStr()).asStr())
+        fprint(2, format("error: the code generator supports only the arm64-apple-macos target, this build targets {}\n", target.triple.asStr()).asStr())
         return false
     }
 
     // Plan 24: only what the roots reach is code-generated and linked; the flat module below is
     // read after that prune, so it describes exactly what is generated.
     pruneProgram(session, plan.emit.asStr(), plan.inputs.length() > 0)
-    local f = Flat()
-    flattenModule(&f, xlcSessionHirModule(session))
+    local module = session.hirModule()
 
     local rootName = fileNameOf(plan.root.asStr())
     local stem = stemOf(plan.root.asStr())
-    if !checkEntry(session, &f.m, plan.emit.asStr(), rootName.asStr(), os.asStr(), plan.crt) {
+    if !checkEntry(session, module, plan.emit.asStr(), rootName.asStr(), os.asStr(), plan.crt) {
         return false
     }
 
     if plan.emit.asStr() == "header" {
         local guard = toUpperAscii(format("XLANG_{}_H", stem.asStr()).asStr())
-        local text = headerText(session, &f.m, guard.asStr())
+        local text = headerText(session, module, guard.asStr())
         if output.asStr() == "-" { // `-o -` streams, like the LLVM writers of ir, bc and obj
             fprint(1, text.asStr())
             return true
@@ -113,18 +109,17 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
 
     local emit = plan.emit.asStr()
     local linked = emit == "exe" || emit == "static" || emit == "shared"
-    local optLevel = xlcSessionOptLevel(session)
     local objects = Vec<String>()
     local temporary = false
     local none = String()
 
     if !linked {
         // obj: written in place.
-        return emitNativeObj(&f.m, false, "", &output)
+        return emitNativeObj(module, false, "", &output)
     }
 
     if plan.incremental {
-        if !emitIncremental(session, &f.m, &plan.emit, &stem, &output, &plan.cacheDir, windows, &objects) {
+        if !emitIncremental(session, module, &plan.emit, &stem, &output, &plan.cacheDir, windows, &objects) {
             return false
         }
     } else {
@@ -132,13 +127,13 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
         // and file system); the CLI removes it whether or not the link succeeds.
         local obj = output.clone()
         obj.append(".tmp.o")
-        if !emitNativeObj(&f.m, false, "", &obj) {
+        if !emitNativeObj(module, false, "", &obj) {
             return false
         }
         objects.push(obj)
         temporary = true
     }
-    if xlcSessionHasErrors(session) != 0 {
+    if session.hasErrors() {
         return false
     }
 
@@ -157,8 +152,8 @@ export fn emitProgram(session: *XlcSession, plan: *EmitPlan) -> bool {
         r.shared = emit == "shared"
         r.crt = plan.crt
         r.os = os.clone()
-        r.arch = ownedOf(target.arch)
-        addLinkImports(&f.m, &r)
+        r.arch = arch.clone()
+        addLinkImports(module, &r)
         for a in plan.linkArgs {
             r.extraArgs.push(a.clone())
         }

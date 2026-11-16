@@ -82,16 +82,50 @@ export fn lookupEntity(s: *Sema, name: str) -> EntityRef {
             return addDerived(s, name, r)
         }
     }
-    // Import bindings and registered names need the compilation driver.
-    if s.hasComp {
+    // An import binding: the entity lives in the module the binding names.
+    if s.hasComp && s.peers != nil {
         for i in 0..s.importBindingNames.length() {
             local b = s.importBindings.get(i)
             if (*b).isNamespace { continue }
             if s.text(*s.importBindingNames.get(i)) == name {
-                // The compilation resolves the binding's module key to an owner; with the driver
-                // not ported yet the binding cannot be followed here.
-                return none()
+                return inModule(s, s.text((*b).moduleKey), s.text((*b).name))
             }
+        }
+        // A `register`ed name of the program is visible everywhere.
+        local owner = s.peers.registeredOwner(name)
+        if owner != nil { return inOwner(owner, name) }
+    }
+    return none()
+}
+
+/// The entity `entity` of module `owner` (an EntityRef whose `owner` is that module).
+fn inOwner(owner: *Sema, entity: str) -> EntityRef {
+    local sym = owner.find(entity)
+    if sym < 0 { return none() }
+    local r: EntityRef
+    r.owner = owner
+    r.sym = sym
+    r.name = *owner.symNames.get(sym as usize)
+    r.foundAs = r.name
+    return r
+}
+
+/// The entity `entity` of the module with key `key`.
+fn inModule(s: *Sema, key: str, entity: str) -> EntityRef {
+    local owner = s.peers.byKey(key)
+    if owner == nil { return none() }
+    return inOwner(owner, entity)
+}
+
+/// The entity module `key` exports under `name`, followed to the module that defines it; none
+/// when the module exports no such entity (a namespace export is no entity).
+export fn exportedEntity(s: *Sema, key: str, name: str) -> EntityRef {
+    if s.peers == nil { return none() }
+    local m = s.peers.byKey(key)
+    if m == nil { return none() }
+    for i in 0..m.exportNames.length() {
+        if (*m.exportNames.get(i)).asStr() == name && !*m.exportNs.get(i) {
+            return inModule(s, (*m.exportKeys.get(i)).asStr(), (*m.exportLocals.get(i)).asStr())
         }
     }
     return none()
@@ -99,12 +133,12 @@ export fn lookupEntity(s: *Sema, name: str) -> EntityRef {
 
 /// Resolves `a.b` through a namespace import (`io.Writer`). Needs the compilation.
 export fn lookupQualified(s: *Sema, a: str, b: str) -> EntityRef {
-    if !s.hasComp { return none() }
+    if !s.hasComp || s.peers == nil { return none() }
     for i in 0..s.importBindingNames.length() {
         local bind = s.importBindings.get(i)
         if !(*bind).isNamespace { continue }
         if s.text(*s.importBindingNames.get(i)) == a {
-            return none() // the compilation driver resolves this; not ported yet
+            return exportedEntity(s, s.text((*bind).moduleKey), b)
         }
     }
     return none()
@@ -126,8 +160,30 @@ export fn entityByQName(s: *Sema, qname: str) -> EntityRef {
         return none()
     }
     // With the compilation: split at the last `::`, find the owner module, look the local part up
-    // there, falling back to the payload-enum parts of the instance.
-    return none() // the compilation driver resolves this; not ported yet
+    // there; a payload-enum part (`Result<i32, E>$Ok`) answers with its instance.
+    local cut = -1
+    for i in 0..qname.len as usize {
+        if qname[i] == b':' && i + 1 < qname.len as usize && qname[i + 1] == b':' { cut = i as i32 }
+    }
+    local owner = s
+    local local_ = qname
+    if cut >= 0 && s.peers != nil {
+        owner = s.peers.byKey(qname[0..cut as usize])
+        local_ = qname[(cut + 2) as usize..qname.len as usize]
+        if owner == nil { return none() }
+    }
+    local r = inOwner(owner, local_)
+    if r.sym >= 0 { return r }
+    local d = lastDollar(local_)
+    if d >= 0 {
+        local base = String(local_).slice(0, d as usize).asStr()
+        local baseRef = inOwner(owner, base)
+        if baseRef.sym >= 0 && isPayloadEnum(owner, owner.itemOf(baseRef.sym)) {
+            baseRef.foundAs = owner.str(local_)
+            return baseRef
+        }
+    }
+    return none()
 }
 
 /// The compile-time length of an array-type repeat expression: integer literals only (the full

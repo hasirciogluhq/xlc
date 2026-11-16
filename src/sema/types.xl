@@ -67,11 +67,17 @@ export class Types {
 
     /// interns a path of segments in order and ranges them in the string arena.
     fn internPath(self, segs: Vec<String>) -> (u32, u32) {
-        local first = self.strs.length() as u32
+        // `intern` itself appends a new text to `strs`, so the views are collected first and the
+        // range is then laid out contiguously: exactly one entry per segment.
+        local views = Vec<XStr>()
         for i in 0..segs.length() {
-            self.strs.push(self.intern(segs.get(i).asStr()))
+            views.push(self.intern(segs.get(i).asStr()))
         }
-        return (first, (self.strs.length() as u32) - first)
+        local first = self.strs.length() as u32
+        for i in 0..views.length() {
+            self.strs.push(*views.get(i))
+        }
+        return (first, views.length() as u32)
     }
 
     /// pushes an empty record of `kind` and returns its index; index fields default to none.
@@ -235,21 +241,24 @@ export class Types {
     fn rebuild(self, kind: i32, elem: i32, ret: i32, args: Vec<i32>, params: Vec<i32>,
                isMutable: bool, length: i32) -> i32 {
         local idx = self.push(kind)
+        // The pushes below may move the arena: the record is addressed again after them.
+        local argsFirst = self.types.length() as u32
+        for i in 0..args.length() {
+            self.types.push(self.get(*args.get(i)))
+        }
+        local paramsFirst = self.types.length() as u32
+        for i in 0..params.length() {
+            self.types.push(self.get(*params.get(i)))
+        }
         local t = self.at(idx)
         (*t).elem = elem
         (*t).ret = ret
         (*t).length = length
         (*t).isMutable = isMutable ? 1 : 0
-        (*t).argsFirst = self.types.length() as u32
-        for i in 0..args.length() {
-            self.types.push(self.get(*args.get(i)))
-        }
-        (*t).argsCount = (self.types.length() as u32) - (*t).argsFirst
-        (*t).paramsFirst = self.types.length() as u32
-        for i in 0..params.length() {
-            self.types.push(self.get(*params.get(i)))
-        }
-        (*t).paramsCount = (self.types.length() as u32) - (*t).paramsFirst
+        (*t).argsFirst = argsFirst
+        (*t).argsCount = paramsFirst - argsFirst
+        (*t).paramsFirst = paramsFirst
+        (*t).paramsCount = (self.types.length() as u32) - paramsFirst
         return idx
     }
 
@@ -305,6 +314,39 @@ export class Types {
             self.types.set((at + i as u32) as usize, self.get(r))
         }
         return at
+    }
+
+    /// Copies the resolved type `idx` of another module's arena into this one and returns its
+    /// index. Every module owns its arena (its path segments live in its own byte table), so a
+    /// type resolved by the module that owns an entity is adopted before the user module keeps it.
+    fn adopt(self, other: *Types, idx: i32) -> i32 {
+        if idx < 0 { return -1 }
+        local src = other.get(idx)
+        local segs = Vec<String>()
+        for i in 0..src.pathCount as usize {
+            local s = other.strs.get(src.pathFirst + i as u32)
+            local p = (other.bytes.data as usize + (*s).off as usize) as *u8
+            segs.push(String(fromParts(p, (*s).len as usize)))
+        }
+        local range = self.internPath(segs)
+        local elem = self.adopt(other, src.elem)
+        local ret = self.adopt(other, src.ret)
+        local params = Vec<i32>()
+        for i in 0..src.paramsCount as usize {
+            params.push(self.adopt(other, (src.paramsFirst + i as u32) as i32))
+        }
+        local args = Vec<i32>()
+        for i in 0..src.argsCount as usize {
+            args.push(self.adopt(other, (src.argsFirst + i as u32) as i32))
+        }
+        local out = self.rebuild(src.kind, elem, ret, args, params, src.isMutable != 0, src.length)
+        local t = self.at(out)
+        (*t).bits = src.bits
+        (*t).isSigned = src.isSigned
+        (*t).span = src.span
+        (*t).pathFirst = range.0
+        (*t).pathCount = range.1
+        return out
     }
 
     /// `i32`, `u8`, `usize`, `f64`, `bool`, `void` -> the type; -1 for any other name.

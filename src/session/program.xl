@@ -1,0 +1,107 @@
+// Lowering of the whole program: every module of the compilation is lowered by its own `Lowerer`
+// into one shared HIR builder, the generic instances the bodies request are lowered until none
+// is left, and the `declare`d symbols nothing in the program defines are reported (W0301).
+//
+// The library group (modules found through a module root) is lowered first, so the registrations
+// and `@init` functions of the program come after the defaults of the libraries.
+from "std" import String, Vec, format
+from "../hir/abi" import XlcHirModule, view
+from "../util/diagnostics" import DiagnosticEngine
+from "../util/source" import spanNone
+from "../lower/builder" import HirBuilder, HirKeep
+from "../lower/state" import Lowerer
+from "../lower/items" import lowerBatch
+from "../lower/instances" import lowerPendingInstances
+from "../lower/impls" import lowerImpls
+from "../lower/roles" import checkRegistrations
+from "./compilation" import Compilation, Module
+
+/// The lowered program: the HIR the code generator reads, and the arenas behind it.
+export class Program {
+    builder: HirBuilder
+    keep: HirKeep
+    module: XlcHirModule
+
+    fn init(self) {
+        self.builder = HirBuilder()
+        self.keep = HirKeep()
+    }
+}
+
+/// The modules in lowering order: libraries first, each group in dependency order.
+fn loweringOrder(comp: *Compilation) -> Vec<*Module> {
+    local out = Vec<*Module>()
+    for i in 0..comp.order.length() {
+        if (*(*comp.order.get(i))).isLibrary { out.push(*comp.order.get(i)) }
+    }
+    for i in 0..comp.order.length() {
+        if !(*(*comp.order.get(i))).isLibrary { out.push(*comp.order.get(i)) }
+    }
+    return out
+}
+
+/// Lowers every module of the compilation into one HIR module.
+export fn lowerProgram(comp: *Compilation) -> *Program {
+    local p = new Program()
+    local mods = loweringOrder(comp)
+    local lowerers = Vec<*Lowerer>()
+    for i in 0..mods.length() {
+        local m = *mods.get(i)
+        local l = new Lowerer(&m.sema, &p.builder, m.isLibrary)
+        l.buildModuleScope()
+        lowerers.push(l)
+    }
+    for i in 0..lowerers.length() { checkRegistrations(*lowerers.get(i)) }
+    for i in 0..lowerers.length() {
+        lowerBatch(*lowerers.get(i))
+        lowerImpls(*lowerers.get(i))
+    }
+    // An instance requested by one module can belong to another: lower until none is left.
+    local more = true
+    while more {
+        more = false
+        for i in 0..lowerers.length() {
+            if lowerPendingInstances(*lowerers.get(i)) { more = true }
+        }
+    }
+    for i in 0..lowerers.length() { (*(*lowerers.get(i))).scopes.pop() }
+    p.module = p.builder.materialize(&p.keep)
+    warnUndefined(&p.module, comp.diag)
+    return p
+}
+
+/// W0301: a `declare`d function or global that no module of the program defines is looked up at
+/// link time (with `--emit=obj` that is normal).
+fn warnUndefined(m: *XlcHirModule, diag: *DiagnosticEngine) {
+    local defined = Vec<String>()
+    for i in 0..m.functionCount as usize {
+        local f = &m.functions[i]
+        if f.declared == 0 && f.hasBody != 0 { defined.push(String(view(f.symbol))) }
+    }
+    for i in 0..m.globalCount as usize {
+        local g = &m.globals[i]
+        if g.declared == 0 { defined.push(String(view(g.symbol))) }
+    }
+    for i in 0..m.functionCount as usize {
+        local f = &m.functions[i]
+        // A `@library` import is resolved by the OS library, not by another object.
+        if f.declared != 0 && f.importLibrary.len == 0 && !has(&defined, view(f.symbol)) {
+            diag.warning("W0301", f.span, format("declared function `{}` is not defined in this compilation",
+                view(f.symbol)).asStr(), "resolved at link time")
+        }
+    }
+    for i in 0..m.globalCount as usize {
+        local g = &m.globals[i]
+        if g.declared != 0 && !has(&defined, view(g.symbol)) {
+            diag.warning("W0301", spanNone(), format("declared global `{}` is not defined in this compilation",
+                view(g.symbol)).asStr(), "resolved at link time")
+        }
+    }
+}
+
+fn has(list: *Vec<String>, name: str) -> bool {
+    for i in 0..(*list).length() {
+        if (*(*list).get(i)).asStr() == name { return true }
+    }
+    return false
+}

@@ -95,7 +95,14 @@ export fn substituteType(s: *Sema, idx: i32, env: *TypeEnv) -> i32 {
         params.push(substituteType(s, (t.paramsFirst + i) as i32, env))
     }
     local out = s.types.rebuild(t.kind, elem, ret, args, params, t.isMutable != 0, t.length as i32)
-    (*s.types.at(out)).span = t.span
+    local r = s.types.at(out)
+    // The name stays (`Option<T>` becomes `Option<i32>`), as do the array length spelling and
+    // the width of a leaf-like record.
+    (*r).pathFirst = t.pathFirst
+    (*r).pathCount = t.pathCount
+    (*r).bits = t.bits
+    (*r).isSigned = t.isSigned
+    (*r).span = t.span
     return out
 }
 

@@ -9,11 +9,9 @@ from "std" import String, Vec, format
 from "std/str" import eq, fromParts
 from "std/io/files" import exists, makeDirAll
 from "../hir/abi" import XlcHirModule, view
-from "backend" import XlcSession, XlcModule, XlcStr, xstr, xview, strOf, xlcSessionModuleCount, xlcSessionModule,
-    xlcSessionConfigKey, xlcSessionOptLevel, xlcSessionDiagnose, xlcSessionHasErrors
+from "../session/session" import Session, ModuleRow
 from "path" import dirOf, joinPath
 from "../codegen/native" import emitNativeObj
-from "entry" import boundarySpan
 from "../util/source" import spanNone
 
 /// FNV-1a offset basis and prime (64-bit).
@@ -31,16 +29,16 @@ fn mix(h: u64, s: str) -> u64 {
 
 /// The hash of module `i`, memoized. A module reached again while it is being hashed (an import
 /// cycle) contributes 0, as the C++ `base[&m] = 0` did.
-fn baseHash(i: usize, cfg: str, mods: *Vec<XlcModule>, memo: *Vec<u64>, state: *Vec<u8>) -> u64 {
+fn baseHash(i: usize, cfg: str, mods: *Vec<ModuleRow>, memo: *Vec<u64>, state: *Vec<u8>) -> u64 {
     if *state.get(i) != 0 {
         return *memo.get(i)
     }
     state.set(i, 1)
     memo.set(i, 0)
     local m = mods.get(i)
-    local h = mix(mix(mix(FNV_BASIS, cfg), xview(m.key)), xview(m.text))
-    for k in 0..m.deps.count as usize {
-        local d = baseHash(m.deps.items[k] as usize, cfg, mods, memo, state)
+    local h = mix(mix(mix(FNV_BASIS, cfg), m.key.asStr()), m.text)
+    for k in 0..m.deps.length() {
+        local d = baseHash(*m.deps.get(k) as usize, cfg, mods, memo, state)
         local text = format("{}", d)
         h = mix(h, text.asStr())
     }
@@ -79,23 +77,16 @@ fn hasCode(m: *XlcHirModule, key: str) -> bool {
 /// link order. `emit` is the output kind (it is part of the key), `output` the final output (the
 /// cache sits next to it unless `cacheDir` names one), `stem` the root file stem. False after a
 /// reported failure; `objects` then holds nothing usable.
-export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String, stem: *String, output: *String,
+export fn emitIncremental(session: *Session, m: *XlcHirModule, emit: *String, stem: *String, output: *String,
                           cacheDir: *String, windows: bool, objects: *Vec<String>) -> bool {
     local cacheRoot: String = cacheDir.length() > 0 ? cacheDir.clone() : joinPath(dirOf(output.asStr()).asStr(), ".xlc-cache", windows)
     makeDirAll(&cacheRoot)
 
-    local keyText: XlcStr
-    xlcSessionConfigKey(session, xstr(emit), &keyText)
-    local cfg = String(xview(keyText))
+    local cfg = session.configKey(emit.asStr())
 
     // The module table of the session, in dependency order.
-    local count = xlcSessionModuleCount(session) as usize
-    local mods = Vec<XlcModule>()
-    for i in 0..count {
-        local row: XlcModule
-        xlcSessionModule(session, i as u32, &row)
-        mods.push(row)
-    }
+    local mods = session.modules()
+    local count = mods.length()
     local memo = Vec<u64>()
     local state = Vec<u8>()
     for i in 0..count {
@@ -106,7 +97,7 @@ export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String,
     // Registered names (panic, allocator, ...) are visible everywhere: they salt every module hash.
     local salt = String()
     for i in 0..count {
-        if mods.get(i).registered != 0 {
+        if mods.get(i).registered {
             local h = baseHash(i, cfg.asStr(), &mods, &memo, &state)
             salt.append(format("{};", h).asStr())
         }
@@ -115,7 +106,7 @@ export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String,
     local ext: str = windows ? ".obj" : ".o"
     for i in 0..count {
         local row = mods.get(i)
-        local key = xview(row.key)
+        local key = row.key.asStr()
         if !hasCode(m, key) {
             continue
         }
@@ -124,17 +115,14 @@ export fn emitIncremental(session: *XlcSession, m: *XlcHirModule, emit: *String,
         local obj = joinPath(cacheRoot.asStr(), leaf.asStr(), windows)
         if !exists(&obj) {
             if !emitNativeObj(m, true, key, &obj) {
-                if xlcSessionHasErrors(session) == 0 {
-                    local span = boundarySpan(spanNone())
+                if !session.hasErrors() {
                     local message = format("code generation for module `{}` failed without a diagnostic", name.asStr())
-                    local hint = "internal error: the back end returned no object"
-                    local hintText = strOf(hint)
-                    xlcSessionDiagnose(session, strOf("E0714"), &span, xstr(&message), hintText)
+                    session.diagnose("E0714", spanNone(), message.asStr(), "internal error: the back end returned no object")
                 }
                 return false
             }
         }
         objects.push(obj)
     }
-    return xlcSessionHasErrors(session) == 0
+    return !session.hasErrors()
 }

@@ -8,7 +8,7 @@ from "../sema/flat" import Flat
 from "../sema/item" import SDecl, SItem, SParam, SField
 from "../sema/types" import T_NAMED, T_POINTER
 from "../sema/resolve" import resolve
-from "../sema/enums" import checkEnum
+from "../sema/enums" import checkEnum, isGenericEnumPart
 from "../sema/layout_calc" import layoutOfName
 from "../sema/const_eval" import evalConst
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_GLOBAL, SE_CONSTANT, SE_TYPE
@@ -22,7 +22,8 @@ from "./typing" import exprType, exprTypeName
 from "./diagnose" import cCompatible
 from "./overload" import declParamTypes, declRetType
 from "./roles" import checkRegistrations
-from "./instances" import lowerPendingInstances, lowerImpls
+from "./instances" import lowerPendingInstances
+from "./impls" import lowerImpls
 
 /// The declaration kinds of the flat AST (mirrored here for the dispatch).
 const XD_FN: i32 = 0
@@ -61,6 +62,7 @@ export fn lowerBatch(l: *Lowerer) {
             local d = l.s.declOf(item)
             local gp = l.s.genericParamsOf(item)
             if gp.1 > 0 { continue } // a generic declaration is lowered per instance
+            if isGenericEnumPart(l.s, d) { continue }
             if (*d).kind == XD_IMPL { continue } // the module's impls are in lowerImpls
             if (*d).kind == XD_ENUM {
                 lowerEnum(l, item, declIdx)

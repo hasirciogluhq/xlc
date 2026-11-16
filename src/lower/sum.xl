@@ -12,10 +12,11 @@ from "../hir/abi" import XlcHirStr, XlcHirFieldInit, E_STRUCT_LIT
 from "../lang/ast/ast" import XExpr, XStmt, XE_CALL, XE_FIELD, XE_NAME
 from "./stmt" import switchChain
 from "../sema/sema" import Sema, SY_STRUCT
-from "../sema/item" import SDecl
+from "../sema/item" import SDecl, SSumVariant
 from "../sema/resolve" import resolve
-from "./state" import Lowerer
-from "./typing" import typeNameOf
+from "./state" import Lowerer, SE_TYPE
+from "./typing" import typeNameOf, adoptFrom, entryOwner
+from "./methods" import classLoc
 from "./function" import lowerExprAs, lowerExprWant, lowerBlockInto, hiddenLocal, addLocal, bindLocal
 
 /// A payload enum: the module that owns it and its declaration.
@@ -24,16 +25,75 @@ export struct Sum {
     decl: *SDecl
 }
 
-/// The payload enum named `name` in this module, or a Sum with a nil `decl`.
+/// The payload enum that `name` names in this module (its own or an import), or a Sum with a nil
+/// `decl`. A generic enum (`Result`) is the instance the expected type `l.sumWant` names.
 export fn sumNamed(l: *Lowerer, name: str) -> Sum {
     local none = Sum { owner: l.s, decl: nil as *SDecl }
-    local sym = l.s.find(name)
-    if sym < 0 || (*l.s.symbols.get(sym as usize)).kind != SY_STRUCT { return none }
-    local item = l.s.declOfItem(l.s.itemOf(sym))
-    if item < 0 { return none }
-    local d = l.s.declOf(item)
-    if (*d).variantsCount == 0 { return none }
-    return Sum { owner: l.s, decl: d }
+    local entry = l.lookupName(name)
+    if entry == nil || (*entry).kind != SE_TYPE || (*entry).item < 0 { return none }
+    local owner = entryOwner(l, entry)
+    local d = owner.declOfItem((*entry).item)
+    if d < 0 { return none }
+    local decl = owner.declAt(d as usize)
+    if (*decl).variantsCount == 0 { return none }
+    if owner.genericParamsOf((*entry).item).1 == 0 { return Sum { owner: owner, decl: decl } }
+    // A generic enum: the instance of the expected type, when that is an instance of this enum.
+    local want = sumOfType(l, l.sumWant)
+    if want.decl == nil as *SDecl || want.owner != owner { return none }
+    local head = Sum { owner: owner, decl: decl }
+    if baseOf(want) != baseOf(head) { return none }
+    return want
+}
+
+/// The payload enum (or instance of a generic one) that type `t` of this module is.
+export fn sumOfType(l: *Lowerer, t: i32) -> Sum {
+    local at = classLoc(l.s, t)
+    local none = Sum { owner: l.s, decl: nil as *SDecl }
+    if at.decl < 0 { return none }
+    local decl = at.owner.declAt(at.decl as usize)
+    if (*decl).variantsCount == 0 { return none }
+    return Sum { owner: at.owner, decl: decl }
+}
+
+/// The name of the enum without the instance arguments: `Result<i32, E>` -> `Result`.
+fn baseOf(sum: Sum) -> str {
+    local name = sum.owner.text((*sum.decl).name)
+    for i in 0..name.len as usize {
+        if name[i] == b'<' { return name[0..i] }
+    }
+    return name
+}
+
+/// The instance arguments with their brackets (`<i32, E>`), "" for an enum that is not generic.
+fn argsOf(sum: Sum) -> str {
+    local name = sum.owner.text((*sum.decl).name)
+    for i in 0..name.len as usize {
+        if name[i] == b'<' { return name[i..name.len as usize] }
+    }
+    return ""
+}
+
+/// The qualified names of the parts of an enum (instances of a generic keep the arguments after
+/// the part name: `Result$Data<i32, E>`; the tag enum is shared by every instance).
+fn wholeName(l: *Lowerer, sum: Sum) -> str {
+    return l.keep(sum.owner.qualify(sum.owner.text((*sum.decl).name)).asStr())
+}
+
+fn tagTypeName(l: *Lowerer, sum: Sum) -> str {
+    return l.keep(sum.owner.qualify(format("{}$Tag", baseOf(sum)).asStr()).asStr())
+}
+
+fn dataTypeName(l: *Lowerer, sum: Sum) -> str {
+    return l.keep(sum.owner.qualify(format("{}$Data{}", baseOf(sum), argsOf(sum)).asStr()).asStr())
+}
+
+fn payloadTypeName(l: *Lowerer, sum: Sum, vname: str) -> str {
+    return l.keep(sum.owner.qualify(format("{}${}{}", baseOf(sum), vname, argsOf(sum)).asStr()).asStr())
+}
+
+/// The type of payload value `i` of variant `v`, resolved in the declaring module and adopted.
+fn payloadType(l: *Lowerer, sum: Sum, v: *SSumVariant, i: u32) -> i32 {
+    return adoptFrom(l, sum.owner, resolve(sum.owner, ((*v).payloadFirst + i) as i32))
 }
 
 /// Index of the variant `name`, or -1.
@@ -74,10 +134,9 @@ fn literal(l: *Lowerer, typeName: str, names: Vec<str>, indexes: Vec<u32>, value
 }
 
 /// The enum value of variant `variant` carrying `values` (one per payload type).
-fn construct(l: *Lowerer, sum: Sum, variant: i32, values: Vec<i32>) -> i32 {
-    local base = sum.owner.text((*sum.decl).name)
-    local whole = l.keep(sum.owner.qualify(base).asStr())
-    local tagName = l.keep(sum.owner.qualify(format("{}$Tag", base).asStr()).asStr())
+export fn construct(l: *Lowerer, sum: Sum, variant: i32, values: Vec<i32>) -> i32 {
+    local whole = wholeName(l, sum)
+    local tagName = tagTypeName(l, sum)
     local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
     local names = Vec<str>()
     local indexes = Vec<u32>()
@@ -93,16 +152,14 @@ fn construct(l: *Lowerer, sum: Sum, variant: i32, values: Vec<i32>) -> i32 {
             payNames.push(l.keep(format("_{}", i).asStr()))
             payIndexes.push(i as u32)
         }
-        local payload = literal(l, l.keep(sum.owner.qualify(format("{}${}", base, vname).asStr()).asStr()),
-            payNames, payIndexes, values)
+        local payload = literal(l, payloadTypeName(l, sum, vname), payNames, payIndexes, values)
         local dataNames = Vec<str>()
         local dataIndexes = Vec<u32>()
         local dataValues = Vec<i32>()
         dataNames.push(vname)
         dataIndexes.push(dataIndex(sum, variant))
         dataValues.push(payload)
-        local data = literal(l, l.keep(sum.owner.qualify(format("{}$Data", base).asStr()).asStr()),
-            dataNames, dataIndexes, dataValues)
+        local data = literal(l, dataTypeName(l, sum), dataNames, dataIndexes, dataValues)
         names.push("data")
         indexes.push(1)
         inner.push(data)
@@ -113,7 +170,7 @@ fn construct(l: *Lowerer, sum: Sum, variant: i32, values: Vec<i32>) -> i32 {
 /// `E.B` used as a value: only a variant without data can stand alone (E0706, E0751).
 export fn lowerSumValue(l: *Lowerer, sum: Sum, e: *XExpr, member: str) -> i32 {
     local variant = variantIndex(sum, member)
-    local ename = sum.owner.text((*sum.decl).name)
+    local ename = baseOf(sum)
     if variant < 0 {
         l.err("E0706", (*e).span, format("enum `{}` has no member `{}`", ename, member).asStr(),
             "unknown member")
@@ -132,7 +189,7 @@ export fn lowerSumValue(l: *Lowerer, sum: Sum, e: *XExpr, member: str) -> i32 {
 /// `E.A(x, y)`: every argument converts to the payload type at its position (E0706, E0751).
 export fn lowerSumCall(l: *Lowerer, sum: Sum, call: *XExpr, member: str) -> i32 {
     local variant = variantIndex(sum, member)
-    local ename = sum.owner.text((*sum.decl).name)
+    local ename = baseOf(sum)
     if variant < 0 {
         l.err("E0706", (*call).span, format("enum `{}` has no member `{}`", ename, member).asStr(),
             "unknown member")
@@ -150,7 +207,7 @@ export fn lowerSumCall(l: *Lowerer, sum: Sum, call: *XExpr, member: str) -> i32 
     local ok = true
     for i in 0..(*call).argsCount as usize {
         local arg = l.s.refAt("expr", ((*call).argsFirst + i as u32) as i32)
-        local want = resolve(l.s, ((*v).payloadFirst + i as u32) as i32)
+        local want = payloadType(l, sum, v, i as u32)
         local value = lowerExprAs(l, arg, want)
         if value < 0 { ok = false }
         values.push(value)
@@ -160,23 +217,20 @@ export fn lowerSumCall(l: *Lowerer, sum: Sum, call: *XExpr, member: str) -> i32 
 }
 
 /// The `Shape$Tag == variant` test over the hidden local `subject`.
-fn tagIs(l: *Lowerer, sum: Sum, subject: u32, selfName: str, variant: i32) -> i32 {
-    local tagName = l.keep(sum.owner.qualify(format("{}$Tag", sum.owner.text((*sum.decl).name)).asStr()).asStr())
+export fn tagIs(l: *Lowerer, sum: Sum, subject: u32, selfName: str, variant: i32) -> i32 {
+    local tagName = tagTypeName(l, sum)
     local tag = l.b.field(l.b.localRef(subject, selfName), "tag", tagName, false, 0)
     return l.b.binary("==", tag, l.b.intConst(variant as u64, tagName), "bool")
 }
 
 /// The place `subject.data.<Variant>._<index>`.
-fn payloadRead(l: *Lowerer, sum: Sum, subject: u32, selfName: str, variant: i32, index: u32) -> i32 {
-    local base = sum.owner.text((*sum.decl).name)
+export fn payloadRead(l: *Lowerer, sum: Sum, subject: u32, selfName: str, variant: i32, index: u32) -> i32 {
     local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
     local vname = sum.owner.text((*v).name)
-    local data = l.b.field(l.b.localRef(subject, selfName), "data",
-        l.keep(sum.owner.qualify(format("{}$Data", base).asStr()).asStr()), false, 1)
-    local payload = l.b.field(data, vname,
-        l.keep(sum.owner.qualify(format("{}${}", base, vname).asStr()).asStr()), false, dataIndex(sum, variant))
+    local data = l.b.field(l.b.localRef(subject, selfName), "data", dataTypeName(l, sum), false, 1)
+    local payload = l.b.field(data, vname, payloadTypeName(l, sum, vname), false, dataIndex(sum, variant))
     return l.b.field(payload, l.keep(format("_{}", index).asStr()),
-        typeNameOf(l, resolve(l.s, ((*v).payloadFirst + index) as i32)), false, index)
+        typeNameOf(l, payloadType(l, sum, v, index)), false, index)
 }
 
 /// `switch` on a payload enum (C++ sum/switch.cpp, without drops): a case names variants,
@@ -184,7 +238,7 @@ fn payloadRead(l: *Lowerer, sum: Sum, subject: u32, selfName: str, variant: i32,
 /// `default` every variant must be covered (E0750).
 export fn lowerSumSwitch(l: *Lowerer, st: *XStmt, sum: Sum, selfTy: i32) -> i32 {
     local selfName = typeNameOf(l, selfTy)
-    local ename = sum.owner.text((*sum.decl).name)
+    local ename = baseOf(sum)
     l.scopes.push()
     local value = lowerExprWant(l, (*st).expr, -1)
     local subject = hiddenLocal(l, "sw", selfName)
@@ -216,6 +270,7 @@ export fn lowerSumSwitch(l: *Lowerer, st: *XStmt, sum: Sum, selfTy: i32) -> i32 
             local pat = l.s.exprAt(patIdx)
             local named = Sum { owner: l.s, decl: nil as *SDecl }
             if (*pat).kind == XE_FIELD && (*l.s.exprAt((*pat).lhs)).kind == XE_NAME {
+                l.sumWant = selfTy
                 named = sumNamed(l, l.s.exprTextAt((*pat).lhs))
             }
             if named.decl == nil as *SDecl {
@@ -225,11 +280,10 @@ export fn lowerSumSwitch(l: *Lowerer, st: *XStmt, sum: Sum, selfTy: i32) -> i32 
                 continue
             }
             local member = l.s.exprTextAt(patIdx)
-            if named.owner.text((*named.decl).name) != ename {
+            if baseOf(named) != ename {
                 l.err("E0757", (*value).span,
                     format("`case {}.{}` names a variant of `{}`, but the value is a `{}`",
-                        named.owner.text((*named.decl).name), member,
-                        named.owner.text((*named.decl).name), ename).asStr(),
+                        baseOf(named), member, baseOf(named), ename).asStr(),
                     format("write `{}.{}`", ename, member).asStr())
                 continue
             }
@@ -270,7 +324,7 @@ export fn lowerSumSwitch(l: *Lowerer, st: *XStmt, sum: Sum, selfTy: i32) -> i32 
                 local nameIdx = l.s.refAt("expr", ((*value).argsFirst + a as u32) as i32)
                 local name = l.s.exprTextAt(nameIdx)
                 if name == "_" { continue }
-                local pty = resolve(l.s, ((*v).payloadFirst + a as u32) as i32)
+                local pty = payloadType(l, sum, v, a as u32)
                 local id = addLocal(l, name, typeNameOf(l, pty))
                 binds.push(l.b.localStmt(id, name, typeNameOf(l, pty),
                     payloadRead(l, sum, subject, selfName, variant, a as u32)))

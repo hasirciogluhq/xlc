@@ -97,7 +97,10 @@ export fn layoutOf(s: *Sema, tyIdx: i32, at: XSpan) -> i32 {
             return -1
         }
         local owner = ref.owner != nil ? ref.owner : s
-        return layoutOfName(owner, owner.text(ref.foundAs), at)
+        local found = layoutOfName(owner, owner.text(ref.foundAs), at)
+        if found < 0 || owner == s { return found }
+        // The index names a layout in the owner's cache; the caller reads its own cache.
+        return pushLayout(s, *owner.layoutCache.get(found as usize))
     }
     if t.kind == T_TUPLE {
         // A tuple is laid out like `@repr(c)` with the elements in order: no scheme reordering, so
@@ -254,7 +257,7 @@ fn attrInt(s: *Sema, first: u32, count: u32, name: str) -> i64 {
 
 /// The layout of one struct or class declaration.
 export fn aggregateLayout(s: *Sema, name: str, declIdx: i32, at: XSpan) -> i32 {
-    local d = s.declOf(declIdx)
+    local d = s.declAt(declIdx as usize)
     local isClass = (*d).kind == XD_CLASS
     local opaque = (*d).opaque != 0
     local isUnion = (*d).isUnion != 0
@@ -304,7 +307,7 @@ export fn aggregateLayout(s: *Sema, name: str, declIdx: i32, at: XSpan) -> i32 {
     if isClass {
         // A class with a virtual method carries the vptr.
         for m in 0..(*d).methodsCount as usize {
-            local md = s.declOf(((*d).methodsFirst + m as u32) as i32)
+            local md = s.declAt(((*d).methodsFirst as usize + m))
             if (*md).isVirtual != 0 { (*out).hasVptr = true }
         }
         if (*d).baseCount != 0 {

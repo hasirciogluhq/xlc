@@ -1,0 +1,328 @@
+// The `__builtin_` forms of the lowering pass: atomics, fences, raw reads and writes, the unwind
+// tables and inline asm. The xlang twin of sema/lower/call/builtins.cpp and of `lowerRawWrite`
+// in stmt/assign.cpp. The set is closed: a `__builtin_` name not handled here is E0706, and the
+// compiler never learns a new one from the standard library.
+//
+// Not here yet: `__builtin_needsDrop` and `__builtin_drop` (they need the drop glue of the
+// ownership pass, see docs-notes/lowering-todo.md "drops and moves").
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XE_STRING_LITERAL, XE_NAME, XE_CALL, XE_ASM_OPERAND
+from "../hir/abi" import view, E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG, E_ATOMIC_CAS, E_ATOMIC_ADD,
+    E_FENCE, E_ASM, E_RAW_READ, E_UNWIND_PADS, E_UNWIND_PAD_COUNT, XlcHirAsmOperand
+from "../sema/types" import T_INT, T_BOOL, T_POINTER, T_FLOAT, T_FN_PTR, T_ENUM, T_VOID
+from "./state" import Lowerer
+from "./typing" import exprType, typeNameOf, resolveBase
+from "./function" import lowerExpr, lowerExprAs
+
+/// True for a name of the closed `__builtin_` list that this file lowers as an expression.
+export fn isBuiltinName(name: str) -> bool {
+    return name == "__builtin_atomicLoad" || name == "__builtin_atomicStore" ||
+        name == "__builtin_atomicXchg" || name == "__builtin_atomicCas" ||
+        name == "__builtin_atomicAdd" || name == "__builtin_read" || name == "__builtin_write" ||
+        name == "__builtin_fence" || name == "__builtin_unwindPads" ||
+        name == "__builtin_unwindPadCount" || name == "__builtin_asm"
+}
+
+/// The type of a builtin call (a Types index, -1 when unknown): the pointee for a read and the
+/// atomics that return a value, `void` for a store, a fence and asm.
+export fn builtinType(l: *Lowerer, e: *XExpr, name: str) -> i32 {
+    local t = l.s.types
+    if name == "__builtin_fence" || name == "__builtin_asm" || name == "__builtin_write" ||
+        name == "__builtin_atomicStore" { return t.makeVoid() }
+    if name == "__builtin_unwindPads" { return t.makePointer(t.makeInt(0, false)) }
+    if name == "__builtin_unwindPadCount" { return t.makeInt(0, false) }
+    if (*e).argsCount == 0 { return -1 }
+    local p = exprType(l, l.s.refAt("expr", (*e).argsFirst as i32))
+    if p < 0 || t.get(p).kind != T_POINTER { return -1 }
+    return t.get(p).elem
+}
+
+/// `syscall`, `__builtin_*` as an expression. Returns the HIR expression, -1 after a diagnostic.
+export fn lowerBuiltin(l: *Lowerer, idx: i32, e: *XExpr, name: str) -> i32 {
+    if name == "__builtin_asm" { return lowerAsm(l, e) }
+    if name == "__builtin_write" {
+        l.err("E0709", (*e).span, "`__builtin_write` is a statement, not a value",
+            "call it as a statement: `__builtin_write(p, v)`")
+        return -1
+    }
+    if name == "__builtin_read" { return lowerRawRead(l, e) }
+    if name == "__builtin_unwindPads" || name == "__builtin_unwindPadCount" {
+        if (*e).argsCount != 0 {
+            l.err("E0710", (*e).span, format("`{}` takes no arguments", name).asStr(),
+                "wrong number of arguments")
+            return -1
+        }
+        local pads = name == "__builtin_unwindPads"
+        return l.b.expr(pads ? E_UNWIND_PADS : E_UNWIND_PAD_COUNT, pads ? "*usize" : "usize")
+    }
+    if name == "__builtin_fence" {
+        if (*e).argsCount != 1 {
+            l.err("E0710", (*e).span, "`__builtin_fence` takes the memory order",
+                "wrong number of arguments")
+            return -1
+        }
+        local order = memoryOrder(l, argAt(l, e, 0))
+        if order < 0 { return -1 }
+        if order == 0 {
+            l.err("E0708", (*l.s.exprAt(argAt(l, e, 0))).span, "a fence cannot be `relaxed`",
+                "use acquire, release, acqRel or seqCst")
+            return -1
+        }
+        local f = l.b.expr(E_FENCE, "void")
+        (*l.b.exprAt(f)).index = order as u32
+        return f
+    }
+    return lowerAtomic(l, e, name)
+}
+
+/// The expression index of argument `i` of the call `e`.
+fn argAt(l: *Lowerer, e: *XExpr, i: u32) -> i32 {
+    return l.s.refAt("expr", ((*e).argsFirst + i) as i32)
+}
+
+/// A compile-time `MemoryOrder` member (`MemoryOrder.seqCst`): 0 relaxed .. 4 seqCst; -1 after
+/// a diagnostic.
+fn memoryOrder(l: *Lowerer, arg: i32) -> i32 {
+    local v = lowerExpr(l, arg)
+    if v < 0 { return -1 }
+    local h = l.b.exprAt(v)
+    if (*h).kind != 0 || view((*h).typeName) != "MemoryOrder" { // E_INT_CONST typed as the enum
+        l.err("E0708", (*l.s.exprAt(arg)).span, "the memory order must be a `MemoryOrder` member",
+            "write `MemoryOrder.seqCst` (a compile-time constant)")
+        return -1
+    }
+    return (*h).intValue as i32
+}
+
+/// The pointer type of argument `arg` or -1 after E0709; `what` names the builtin.
+fn pointerArg(l: *Lowerer, arg: i32, what: str, code: str) -> i32 {
+    local t = exprType(l, arg)
+    if t < 0 { return -1 }
+    local base = t
+    if base < 0 || l.s.types.get(base).kind != T_POINTER {
+        local msg = format("`{}` needs a pointer, found `{}`", what, l.s.types.text(t).asStr())
+        l.err(code, (*l.s.exprAt(arg)).span, msg.asStr(), "pass `&x`")
+        return -1
+    }
+    return base
+}
+
+/// `__builtin_read(p)`: the value at `p`, copied out. Nothing is dropped or moved; the caller
+/// owns the copy.
+fn lowerRawRead(l: *Lowerer, e: *XExpr) -> i32 {
+    if (*e).argsCount != 1 {
+        l.err("E0710", (*e).span, "`__builtin_read` takes one pointer", "wrong number of arguments")
+        return -1
+    }
+    local arg = argAt(l, e, 0)
+    local pt = pointerArg(l, arg, "__builtin_read", "E0709")
+    if pt < 0 { return -1 }
+    local elem = l.s.types.get(pt).elem
+    if l.s.types.get(elem).kind == T_VOID {
+        l.err("E0709", (*l.s.exprAt(arg)).span, "`__builtin_read` cannot read a `void`",
+            "pass a pointer to a typed value")
+        return -1
+    }
+    local p = lowerExpr(l, arg)
+    if p < 0 { return -1 }
+    local r = l.b.expr(E_RAW_READ, typeNameOf(l, elem))
+    (*l.b.exprAt(r)).lhs = p
+    return r
+}
+
+/// `__builtin_write(p, v)` as a statement: a store through `p` that drops nothing. Returns the
+/// HIR statement, -1 after a diagnostic.
+export fn lowerRawWrite(l: *Lowerer, e: *XExpr) -> i32 {
+    if (*e).argsCount != 2 {
+        l.err("E0710", (*e).span, "`__builtin_write` takes a pointer and a value",
+            "write it as `__builtin_write(p, v)`")
+        return -1
+    }
+    local pArg = argAt(l, e, 0)
+    local pt = pointerArg(l, pArg, "__builtin_write", "E0709")
+    if pt < 0 { return -1 }
+    local elem = l.s.types.get(pt).elem
+    local p = lowerExpr(l, pArg)
+    local v = lowerExprAs(l, argAt(l, e, 1), elem)
+    if p < 0 || v < 0 { return -1 }
+    return l.b.assign(l.b.deref(p, typeNameOf(l, elem)), v)
+}
+
+/// `__builtin_atomicLoad/Store/Xchg/Cas/Add`: the pointee is an integer, `bool` or pointer and
+/// the last argument is the memory order.
+fn lowerAtomic(l: *Lowerer, e: *XExpr, name: str) -> i32 {
+    local kind = name == "__builtin_atomicLoad" ? E_ATOMIC_LOAD
+        : name == "__builtin_atomicStore" ? E_ATOMIC_STORE
+        : name == "__builtin_atomicXchg" ? E_ATOMIC_XCHG
+        : name == "__builtin_atomicCas" ? E_ATOMIC_CAS
+        : name == "__builtin_atomicAdd" ? E_ATOMIC_ADD : -1
+    if kind < 0 {
+        l.err("E0706", (*e).span, format("unknown builtin `{}`", name).asStr(),
+            "not in the closed builtin list")
+        return -1
+    }
+    local want: u32 = kind == E_ATOMIC_LOAD ? 2 : kind == E_ATOMIC_CAS ? 4 : 3
+    if (*e).argsCount != want {
+        local msg = format("`{}` takes {} arguments, {} given", name, want, (*e).argsCount)
+        l.err("E0710", (*e).span, msg.asStr(), "wrong number of arguments")
+        return -1
+    }
+    local pArg = argAt(l, e, 0)
+    local pt = exprType(l, pArg)
+    if pt < 0 { return -1 }
+    local base = pt
+    if base < 0 || l.s.types.get(base).kind != T_POINTER {
+        local msg = format("atomics take a pointer, found `{}`", l.s.types.text(pt).asStr())
+        l.err("E0708", (*l.s.exprAt(pArg)).span, msg.asStr(), "pointer expected")
+        return -1
+    }
+    local elem = l.s.types.get(base).elem
+    local ek = l.s.types.get(elem).kind
+    if ek != T_INT && ek != T_BOOL && ek != T_POINTER {
+        local msg = format("atomics work on integers, `bool` and pointers, not `{}`",
+            l.s.types.text(elem).asStr())
+        l.err("E0708", (*l.s.exprAt(pArg)).span, msg.asStr(), "unsupported atomic type")
+        return -1
+    }
+    if kind == E_ATOMIC_ADD && ek != T_INT {
+        l.err("E0708", (*l.s.exprAt(pArg)).span, "`__builtin_atomicAdd` needs an integer",
+            "not an integer")
+        return -1
+    }
+    local lastArg = argAt(l, e, want - 1)
+    local order = memoryOrder(l, lastArg)
+    if order < 0 { return -1 }
+    local at = (*l.s.exprAt(lastArg)).span
+    if kind == E_ATOMIC_LOAD && (order == 2 || order == 3) {
+        l.err("E0708", at, "a load cannot be `release` or `acqRel`",
+            "use relaxed, acquire or seqCst")
+        return -1
+    }
+    if kind == E_ATOMIC_STORE && (order == 1 || order == 3) {
+        l.err("E0708", at, "a store cannot be `acquire` or `acqRel`",
+            "use relaxed, release or seqCst")
+        return -1
+    }
+    local p = lowerExpr(l, pArg)
+    if p < 0 { return -1 }
+    local result = kind == E_ATOMIC_STORE ? "void" : typeNameOf(l, elem)
+    local out = l.b.expr(kind, result)
+    (*l.b.exprAt(out)).index = order as u32
+    (*l.b.exprAt(out)).lhs = p
+    if kind == E_ATOMIC_LOAD { return out }
+    local v = lowerExprAs(l, argAt(l, e, 1), elem)
+    if v < 0 { return -1 }
+    (*l.b.exprAt(out)).rhs = v
+    if kind == E_ATOMIC_CAS {
+        local desired = lowerExprAs(l, argAt(l, e, 2), elem)
+        if desired < 0 { return -1 }
+        local list = Vec<i32>()
+        list.push(desired)
+        local range = l.b.args(list)
+        (*l.b.exprAt(out)).argFirst = range.0
+        (*l.b.exprAt(out)).argCount = range.1
+    }
+    return out
+}
+
+/// True for a scalar an asm operand may carry: an integer, a float, a pointer or a function
+/// pointer.
+fn asmScalar(kind: i32) -> bool {
+    return kind == T_INT || kind == T_POINTER || kind == T_FLOAT || kind == T_FN_PTR
+}
+
+/// `__builtin_asm("template", in(reg) x, out("rax") y, inout(reg) z, clobber("memory"),
+/// options(nomem, noreturn))`: `{k}` in the template counts the operands in order.
+fn lowerAsm(l: *Lowerer, e: *XExpr) -> i32 {
+    if (*e).argsCount == 0 || (*l.s.exprAt(argAt(l, e, 0))).kind != XE_STRING_LITERAL {
+        l.err("E0709", (*e).span, "`__builtin_asm` needs a template string first",
+            "write `__builtin_asm(\"nop\")`")
+        return -1
+    }
+    local ok = true
+    local operands = Vec<XlcHirAsmOperand>()
+    local clobbers = Vec<String>()
+    local nomem = false
+    local noreturn = false
+    for i in 1..(*e).argsCount {
+        local ai = argAt(l, e, i)
+        local a = l.s.exprAt(ai)
+        if (*a).kind == XE_ASM_OPERAND {
+            local which = l.s.exprTextAt(ai)
+            local regExpr = l.s.exprAt((*a).lhs)
+            local reg = ""
+            if (*regExpr).kind == XE_STRING_LITERAL {
+                reg = l.s.exprTextAt((*a).lhs)
+            } else if (*regExpr).kind == XE_NAME && l.s.exprTextAt((*a).lhs) == "reg" {
+                reg = "reg"
+            } else {
+                l.err("E0709", (*regExpr).span, "register must be `reg` or a register name string",
+                    "invalid register")
+                ok = false
+                continue
+            }
+            local vt = exprType(l, (*a).rhs)
+            if vt >= 0 && !asmScalar(l.s.types.get(vt).kind) {
+                local msg = format("asm operands are scalars, found `{}`", l.s.types.text(vt).asStr())
+                l.err("E0708", (*l.s.exprAt((*a).rhs)).span, msg.asStr(),
+                    "integer, float or pointer expected")
+                ok = false
+                continue
+            }
+            local v = lowerExpr(l, (*a).rhs)
+            if v < 0 {
+                ok = false
+                continue
+            }
+            local op: XlcHirAsmOperand
+            op.kind = which == "in" ? 0 : which == "out" ? 1 : 2
+            op.reg = l.b.str(reg)
+            op.value = v
+            operands.push(op)
+        } else if (*a).kind == XE_CALL && (*l.s.exprAt((*a).lhs)).kind == XE_NAME &&
+            (l.s.exprTextAt((*a).lhs) == "clobber" || l.s.exprTextAt((*a).lhs) == "options") {
+            local isClobber = l.s.exprTextAt((*a).lhs) == "clobber"
+            for j in 0..(*a).argsCount {
+                local si = l.s.refAt("expr", ((*a).argsFirst + j) as i32)
+                if (*l.s.exprAt(si)).kind != XE_STRING_LITERAL {
+                    l.err("E0709", (*l.s.exprAt(si)).span,
+                        format("`{}` takes strings", l.s.exprTextAt((*a).lhs)).asStr(), "string expected")
+                    ok = false
+                    continue
+                }
+                local text = l.s.exprTextAt(si)
+                if isClobber {
+                    clobbers.push(String(text))
+                } else if text == "nomem" {
+                    nomem = true
+                } else if text == "noreturn" {
+                    noreturn = true
+                } else {
+                    l.err("E0709", (*l.s.exprAt(si)).span,
+                        format("unknown asm option `{}`", text).asStr(), "known options: nomem, noreturn")
+                    ok = false
+                }
+            }
+        } else {
+            l.err("E0709", (*a).span, "unexpected `__builtin_asm` argument",
+                "operands are `in(..)`, `out(..)`, `inout(..)`, `clobber(..)`, `options(..)`")
+            ok = false
+        }
+    }
+    if !ok { return -1 }
+    local out = l.b.expr(E_ASM, "void")
+    (*l.b.exprAt(out)).text = l.b.str(l.s.exprTextAt(argAt(l, e, 0)))
+    local operandFirst = l.b.operands.length() as u32
+    for i in 0..operands.length() { l.b.operands.push(*operands.get(i)) }
+    // The clobbers are consecutive entries of the string arena.
+    local clobberFirst = l.b.strs.length() as u32
+    for i in 0..clobbers.length() { l.b.str((*clobbers.get(i)).asStr()) }
+    local h = l.b.exprAt(out)
+    (*h).operandFirst = operandFirst
+    (*h).operandCount = operands.length() as u32
+    (*h).clobberFirst = clobberFirst
+    (*h).clobberCount = clobbers.length() as u32
+    (*h).nomem = nomem ? 1 : 0
+    (*h).noreturn = noreturn ? 1 : 0
+    return out
+}

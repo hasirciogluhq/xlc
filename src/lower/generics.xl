@@ -7,10 +7,10 @@
 // `Name<A, B>` matches an instance of the same generic and recurses into its arguments, and any
 // other parameter takes an argument that is the same type or converts to it.
 from "std" import String, Vec, format
-from "../lang/ast/ast" import XExpr, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_STRING_LITERAL
+from "../lang/ast/ast" import XExpr, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_STRING_LITERAL, XD_CLASS
 from "../sema/sema" import Sema, EntityRef
 from "../sema/subst" import TypeEnv
-from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_TUPLE
+from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_TUPLE, T_CLASS
 from "../sema/resolve" import resolve
 from "../sema/instances" import instantiate
 from "../sema/conversion" import implicitConversion, C_OK, C_WARN
@@ -151,5 +151,54 @@ export fn genericInstance(l: *Lowerer, e: *XExpr, entry: *ScopeEntry) -> EntityR
     gref.sym = sym
     gref.name = *owner.symNames.get(sym as usize)
     gref.foundAs = gref.name
-    return instantiate(l.s, gref, targs, (*e).span)
+    // The instance is made in the declaring module, whose arena the arguments must be in.
+    local ownerArgs = Vec<i32>()
+    for i in 0..targs.length() {
+        ownerArgs.push(owner == l.s ? *targs.get(i) : owner.types.adopt(l.s.types, *targs.get(i)))
+    }
+    return instantiate(owner, gref, ownerArgs, (*e).span)
+}
+
+/// The class type that a construction `T(args)` or `Vec<i32>(args)` names, as a type of this
+/// module (`T_CLASS`); -1 when `entry` is not a class (or after reporting). A generic class needs
+/// its type arguments written (E0724), and is instantiated in its own module.
+export fn constructType(l: *Lowerer, e: *XExpr, entry: *ScopeEntry) -> i32 {
+    local owner = (*entry).owner != nil ? (*entry).owner : l.s
+    if (*entry).item < 0 { return -1 }
+    local d = owner.declOfItem((*entry).item)
+    if d < 0 || (*owner.declAt(d as usize)).kind != XD_CLASS { return -1 }
+    local gp = owner.genericParamsOf((*entry).item)
+    if gp.1 == 0 {
+        local segs = Vec<String>()
+        segs.push((*entry).qname.clone())
+        return l.s.types.makeAggregate(T_CLASS, segs, Vec<i32>())
+    }
+    local callee = l.s.exprAt((*e).lhs)
+    local local_ = owner.text((*owner.declAt(d as usize)).name)
+    if (*callee).genericArgsCount != gp.1 {
+        l.err("E0724", (*e).span, format("cannot infer the type arguments of `{}`", local_).asStr(),
+            format("write them: `{}<...>(...)`", local_).asStr())
+        return -1
+    }
+    local targs = Vec<i32>()
+    local ownerArgs = Vec<i32>()
+    for i in 0..gp.1 as usize {
+        local written = l.s.flat.ref(l.s.flat.r.typeRefs, (*callee).genericArgsFirst + i as u32)
+        local t = resolve(l.s, l.s.types.internAst(written))
+        if t < 0 { return -1 }
+        targs.push(t)
+        ownerArgs.push(owner == l.s ? t : owner.types.adopt(l.s.types, t))
+    }
+    local sym = owner.find(local_)
+    if sym < 0 { return -1 }
+    local gref: EntityRef
+    gref.owner = owner
+    gref.sym = sym
+    gref.name = *owner.symNames.get(sym as usize)
+    gref.foundAs = gref.name
+    local inst = instantiate(owner, gref, ownerArgs, (*e).span)
+    if inst.sym < 0 { return -1 }
+    local segs = Vec<String>()
+    segs.push(owner.qualify(owner.text(inst.name)))
+    return l.s.types.makeAggregate(T_CLASS, segs, targs)
 }
