@@ -25,7 +25,7 @@ from "./builder" import FnBuild, XlcHirGlobalRec
 from "./queries" import lowerLayoutQuery, enumMemberValue, unaryOpName, binaryOpName, lowerArrayLen,
     isConstValue
 from "./call" import lowerCall
-from "./sum" import sumNamed, lowerSumValue
+from "./sum" import sumNamed, lowerSumValue, lowerSumSwitch
 from "./methods" import classSelfType
 from "./typing" import exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
@@ -890,6 +890,10 @@ export fn lowerSwitch(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
     // is `$swN == v || ...` (C++ stmt/switch.cpp). Sum types are not ported yet.
     local t = exprType(l, (*st).expr)
     local k = t < 0 ? -1 : l.s.types.get(t).kind
+    if t >= 0 {
+        local sum = sumNamed(l, typeNameOf(l, t))
+        if sum.decl != nil as *SDecl { return lowerSumSwitch(l, st, sum, t) }
+    }
     if k != T_INT && k != T_BOOL && k != T_ENUM {
         l.err("E0500", (*st).span, "this `switch` form is not lowered yet",
             "switch on integers, bools and enums only, for now")

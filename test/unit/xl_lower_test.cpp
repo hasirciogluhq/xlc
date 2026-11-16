@@ -157,6 +157,18 @@ const Sample kLaneASamples[] = {
     {"sum-construct", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn make() -> Shape {\n    return Shape.Circle(3)\n}\n"},
     {"sum-unit", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn make() -> Shape {\n    return Shape.Dot\n}\n"},
     {"sum-two-payload", "enum Pair {\n    Both(i32, i32)\n    None\n}\nfn make(a: i32) -> Pair {\n    return Pair.Both(a, 2)\n}\n"},
+    {"sum-switch-bind",
+     "enum Shape {\n    Circle(i64)\n    Dot\n}\n"
+     "fn area(s: Shape) -> i64 {\n    switch s {\n        case Shape.Circle(r) {\n            return r\n        }\n"
+     "        case Shape.Dot {\n            return 0\n        }\n    }\n}\n"},
+    {"sum-switch-default",
+     "enum Shape {\n    Circle(i64)\n    Dot\n    Line(i64, i64)\n}\n"
+     "fn big(s: Shape) -> bool {\n    switch s {\n        case Shape.Circle(r) {\n            return r > 1\n        }\n"
+     "        case Shape.Dot, Shape.Line {\n            return false\n        }\n    }\n}\n"},
+    {"sum-switch-wildcard",
+     "enum Pair {\n    Both(i32, i32)\n    None\n}\n"
+     "fn first(p: Pair) -> i32 {\n    switch p {\n        case Pair.Both(a, _) {\n            return a\n        }\n"
+     "        default {\n            return 0\n        }\n    }\n}\n"},
 };
 
 // Remaining forms: the array `.len`, the `switch` checks on values and defaults.
@@ -206,6 +218,12 @@ const Sample kRemainingSamples[] = {
 };
 
 const Sample kRemainingDiagnostics[] = {
+    {"err-sum-missing-variant",
+     "enum Shape {\n    Circle(i64)\n    Dot\n}\n"
+     "fn f(s: Shape) {\n    switch s {\n        case Shape.Dot {\n        }\n    }\n}\n"},
+    {"err-sum-payload-as-value", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn f() {\n    local x = Shape.Circle\n}\n"},
+    {"err-sum-arity", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn f() {\n    local x = Shape.Circle(1, 2)\n}\n"},
+    {"err-sum-unknown-variant", "enum Shape {\n    Circle(i64)\n    Dot\n}\nfn f() {\n    local x = Shape.Nope\n}\n"},
     {"err-export-c-str", "export(c) fn f(s: str) -> i32 {\n    return 0\n}\n"},
     {"err-export-c-struct-value",
      "struct P { x: i32 }\nexport(c) fn f(p: P) -> i32 {\n    return p.x\n}\n"},

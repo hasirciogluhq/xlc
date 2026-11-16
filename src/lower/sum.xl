@@ -7,15 +7,16 @@
 //
 // Lowered: payload enums that are not generic. A generic payload enum (`Option<T>`) needs the
 // instance choice (`sumFor` in the C++ pass) and is not ported yet.
-from "std" import Vec, format
+from "std" import String, Vec, format
 from "../hir/abi" import XlcHirStr, XlcHirFieldInit, E_STRUCT_LIT
-from "../lang/ast/ast" import XExpr
+from "../lang/ast/ast" import XExpr, XStmt, XE_CALL, XE_FIELD, XE_NAME
+from "./stmt" import switchChain
 from "../sema/sema" import Sema, SY_STRUCT
 from "../sema/item" import SDecl
 from "../sema/resolve" import resolve
 from "./state" import Lowerer
 from "./typing" import typeNameOf
-from "./function" import lowerExprAs
+from "./function" import lowerExprAs, lowerExprWant, lowerBlockInto, hiddenLocal, addLocal, bindLocal
 
 /// A payload enum: the module that owns it and its declaration.
 export struct Sum {
@@ -156,4 +157,160 @@ export fn lowerSumCall(l: *Lowerer, sum: Sum, call: *XExpr, member: str) -> i32 
     }
     if !ok { return -1 }
     return construct(l, sum, variant, values)
+}
+
+/// The `Shape$Tag == variant` test over the hidden local `subject`.
+fn tagIs(l: *Lowerer, sum: Sum, subject: u32, selfName: str, variant: i32) -> i32 {
+    local tagName = l.keep(sum.owner.qualify(format("{}$Tag", sum.owner.text((*sum.decl).name)).asStr()).asStr())
+    local tag = l.b.field(l.b.localRef(subject, selfName), "tag", tagName, false, 0)
+    return l.b.binary("==", tag, l.b.intConst(variant as u64, tagName), "bool")
+}
+
+/// The place `subject.data.<Variant>._<index>`.
+fn payloadRead(l: *Lowerer, sum: Sum, subject: u32, selfName: str, variant: i32, index: u32) -> i32 {
+    local base = sum.owner.text((*sum.decl).name)
+    local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
+    local vname = sum.owner.text((*v).name)
+    local data = l.b.field(l.b.localRef(subject, selfName), "data",
+        l.keep(sum.owner.qualify(format("{}$Data", base).asStr()).asStr()), false, 1)
+    local payload = l.b.field(data, vname,
+        l.keep(sum.owner.qualify(format("{}${}", base, vname).asStr()).asStr()), false, dataIndex(sum, variant))
+    return l.b.field(payload, l.keep(format("_{}", index).asStr()),
+        typeNameOf(l, resolve(l.s, ((*v).payloadFirst + index) as i32)), false, index)
+}
+
+/// `switch` on a payload enum (C++ sum/switch.cpp, without drops): a case names variants,
+/// `case E.A(x, y) { }` binds the payload, `case E.A, E.B { }` matches without binding. Without a
+/// `default` every variant must be covered (E0750).
+export fn lowerSumSwitch(l: *Lowerer, st: *XStmt, sum: Sum, selfTy: i32) -> i32 {
+    local selfName = typeNameOf(l, selfTy)
+    local ename = sum.owner.text((*sum.decl).name)
+    l.scopes.push()
+    local value = lowerExprWant(l, (*st).expr, -1)
+    local subject = hiddenLocal(l, "sw", selfName)
+    local inner = Vec<i32>()
+    inner.push(l.b.localStmt(subject, format("$sw{}", l.hiddenCount - 1).asStr(), selfName, value))
+    local conds = Vec<i32>()
+    local bodies = Vec<Vec<i32>>()
+    local defaultBody = Vec<i32>()
+    local hasDefault = false
+    local covered = Vec<i32>()
+    for i in 0..(*st).casesCount as usize {
+        local c = l.s.flat.caseAt(((*st).casesFirst + i as u32) as i32)
+        if (*c).isDefault != 0 {
+            if hasDefault {
+                l.err("E0709", (*c).span, "a `switch` has more than one `default`", "remove the duplicate")
+            }
+            hasDefault = true
+            defaultBody = lowerBlockInto(l, (*c).body)
+            continue
+        }
+        l.scopes.push()
+        local cond = -1
+        local binds = Vec<i32>()
+        for j in 0..(*c).valuesCount as usize {
+            local vi = l.s.refAt("expr", ((*c).valuesFirst + j as u32) as i32)
+            local value = l.s.exprAt(vi)
+            local isCall = (*value).kind == XE_CALL
+            local patIdx = isCall ? (*value).lhs : vi
+            local pat = l.s.exprAt(patIdx)
+            local named = Sum { owner: l.s, decl: nil as *SDecl }
+            if (*pat).kind == XE_FIELD && (*l.s.exprAt((*pat).lhs)).kind == XE_NAME {
+                named = sumNamed(l, l.s.exprTextAt((*pat).lhs))
+            }
+            if named.decl == nil as *SDecl {
+                l.err("E0749", (*value).span,
+                    format("`case` of a `{}` switch must name one of its variants", ename).asStr(),
+                    format("write `{}.Variant` or `{}.Variant(names...)`", ename, ename).asStr())
+                continue
+            }
+            local member = l.s.exprTextAt(patIdx)
+            if named.owner.text((*named.decl).name) != ename {
+                l.err("E0757", (*value).span,
+                    format("`case {}.{}` names a variant of `{}`, but the value is a `{}`",
+                        named.owner.text((*named.decl).name), member,
+                        named.owner.text((*named.decl).name), ename).asStr(),
+                    format("write `{}.{}`", ename, member).asStr())
+                continue
+            }
+            local variant = variantIndex(sum, member)
+            if variant < 0 {
+                l.err("E0706", (*pat).span, format("enum `{}` has no member `{}`", ename, member).asStr(),
+                    "unknown member")
+                continue
+            }
+            local dup = false
+            for k in 0..covered.length() {
+                if *covered.get(k) == variant { dup = true }
+            }
+            if dup {
+                l.err("E0709", (*value).span, "duplicate `case` variant",
+                    "this variant is already handled by an earlier `case`")
+            } else {
+                covered.push(variant)
+            }
+            local test = tagIs(l, sum, subject, selfName, variant)
+            cond = cond < 0 ? test : l.b.binary("||", cond, test, "bool")
+            if !isCall { continue }
+            local v = sum.owner.variants.get(((*sum.decl).variantsFirst + variant as u32) as usize)
+            local allNames = true
+            for a in 0..(*value).argsCount as usize {
+                if (*l.s.exprAt(l.s.refAt("expr", ((*value).argsFirst + a as u32) as i32))).kind != XE_NAME {
+                    allNames = false
+                }
+            }
+            if (*c).valuesCount != 1 || (*value).argsCount != (*v).payloadCount || !allNames {
+                l.err("E0749", (*value).span,
+                    format("pattern `{}.{}(...)` needs one name per payload value ({}), alone in its `case`",
+                        ename, member, (*v).payloadCount).asStr(),
+                    "write `case E.A(x, y) { }`; use `_` to ignore a value")
+                continue
+            }
+            for a in 0..(*v).payloadCount as usize {
+                local nameIdx = l.s.refAt("expr", ((*value).argsFirst + a as u32) as i32)
+                local name = l.s.exprTextAt(nameIdx)
+                if name == "_" { continue }
+                local pty = resolve(l.s, ((*v).payloadFirst + a as u32) as i32)
+                local id = addLocal(l, name, typeNameOf(l, pty))
+                binds.push(l.b.localStmt(id, name, typeNameOf(l, pty),
+                    payloadRead(l, sum, subject, selfName, variant, a as u32)))
+                bindLocal(l, name, id, pty)
+            }
+        }
+        local body = lowerBlockInto(l, (*c).body)
+        l.scopes.pop()
+        if cond < 0 { continue }
+        local all = binds
+        for k in 0..body.length() { all.push(*body.get(k)) }
+        conds.push(cond)
+        bodies.push(all)
+    }
+    l.scopes.pop()
+    local variantCount = (*sum.decl).variantsCount as usize
+    if !hasDefault && covered.length() < variantCount {
+        local missing = String("")
+        for k in 0..variantCount {
+            local seen = false
+            for m in 0..covered.length() {
+                if *covered.get(m) == k as i32 { seen = true }
+            }
+            if seen { continue }
+            local v = sum.owner.variants.get(((*sum.decl).variantsFirst + k as u32) as usize)
+            if missing.length() > 0 { missing.append(", ") }
+            missing.append(format("`{}.{}`", ename, sum.owner.text((*v).name)).asStr())
+        }
+        l.err("E0750", (*st).span, format("`switch` on `{}` does not cover {}", ename, missing.asStr()).asStr(),
+            "add a `case` for each missing variant, or a `default`")
+    }
+    local chain = Vec<i32>()
+    if !hasDefault && covered.length() == variantCount && conds.length() > 0 {
+        // Every variant is covered: the last arm is the `else` of the chain.
+        local lastBody = (*bodies.get(bodies.length() - 1)).clone()
+        defaultBody.push(l.b.blockStmt(lastBody))
+        conds.pop()
+        bodies.pop()
+    }
+    chain = switchChain(l, &conds, &bodies, &defaultBody)
+    for i in 0..chain.length() { inner.push(*chain.get(i)) }
+    return l.b.blockStmt(inner)
 }
