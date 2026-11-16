@@ -1,2 +1,7 @@
+# The manifest of xlc (https://hasirciogluhq.github.io/xlang/compiler/packages/).
+[package]
+name = "xlc"
+root = "src"
+
 [dependencies]
-"github.com/hasirciogluhq/xl-std" = "latest"
+"github.com/hasirciogluhq/xl-std" = "v1.6.2"
