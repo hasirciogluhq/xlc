@@ -53,6 +53,76 @@ Order (each needs the ones above it):
 14. Then from memory.md: virtual methods + vtable, interface E0504, cross-module bases,
     `switch` widening, ownership edges, the function.xl split.
 
+Later tracks (user request 2026-11-17; design, not started). Split of duties: xlc only
+translates what it is given (files in, files out, no cache directory of its own, no network);
+everything about where files live, when to rebuild and what to fetch is `xl`.
+
+L. Own linker (no `cc`, `ld.lld`, `lld-link`, `llvm-dlltool`, `llvm-ar` left).
+   - xlc already writes the objects; the link is one more output of the same translation
+     (`--emit=exe|shared|static`), so it belongs in xlc: src/link/ next to src/codegen/.
+   - Order, simplest first: static archive (`ar` format, the Windows `.lib` variant); ELF static
+     executable (Linux arm64/armv7, no dynamic loader); Mach-O executable (dyld load commands,
+     chained fixups, `LC_MAIN`, and the ad-hoc code signature arm64 macOS requires before it
+     runs a binary); PE/COFF executable with import tables written directly (replaces
+     `llvm-dlltool` and import libraries); then shared libraries (ELF `.so`, `.dylib`, `.dll`).
+   - Input: our own objects plus prebuilt objects/archives handed on the command line, so the
+     reader parses the standard formats, not only what xlc writes.
+   - Tests: e2e rows link and run per OS; the linker driver (src/driver/link.xl) is deleted
+     at the end.
+
+U. Compiled packages ("units"; the name is open), incremental builds and the cache.
+   - A unit is one package compiled once per (compiler version, target, defines, features,
+     safety mode, dependency unit hashes). The stdlib is a unit like any other: today every
+     build parses and checks all of std again; as a unit it is built once per target and
+     reused.
+   - One unit file (`.xlu`, a small container with a table of sections), written by
+     `xlc --emit=unit` and read with `--unit name=path`:
+     - interface: the exported names, types, layouts, enum values, constants, roles,
+       `@init` order, so importers type-check without the source;
+     - HIR of everything an importer must instantiate or run: generic functions, classes and
+       methods (instantiated in the importer, as today), `@inline` bodies, macros, and the
+       compile-time functions of track C;
+     - native code: one object section for the target with every non-generic function;
+     - fingerprints: a hash per item (signature hash and body hash), so a change in a body
+       only rebuilds importers when the signature hash changed.
+   - Why mixed and not only objects: generic and compile-time code has no machine code until
+     the importer's types are known; plain code does, and storing it as an object means the
+     importer never compiles it again. Instances made in two units can both exist: the final
+     link keeps one by symbol name (COMDAT/weak-style, needs track L).
+   - The final step: xlc reads the units, instantiates generics, runs the codegen for the root
+     package and links the objects of all units (track L).
+   - `xl` side (not in xlc): computes the unit key, keeps the units in its cache
+     (`.xlang/cache/units/<key>.xlu`), decides what is stale, builds the dependency order in
+     parallel, and passes `--unit` flags; `xl clean` and the uninstall scripts know the
+     directory. xlc never looks for a unit by itself.
+   - Incremental inside one unit (later): the per-item fingerprints let xlc reuse the native
+     code of unchanged functions from the previous unit file handed to it (`--previous`).
+
+C. Compile-time functions and attributes (libraries extend the language without the compiler
+   knowing them).
+   - A library declares `@attribute fn name(d: *Decl) -> Items` (names open). A user writes
+     `@name(args)` on a declaration; the compiler calls the function at compile time and adds
+     the items it returns (methods, impls, functions) to the module, then checks them like
+     hand-written code. Typical: equality, hashing, formatting, serialization, builders,
+     registration tables.
+   - Execution: an interpreter over HIR inside xlc, not a native plugin. Portable (the unit
+     carries HIR, so it runs on any host for any target), deterministic, and sandboxed: no
+     files, network, processes or clock; the only inputs are the declaration and the args.
+     A compile-time function may call only other compile-time-able code (no syscall, no
+     `declare fn`), checked with a diagnostic.
+   - The API it sees: a read-only description of the declaration (name, fields, types,
+     attributes, generic parameters) and a builder that returns new items as AST, not text,
+     so spans and errors point at the attribute.
+   - Stored in the unit as HIR (track U); evaluated during sema of the importer, before
+     lowering. Results are cached in the importer's unit by (function body hash, input
+     declaration hash).
+   - Needs: the HIR interpreter (also gives `const` evaluation of calls), a stable `Decl`
+     description in the stdlib (`std/meta`), and track U for sharing across packages.
+
+Order of the tracks: U interface + HIR sections and the stdlib as a unit first (largest build
+time gain), then L (needed for the native-code sections and instance dedupe across units), then
+C (needs the interpreter and the unit HIR).
+
 Codegen (sub-agents, finished): arm64 macOS/Linux/generic/Windows (COFF, not run yet) and
 arm32 (armv7 Linux, A32) done;
 gaps (T32, try on arm32, PIC, Linux C stack args) in src/codegen/codegen.md.
