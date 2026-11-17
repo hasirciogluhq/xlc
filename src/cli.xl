@@ -9,7 +9,8 @@ from "std/str" import view, find, startsWith, endsWith, toU64, fromParts
 from "std/str" import toI64
 from "cli/console" import decideColor, printError, STDERR
 from "cli/emit" import EmitPlan, emitProgram
-from "session/config" import BuildConfig, ConfigValue, parseTarget, valueText
+from "session/config" import BuildConfig, ConfigValue, valueText
+from "codegen/target" import parseTarget
 from "session/session" import Session, DiagSettings, explainCode, XLC_VERSION
 
 // ---- the options ----------------------------------------------------------------------------
@@ -347,7 +348,7 @@ export fn printHelp() {
 /// optimization level or definition.
 export fn buildConfig(o: *Opts, out: *BuildConfig) -> bool {
     if o.target.length() > 0 && !parseTarget(o.target.asStr(), &out.target) {
-        printError(&format("unsupported target `{}` (x86_64/aarch64 on linux/macos/windows)", o.target.asStr()))
+        printError(&format("unsupported target `{}` (aarch64 on macos/linux, arm on linux, x86_64; no OS word means the generic OS, run as linux)", o.target.asStr()))
         return false
     }
     if o.opt.length() > 0 {

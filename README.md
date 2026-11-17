@@ -5,8 +5,18 @@ command, like `clang++`: it reads source, writes an object, library, executable 
 exits. It does not run programs, manage packages or know a standard library; tools built on top of
 it (the `xl` CLI) do that and call `xlc`.
 
-`xlc` is written in xlang. Its only code generator is the native arm64 Mach-O backend
-(`src/codegen/`); the one supported target is macOS on Apple silicon.
+`xlc` is written in xlang and has its own native code generator (`src/codegen/`, no LLVM).
+
+| `--target` | OS | Object | Status |
+| --- | --- | --- | --- |
+| `aarch64-apple-darwin` (default on a Mac) | macOS | Mach-O | built and run |
+| `aarch64-unknown-linux-gnu`, `aarch64-unknown` | Linux | ELF64 | built and run (static, `ld.lld`) |
+| `armv7-unknown-linux-gnueabihf`, `armv7-unknown` | Linux | ELF32 | built and run (static, `ld.lld`) |
+| `aarch64-pc-windows-msvc`, `aarch64-windows` | Windows | COFF | built and linked (`lld-link`), not run yet |
+
+A triple without an OS (`aarch64-unknown`) is Linux. `arm64` and `aarch64` name the same CPU.
+The facts behind each target and its known gaps are in
+[src/codegen/codegen.md](src/codegen/codegen.md).
 
 ```
 xlc [options] main.xl [prebuilt.o ...] [-o out] [--emit=exe|obj|header|static|shared]
@@ -175,13 +185,13 @@ Warnings: `W0770` `next` takes `self` by value (every call works on a copy, the 
 
 The repository is an [xl](https://github.com/hasirciogluhq/xlang) package (`xlang.toml`) and needs
 only `xl`, a released `xlc` and the stdlib it pins (`xl lc install`, `xl std install`, `xl pkg
-install`) on a Mac with Apple silicon, and the system `cc` for the final link.
+install`) on a Mac with Apple silicon, and the system `cc` for the final link. `ld.lld` and
+Docker add the Linux runs to the tests, `lld-link` and `llvm-dlltool` the Windows links.
 
 ```
-xl build -o build/xlc                     # the compiler
-xl test                                   # the *.test.xl suites
+xl build src/main.xl -o build/xlc         # the compiler
 test/native/run.sh                        # the arm64 encoders against the system assembler
-test/e2e/run.sh build/xlc                 # the binary on the host
+test/e2e/run.sh build/xlc                 # programs built, linked and run per target
 ```
 
 ## Releases
@@ -201,7 +211,10 @@ origin vX.Y.Z[-rc.N]`.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
+Where to report a problem is in [SUPPORT.md](SUPPORT.md): compiler bugs here, the language, the
+`xl` tool and everything unsure in [xlang](https://github.com/hasirciogluhq/xlang). See also
+[CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
@@ -211,7 +224,7 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ```
 src/lang/        lexer, preprocessor, macros, parser, AST, types, config (all xlang)
-src/sema/        modules, name tables, constant evaluation, layout
+src/sema/        modules, name tables, constant evaluation, layout, generic instances, packs
 src/lower/       the lowering pass to the flat HIR: program.xl is its entry, state.xl the scopes and
                  the Lowerer, builder.xl the HIR arenas, items.xl the module items (globals, enums,
                  functions, methods), roles.xl the role registrations (before the bodies),
@@ -222,16 +235,20 @@ src/lower/       the lowering pass to the flat HIR: program.xl is its entry, sta
                  conversion, cast, index, slice, field, literal and C ABI checks, call.xl the calls
                  (functions, overloads, methods, function values), overload.xl the overload keys
                  and the choice among candidates, methods.xl the class declarations and the method
-                 lookup through base classes
+                 lookup through base classes and impls, generics.xl generic calls and generic
+                 methods, instances.xl the generic instances and lazy instance methods, pack.xl
+                 parameter packs (`..args`), inherent.xl struct `impl` calls
 src/hir/         the flat HIR (abi.xl), its dump (dump.xl) and the reachability prune (prune.xl)
 src/mir/         HIR -> MIR (control-flow graph per function): builder/, model.xl, dump.xl
 src/analysis/    static analyses over MIR (moves.xl, findings.xl): read only, findings sorted by
                  position
-src/codegen/     the code generator: native/ (the entry, writes the object file), isel/ (the
-                 instruction selector: gen, layout, regs, expr, stmt, call, conv, asm, func, data),
-                 arm64/ (the instruction encoders), macho/ (the object file writer), header.xl (the
-                 C header, `--emit=header`)
-src/driver/      the linker driver (`link.xl`): links with `cc`, archives with `libtool`
+src/codegen/     the code generator (details in codegen.md): target/ (triples), native/ (picks the
+                 selector and writer per target), arm64/ and arm32/ (encode/ the instruction
+                 encoders, isel/ the instruction selectors), common/ (layout and types shared by
+                 the selectors), obj/ (the format-neutral object), macho/, elf/, coff/ (the
+                 object writers), header.xl (the C header, `--emit=header`)
+src/driver/      the linker driver (`link.xl`): `cc` on macOS, `ld.lld` on Linux, `lld-link` on
+                 Windows
 src/util/        source files and diagnostics
 src/session/     the compilation session: module loading, the multi-module lowering driver
 src/main.xl      the CLI entry

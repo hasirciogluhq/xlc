@@ -6,7 +6,7 @@ from "../hir/abi" import XlcHirLocal, XlcHirStr, XlcHirFieldInit, E_STRUCT_LIT, 
 from "../lang/ast/ast" import XSpan, XE_INT_LITERAL, XE_FLOAT_LITERAL, XE_BOOL_LITERAL, XE_STRING_LITERAL,
     XE_BYTE_LITERAL, XE_NAME, XE_UNARY, XE_BINARY, XE_CALL, XE_INDEX, XE_SLICE, XE_FIELD,
     XE_CAST, XE_ARRAY_LIST, XE_ARRAY_REPEAT, XE_TUPLE_LITERAL, XE_STRUCT_LITERAL, XE_NEW,
-    XE_TERNARY, XE_TRY, XE_CLOSURE,
+    XE_TERNARY, XE_TRY, XE_CLOSURE, XE_SPREAD,
     XS_LOCAL, XS_DELETE, XS_CONST, XS_ASSIGN, XS_RETURN, XS_EXPR, XS_IF, XS_WHILE, XS_DO_WHILE,
     XS_FOR, XS_FOR_RANGE, XS_FOR_PACK, XS_FOR_EACH, XS_SWITCH, XS_DEFER, XS_TRY, XS_CONTINUE,
     XS_BREAK, XS_UNSAFE, XS_BLOCK
@@ -30,7 +30,7 @@ from "./call" import lowerCall
 from "./sum" import sumNamed, sumOfType, lowerSumValue, lowerSumSwitch
 from "./methods" import classSelfType, classLoc, baseLoc, methodsNamed
 from "./own" import needsDrop, registerDrop, moveOut, dropAssign, dropPlace, dropCallOn
-from "./typing" import listFits, exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
+from "./typing" import listFits, pointerLiteral,exprType, exprTypeName, isLiteralExpr, isFloatLiteralExpr, isNumeric,
     effectiveType, typeNameOf, isIntType, isFloatType, resolveBase, fieldIndexOf, aggregateTypeOf,
     fieldTypeOf
 from "./diagnose" import coerceChecked, checkCast, checkIndex, checkSlice, checkDeref, checkField,
@@ -39,6 +39,8 @@ from "../sema/conversion" import implicitConversion, commonBinaryType, C_OK, C_W
 from "./builtins" import lowerRawWrite, needsDropTest
 from "./propagate" import lowerPropagate
 from "./iterate" import lowerForEach
+from "./pack" import isPackName, isPackLen, lowerPackLoop
+from "../sema/packs" import packInstanceOf, reportPackValue
 from "../sema/const_eval" import evalConst
 from "../sema/const_value" import CV_INT, CV_FLOAT, CV_BOOL, CV_STRING
 from "../sema/layout_calc" import layoutOfName
@@ -109,6 +111,20 @@ export fn endFunction(l: *Lowerer, item: i32) {
             (*f).exported = (*it).exported != 0 || (*it).exportC != 0 || (*it).registered != 0
             (*f).exportC = (*it).exportC != 0
             (*f).registered = (*it).registered != 0
+            // A `declare fn` has no body here: the HIR record says so, and names its
+            // `@library("name")` for the import (was: emitted as an empty defined function).
+            if (*it).declared != 0 && l.fnDecl != nil {
+                (*f).declared = true
+                (*f).hasBody = false
+                local lib = l.s.findAttr((*l.fnDecl).attrsFirst, (*l.fnDecl).attrsCount, "library")
+                if lib >= 0 {
+                    local a = l.s.flat.attrAt(lib)
+                    if (*a).argsCount > 0 {
+                        local arg = l.s.flat.r.attrArgs[(*a).argsFirst]
+                        if arg.kind == 2 { (*f).importLibrary = String(l.s.flat.strOf(arg.text)) }
+                    }
+                }
+            }
             // The module-level hooks `@entry`, `@init` and `@fini` (never a method).
             local fd = l.fnDecl
             local plain = fd != nil && l.currentClass.length() == 0
@@ -136,6 +152,12 @@ export fn addLocal(l: *Lowerer, name: str, typeName: str) -> u32 {
 
     /// A function with a body: parameters, prologue, the body statements and the drops.
 export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: str, owner: str) {
+        // A copy: the body can instantiate generics, which grows `s.decls` and moves the record
+        // `d` points into (a call on a generic class instance crashed `endFunction` that way).
+        // `packInstanceOf` matches the arena address, so it is asked before the copy.
+        local packAt = packInstanceOf(l.s, d)
+        local held: SDecl = *d
+        d = &held
         l.fnDecl = d
         local ret = l.typeName(resolve(l.s, (*d).ret))
         if (*d).hasRet == 0 { ret = String("void") }
@@ -155,6 +177,13 @@ export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: 
             (*e).localId = id
             l.scopes.declare(e)
         }
+        // A pack instance: its element parameters `args#i` are the pack (pack.xl).
+        l.packName = packAt >= 0 ? String(l.s.text(*l.s.packInstPacks.get(packAt as usize))) : String("")
+        l.packLocals = Vec<u32>()
+        l.packTypes = Vec<i32>()
+        l.spreadFrom = Vec<i32>()
+        l.spreadTo = Vec<i32>()
+        local elementPrefix = format("{}#", l.packName.asStr())
         // The function frame: the drops of the parameters it owns, run after the body's own.
         l.defers.push(Vec<i32>())
         local prologue = Vec<i32>()
@@ -164,6 +193,12 @@ export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: 
             local pt = resolve(l.s, (*p).ty)
             local ty = l.typeName(pt)
             local id = addLocal(l, l.s.text((*p).name), ty.asStr())
+            local pname = l.s.text((*p).name)
+            if packAt >= 0 && pname.len > elementPrefix.length() &&
+               pname[0..elementPrefix.length()] == elementPrefix.asStr() {
+                l.packLocals.push(id)
+                l.packTypes.push(pt)
+            }
             l.fnParamCount = l.fnParamCount + 1
             local e = new ScopeEntry()
             (*e).kind = SE_LOCAL
@@ -198,7 +233,9 @@ export fn runFunction(l: *Lowerer, item: i32, d: *SDecl, qname: str, localName: 
             }
         }
         l.defers.pop()
+        l.packName = String("")
         endFunction(l, item)
+        l.fnDecl = nil
     }
 
 /// The fixed answer of an `if` condition that is `__builtin_needsDrop<T>()` or its negation: 1
@@ -362,7 +399,7 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
             return l.b.whileStmt(cond, body, false)
         }
         if (*st).kind == XS_BREAK || (*st).kind == XS_CONTINUE {
-            local depth = jumpDepth(l, l.s.flat.strOf((*st).name))
+            local depth = jumpDepth(l, l.s.flat.strOf((*st).name), (*st).kind == XS_BREAK)
             if depth < 0 {
                 reportJump(l, (*st).span, (*st).kind == XS_BREAK, l.s.flat.strOf((*st).name))
                 return -1
@@ -389,7 +426,8 @@ export fn lowerStmt(l: *Lowerer, idx: i32) -> i32 {
         if (*st).kind == XS_FOR {
             return lowerCFor(l, st)
         }
-        if (*st).kind == XS_FOR_EACH {
+        if (*st).kind == XS_FOR_EACH || (*st).kind == XS_FOR_PACK {
+            if isPackName(l, (*st).expr) { return lowerPackLoop(l, idx, st) }
             return lowerForEach(l, idx, st)
         }
         if (*st).kind == XS_FOR_RANGE {
@@ -635,6 +673,19 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
             if !checkCast(l, idx, exprType(l, (*e).lhs), to) { return -1 }
             return l.b.cast(value, exprTypeName(l, idx), false)
         }
+        if (*e).kind == XE_FIELD && isPackName(l, (*e).lhs) {
+            // `pack.len`: the element count, typed like an integer literal. Another member is
+            // E0735 from the sema.
+            if !isPackLen(l, idx) { return -1 }
+            local count = l.packLocals.length() as u64
+            if want >= 0 && isFloatType(l, want) { return l.b.floatConst(count as f64, typeNameOf(l, want)) }
+            return l.b.intConst(count, want >= 0 && isIntType(l, want) ? typeNameOf(l, want) : "i32")
+        }
+        if (*e).kind == XE_SPREAD {
+            // A spread is written out by the call that holds it (`expandSpread`); one that
+            // reaches here is not this function's pack, E0737 from the sema.
+            return -1
+        }
         if (*e).kind == XE_FIELD {
             // `Enum.Member` is the member's constant, typed as the enum (C++ fieldExpr).
             if (*l.s.exprAt((*e).lhs)).kind == XE_NAME {
@@ -732,7 +783,11 @@ fn lowerExprNode(l: *Lowerer, idx: i32, want: i32) -> i32 {
             local elseLit = isLiteralExpr(l, elseIdx)
             local thenValue = -1
             local elseValue = -1
-            if thenLit && !elseLit {
+            if pointerLiteral(l, idx, want) {
+                // `c ? "a" : nil` as a pointer: each branch converts to it like a lone literal.
+                thenValue = lowerExprAs(l, thenIdx, want)
+                elseValue = lowerExprAs(l, elseIdx, want)
+            } else if thenLit && !elseLit {
                 elseValue = lowerExprWant(l, elseIdx, want)
                 thenValue = lowerExprWant(l, thenIdx, effectiveType(l, elseIdx, want))
             } else if !thenLit && elseLit {
@@ -842,6 +897,10 @@ export fn lowerBinaryOf(l: *Lowerer, op: i32, lhsExpr: i32, rhsExpr: i32, want: 
     /// A name: a local, a global, a function or a constant.
 export fn lowerName(l: *Lowerer, idx: i32, want: i32) -> i32 {
         local name = l.s.exprTextAt(idx)
+        if l.packName.length() > 0 && name == l.packName.asStr() {
+            reportPackValue(l.s, (*l.s.exprAt(idx)).span, name)
+            return -1
+        }
         local entry = l.lookupName(name)
         if entry == nil {
             // `nil` with no binding of that name is the null pointer, typed `*void` (C++ nameExpr).
@@ -855,6 +914,8 @@ export fn lowerName(l: *Lowerer, idx: i32, want: i32) -> i32 {
             return l.b.localRef((*entry).localId, tyName)
         }
         if (*entry).kind == SE_GLOBAL {
+            // An untyped `const n = 1` has no declared type: it takes the context's, else i32.
+            if tyName.len == 0 { tyName = want >= 0 ? typeNameOf(l, want) : "i32" }
             return l.b.globalRef((*entry).qname.asStr(), tyName)
         }
         if (*entry).kind == SE_FUNCTION {
@@ -907,12 +968,18 @@ export fn loopBody(l: *Lowerer, label: str, block: i32) -> Vec<i32> {
 
     /// The `depth` of a `break` or `continue`: the number of loops it leaves, 0 for the innermost.
     /// A label names an enclosing loop; -1 when there is no loop, or none with that label.
-export fn jumpDepth(l: *Lowerer, label: str) -> i32 {
+export fn jumpDepth(l: *Lowerer, label: str, isBreak: bool) -> i32 {
         local n = l.loops.length()
-        if n == 0 { return -1 }
-        if label.len == 0 { return 0 }
+        // An element of an unrolled pack loop is a frame `$item:<label>` (pack.xl): `continue`
+        // stops at it, `break` passes it to leave the whole loop.
         for i in 0..n {
-            if (*l.loops.get(n - 1 - i)).asStr() == label { return i as i32 }
+            local frame = (*l.loops.get(n - 1 - i)).asStr()
+            local item = frame.len >= 6 && frame[0..6] == "$item:"
+            if item {
+                if !isBreak && (label.len == 0 || frame[6..] == label) { return i as i32 }
+                continue
+            }
+            if label.len == 0 || frame == label { return i as i32 }
         }
         return -1
     }

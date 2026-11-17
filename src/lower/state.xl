@@ -131,6 +131,19 @@ export class ScopeStack {
 }
 
 /// The lowering of one module: its Sema, the shared HIR module and the scopes.
+/// A non-virtual method of a generic class instance, waiting for its first call: `Vec<T>.clone`
+/// of a `T` without `clone` is lowered only if something calls it (C++ lazy_methods).
+export class LazyMethod {
+    key: String       ///< the function symbol a call names
+    localName: String ///< `Cls.method`
+    cq: String        ///< qualified class name
+    item: i32         ///< the instance item
+    method: i32       ///< the method decl index
+    instance: String  ///< the instance name (`Sema.currentInstance`)
+    env: *void        ///< the instance's `*TypeEnv`
+    done: bool
+}
+
 export class Lowerer {
     s: *Sema
     b: *HirBuilder
@@ -182,6 +195,15 @@ export class Lowerer {
     hiddenCount: i32    ///< the suffix of the next compiler-made local (`$end0`, `$ret1`, ...)
     unsafeDepth: i32    ///< the `unsafe { }` blocks around the statement being lowered (C++ unsafe_)
 
+    // The parameter pack of the pack instance under construction (lower/pack.xl); `packName` is
+    // "" outside one. The element parameters are locals `packLocals[i]` of type `packTypes[i]`.
+    packName: String
+    packLocals: Vec<u32>
+    packTypes: Vec<i32>
+    spreadFrom: Vec<i32> ///< call expressions with `..pack` already expanded in this function
+    spreadTo: Vec<i32>   ///< their expanded copies, parallel to `spreadFrom`
+    lazy: Vec<LazyMethod> ///< instance methods lowered only once a call names them (items.xl)
+
     fn init(self, s: *Sema, b: *HirBuilder, isLibrary: bool) {
         self.s = s
         self.b = b
@@ -218,6 +240,12 @@ export class Lowerer {
         self.fnFlags = Vec<u32>()
         self.hiddenCount = 0
         self.unsafeDepth = 0
+        self.packName = String("")
+        self.packLocals = Vec<u32>()
+        self.packTypes = Vec<i32>()
+        self.spreadFrom = Vec<i32>()
+        self.spreadTo = Vec<i32>()
+        self.lazy = Vec<LazyMethod>()
     }
 
     /// The spelling of a type for the HIR (the same text the C++ pass writes).

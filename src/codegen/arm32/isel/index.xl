@@ -1,0 +1,61 @@
+// The arm32 instruction selector (A32 state, armv7-a, VFPv3-D16, AAPCS32 hard-float): walks the
+// flat HIR module (hir/abi.xl) and emits machine code and data into the format-neutral object
+// (codegen/obj), which elf/ writes as ELF32. Only Linux and the generic OS reach it.
+//
+//   gen.xl    the state, the value model, symbols, labels, frame slots, loads and stores
+//   conv.xl   the calling convention          expr.xl   expressions
+//   call.xl   calls, `syscall`, `new`, atomics  stmt.xl  statements
+//   func.xl   one function                    data.xl   globals, tables, boot, runtime routines
+// @spec https://developer.arm.com/documentation/ddi0406/latest
+from "std" import Vec
+from "../../../hir/abi" import XlcHirModule, XlcHirFunction, view
+from "../../obj" import ObjectFile
+from "../../target" import Target
+from "../../common/syms" import flushSyms
+from "call" import installCalls
+from "data" import emitGlobals, emitTables, emitPadTable, emitBoot, emitRuntime
+from "func" import genFunction
+from "gen" import Gen, Fixup, Rel
+
+/// Resolves every pending branch: A32 `b`/`bl` hold the signed word distance from the branch plus
+/// 8 bytes (the PC reads two words ahead, DDI 0406C A8.8.18) in bits 0..23.
+fn patchAll(g: *Gen) {
+    for i in 0..g.fixups.length() {
+        local f: *Fixup = g.fixups.get(i)
+        local off: i32 = (*g.labelPos.get(f.label as usize) as i32) - (f.at as i32) - 2
+        g.code.set(f.at as usize, *g.code.get(f.at as usize) | ((off & 0xffffff) as u32))
+    }
+}
+
+/// Selects the module into `o`. With `hasOnly`, only the functions and globals of module `only`
+/// are defined; otherwise the whole program, boot code included. False (reported) on a failure.
+export fn select(m: *XlcHirModule, o: *ObjectFile, target: *Target, hasOnly: bool, only: str) -> bool {
+    local g: Gen = Gen(m, o, target, hasOnly, only)
+    installCalls(&g)
+    local made = Vec<u32>()
+    for fi in 0..m.functionCount as usize {
+        local f: *XlcHirFunction = &m.functions[fi]
+        if f.hasBody != 0 && g.definedHere(view(f.module)) {
+            genFunction(&g, fi as u32)
+            g.syms.define(g.syms.id(g.fnSymbol(fi as u32)), g.text, *g.labelPos.get(fi) as u64 * 4)
+            made.push(fi as u32)
+        }
+    }
+    if !hasOnly { emitBoot(&g) }
+    emitRuntime(&g)
+    emitGlobals(&g)
+    emitTables(&g)
+    emitPadTable(&g, &made)
+    patchAll(&g)
+    for i in 0..g.code.length() { o.addWord(g.text, *g.code.get(i)) }
+    local mapped = flushSyms(&g.syms, o)
+    for i in 0..g.rels.length() {
+        local r: *Rel = g.rels.get(i)
+        o.addReloc(g.text, r.addr, *mapped.get(r.sym as usize), r.kind)
+    }
+    for i in 0..g.drels.length() {
+        local r: *Rel = g.drels.get(i)
+        o.addReloc(*g.drelSec.get(i), r.addr, *mapped.get(r.sym as usize), r.kind)
+    }
+    return !g.failed
+}

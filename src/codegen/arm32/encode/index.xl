@@ -1,0 +1,281 @@
+// The A32 (ARM state) instruction encoders of the arm32 backend: one 32-bit word per instruction,
+// little-endian, always the condition AL unless a `cond` is passed. ARMv7-A, ARM mode only; Thumb-2
+// (T32) is a gap recorded in codegen.md.
+//
+// Encodings: Arm Architecture Reference Manual ARMv7-A/R (DDI 0406C), chapter A8
+// https://developer.arm.com/documentation/ddi0406/latest. Each encoder names its form; the word
+// layouts are checked against `llvm-mc -triple=armv7 -show-encoding` (test/native).
+//
+//   data processing  cond 00 I opcode S Rn Rd operand2
+//   load/store word  cond 01 I P U B W L Rn Rt imm12
+//   load/store half  cond 000 P U 1 W L Rn Rt imm4H 1 S H 1 imm4L
+//   branch           cond 101 L imm24 (word distance from the instruction + 8)
+from "std" import Vec
+
+export const R0: u32 = 0
+export const R1: u32 = 1
+export const R2: u32 = 2
+export const R3: u32 = 3
+export const R4: u32 = 4
+export const R7: u32 = 7     // the EABI syscall number register
+export const R11: u32 = 11   // fp: the frame pointer of this backend
+export const R12: u32 = 12   // ip: intra-procedure scratch (veneers may clobber it)
+export const SP: u32 = 13
+export const LR: u32 = 14
+export const PC: u32 = 15
+
+// Condition codes (A8.3).
+export const EQ: u32 = 0x0
+export const NE: u32 = 0x1
+export const CS: u32 = 0x2   // HS: unsigned >=
+export const CC: u32 = 0x3   // LO: unsigned <
+export const MI: u32 = 0x4
+export const PL: u32 = 0x5
+export const VS: u32 = 0x6
+export const VC: u32 = 0x7
+export const HI: u32 = 0x8
+export const LS: u32 = 0x9
+export const GE: u32 = 0xa
+export const LT: u32 = 0xb
+export const GT: u32 = 0xc
+export const LE: u32 = 0xd
+export const AL: u32 = 0xe
+
+// Data-processing opcodes (A5.2.1).
+export const OP_AND: u32 = 0
+export const OP_EOR: u32 = 1
+export const OP_SUB: u32 = 2
+export const OP_RSB: u32 = 3
+export const OP_ADD: u32 = 4
+export const OP_ADC: u32 = 5
+export const OP_SBC: u32 = 6
+export const OP_RSC: u32 = 7
+export const OP_TST: u32 = 8
+export const OP_CMP: u32 = 10
+export const OP_CMN: u32 = 11
+export const OP_ORR: u32 = 12
+export const OP_MOV: u32 = 13
+export const OP_BIC: u32 = 14
+export const OP_MVN: u32 = 15
+
+// Shift types.
+export const LSL: u32 = 0
+export const LSR: u32 = 1
+export const ASR: u32 = 2
+export const ROR: u32 = 3
+
+/// The S bit: TST, TEQ, CMP and CMN exist only with S set (A5.2.1).
+fn sBit(op: u32, s: bool) -> u32 {
+    return s || (op >= 8 && op <= 11) ? 1 << 20 : 0
+}
+
+/// `op{s}{cond} rd, rn, rm` (register form, no shift).
+export fn dpReg(out: *Vec<u32>, cond: u32, op: u32, s: bool, rd: u32, rn: u32, rm: u32) {
+    out.push((cond << 28) | (op << 21) | sBit(op, s) | (rn << 16) | (rd << 12) | rm)
+}
+
+/// `op{s} rd, rn, rm, <type> #imm5` (register shifted by an immediate).
+export fn dpShiftImm(out: *Vec<u32>, op: u32, s: bool, rd: u32, rn: u32, rm: u32, kind: u32, imm5: u32) {
+    out.push((AL << 28) | (op << 21) | sBit(op, s) | (rn << 16) | (rd << 12) | ((imm5 & 31) << 7) | (kind << 5) | rm)
+}
+
+/// `op{s} rd, rn, rm, <type> rs` (register shifted by a register).
+export fn dpShiftReg(out: *Vec<u32>, op: u32, s: bool, rd: u32, rn: u32, rm: u32, kind: u32, rs: u32) {
+    out.push((AL << 28) | (op << 21) | sBit(op, s) | (rn << 16) | (rd << 12) | (rs << 8) | (kind << 5) | 0x10 | rm)
+}
+
+/// `mov{s} rd, rm, <type> rs` (register shifted by a register; only the low byte of rs counts,
+/// so LSL/LSR by 32..255 give 0 and ASR gives the sign fill).
+export fn shiftReg(out: *Vec<u32>, s: bool, rd: u32, rm: u32, kind: u32, rs: u32) {
+    out.push(0xe1a00010 | ((s ? 1 : 0) << 20) | (rd << 12) | (rs << 8) | (kind << 5) | rm)
+}
+
+/// The A32 modified immediate of `v` (8 bits rotated right by an even amount, A5.2.4), or
+/// 0xffffffff when `v` has none.
+export fn modImm(v: u32) -> u32 {
+    for rot in 0..16 as u32 {
+        // Rotating v left by 2*rot undoes a rotate right by 2*rot.
+        local sh: u32 = rot * 2
+        local x: u32 = sh == 0 ? v : (v << sh) | (v >> (32 - sh))
+        if x < 256 { return (rot << 8) | x }
+    }
+    return 0xffffffff
+}
+
+/// `op{s}{cond} rd, rn, #imm` with an encodable modified immediate `enc` (see modImm).
+export fn dpImm(out: *Vec<u32>, cond: u32, op: u32, s: bool, rd: u32, rn: u32, enc: u32) {
+    out.push((cond << 28) | 0x02000000 | (op << 21) | sBit(op, s) | (rn << 16) | (rd << 12) | enc)
+}
+
+/// `mov rd, rm`.
+export fn movReg(out: *Vec<u32>, rd: u32, rm: u32) {
+    dpReg(out, AL, OP_MOV, false, rd, 0, rm)
+}
+
+/// `movw{cond} rd, #imm16`: writes the low half, zeroes the high half (ARMv6T2+).
+export fn movw(out: *Vec<u32>, cond: u32, rd: u32, imm16: u32) {
+    out.push((cond << 28) | 0x03000000 | ((imm16 >> 12) << 16) | (rd << 12) | (imm16 & 0xfff))
+}
+
+/// `movt rd, #imm16`: writes the high half, keeps the low half.
+export fn movt(out: *Vec<u32>, rd: u32, imm16: u32) {
+    out.push(0xe3400000 | ((imm16 >> 12) << 16) | (rd << 12) | (imm16 & 0xfff))
+}
+
+/// rd = the 32-bit constant `v`, in one instruction when a modified immediate (or its
+/// complement) reaches it, else `movw` + `movt`.
+export fn loadConst(out: *Vec<u32>, rd: u32, v: u32) {
+    local e: u32 = modImm(v)
+    if e != 0xffffffff {
+        dpImm(out, AL, OP_MOV, false, rd, 0, e)
+        return
+    }
+    local n: u32 = modImm(~v)
+    if n != 0xffffffff {
+        dpImm(out, AL, OP_MVN, false, rd, 0, n)
+        return
+    }
+    movw(out, AL, rd, v & 0xffff)
+    if (v >> 16) != 0 { movt(out, rd, v >> 16) }
+}
+
+/// rd = rn + off for any 32-bit `off` (via ip when the immediate does not encode).
+export fn addConst(out: *Vec<u32>, rd: u32, rn: u32, off: i32) {
+    if off == 0 {
+        if rd != rn { movReg(out, rd, rn) }
+        return
+    }
+    local mag: u32 = off < 0 ? (-off) as u32 : off as u32
+    local e: u32 = modImm(mag)
+    if e != 0xffffffff {
+        dpImm(out, AL, off < 0 ? OP_SUB : OP_ADD, false, rd, rn, e)
+        return
+    }
+    loadConst(out, R12, off as u32)
+    dpReg(out, AL, OP_ADD, false, rd, rn, R12)
+}
+
+/// `sxtb`, `uxtb`, `sxth`, `uxth rd, rm` (ARMv6+): extends the low byte or half of rm.
+export fn extend(out: *Vec<u32>, rd: u32, rm: u32, bits: u32, signed: bool) {
+    local base: u32 = bits == 8 ? (signed ? 0xe6af0070 : 0xe6ef0070) : (signed ? 0xe6bf0070 : 0xe6ff0070)
+    out.push(base | (rd << 12) | rm)
+}
+
+/// `mul rd, rn, rm` (rd = rn * rm, low 32 bits).
+export fn mul(out: *Vec<u32>, rd: u32, rn: u32, rm: u32) {
+    out.push(0xe0000090 | (rd << 16) | (rm << 8) | rn)
+}
+
+/// `mla rd, rn, rm, ra` (rd = rn * rm + ra).
+export fn mla(out: *Vec<u32>, rd: u32, rn: u32, rm: u32, ra: u32) {
+    out.push(0xe0200090 | (rd << 16) | (ra << 12) | (rm << 8) | rn)
+}
+
+/// `umull rdlo, rdhi, rn, rm` (the full unsigned 64-bit product).
+export fn umull(out: *Vec<u32>, rdlo: u32, rdhi: u32, rn: u32, rm: u32) {
+    out.push(0xe0800090 | (rdhi << 16) | (rdlo << 12) | (rm << 8) | rn)
+}
+
+/// Single-register load/store with an immediate offset, any sign: `ldr`/`str` (word),
+/// `ldrb`/`strb`. `off` must lie in -4095..4095.
+fn ldst(out: *Vec<u32>, load: bool, byte: bool, rt: u32, rn: u32, off: i32) {
+    local up: u32 = off < 0 ? 0 : 1
+    local mag: u32 = off < 0 ? (-off) as u32 : off as u32
+    out.push(0xe5000000 | (up << 23) | ((byte ? 1 : 0) << 22) | ((load ? 1 : 0) << 20) | (rn << 16) | (rt << 12) | mag)
+}
+
+/// Halfword and signed-byte loads/stores (`ldrh`, `strh`, `ldrsh`, `ldrsb`): `sh` is the S:H
+/// field (01 halfword, 10 signed byte, 11 signed halfword). `off` must lie in -255..255.
+fn ldstMisc(out: *Vec<u32>, load: bool, sh: u32, rt: u32, rn: u32, off: i32) {
+    local up: u32 = off < 0 ? 0 : 1
+    local mag: u32 = off < 0 ? (-off) as u32 : off as u32
+    out.push(0xe1400090 | (up << 23) | ((load ? 1 : 0) << 20) | (rn << 16) | (rt << 12) | ((mag >> 4) << 8) | (sh << 5) | (mag & 0xf))
+}
+
+/// Loads `size` bytes (1, 2, 4) at `[rn + off]` into rt, sign-extending when `signed`. A far
+/// offset goes through ip.
+export fn load(out: *Vec<u32>, rt: u32, rn: u32, off: i32, size: u32, signed: bool) {
+    local reach: i32 = size == 4 || (size == 1 && !signed) ? 4095 : 255
+    local base: u32 = rn
+    local o: i32 = off
+    if off > reach || off < -reach {
+        addConst(out, R12, rn, off)
+        base = R12
+        o = 0
+    }
+    if size == 4 { ldst(out, true, false, rt, base, o) }
+    else if size == 1 { if signed { ldstMisc(out, true, 2, rt, base, o) } else { ldst(out, true, true, rt, base, o) } }
+    else { ldstMisc(out, true, signed ? 3 : 1, rt, base, o) }
+}
+
+/// Stores the low `size` bytes (1, 2, 4) of rt at `[rn + off]`. A far offset goes through ip,
+/// so rt and rn must not be ip.
+export fn store(out: *Vec<u32>, rt: u32, rn: u32, off: i32, size: u32) {
+    local reach: i32 = size == 2 ? 255 : 4095
+    local base: u32 = rn
+    local o: i32 = off
+    if off > reach || off < -reach {
+        addConst(out, R12, rn, off)
+        base = R12
+        o = 0
+    }
+    if size == 4 { ldst(out, false, false, rt, base, o) }
+    else if size == 1 { ldst(out, false, true, rt, base, o) }
+    else { ldstMisc(out, false, 1, rt, base, o) }
+}
+
+/// `push {list}` (`stmdb sp!, {list}`); bit n of `list` is register rn.
+export fn push(out: *Vec<u32>, list: u32) {
+    out.push(0xe92d0000 | list)
+}
+
+/// `pop {list}` (`ldmia sp!, {list}`).
+export fn pop(out: *Vec<u32>, list: u32) {
+    out.push(0xe8bd0000 | list)
+}
+
+/// `b{cond}` with a zero distance, patched later (fixup) or relocated (R_ARM_JUMP24).
+export fn bCond(out: *Vec<u32>, cond: u32) {
+    out.push((cond << 28) | 0x0a000000)
+}
+
+/// `bl sym`: imm24 = -2 words, the REL addend that cancels the pipeline offset (P + 8), as GNU
+/// `as` writes it (aaelf32, R_ARM_CALL: S + A - P).
+export fn blReloc(out: *Vec<u32>) {
+    out.push(0xebfffffe)
+}
+
+/// `blx rm`: call through a register.
+export fn blx(out: *Vec<u32>, rm: u32) {
+    out.push(0xe12fff30 | rm)
+}
+
+/// `bx rm`: return through lr (`bx lr`) or jump.
+export fn bx(out: *Vec<u32>, rm: u32) {
+    out.push(0xe12fff10 | rm)
+}
+
+/// `svc #imm24`: the system call (EABI: number in r7, `svc #0`).
+export fn svc(out: *Vec<u32>, imm24: u32) {
+    out.push(0xef000000 | (imm24 & 0xffffff))
+}
+
+/// `udf #imm16`: the permanently undefined instruction, a trap.
+export fn udf(out: *Vec<u32>, imm16: u32) {
+    out.push(0xe7f000f0 | ((imm16 >> 4) << 8) | (imm16 & 0xf))
+}
+
+/// `dmb ish`: the barrier for sequentially consistent atomics (ARMv7).
+export fn dmbIsh(out: *Vec<u32>) {
+    out.push(0xf57ff05b)
+}
+
+/// `ldrex rt, [rn]`.
+export fn ldrex(out: *Vec<u32>, rt: u32, rn: u32) {
+    out.push(0xe1900f9f | (rn << 16) | (rt << 12))
+}
+
+/// `strex rd, rt, [rn]`: rd = 0 on success.
+export fn strex(out: *Vec<u32>, rd: u32, rt: u32, rn: u32) {
+    out.push(0xe1800f90 | (rn << 16) | (rd << 12) | rt)
+}

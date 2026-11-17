@@ -16,7 +16,7 @@ from "../sema/types" import T_POINTER
 from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_LOCAL, SE_GLOBAL, SE_TYPE
 from "./function" import lowerExpr, lowerExprAs, hiddenLocal
 from "./sum" import sumNamed, lowerSumCall
-from "./generics" import genericInstance, constructType
+from "./generics" import genericInstance, constructType, genericMethodInstance
 from "./overload" import declRetType
 from "../sema/item" import SDecl
 from "./queries" import lowerLayoutQuery
@@ -29,11 +29,16 @@ from "./interface" import interfaceOf, lowerInterfaceCall
 from "./inherent" import lowerInherentCall
 from "./builtins" import isBuiltinName, lowerBuiltin
 from "./own" import needsDrop, moveOut, materializeTemp
+from "./pack" import expandSpread, packTarget
+from "../sema/sema" import EntityRef
 
 /// A call: the callee's form decides the lowering (see the file comment). Returns the HIR
 /// expression index, -1 after a diagnostic.
-export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
-    local e = l.s.exprAt(idx)
+export fn lowerCall(l: *Lowerer, written: i32) -> i32 {
+    // `..pack` is written out first; the record is held by value (the synthesized arena moves).
+    local idx = expandSpread(l, written)
+    local held: XExpr = *l.s.exprAt(idx)
+    local e = &held
     local calleeIdx = (*e).lhs
     local callee = l.s.exprAt(calleeIdx)
     if (*callee).kind == XE_NAME {
@@ -47,6 +52,9 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         if isBuiltinName(name) { return lowerBuiltin(l, idx, e, name) }
         local entry = l.lookupName(name)
         if entry != nil && (*entry).kind == SE_FUNCTION {
+            local pack = packTarget(l, e, entry)
+            if pack.sym == -2 { return -1 }
+            if pack.sym >= 0 { return callInstance(l, e, pack, name) }
             local decls = functionDecls(l, entry)
             if decls.length() == 1 && (*entryOwner(l, entry).declAt(*decls.get(0) as usize)).genericCount > 0 {
                 return lowerGenericCall(l, idx, e, entry)
@@ -80,6 +88,13 @@ export fn lowerCall(l: *Lowerer, idx: i32) -> i32 {
         if recvTy >= 0 {
             local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt(calleeIdx))
             if (*m).found {
+                if (*m).ambiguous {
+                    l.err("E0403", (*e).span,
+                        format("`{}` is declared by several interface impls of `{}`",
+                            l.s.exprTextAt(calleeIdx), l.s.types.text(resolveBase(l, recvTy)).asStr()).asStr(),
+                        "convert the value to the interface first (`(x as I).name()`)")
+                    return -1
+                }
                 if (*m).isVirtual {
                     l.err("E0709", (*e).span,
                         "a virtual method call is not lowered by the xlang pass yet",
@@ -134,6 +149,13 @@ fn lowerDirectCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry, d: i32)
     local args = Vec<i32>()
     if !lowerArgs(l, e, &params, &args, name) { return -1 }
     local range = l.b.args(args)
+    // One candidate is left when the others are pack templates, but the name is still
+    // overloaded: the declaration was lowered under its overload key (items.xl).
+    if (*entry).overloads.length() > 1 {
+        local mangled = mangledParams(l.s, &params)
+        local key = overloadKey((*entry).qname.asStr(), &mangled)
+        return l.b.call(key.asStr(), range.0, range.1, exprTypeName(l, idx))
+    }
     return l.b.call((*entry).qname.asStr(), range.0, range.1, exprTypeName(l, idx))
 }
 
@@ -146,6 +168,12 @@ fn lowerGenericCall(l: *Lowerer, idx: i32, e: *XExpr, entry: *ScopeEntry) -> i32
         l.err("E0404", (*e).span, format("no `{}` fits this call", name).asStr(), "check the arguments")
         return -1
     }
+    return callInstance(l, e, inst, name)
+}
+
+/// A call of instance `inst` (a generic or a pack instance): the arguments convert to the
+/// instance's parameter types, the callee is the instance's qualified name.
+fn callInstance(l: *Lowerer, e: *XExpr, inst: EntityRef, name: str) -> i32 {
     local owner = inst.owner != nil ? inst.owner : l.s
     local d = owner.declOf(owner.itemOf(inst.sym))
     local params = declParamTypes(owner, d)
@@ -180,20 +208,22 @@ fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef
     local name = l.s.exprTextAt((*e).lhs)
     local mo = (*m).owner
     local decls = methodsNamed(mo, (*m).cdecl, name)
-    for i in 0..decls.length() {
-        if (*mo.declAt(*decls.get(i) as usize)).genericCount > 0 {
-            l.err("E0709", (*e).span,
-                format("generic method `{}` is not lowered by the xlang pass yet", name).asStr(),
-                "call it through the C++ pass")
-            return -1
-        }
+    // A generic method (never overloaded: lowerMethods reports E0405) calls its instance.
+    local instKey = String("")
+    local target = *decls.get(0)
+    if (*mo.declAt(target as usize)).genericCount > 0 {
+        local inst = genericMethodInstance(l, e, mo, target, (*m).cls.asStr())
+        if inst < 0 { return -1 }
+        target = *mo.methodInstDecls.get(inst as usize)
+        instKey = String(mo.text(*mo.methodInstKeys.get(inst as usize)))
     }
     local pick = 0
     if decls.length() > 1 {
         pick = chooseDecl(l, mo, &decls, argSpecs(l, e))
         if pick < 0 { return reportNoPick(l, e, name, pick) }
+        target = *decls.get(pick as usize)
     }
-    local params = declParamsIn(l, mo, *decls.get(pick as usize))
+    local params = declParamsIn(l, mo, target)
     local recvTy = exprType(l, recvIdx)
     local selfArg = -1
     if l.s.types.get(recvTy).kind == T_POINTER {
@@ -228,6 +258,7 @@ fn lowerMethodCall(l: *Lowerer, idx: i32, e: *XExpr, recvIdx: i32, m: *MethodRef
         local mangled = mangledParams(l.s, &params)
         key = overloadKey(qualified.asStr(), &mangled)
     }
+    if instKey.length() > 0 { key = instKey.clone() }
     return l.b.call(key.asStr(), range.0, range.1, exprTypeName(l, idx))
 }
 

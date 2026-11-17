@@ -1,0 +1,231 @@
+// The COFF object writer (Windows, arm64): serializes an ObjectFile (src/codegen/obj) into a
+// relocatable object for `lld-link` and `link.exe`. Reference: the PE Format specification,
+// https://learn.microsoft.com/en-us/windows/win32/debug/pe-format ("COFF File Header",
+// "Section Table", "COFF Relocations", "COFF Symbol Table", "Auxiliary Symbol Records",
+// "COFF String Table"). Facts and the rest of the Windows target: src/codegen/codegen.md.
+//
+// File layout: the 20-byte file header (no optional header in an object), the 40-byte section
+// headers, the section contents (each 4-aligned in the file), the 10-byte relocation records of
+// each section, the 18-byte symbol records, the string table. All integers little-endian.
+//
+// What the selector never sees:
+// - names are written as in the source (no prefix on arm64); a name over 8 bytes goes into the
+//   string table, whose offsets count its own 4-byte size field;
+// - each section gets a STATIC section symbol with a section-definition aux record (format 5);
+// - a weak definition `name` becomes the defined EXTERNAL `.weak.<name>.default` plus the
+//   WEAK_EXTERNAL `name` with a format-3 aux record pointing at it, IMAGE_WEAK_EXTERN_SEARCH_ALIAS
+//   (3, winnt.h); this is the form LLVM writes and lld-link reads;
+// - addends live in the patched bytes (BRANCH26 in imm26, PAGEBASE_REL21 in immhi:immlo,
+//   PAGEOFFSET_12A/12L in imm12, ADDR64 in the 8 data bytes), as in Mach-O;
+// - COFF has no GOT: an R_GOT_* access to `name` becomes the same instruction pair against the
+//   import address slot `__imp_<name>`, which an import library (or lld-link, for a symbol of
+//   the image itself) defines. `adrp` + `ldr` of that slot yields the address, as the GOT does.
+from "std" import String, Vec, format
+from "../obj" import ObjectFile, Section, Sym, Reloc, readWord, SEC_TEXT, SEC_CSTRING, SEC_CONST,
+    R_ABS64, R_BRANCH26, R_PAGE21, R_PAGEOFF12, R_GOT_PAGE21, R_GOT_PAGEOFF12, BIND_LOCAL, BIND_WEAK
+
+export const IMAGE_FILE_MACHINE_ARM64: u32 = 0xaa64
+
+// IMAGE_REL_ARM64_* (PE Format, "ARM64 Processors").
+const REL_ADDR64: u32 = 0x0e
+const REL_BRANCH26: u32 = 0x03
+const REL_PAGEBASE_REL21: u32 = 0x04
+const REL_PAGEOFFSET_12A: u32 = 0x06   // `add` immediate
+const REL_PAGEOFFSET_12L: u32 = 0x07   // `ldr`/`str` immediate, scaled by the access size
+
+// IMAGE_SCN_* section characteristics. Alignment is (log2 + 1) << 20, objects only.
+const SCN_CNT_CODE: u32 = 0x20
+const SCN_CNT_INITIALIZED_DATA: u32 = 0x40
+const SCN_MEM_EXECUTE: u32 = 0x20000000
+const SCN_MEM_READ: u32 = 0x40000000
+const SCN_MEM_WRITE: u32 = 0x80000000
+
+// Symbol storage classes and the function type (IMAGE_SYM_DTYPE_FUNCTION << 4).
+const CLASS_EXTERNAL: u32 = 2
+const CLASS_STATIC: u32 = 3
+const CLASS_WEAK_EXTERNAL: u32 = 105
+const TYPE_FUNCTION: u32 = 0x20
+const WEAK_SEARCH_ALIAS: u32 = 3
+
+fn secName(kind: u32) -> str {
+    return kind == SEC_TEXT ? ".text" : kind == SEC_CSTRING || kind == SEC_CONST ? ".rdata" : ".data"
+}
+
+fn secFlags(kind: u32, alignLog2: u32) -> u32 {
+    local a: u32 = (alignLog2 > 13 ? 13 : alignLog2) + 1
+    local base: u32 = kind == SEC_TEXT ? SCN_CNT_CODE | SCN_MEM_EXECUTE | SCN_MEM_READ
+                    : kind == SEC_CSTRING || kind == SEC_CONST ? SCN_CNT_INITIALIZED_DATA | SCN_MEM_READ
+                    : SCN_CNT_INITIALIZED_DATA | SCN_MEM_READ | SCN_MEM_WRITE
+    return base | (a << 20)
+}
+
+/// The relocation number of `kind` at the instruction `w`.
+fn coffReloc(kind: u32, w: u32) -> u32 {
+    if kind == R_ABS64 { return REL_ADDR64 }
+    if kind == R_BRANCH26 { return REL_BRANCH26 }
+    if kind == R_PAGE21 || kind == R_GOT_PAGE21 { return REL_PAGEBASE_REL21 }
+    // Low 12: load/store register (unsigned immediate) is `size:2 111 V 01 opc:2 imm12 Rn Rt`
+    // (Arm ARM C4.1.94); anything else is `add` (immediate).
+    return (w & 0x3b000000) == 0x39000000 ? REL_PAGEOFFSET_12L : REL_PAGEOFFSET_12A
+}
+
+fn put16(out: *String, v: u32) {
+    for k in 0..2 { out.push(((v >> ((k * 8) as u32)) & 0xff) as u8) }
+}
+
+fn put32(out: *String, v: u32) {
+    for k in 0..4 { out.push(((v >> ((k * 8) as u32)) & 0xff) as u8) }
+}
+
+fn zeros(out: *String, n: usize) {
+    for i in 0..n { out.push(0) }
+}
+
+/// One symbol record to write (aux records are separate entries with `aux` set).
+class OutSym {
+    name: String
+    value: u32
+    section: u32     // 1-based, 0 undefined
+    symType: u32
+    storage: u32
+    naux: u32
+    aux: String      // the 18 bytes of the aux record, when `naux` is 1
+
+    fn init(self, name: str, value: u32, section: u32, symType: u32, storage: u32) {
+        self.name = String(name)
+        self.value = value
+        self.section = section
+        self.symType = symType
+        self.storage = storage
+        self.naux = 0
+        self.aux = String()
+    }
+}
+
+/// The 8-byte name field of `name`, interning a long one into `strtab` (offsets count the
+/// table's 4-byte size field, so the first string is at 4).
+fn putName(out: *String, name: str, strtab: *String) {
+    if name.len <= 8 {
+        for i in 0..name.len as usize { out.push(name[i]) }
+        zeros(out, 8 - name.len as usize)
+        return
+    }
+    put32(out, 0)
+    put32(out, (strtab.length() + 4) as u32)
+    strtab.append(name)
+    strtab.push(0)
+}
+
+/// Serializes `o` as an IMAGE_FILE_MACHINE_ARM64 COFF object.
+export fn writeCoff(o: *ObjectFile) -> String {
+    local nsect: usize = o.sections.length()
+    local syms = Vec<OutSym>()
+    local index = Vec<u32>()      // object symbol -> record index
+    local imp = Vec<u32>()        // object symbol -> record index of `__imp_<name>`, or 0
+    local count: u32 = 0
+
+    // Section symbols: `.text` etc., STATIC, value 0, one format-5 aux record.
+    for i in 0..nsect {
+        local s: *Section = o.sections.get(i)
+        local rec = OutSym(secName(s.kind), 0, (i + 1) as u32, 0, CLASS_STATIC)
+        rec.naux = 1
+        put32(&rec.aux, s.code.length() as u32)
+        put16(&rec.aux, s.relocs.length() as u32)
+        put16(&rec.aux, 0)
+        put32(&rec.aux, 0)
+        put16(&rec.aux, 0)
+        zeros(&rec.aux, 4)
+        syms.push(rec)
+        count += 2
+    }
+    for i in 0..o.syms.length() {
+        local s: *Sym = o.syms.get(i)
+        imp.push(0)
+        local fnType: u32 = s.defined && o.sections.get(s.section).kind == SEC_TEXT ? TYPE_FUNCTION : 0
+        if s.defined && s.bind == BIND_WEAK {
+            local def = format(".weak.{}.default", s.name.asStr())
+            syms.push(OutSym(def.asStr(), s.value as u32, s.section + 1, fnType, CLASS_EXTERNAL))
+            local rec = OutSym(s.name.asStr(), 0, 0, fnType, CLASS_WEAK_EXTERNAL)
+            rec.naux = 1
+            put32(&rec.aux, count)
+            put32(&rec.aux, WEAK_SEARCH_ALIAS)
+            zeros(&rec.aux, 10)
+            syms.push(rec)
+            index.push(count + 1)
+            count += 3
+            continue
+        }
+        index.push(count)
+        syms.push(OutSym(s.name.asStr(), s.defined ? s.value as u32 : 0, s.defined ? s.section + 1 : 0, fnType,
+            s.defined && s.bind == BIND_LOCAL ? CLASS_STATIC : CLASS_EXTERNAL))
+        count += 1
+    }
+    // The import slots of the GOT-style accesses.
+    for sec in o.sections {
+        for r in sec.relocs {
+            if (r.kind == R_GOT_PAGE21 || r.kind == R_GOT_PAGEOFF12) && *imp.get(r.sym as usize) == 0 {
+                local name = format("__imp_{}", o.syms.get(r.sym as usize).name.asStr())
+                syms.push(OutSym(name.asStr(), 0, 0, 0, CLASS_EXTERNAL))
+                imp.set(r.sym as usize, count)
+                count += 1
+            }
+        }
+    }
+
+    // Offsets: header, section headers, then per section its bytes and its relocations.
+    local out = String()
+    local body = String()
+    local base: u32 = (20 + 40 * nsect) as u32
+    local strtab = String()
+    local heads = String()
+    for i in 0..nsect {
+        local s: *Section = o.sections.get(i)
+        while body.length() % 4 != 0 { body.push(0) }
+        local dataAt: u32 = base + body.length() as u32
+        for b in s.code { body.push(*b) }
+        local relAt: u32 = base + body.length() as u32
+        for r in s.relocs {
+            local got = r.kind == R_GOT_PAGE21 || r.kind == R_GOT_PAGEOFF12
+            put32(&body, r.addr)
+            put32(&body, got ? *imp.get(r.sym as usize) : *index.get(r.sym as usize))
+            put16(&body, coffReloc(r.kind, r.kind == R_ABS64 ? 0 : readWord(&s.code, r.addr as usize)))
+        }
+        putName(&heads, secName(s.kind), &strtab)
+        put32(&heads, 0)                              // VirtualSize: 0 in an object
+        put32(&heads, 0)                              // VirtualAddress
+        put32(&heads, s.code.length() as u32)
+        put32(&heads, s.code.length() > 0 ? dataAt : 0)
+        put32(&heads, s.relocs.length() > 0 ? relAt : 0)
+        put32(&heads, 0)                              // PointerToLinenumbers
+        put16(&heads, s.relocs.length() as u32)       // under 65535 (no IMAGE_SCN_LNK_NRELOC_OVFL)
+        put16(&heads, 0)
+        put32(&heads, secFlags(s.kind, s.alignLog2))
+    }
+    while body.length() % 4 != 0 { body.push(0) }
+    local symAt: u32 = base + body.length() as u32
+    for s in syms {
+        putName(&body, s.name.asStr(), &strtab)
+        put32(&body, s.value)
+        put16(&body, s.section)
+        put16(&body, s.symType)
+        body.push(s.storage as u8)
+        body.push(s.naux as u8)
+        if s.naux == 1 { body.append(&s.aux) }
+    }
+    put32(&body, (strtab.length() + 4) as u32)
+    body.append(&strtab)
+
+    // The file header: Machine, NumberOfSections, TimeDateStamp (0: reproducible),
+    // PointerToSymbolTable, NumberOfSymbols (aux records included), SizeOfOptionalHeader 0,
+    // Characteristics 0.
+    put16(&out, IMAGE_FILE_MACHINE_ARM64)
+    put16(&out, nsect as u32)
+    put32(&out, 0)
+    put32(&out, symAt)
+    put32(&out, count)
+    put16(&out, 0)
+    put16(&out, 0)
+    out.append(&heads)
+    out.append(&body)
+    return out
+}

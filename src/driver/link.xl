@@ -1,17 +1,36 @@
-// The linker driver for macOS (Apple silicon). The native backend writes a Mach-O object whose
-// `main` stub runs the boot hooks and the entry (src/codegen/isel), so the system C compiler
-// driver `cc` links it: it brings `crt1`, libSystem and `ld`. A static library is made by the
-// system `libtool -static`, which writes the symbol table `ld` needs.
+// The linker driver. The native backend writes an object whose `main` stub runs the boot hooks and
+// the entry (src/codegen/arm64/isel/data.xl); this file turns the objects into the output with the
+// tools of the target OS. Facts and sources: src/codegen/codegen.md, "Linking".
 //
+// macOS (Mach-O). A program needs dyld and libSystem (macOS has no stable syscall ABI for static
+// programs and the kernel refuses a static arm64 executable), so the system C compiler driver
+// `cc` links it: it brings crt, libSystem and `ld`; dyld calls `main` through LC_MAIN.
 //   exe     `cc -arch arm64 -o out objects... -lLIB...`
 //   shared  the same with `-dynamiclib`
 //   static  `libtool -static -o out objects...`
-//   --crt   the C++ compiler driver `clang++` for programs that still carry C++ code (the xlc
-//           binary itself); host only.
+//   --crt   `clang++` for programs that still carry C++ code (the xlc binary itself); host only
+//
+// Linux and the generic OS (ELF). A program needs no C library: the object has its own weak
+// `_start` (the kernel's entry) and raw syscalls, so `ld.lld` (or the GNU `ld` of a Linux host)
+// links it static, from any host.
+//   exe     `ld.lld -static -o out objects... -lLIB...` (entry `_start`, the linker default)
+//   shared  `ld.lld -shared -o out objects...`
+//   static  `llvm-ar rcs out objects...` (or `ar`)
+//   --crt   `cc -o out objects...` on a Linux host: the C library's crt1 `_start` replaces ours
+//
+// Windows arm64 (COFF). No CRT: the object's `mainCRTStartup` is the entry and ends with kernel32
+// `ExitProcess`. Import libraries are generated per DLL with `llvm-dlltool`, so no Windows SDK is
+// needed, from any host.
+//   exe     `lld-link /out:out /machine:arm64 /nodefaultlib /stack:8M,8M /subsystem:console
+//            /entry:mainCRTStartup objects... kernel32.lib LIB.lib...`
+//   shared  the same with `/dll /noentry` instead of the subsystem and entry
+//   static  `llvm-lib /out:out objects...`
 from "std" import String, Vec, Option, format
 from "std/os/process" import Command
 from "std/os/env" import get as envGet
 from "std/io/files" import exists, isDir, removeFile
+from "std/io/fs" import fsWrite
+from "std/str" import toLowerAscii
 from "../cli/console" import printError
 
 /// One `@library("lib") declare fn sym` import of the program.
@@ -29,10 +48,10 @@ export class Import {
 export class LinkRequest {
     objects: Vec<String>
     output: String
-    shared: bool           // a dynamic library (`-dynamiclib`) instead of a program
-    crt: bool              // `--crt`: link through the C++ compiler driver
-    os: String             // macos
-    arch: String           // aarch64
+    shared: bool           // a dynamic library instead of a program
+    crt: bool              // `--crt`: link through the C compiler driver and the C library
+    os: String             // macos, linux
+    arch: String           // aarch64, arm
     imports: Vec<Import>   // `@library` imports reachable after pruning
     extraArgs: Vec<String> // `--link-arg`, appended verbatim
 
@@ -54,12 +73,12 @@ fn fail(message: String) -> bool {
     return false
 }
 
-/// The full path of the first of `names` found on PATH or in the system tool directories, or ""
-/// (reported) when none is.
-fn findTool<A>(names: A, what: str) -> String {
+/// The full path of the first of `names` found on PATH or in the usual tool directories, or ""
+/// (reported) when none is. `hint` says how to get one.
+fn findTool<A>(names: A, what: str, hint: str) -> String {
     local name = String("PATH")
     local dirs = envGet(&name).unwrapOr(String()).split(":")
-    pushAll(&dirs, ["/opt/homebrew/bin", "/usr/bin"])
+    pushAll(&dirs, ["/opt/homebrew/bin", "/opt/homebrew/opt/llvm/bin", "/usr/local/bin", "/usr/bin"])
     for n in names {
         for dir in dirs {
             if dir.length() == 0 { continue }
@@ -69,7 +88,7 @@ fn findTool<A>(names: A, what: str) -> String {
             }
         }
     }
-    fail(format("no {} found; install the Xcode command line tools, or stop at `--emit=obj`", what))
+    fail(format("no {} found; {}, or stop at `--emit=obj`", what, hint))
     return String()
 }
 
@@ -89,28 +108,32 @@ fn runTool(tool: *String, args: *Vec<String>) -> bool {
     return true
 }
 
-/// Archives `objects` into the static library `output`.
-export fn archive(objects: *Vec<String>, output: *String) -> bool {
-    local tool = findTool(["libtool"], "archiver (`libtool`)")
-    if tool.length() == 0 { return false }
+/// Archives `objects` into the static library `output` for `os`.
+export fn archive(objects: *Vec<String>, output: *String, os: *String) -> bool {
     local args = Vec<String>()
-    pushAll(&args, ["-static", "-o"])
+    local tool = String()
+    if os.asStr() == "macos" {
+        tool = findTool(["libtool"], "archiver (`libtool`)", "install the Xcode command line tools")
+        pushAll(&args, ["-static", "-o"])
+    } else if os.asStr() == "windows" {
+        tool = findTool(["llvm-lib"], "librarian (`llvm-lib`)", "install LLVM")
+        if tool.length() == 0 { return false }
+        args.push(format("/out:{}", output.asStr()))
+        for o in objects { args.push(o.clone()) }
+        return runTool(&tool, &args)
+    } else {
+        // `rcs`: replace members, create the archive, write the symbol index `ld` needs.
+        tool = findTool(["llvm-ar", "ar"], "archiver (`llvm-ar` or `ar`)", "install LLVM or binutils")
+        pushAll(&args, ["rcs"])
+    }
+    if tool.length() == 0 { return false }
     args.push(output.clone())
     for o in objects { args.push(o.clone()) }
     return runTool(&tool, &args)
 }
 
-/// Links `r`. False when the link failed; the reason is already on stderr.
-export fn link(r: *LinkRequest) -> bool {
-    local args = Vec<String>()
-    local tool = findTool([r.crt && !r.shared ? "clang++" : "cc", "clang"], "C compiler driver (`cc`)")
-    if tool.length() == 0 { return false }
-    pushAll(&args, ["-arch", "arm64", "-o"])
-    args.push(r.output.clone())
-    if r.shared { pushAll(&args, ["-dynamiclib"]) }
-    if r.crt && !r.shared { pushAll(&args, ["-Wl,-dead_strip"]) }
-    for o in r.objects { args.push(o.clone()) }
-    // The OS libraries the program imports with `@library`, each once, after the objects.
+/// The `-lLIB` of every `@library` the program imports, each once, in first-use order.
+fn libraryArgs(r: *LinkRequest, args: *Vec<String>) {
     local libs = Vec<String>()
     for imp in r.imports {
         local seen = false
@@ -118,6 +141,128 @@ export fn link(r: *LinkRequest) -> bool {
         if !seen { libs.push(imp.library.clone()) }
     }
     for l in libs { args.push(format("-l{}", l.asStr())) }
+}
+
+/// Links `r`. False when the link failed; the reason is already on stderr.
+export fn link(r: *LinkRequest) -> bool {
+    local os = r.os.asStr()
+    return os == "macos" ? linkMacos(r) : os == "windows" ? linkWindows(r) : linkLinux(r)
+}
+
+/// Writes the import library `<dir>/<lib>.lib` for the DLL `<lib>.dll` exporting `symbols` with
+/// `llvm-dlltool` (a `.def` module-definition file in, an import library out:
+/// https://learn.microsoft.com/en-us/cpp/build/reference/module-definition-dot-def-files). No
+/// Windows SDK is needed: the library only names the DLL and its exports.
+fn importLibrary(dlltool: *String, base: *String, lib: *String, symbols: *Vec<String>) -> String {
+    local def = format("LIBRARY {}.dll\nEXPORTS\n", lib.asStr())
+    for s in symbols { def.append(format("  {}\n", s.asStr()).asStr()) }
+    local defPath = format("{}.{}.def", base.asStr(), lib.asStr())
+    local libPath = format("{}.{}.lib", base.asStr(), lib.asStr())
+    if !fsWrite(defPath.cstr(), def.asStr()) {
+        fail(format("cannot write `{}`", defPath.asStr()))
+        return String()
+    }
+    local args = Vec<String>()
+    pushAll(&args, ["-m", "arm64", "-d"])
+    args.push(defPath.clone())
+    args.push(String("-l"))
+    args.push(libPath.clone())
+    local ok = runTool(dlltool, &args)
+    removeFile(&defPath)
+    return ok ? libPath : String()
+}
+
+fn linkWindows(r: *LinkRequest) -> bool {
+    if r.crt { return fail(String("`--crt` for a Windows target is not supported yet; the program links without the CRT")) }
+    local tool = findTool(["lld-link"], "COFF linker (`lld-link`)", "install LLD")
+    if tool.length() == 0 { return false }
+    local dlltool = findTool(["llvm-dlltool"], "import library tool (`llvm-dlltool`)", "install LLVM")
+    if dlltool.length() == 0 { return false }
+    // The imports grouped by DLL; kernel32 always, for `ExitProcess` in `mainCRTStartup`.
+    local libs = Vec<String>()
+    local syms = Vec<Vec<String>>()
+    libs.push(String("kernel32"))
+    local first = Vec<String>()
+    first.push(String("ExitProcess"))
+    syms.push(first)
+    for imp in r.imports {
+        local lib = toLowerAscii(imp.library.asStr())
+        local at: usize = libs.length()
+        for i in 0..libs.length() { if libs.get(i).asStr() == lib.asStr() { at = i } }
+        if at == libs.length() {
+            libs.push(lib.clone())
+            syms.push(Vec<String>())
+        }
+        local list: *Vec<String> = syms.get(at)
+        local seen = false
+        for s in list { if s.asStr() == imp.symbol.asStr() { seen = true } }
+        if !seen { list.push(imp.symbol.clone()) }
+    }
+    local args = Vec<String>()
+    args.push(format("/out:{}", r.output.asStr()))
+    // /stack reserve,commit: the whole 8 MiB committed up front, so a frame over one page needs
+    // no `__chkstk` probe (the selector emits none; Windows grows a lazily committed stack only
+    // one guard page at a time, https://learn.microsoft.com/en-us/cpp/build/arm64-windows-abi-conventions#stack).
+    pushAll(&args, ["/machine:arm64", "/nodefaultlib", "/stack:8388608,8388608"])
+    pushAll(&args, r.shared ? ["/dll", "/noentry"] : ["/subsystem:console", "/entry:mainCRTStartup"])
+    for o in r.objects { args.push(o.clone()) }
+    local made = Vec<String>()
+    local ok = true
+    for i in 0..libs.length() {
+        local path = importLibrary(&dlltool, &r.output, libs.get(i), syms.get(i))
+        if path.length() == 0 {
+            ok = false
+            break
+        }
+        args.push(path.clone())
+        made.push(path)
+    }
+    for a in r.extraArgs { args.push(a.clone()) }
+    if ok { ok = runTool(&tool, &args) }
+    for p in made { removeFile(p) }
+    return ok
+}
+
+fn linkMacos(r: *LinkRequest) -> bool {
+    local args = Vec<String>()
+    local tool = findTool([r.crt && !r.shared ? "clang++" : "cc", "clang"], "C compiler driver (`cc`)",
+        "install the Xcode command line tools")
+    if tool.length() == 0 { return false }
+    pushAll(&args, ["-arch", "arm64", "-o"])
+    args.push(r.output.clone())
+    if r.shared { pushAll(&args, ["-dynamiclib"]) }
+    if r.crt && !r.shared { pushAll(&args, ["-Wl,-dead_strip"]) }
+    for o in r.objects { args.push(o.clone()) }
+    libraryArgs(r, &args)
+    for a in r.extraArgs { args.push(a.clone()) }
+    return runTool(&tool, &args)
+}
+
+fn linkLinux(r: *LinkRequest) -> bool {
+    local args = Vec<String>()
+    local tool = String()
+    if r.crt {
+        // The C library's startup files: only the host's own C compiler driver knows them.
+#if os != "linux"
+        return fail(String("`--crt` for a Linux target links with the host C library and needs a Linux host"))
+#endif
+        tool = findTool(["cc", "clang", "gcc"], "C compiler driver (`cc`)", "install a C compiler")
+    } else {
+        tool = findTool(["ld.lld", "ld"], "ELF linker (`ld.lld`)", "install LLD")
+    }
+    if tool.length() == 0 { return false }
+    // A 32-bit Arm object needs the emulation named: `ld.lld` picks it from the first object, but
+    // GNU `ld` defaults to its host's (https://sourceware.org/binutils/docs/ld/Options.html, -m).
+    if !r.crt && r.arch.asStr() == "arm" { pushAll(&args, ["-m", "armelf_linux_eabi"]) }
+    args.push(String("-o"))
+    args.push(r.output.clone())
+    if r.shared {
+        pushAll(&args, ["-shared"])
+    } else if !r.crt {
+        pushAll(&args, ["-static"])
+    }
+    for o in r.objects { args.push(o.clone()) }
+    libraryArgs(r, &args)
     for a in r.extraArgs { args.push(a.clone()) }
     return runTool(&tool, &args)
 }

@@ -8,19 +8,19 @@
 // body; the unwinder lands in the catch block with sp, fp and the callee-saved registers restored
 // from the snapshot, which is why a function with a `try` keeps every local in memory (regs.xl).
 // Snapshot words: 0 catch address, 1 sp, 2 fp, 3..12 x19..x28, 13..20 d8..d15.
-from "../../hir/abi" import XlcHirExpr, XlcHirStmt, view, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE,
+from "../../../hir/abi" import XlcHirExpr, XlcHirStmt, view, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE,
     S_CONTINUE, S_BREAK, S_BLOCK, S_TRY, E_LOCAL_REF
-from "../arm64" import X0, X1, X19, X29, SP, XZR, b, adr, movReg64, add64Imm, stpOff64, stpOffD, str64Imm
-from "../arm64/float" import fmovReg, fmovFromGp
+from "../encode" import X0, X1, X19, X29, SP, XZR, b, adr, movReg64, add64Imm, stpOff64, stpOffD, str64Imm
+from "../encode/float" import fmovReg, fmovFromGp
 from "call" import callUnwind
 from "conv" import word, resultClass, hfaCount, hfaMember
 from "emit" import loadTyped, storeTyped, loadFloat, storeFloat, addOff
 from "expr" import genScalar, genFloat, genPlace, genInto, genCond, isCallLike, storeVptr
 from "gen" import Gen, Place, LoopRec
-from "layout" import K_VOID, K_NEVER, K_INT, K_FLOAT
+from "../../common/layout" import K_VOID, K_NEVER, K_INT, K_FLOAT
 from "mem" import zeroMem, copyMem
 from "regs" import LK_REG, LK_SLOT, LK_MEM
-from "types" import scalarOf
+from "../../common/types" import scalarOf
 
 fn node(g: *Gen, i: i32) -> *XlcHirExpr {
     return &g.m.exprs[i as usize]

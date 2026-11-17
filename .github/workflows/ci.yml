@@ -20,58 +20,27 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       # The toolchain from GitHub releases, exactly as the xl repository installs it
-      # (hasirciogluhq/xlang/.github/actions/toolchain): the `xl` tool binary-only by the
-      # release's install script, the compiler `xlc` and the stdlib, each the newest release.
-      # The released `xlc` compiles the xlang parts of this repository (src/bootstrap.xl,
-      # src/lang/compiler.xl) and is the rung the bootstrap binary is built from.
+      # (hasirciogluhq/xlang/.github/actions/toolchain): the `xl` tool, the released `xlc` and the
+      # stdlib. The released xlc builds this compiler; the result is then tested.
       - id: toolchain
         uses: hasirciogluhq/xlang/.github/actions/toolchain@development
-      # LLVM 23 on every OS, the newest release: Homebrew's `llvm` is always the newest, the Linux build uses apt.llvm.org through
-      # `.github/actions/apt-llvm` (its .deb files are cached) and Windows takes conda-forge's `llvmdev` (the environment is cached).
-      - name: LLVM (macOS)
+      # ld.lld, lld-link, llvm-dlltool and llvm-readobj for the cross-target rows of the e2e run.
+      - name: LLVM tools (macOS)
         if: runner.os == 'macOS'
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
           HOMEBREW_NO_ENV_HINTS: "1"
         run: |
-          brew install llvm zstd lld
+          brew install llvm lld
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-      - name: LLVM (Linux)
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+      - name: LLVM tools (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/apt-llvm
         with:
           version: "23"
-      # Windows: MSVC ABI through clang-cl (the code uses `__int128`), LLVM from conda-forge.
-      - name: LLVM (Windows)
-        if: runner.os == 'Windows'
-        uses: mamba-org/setup-micromamba@v3.2.1
-        with:
-          environment-name: llvm
-          create-args: >-
-            llvmdev=23
-            zstd-static
-            zlib
-          init-shell: bash
-          cache-environment: true
-      - name: Visual Studio environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: x64
-      - uses: xmake-io/github-action-setup-xmake@v1.2.5
-        with:
-          xmake-version: latest
-          # xmake's own caches, one per OS/CPU: downloaded packages (cli11) and compiled objects.
-          actions-cache-folder: .xmake-cache
-          actions-cache-key: ci-${{ runner.os }}-${{ runner.arch }}
-          package-cache: true
-          package-cache-key: ci-${{ runner.os }}-${{ runner.arch }}
-          build-cache: true
-          build-cache-key: ci-${{ runner.os }}-${{ runner.arch }}
-          project-path: .
       - name: Compiler comment tags
-        if: runner.os != 'Windows'
         # COMPILER-TAGS.md: every tag line must stay collectable with one grep, and the collected
         # view must match the source. The hook stages the view; this fails if it was not run.
         run: |
@@ -79,37 +48,14 @@ jobs:
           ./scripts/tags.sh sync
           git diff --exit-code -- COMPILER-TAGS.md
       - name: Build and test
-        if: runner.os != 'Windows'
-        env:
-          # The released compiler and stdlib: `XLC` and `XLANG_STD` name them for the
-          # xlang.object rule (the install script installs the binary only).
-          XLC: ${{ steps.toolchain.outputs.xlc-bin }}
-          XLANG_STD: ${{ steps.toolchain.outputs.std }}
-        run: |
-          xmake f -P . -y -m release --policies=build.ccache:y
-          xmake -P . -y
-          xmake build -P . -y xlc-tests
-          # Platform-independent checks (parser, sema, HIR), then the compiler binary on this OS (test/e2e).
-          xmake run -P . xlc-tests
-          # The binary of this tree, never a fallback: an empty path would test `$XLC`, the
-          # released compiler.
-          bin=$(find build -type f -name xlc | head -n1)
-          [ -n "$bin" ] || { echo "error: the xlc binary was not built" >&2; exit 1; }
-          test/e2e/run.sh "$bin"
-      - name: Build and test (Windows)
-        if: runner.os == 'Windows'
-        shell: bash -el {0}
+        shell: bash
         env:
           XLC: ${{ steps.toolchain.outputs.xlc-bin }}
           XLANG_STD: ${{ steps.toolchain.outputs.std }}
         run: |
-          ./scripts/tags.sh check
-          ./scripts/tags.sh sync
-          git diff --exit-code -- COMPILER-TAGS.md
-          export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
-          xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
-          # The released xlc has no lowering for `try` on Windows (E0714), so no xlang object
-          # (lexer, preprocessor, macro expander, CLI) can be built there: xlc-bootstrap, xlc and
-          # xlc-tests are disabled, and this job only compiles the C++ module archives, until a
-          # release with Windows unwinding.
-          xmake build -P . -y -a
+          xl pkg install
+          xl build src/main.xl -o build/xlc
+          # The binary of this tree, never a fallback: an empty path would test `$XLC`.
+          [ -x build/xlc ] || { echo "error: the xlc binary was not built" >&2; exit 1; }
+          if [ "$RUNNER_OS" = macOS ]; then test/native/run.sh; fi
+          test/e2e/run.sh build/xlc

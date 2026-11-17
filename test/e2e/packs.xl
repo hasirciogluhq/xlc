@@ -1,0 +1,61 @@
+// e2e: parameter packs (`..xs`), built by the compiler under test and run (run.sh expects 0; a
+// non-zero exit names the first failed check). Covers instantiation per element types, `xs.len`,
+// spreading into another pack call, the unrolled `for x in xs` and `for x, i in xs` with `break`
+// and `continue`, and the overload rule: a fixed overload that takes the call wins, one that does
+// not fit lets the pack overload take it. Needs no stdlib. It lives here, not in a unit suite,
+// because only this runner compiles with the xlc under test (`xl test` uses the installed one).
+fn weight(x: i32) -> i32 { return x }
+fn weight(x: i64) -> i32 { return 100 }
+fn weight(b: bool) -> i32 { return b ? 1000 : 0 }
+
+fn sum(base: i32, ..xs) -> i32 {
+    local total = base
+    for x in xs { total += weight(x) }
+    return total
+}
+
+fn count(..xs) -> i32 { return xs.len }
+
+fn forward(..ys) -> i32 { return sum(0, ..ys) }
+
+fn indexed(..zs) -> i32 {
+    local acc = 0
+    for z, i in zs { acc += (i as i32) * 10 + weight(z) }
+    return acc
+}
+
+fn firstTwo(..ws) -> i32 {
+    local acc = 0
+    for w in ws {
+        if acc >= 2 { break }
+        acc += 1
+    }
+    return acc
+}
+
+fn skipOdd(..vs) -> i32 {
+    local acc = 0
+    for v, i in vs {
+        if i % 2 == 1 { continue }
+        acc += weight(v)
+    }
+    return acc
+}
+
+fn fixedWins(a: i32, b: i32) -> i32 { return 7 }
+fn fixedWins(..rest) -> i32 { return 9 }
+
+@entry fn main() -> i32 {
+    if sum(1, 2, 3) != 6 { return 1 }
+    if sum(1) != 1 { return 2 }
+    if sum(0, 5, 7 as i64, true) != 1105 { return 3 }
+    if count() != 0 || count(1, 2, 3, 4) != 4 { return 4 }
+    if forward(1, 2) != 3 { return 5 }
+    if indexed(1, 1, 1) != 33 { return 6 }
+    if firstTwo(1, 2, 3, 4, 5) != 2 { return 7 }
+    if skipOdd(1, 100, 3, 100, 5) != 9 { return 8 }
+    if fixedWins(1, 2) != 7 { return 9 }
+    if fixedWins(1, 2, 3) != 9 { return 10 }
+    if fixedWins(true, 2) != 9 { return 11 }
+    return 0
+}

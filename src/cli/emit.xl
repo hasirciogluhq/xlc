@@ -1,13 +1,11 @@
 // The output step of the CLI: where the output goes, the program pruned and checked, the header or
-// the code generated, then the archive (src/codegen/llvm.xl, LLVM's writer) or the link
-// (src/driver/link.xl) of the objects it produced.
+// the code generated, then the archive or the link (src/driver/link.xl) of the objects it produced.
 //
-// The backend choice by target happens here, before any codegen runs: `--backend=native` with
-// arm64-apple-macos and `--emit=obj` goes to the native backend (src/codegen/native, pure xlang,
-// no LLVM call); everything else goes through the LLVM codegen (src/codegen/llvm.xl).
+// The one code generator is the native backend (src/codegen/native); it picks the selector and
+// the object writer from the target and rejects a target it has no backend for (E0714).
 //
 //   header                 written from the flat HIR (src/codegen/header.xl) to the output (`-o -` streams)
-//   obj, ir, bc            written by the code generator straight to the output (`-o -` streams)
+//   obj                    written by the code generator straight to the output (`-o -` streams)
 //   exe, shared            linked from the code generator's objects plus the prebuilt inputs
 //   static                 archived from the code generator's objects
 //
@@ -76,17 +74,16 @@ export fn emitProgram(session: *Session, plan: *EmitPlan) -> bool {
     local output = plan.output.length() > 0 ? plan.output.clone() : defaultOutput(&plan.root, &plan.emit, &os)
     local windows = os.asStr() == "windows"
 
-    // The one code generator is the native arm64 Mach-O backend (src/codegen/native).
-    if os.asStr() != "macos" || arch.asStr() != "aarch64" {
-        fprint(2, format("error: the code generator supports only the arm64-apple-macos target, this build targets {}\n", target.triple.asStr()).asStr())
-        return false
-    }
 
+    // Lowering is lazy (the first hirModule call runs it). A program with errors has holes in its
+    // HIR (-1 operands), so it is lowered and checked before the prune walks it; the prune used
+    // to run the lowering itself and crash on the holes before any diagnostic was printed.
+    session.hirModule()
+    if session.hasErrors() { return false }
     // Plan 24: only what the roots reach is code-generated and linked; the flat module below is
     // read after that prune, so it describes exactly what is generated.
     pruneProgram(session, plan.emit.asStr(), plan.inputs.length() > 0)
     local module = session.hirModule()
-    // A program with errors has holes in its HIR: nothing is generated from it.
     if session.hasErrors() { return false }
 
     local rootName = fileNameOf(plan.root.asStr())
@@ -117,7 +114,7 @@ export fn emitProgram(session: *Session, plan: *EmitPlan) -> bool {
 
     if !linked {
         // obj: written in place.
-        return emitNativeObj(module, false, "", &output)
+        return emitNativeObj(module, target, false, "", &output)
     }
 
     if plan.incremental {
@@ -129,7 +126,7 @@ export fn emitProgram(session: *Session, plan: *EmitPlan) -> bool {
         // and file system); the CLI removes it whether or not the link succeeds.
         local obj = output.clone()
         obj.append(".tmp.o")
-        if !emitNativeObj(module, false, "", &obj) {
+        if !emitNativeObj(module, target, false, "", &obj) {
             return false
         }
         objects.push(obj)
@@ -141,7 +138,7 @@ export fn emitProgram(session: *Session, plan: *EmitPlan) -> bool {
 
     local ok = false
     if emit == "static" {
-        ok = archive(&objects, &output)
+        ok = archive(&objects, &output, &os)
     } else {
         local r = LinkRequest()
         for i in 0..objects.length() {

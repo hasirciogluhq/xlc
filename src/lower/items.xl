@@ -11,7 +11,7 @@ from "../sema/resolve" import resolve
 from "../sema/enums" import checkEnum, isGenericEnumPart
 from "../sema/layout_calc" import layoutOfName
 from "../sema/const_eval" import evalConst
-from "./state" import Lowerer, ScopeEntry, SE_FUNCTION, SE_GLOBAL, SE_CONSTANT, SE_TYPE
+from "./state" import Lowerer, LazyMethod, ScopeEntry, SE_FUNCTION, SE_GLOBAL, SE_CONSTANT, SE_TYPE
 from "./builder" import FnBuild, EnumRec, AggrRec, IfaceRec, XlcHirGlobalRec
 from "./helpers" import baseInitKey, overloadKey
 
@@ -23,6 +23,7 @@ from "./diagnose" import cCompatible
 from "./overload" import declParamTypes, declRetType
 from "./roles" import checkRegistrations
 from "./instances" import lowerPendingInstances
+from "../sema/packs" import isPackDecl
 from "./impls" import lowerImpls
 
 /// The declaration kinds of the flat AST (mirrored here for the dispatch).
@@ -64,6 +65,7 @@ export fn lowerBatch(l: *Lowerer) {
             if gp.1 > 0 { continue } // a generic declaration is lowered per instance
             if l.s.itemInstanceOf(item) >= 0 { continue } // an instance is lowered with its env
             if isGenericEnumPart(l.s, d) { continue }
+            if isPackDecl(l.s, declIdx) { continue } // a pack function is lowered per instance (pack.xl)
             if (*d).kind == XD_IMPL { continue } // the module's impls are in lowerImpls
             if (*d).kind == XD_ENUM {
                 lowerEnum(l, item, declIdx)
@@ -291,8 +293,16 @@ export fn lowerMethods(l: *Lowerer, item: i32, declIdx: i32) {
                 continue
             }
             l.fnKeys.push(key.clone())
-            if name == "init" {
-                // The base-class init helper is called by every constructor.
+            // A method of a generic instance waits for its first call (lowerLazyMethods): its body
+            // may only fit some arguments (`clone` on elements that have one). A vtable slot,
+            // `init` and `drop` are named without a call, so they are lowered now.
+            if l.s.itemInstanceOf(item) >= 0 && (*m).isVirtual == 0 && (*m).isOverride == 0 &&
+                name != "init" && name != "drop" {
+                l.lazy.push(LazyMethod {
+                    key: key.clone(), localName: format("{}.{}", cls, name), cq: String(cq),
+                    item: item, method: mIdx, instance: l.s.currentInstance.clone(),
+                    env: l.s.instEnv, done: false })
+                continue
             }
             lowerFunctionDecl(l, item, mIdx, key.asStr(), format("{}.{}", cls, name).asStr(), cq)
         }
@@ -318,6 +328,30 @@ export fn finish(l: *Lowerer) {
 
 /// One instance item made by `instantiate`: lowered like the declaration it was cloned from, with
 /// the type parameters bound by the caller (`Sema.instEnv`).
+/// Lowers each waiting instance method whose symbol a call has named; true when one was lowered
+/// (its body can name more, so the program loop runs again).
+export fn lowerLazyMethods(l: *Lowerer) -> bool {
+    local any = false
+    for i in 0..l.lazy.length() {
+        local m = l.lazy.get(i)
+        if (*m).done || !l.b.called.contains((*m).key.clone()) { continue }
+        (*m).done = true
+        any = true
+        // Copied out: lowering the body can push to `l.lazy` and move its storage.
+        local key = (*m).key.clone()
+        local localName = (*m).localName.clone()
+        local cq = (*m).cq.clone()
+        local item = (*m).item
+        local method = (*m).method
+        l.s.instEnv = (*m).env
+        l.s.currentInstance = (*m).instance.clone()
+        lowerFunctionDecl(l, item, method, key.asStr(), localName.asStr(), cq.asStr())
+        l.s.instEnv = nil
+        l.s.currentInstance = String("")
+    }
+    return any
+}
+
 export fn lowerInstanceItem(l: *Lowerer, item: i32) {
     local declIdx = l.s.declOfItem(item)
     if declIdx < 0 { return }

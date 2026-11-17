@@ -10,16 +10,21 @@
 //   boot           `_xl_initAll` runs the `@init` functions, `_xl_finiAll` the `@fini` ones in
 //                  reverse; the C `main` runs init, the entry, fini and exits with the entry's
 //                  result (`argc` and `argv` pass through when the entry takes them)
+//   _start         Linux and the generic OS only: the process entry of a static program with no C
+//                  library (below). macOS has none: dyld calls `main` through LC_MAIN, which `ld`
+//                  writes from crt/libSystem.
+//   mainCRTStartup Windows only: the image entry; argc/argv from `register(args)`, the result to
+//                  kernel32 `ExitProcess` (below).
 // The tables and literals are file-local symbols: every object that needs one defines its own copy.
-// @spec https://github.com/apple-oss-distributions/cctools (mach-o/loader.h, arm64/reloc.h)
 from "std" import String, Vec, format
-from "../../hir/abi" import XlcHirModule, XlcHirExpr, XlcHirFieldInit, XlcHirGlobal, view,
+from "../../../hir/abi" import XlcHirModule, XlcHirExpr, XlcHirFieldInit, XlcHirGlobal, view,
     E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, E_NIL, E_FUNC_REF, E_GLOBAL_REF, E_ADDR_OF, E_FIELD,
     E_INDEX, E_ARRAY_LIST, E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_TO_INTERFACE, E_CAST
-from "../arm64" import X0, X19, X20, X29, X30, SP, XZR, movReg64, add64Imm, stp64Pre, ldp64Post, stpOff64, ldpOff64, ret
+from "../encode" import X0, X1, X8, X19, X20, X29, X30, SP, XZR, movReg64, movz64, add64Imm, ldr64Imm, stp64Pre,
+    ldp64Post, stpOff64, ldpOff64, ret, svc
 from "gen" import Gen, DRel
-from "layout" import K_FLOAT
-from "types" import Scalar, KIND_BOOL, scalarOf, canonical
+from "../../common/layout" import K_FLOAT
+from "../../common/types" import Scalar, KIND_BOOL, scalarOf, canonical
 
 fn node(g: *Gen, i: i32) -> *XlcHirExpr {
     return &g.m.exprs[i as usize]
@@ -284,6 +289,58 @@ fn hasEntry(g: *Gen) -> bool {
     return false
 }
 
+/// The Linux process entry `_start` of a program linked without a C library. The kernel enters
+/// with `sp` 16-byte aligned pointing at argc, then the argv pointers, NULL, the envp pointers,
+/// NULL, the auxv pairs (https://github.com/torvalds/linux/blob/master/fs/binfmt_elf.c,
+/// create_elf_tables; the System V ABI process stack). It clears the frame pointer and the link
+/// register so a backtrace ends here, calls `main(argc, argv)` and passes its result to
+/// `exit_group` (94 in the generic table, include/uapi/asm-generic/unistd.h). The symbol is weak:
+/// when `--crt` links the C library, its `crt1.o` `_start` wins and calls `main` itself.
+fn emitStart(g: *Gen) {
+    local label: u32 = g.newLabel()
+    g.bind(label)
+    movReg64(&g.code, X29, XZR)
+    movReg64(&g.code, X30, XZR)
+    ldr64Imm(&g.code, X0, SP, 0)
+    add64Imm(&g.code, X1, SP, 8, false)
+    g.callSym(g.syms.id("main"))
+    movz64(&g.code, X8, 94, 0)
+    svc(&g.code, 0)
+    local id: u32 = g.syms.id("_start")
+    g.syms.define(id, g.text, *g.labelPos.get(label as usize) as u64 * 4)
+    g.syms.weak.set(id as usize, true)
+}
+
+/// The Windows process entry `mainCRTStartup` of a program linked without the CRT
+/// (`lld-link /entry:mainCRTStartup /nodefaultlib`). The loader calls it with nothing usable in
+/// x0-x7 (https://learn.microsoft.com/en-us/cpp/build/reference/entry-entry-point-symbol), so
+/// argc/argv come from the `register(args)` function when the program has one (it reads
+/// GetCommandLineW), else they are 0 and NULL. Returning from the entry would only end the thread,
+/// so the result goes to `ExitProcess` (kernel32,
+/// https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-exitprocess),
+/// reached through the import library's thunk. Frame: the record at [sp], argc at [sp + 16].
+fn emitWinStart(g: *Gen) {
+    local label: u32 = g.newLabel()
+    g.bind(label)
+    stp64Pre(&g.code, X29, X30, SP, -32)
+    add64Imm(&g.code, X29, SP, 0, false)
+    stpOff64(&g.code, XZR, XZR, SP, 16)
+    local args: i32 = g.findFunction(view(g.m.argsFunction))
+    if g.m.argsFunction.len > 0 && args >= 0 {
+        add64Imm(&g.code, X0, SP, 16, false)
+        g.callSym(g.syms.id(g.fnSymbol(args as u32)))
+        movReg64(&g.code, X1, X0)
+        ldr64Imm(&g.code, X0, SP, 16)
+    } else {
+        movReg64(&g.code, X0, XZR)
+        movReg64(&g.code, X1, XZR)
+    }
+    g.callSym(g.syms.id("main"))
+    g.callSym(g.syms.id("ExitProcess"))
+    local id: u32 = g.syms.id("mainCRTStartup")
+    g.syms.define(id, g.text, *g.labelPos.get(label as usize) as u64 * 4)
+}
+
 /// The boot code of a whole-program object: the two hooks and the C `main`.
 export fn emitBoot(g: *Gen) {
     emitHook(g, "_xl_initAll", g.m.initFirst, g.m.initCount, false)
@@ -320,6 +377,12 @@ export fn emitBoot(g: *Gen) {
         ldp64Post(&g.code, X29, X30, SP, 32)
         ret(&g.code)
         g.syms.define(g.syms.id("main"), g.text, *g.labelPos.get(label as usize) as u64 * 4)
+        local os = g.target.os.asStr()
+        if os == "windows" {
+            emitWinStart(g)
+        } else if os != "macos" {
+            emitStart(g)
+        }
         return
     }
 }

@@ -114,7 +114,7 @@ export fn emitIncremental(session: *Session, m: *XlcHirModule, emit: *String, st
         local leaf = format("{}-{:016x}{}", name.asStr(), mix(baseHash(i, cfg.asStr(), &mods, &memo, &state), salt.asStr()), ext)
         local obj = joinPath(cacheRoot.asStr(), leaf.asStr(), windows)
         if !exists(&obj) {
-            if !emitNativeObj(m, true, key, &obj) {
+            if !emitNativeObj(m, &session.config.target, true, key, &obj) {
                 if !session.hasErrors() {
                     local message = format("code generation for module `{}` failed without a diagnostic", name.asStr())
                     session.diagnose("E0714", spanNone(), message.asStr(), "internal error: the back end returned no object")

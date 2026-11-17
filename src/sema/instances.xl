@@ -39,7 +39,7 @@ fn typeNesting(s: *Sema, idx: i32) -> i32 {
 
 /// The spelling of a type as an instance-name fragment: `::` becomes `.` (`::` separates the
 /// module in qualified names, `.` is what the instance name shows).
-fn spelledForName(s: *Sema, idx: i32) -> String {
+export fn spelledForName(s: *Sema, idx: i32) -> String {
     local text = s.types.text(idx)
     local bs = text.asStr()
     local out = String("")
@@ -306,6 +306,7 @@ export fn instantiateMethod(s: *Sema, generic: i32, cls: str, clsQ: str, args: V
     s.methodInstKeys.push(s.str(key.asStr()))
     s.methodInstCls.push(s.str(cls))
     s.methodInstClsQ.push(s.str(clsQ))
+    s.methodInstEnvs.push(env as *void)
     s.pendingMethods.push(idx)
     return idx
 }

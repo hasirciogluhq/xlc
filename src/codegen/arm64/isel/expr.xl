@@ -18,27 +18,27 @@
 // `>=` are ordered, so every comparison with a NaN is false except `!=`.
 // @spec https://developer.arm.com/documentation/ddi0487/latest (C1.2.4 condition codes, FCMP)
 from "std" import String, Vec, format
-from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, XlcHirFieldInit, view,
+from "../../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, XlcHirFieldInit, view,
     E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST, E_STR_CONST, E_NIL, E_LOCAL_REF, E_GLOBAL_REF, E_FUNC_REF,
     E_EXTERNAL, E_UNARY, E_BINARY, E_SELECT, E_CAST, E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL, E_CALL_ITABLE,
     E_CALL_EXTERNAL, E_SYSCALL, E_FIELD, E_INDEX, E_SLICE, E_DEREF, E_ADDR_OF, E_ARRAY_LIST, E_ARRAY_REPEAT,
     E_TUPLE_LIT, E_STRUCT_LIT, E_NEW, E_TO_INTERFACE, E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG,
     E_ATOMIC_CAS, E_ATOMIC_ADD, E_FENCE, E_ASM, E_CONSTRUCT, E_MOVE, E_MATERIALIZE, E_RAW_READ,
     E_UNWIND_PADS, E_UNWIND_PAD_COUNT
-from "../arm64" import X0, X16, X17, SP, XZR, EQ, NE, CS, CC, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE,
+from "../encode" import X0, X16, X17, SP, XZR, EQ, NE, CS, CC, MI, PL, VS, VC, HI, LS, GE, LT, GT, LE,
     movReg64, add64Imm, sub64Imm, add64Reg, sub64Reg, add64Lsl, mul64, madd64, sdiv64, udiv64, msub64, mvn64,
     cmp64Reg, cmp64Imm, cset64, csel64, sbfm64, ubfm64, and64Reg, orr64Reg, eor64Reg, and64Imm, orr64Imm,
     eor64Imm, logicalImm64, lsl64Reg, lsr64Reg, asr64Reg, lsl64Imm, lsr64Imm, asr64Imm, ldr64Imm, str64Imm,
     ldrbImm, b, bCond, cbz64, cbnz64, adrp, movz64
-from "../arm64/float" import fadd, fsub, fmul, fdiv, fneg, fmovReg, fcmp, fmovFromGp, fmovToGp, scvtf, ucvtf,
+from "../encode/float" import fadd, fsub, fmul, fdiv, fneg, fmovReg, fcmp, fmovFromGp, fmovToGp, scvtf, ucvtf,
     fcvtzs, fcvtzu, fcvtToDouble, fcvtToSingle, ldrFloat
-from "../macho" import RELOC_PAGEOFF12
+from "../../obj" import R_PAGE21, R_PAGEOFF12
 from "emit" import movConst, addOff, loadTyped, storeTyped, loadFloat, storeFloat, normalizeReg, needsNormalize
 from "gen" import Gen, Place, Cold, poolInt
-from "layout" import K_VOID, K_NEVER, K_INT, K_FLOAT, K_STR, K_SLICE, K_ARRAY, K_TUPLE, K_STRUCT, K_INTERFACE, K_UNKNOWN
+from "../../common/layout" import K_VOID, K_NEVER, K_INT, K_FLOAT, K_STR, K_SLICE, K_ARRAY, K_TUPLE, K_STRUCT, K_INTERFACE, K_UNKNOWN
 from "mem" import zeroMem, copyMem
 from "regs" import LK_REG, LK_SLOT, LK_MEM
-from "types" import Scalar, KIND_OTHER, KIND_INT, KIND_BOOL, KIND_PTR, KIND_FLOAT, scalarOf, canonical
+from "../../common/types" import Scalar, KIND_OTHER, KIND_INT, KIND_BOOL, KIND_PTR, KIND_FLOAT, scalarOf, canonical
 
 // Operator codes, decoded once from the spelling in the HIR.
 const OP_ADD: u32 = 1
@@ -192,9 +192,9 @@ fn loadFloatConst(g: *Gen, v: f64, dbl: bool, d: u32) {
     }
     local sym: u32 = floatPool(g, bits)
     adrp(&g.code, X16, 0)
-    g.relocHere(sym, 3)
+    g.relocHere(sym, R_PAGE21)
     ldrFloat(&g.code, dbl, d, X16, 0)
-    g.relocHere(sym, RELOC_PAGEOFF12)
+    g.relocHere(sym, R_PAGEOFF12)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -441,11 +441,11 @@ export fn genScalar(g: *Gen, e: *XlcHirExpr, d: u32) {
     } else if k == E_UNWIND_PADS {
         g.symAddr(d, g.syms.id("xl$unwindPads"), false)
         ldr64Imm(&g.code, d, d, 0)
-        g.relocHere(g.syms.id("xl$unwindPads"), RELOC_PAGEOFF12)
+        g.relocHere(g.syms.id("xl$unwindPads"), R_PAGEOFF12)
     } else if k == E_UNWIND_PAD_COUNT {
         g.symAddr(d, g.syms.id("xl$unwindPadCount"), false)
         ldr64Imm(&g.code, d, d, 0)
-        g.relocHere(g.syms.id("xl$unwindPadCount"), RELOC_PAGEOFF12)
+        g.relocHere(g.syms.id("xl$unwindPadCount"), R_PAGEOFF12)
     } else if k == E_MOVE || k == E_MATERIALIZE {
         local p: Place = genPlace(g, e, d)
         loadTyped(&g.code, d, p.reg, p.off, scalarOfE(g, e))

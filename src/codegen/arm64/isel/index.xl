@@ -1,5 +1,6 @@
-// The instruction selector of the native macOS backend: walks the flat HIR module (hir/abi.xl) and
-// emits arm64 machine code and data into a Mach-O object (macho/index.xl).
+// The arm64 instruction selector: walks the flat HIR module (hir/abi.xl) and emits arm64 machine
+// code and data into the format-neutral object (codegen/obj); the writer of the target's format
+// (macho/, elf/) serializes it. The OS shows only in `syscall` (call.xl) and the boot code (data.xl).
 //
 //   gen.xl      the state, symbols, labels, temporary registers
 //   layout.xl   sizes, alignments, field offsets          regs.xl   the frame and the local homes
@@ -12,8 +13,10 @@
 // resolves the branches and writes the symbol table: defined symbols first, then the undefined ones.
 // @spec https://developer.arm.com/documentation/ddi0487/latest
 from "std" import String, Vec
-from "../../hir/abi" import XlcHirModule, XlcHirFunction, view
-from "../macho" import MachoObject
+from "../../../hir/abi" import XlcHirModule, XlcHirFunction, view
+from "../../obj" import ObjectFile
+from "../../target" import Target
+from "../../common/syms" import flushSyms
 from "call" import installCalls
 from "data" import emitGlobals, emitTables, emitPadTable, emitBoot
 from "func" import genFunction
@@ -42,12 +45,14 @@ fn patchAll(g: *Gen) {
 /// Selects the module into `o`. With `hasOnly`, only the functions and globals of module `only`
 /// are defined and the rest stays external; otherwise the whole program is defined, boot code
 /// included. False (reported) when something could not be lowered.
-export fn select(m: *XlcHirModule, o: *MachoObject, hasOnly: bool, only: str) -> bool {
-    local g: Gen = Gen(m, o, hasOnly, only)
+export fn select(m: *XlcHirModule, o: *ObjectFile, target: *Target, hasOnly: bool, only: str) -> bool {
+    local g: Gen = Gen(m, o, target, hasOnly, only)
     installCalls(&g)
     for fi in 0..m.functionCount as usize {
         local f: *XlcHirFunction = &m.functions[fi]
-        if f.hasBody != 0 && g.definedHere(view(f.module)) {
+        // A `declare fn` is defined elsewhere (another object or a DLL), even when the HIR marks
+        // it as having a body.
+        if f.hasBody != 0 && f.declared == 0 && g.definedHere(view(f.module)) {
             genFunction(&g, fi as u32)
             g.syms.define(g.syms.id(g.fnSymbol(fi as u32)), g.text, *g.labelPos.get(fi) as u64 * 4)
         }
@@ -62,26 +67,7 @@ export fn select(m: *XlcHirModule, o: *MachoObject, hasOnly: bool, only: str) ->
     for i in 0..g.code.length() {
         o.addWord(g.text, *g.code.get(i))
     }
-    // The symbol table: the defined symbols, then the undefined ones.
-    local n: usize = g.syms.names.length()
-    local mapped = Vec<u32>()
-    for i in 0..n {
-        mapped.push(0)
-    }
-    for i in 0..n {
-        if *g.syms.defined.get(i) {
-            local name: str = g.syms.names.get(i).asStr()
-            local sec: u32 = *g.syms.section.get(i)
-            local off: u64 = *g.syms.offset.get(i)
-            mapped.set(i, *g.syms.fileLocal.get(i) ? o.addLocal(name, sec, off)
-                        : *g.syms.weak.get(i) ? o.addWeak(name, sec, off) : o.addDefined(name, sec, off))
-        }
-    }
-    for i in 0..n {
-        if !*g.syms.defined.get(i) {
-            mapped.set(i, o.addUndefined(g.syms.names.get(i).asStr()))
-        }
-    }
+    local mapped = flushSyms(&g.syms, o)
     for i in 0..g.rels.length() {
         local r: *Rel = g.rels.get(i)
         o.addReloc(g.text, r.addr, *mapped.get(r.sym as usize), r.rtype)

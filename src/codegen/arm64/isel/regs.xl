@@ -23,12 +23,12 @@
 // @spec https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
 // @spec https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
 from "std" import Vec
-from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, view,
+from "../../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirExpr, XlcHirStmt, view,
     E_LOCAL_REF, E_ADDR_OF, E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL, E_CALL_ITABLE, E_CALL_EXTERNAL,
     E_SYSCALL, E_ASM, E_NEW, E_CONSTRUCT, E_MATERIALIZE, E_MOVE, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE,
     S_BLOCK, S_TRY
-from "types" import Scalar, KIND_OTHER, KIND_FLOAT, scalarOf
-from "layout" import Layouts, K_VOID, K_NEVER, K_INT, K_FLOAT
+from "../../common/types" import Scalar, KIND_OTHER, KIND_FLOAT, scalarOf
+from "../../common/layout" import Layouts, K_VOID, K_NEVER, K_INT, K_FLOAT
 
 export const FIRST_SAVED: u32 = 19
 export const LAST_SAVED: u32 = 28

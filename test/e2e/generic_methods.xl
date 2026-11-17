@@ -1,0 +1,29 @@
+// e2e: generic methods of a class (`streamVia<F>` in the stdlib's http client): the type
+// arguments are inferred from the call (`F` = a function value) or written (`.pick<i64>`), one
+// instance per argument list; a generic method of a generic class instance sees both envs.
+// Lives here because only run.sh compiles with the xlc under test.
+fn twice(x: i32) -> i32 { return x * 2 }
+fn inc(x: i32) -> i32 { return x + 1 }
+
+class Runner {
+    base: i32
+    fn apply<F>(self, f: F) -> i32 { return f(self.base) }
+    fn pick<T>(self, a: T, b: T) -> T { return self.base > 0 ? a : b }
+}
+
+class Box<T> {
+    item: T
+    fn with<U>(self, extra: U) -> i64 { return (sizeOf(T) + sizeOf(U)) as i64 }
+}
+
+@entry fn main() -> i32 {
+    local r = Runner()
+    r.base = 5
+    if r.apply(twice) != 10 { return 1 }
+    if r.apply(inc) != 6 { return 2 }
+    if r.pick<i64>(7, 9) != 7 { return 3 }
+    if r.pick(true, false) != true { return 4 }
+    local b = Box<i32>()
+    if b.with(1 as u8) != 5 { return 5 }
+    return 0
+}

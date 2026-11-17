@@ -13,6 +13,7 @@ from "./const_eval" import evalConst
 from "./const_value" import CV_INT, CV_BOOL, CV_STRING
 from "./enums" import checkEnum, genericEnumOf
 from "./layout_calc" import layoutOfName
+from "./packs" import checkPackUses
 
 /// The array lengths anywhere in the type tree must be constants.
 fn checkType(s: *Sema, tyIdx: i32) {
@@ -164,8 +165,10 @@ fn isPackFn(s: *Sema, declIdx: i32) -> bool {
 
 /// A pack function is checked here for its declaration and its uses of the pack; its body is
 /// checked per element count, when a call instantiates it.
-fn checkPackFn(s: *Sema, declIdx: i32) {
+fn checkPackFn(s: *Sema, item: i32, declIdx: i32) {
     local d = s.declAt(declIdx as usize)
+    local it = s.items.get(item as usize)
+    local cSide = (*it).declared != 0 || (*it).exportC != 0
     local packSeen = false
     for i in 0..(*d).paramsCount as usize {
         local p = s.params.get(((*d).paramsFirst + i as u32) as usize)
@@ -187,12 +190,14 @@ fn checkPackFn(s: *Sema, declIdx: i32) {
         }
     }
     checkType(s, (*d).ret)
-    if (*d).hasBody == 0 || (*d).isVirtual != 0 || (*d).isOverride != 0 ||
+    if cSide || (*d).hasBody == 0 || (*d).isVirtual != 0 || (*d).isOverride != 0 ||
             (*d).genericCount != 0 {
         s.error("E0736", (*d).nameSpan,
                 format("`{}` cannot take a parameter pack here", s.text((*d).name)).asStr(),
                 "a pack function needs a body and no `declare`, `export(c)`, `virtual`, `override` or type parameters")
     }
+    // The uses of the pack, once per declaration, called or not (sema/packs.xl).
+    checkPackUses(s, declIdx)
 }
 
 /// Parameter packs are supported on free functions only.
@@ -246,7 +251,7 @@ export fn analyze(s: *Sema) {
                 checkExpr(s, (*d).init)
             }
         } else if isPackFn(s, declIdx) {
-            checkPackFn(s, declIdx)
+            checkPackFn(s, i as i32, declIdx)
         } else if (*d).kind == XD_FN && (*d).genericCount == 0 {
             // Generic declarations are checked per instance, when they are instantiated.
             for p in 0..(*d).paramsCount as usize {

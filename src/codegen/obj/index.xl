@@ -1,0 +1,172 @@
+// The format-neutral object under construction: sections of code and data, a symbol table and
+// relocations. An architecture's instruction selector fills it; a writer per object format
+// (macho/, elf/, later coff/) serializes it. Nothing here knows a file format: section names,
+// symbol spelling (the Mach-O `_` prefix), symbol order and relocation numbers belong to the writer.
+//
+// Relocations name what the patched word does (R_*), not a format's number. Where a format needs
+// more detail than the kind (ELF splits the arm64 low-12 offset by access size), the writer reads
+// the instruction word it patches.
+from "std" import String, Vec
+
+/// Section kinds. A writer maps each to its own section: Mach-O `__TEXT,__text`,
+/// `__TEXT,__cstring`, `__DATA,__const`, `__DATA,__data`; ELF `.text`, `.rodata.str1.1`,
+/// `.data.rel.ro`, `.data`.
+export const SEC_TEXT: u32 = 0      // code
+export const SEC_CSTRING: u32 = 1   // NUL-terminated string literals, merged by the linker
+export const SEC_CONST: u32 = 2     // read-only after load, may hold relocated pointers (vtables)
+export const SEC_DATA: u32 = 3      // writable globals
+
+/// Relocation kinds (the arm64 set; arm32 and x86-64 add their own kinds after these).
+export const R_ABS64: u32 = 0         // the 8-byte absolute address; the addend is the 8 bytes there
+export const R_BRANCH26: u32 = 1      // `b`/`bl`: the 26-bit word distance
+export const R_PAGE21: u32 = 2        // `adrp`: the 21-bit 4 KiB page distance
+export const R_PAGEOFF12: u32 = 3     // `add`/`ldr`/`str` immediate: the low 12 bits (scaled for loads)
+export const R_GOT_PAGE21: u32 = 4    // `adrp` of the symbol's GOT slot
+export const R_GOT_PAGEOFF12: u32 = 5 // `ldr` of the GOT slot
+// arm32 (A32). The addend stays in the patched bytes (ELF32 REL).
+export const R_ABS32: u32 = 6         // the 4-byte absolute address; the addend is the 4 bytes there
+export const R_ARM_CALL: u32 = 7      // `bl`: the 24-bit word distance (imm24 holds -2: P + 8)
+export const R_ARM_JUMP24: u32 = 8    // `b`/`b<cond>`
+export const R_MOVW: u32 = 9          // `movw`: the low 16 bits of the address
+export const R_MOVT: u32 = 10         // `movt`: the high 16 bits of the address
+
+/// Symbol bindings.
+export const BIND_GLOBAL: u32 = 0
+export const BIND_LOCAL: u32 = 1    // visible only inside this object
+export const BIND_WEAK: u32 = 2     // a strong definition elsewhere replaces it
+
+/// One relocation: patch the word or quad at byte `addr` of its section from symbol `sym`.
+@repr(c)
+export struct Reloc {
+    addr: u32
+    sym: u32
+    kind: u32
+}
+
+/// One symbol, spelled as in the source. `section` is the 0-based section of a defined symbol;
+/// `value` the byte offset inside it.
+export class Sym {
+    name: String
+    defined: bool
+    bind: u32
+    section: u32
+    value: u64
+
+    fn init(self, name: str, defined: bool, bind: u32, section: u32, value: u64) {
+        self.name = String(name)
+        self.defined = defined
+        self.bind = bind
+        self.section = section
+        self.value = value
+    }
+}
+
+export class Section {
+    kind: u32
+    alignLog2: u32
+    code: Vec<u8>
+    relocs: Vec<Reloc>
+
+    fn init(self, kind: u32, alignLog2: u32) {
+        self.kind = kind
+        self.alignLog2 = alignLog2
+        self.code = Vec<u8>()
+        self.relocs = Vec<Reloc>()
+    }
+}
+
+export class ObjectFile {
+    sections: Vec<Section>
+    syms: Vec<Sym>
+
+    fn init(self) {
+        self.sections = Vec<Section>()
+        self.syms = Vec<Sym>()
+    }
+
+    /// Adds a section and returns its 0-based index.
+    fn addSection(self, kind: u32, alignLog2: u32) -> u32 {
+        self.sections.push(Section(kind, alignLog2))
+        return (self.sections.length() - 1) as u32
+    }
+
+    /// Appends one instruction word, little-endian (every supported target is little-endian).
+    fn addWord(self, section: u32, w: u32) {
+        for k in 0..4 { self.addByte(section, ((w >> ((k * 8) as u32)) & 0xff) as u8) }
+    }
+
+    fn addByte(self, section: u32, b: u8) {
+        self.sections.get(section).code.push(b)
+    }
+
+    /// Appends a little-endian 64-bit value.
+    fn addQuad(self, section: u32, v: u64) {
+        for k in 0..8 { self.addByte(section, ((v >> ((k * 8) as u64)) & 0xff) as u8) }
+    }
+
+    fn addSym(self, name: str, defined: bool, bind: u32, section: u32, value: u64) -> u32 {
+        self.syms.push(Sym(name, defined, bind, section, value))
+        return (self.syms.length() - 1) as u32
+    }
+
+    /// Adds a defined global symbol at `offset` of `section` and returns its index.
+    fn addDefined(self, name: str, section: u32, offset: u64) -> u32 {
+        return self.addSym(name, true, BIND_GLOBAL, section, offset)
+    }
+
+    fn addWeak(self, name: str, section: u32, offset: u64) -> u32 {
+        return self.addSym(name, true, BIND_WEAK, section, offset)
+    }
+
+    fn addLocal(self, name: str, section: u32, offset: u64) -> u32 {
+        return self.addSym(name, true, BIND_LOCAL, section, offset)
+    }
+
+    /// Adds an undefined external symbol (resolved by the linker) and returns its index.
+    fn addUndefined(self, name: str) -> u32 {
+        return self.addSym(name, false, BIND_GLOBAL, 0, 0)
+    }
+
+    /// The bytes in `section` so far.
+    fn size(self, section: u32) -> u64 {
+        return self.sections.get(section).code.length() as u64
+    }
+
+    /// Pads `section` with zero bytes up to a multiple of `align`.
+    fn padTo(self, section: u32, align: u64) {
+        while self.size(section) % align != 0 { self.addByte(section, 0) }
+    }
+
+    /// Overwrites the 8 bytes at `at` of `section` with `v`.
+    fn patchQuad(self, section: u32, at: u64, v: u64) {
+        local s: *Section = self.sections.get(section)
+        for k in 0..8 as usize {
+            s.code.set((at as usize) + k, ((v >> ((k * 8) as u64)) & 0xff) as u8)
+        }
+    }
+
+    /// An 8-byte absolute pointer to `sym` at byte `addr` of a data section; the 8 bytes already
+    /// there are the addend.
+    fn addDataReloc(self, section: u32, addr: u32, sym: u32) {
+        self.sections.get(section).relocs.push(Reloc { addr: addr, sym: sym, kind: R_ABS64 })
+    }
+
+    /// A relocation of kind `kind` against `sym` at byte `addr` of `section`.
+    fn addReloc(self, section: u32, addr: u32, sym: u32, kind: u32) {
+        self.sections.get(section).relocs.push(Reloc { addr: addr, sym: sym, kind: kind })
+    }
+}
+
+/// The little-endian 64-bit value at `at` of `bytes`.
+export fn readQuad(bytes: *Vec<u8>, at: usize) -> u64 {
+    local v: u64 = 0
+    for k in 0..8 as usize { v |= (*bytes.get(at + k) as u64) << ((k * 8) as u64) }
+    return v
+}
+
+/// The little-endian 32-bit value at `at` of `bytes`.
+export fn readWord(bytes: *Vec<u8>, at: usize) -> u32 {
+    local v: u32 = 0
+    for k in 0..4 as usize { v |= (*bytes.get(at + k) as u32) << ((k * 8) as u32) }
+    return v
+}

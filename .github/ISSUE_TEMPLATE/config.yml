@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Language, xl tool, packages, questions, or not sure
+    url: https://github.com/hasirciogluhq/xlang/issues/new/choose
+    about: The general tracker. Language features and anything not clearly a compiler bug go here.
+  - name: Standard library bug
+    url: https://github.com/hasirciogluhq/xl-std/issues/new/choose
+    about: A stdlib function or type behaves wrongly (and the problem does not reproduce without it).
+  - name: Documentation
+    url: https://github.com/hasirciogluhq/xlang-docs/issues/new/choose
+    about: Mistakes or gaps on the documentation site.
+  - name: Security vulnerability
+    url: https://github.com/hasirciogluhq/xlc/security/advisories/new
+    about: Report privately. Do not open a public issue.

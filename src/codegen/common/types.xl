@@ -59,6 +59,25 @@ fn intOf(s: str) -> Scalar {
 /// The scalar of a type spelling. An enum resolves to its underlying integer type, the way
 /// `castScalar` and `genBinary` of the LLVM path do (`Type::elem`).
 export fn scalarOf(m: *XlcHirModule, spelling: str) -> Scalar {
+    return scalarOfW(m, spelling, 64)
+}
+
+/// The scalar of a type spelling on a target whose pointers, `isize` and `usize` are `ptrBits`
+/// wide (64 on arm64, 32 on arm32).
+export fn scalarOfW(m: *XlcHirModule, spelling: str, ptrBits: u32) -> Scalar {
+    for i in 0..m.enumCount as usize {
+        if spelling == view(m.enums[i].name) {
+            return scalarOfW(m, view(m.enums[i].underlying), ptrBits)
+        }
+    }
+    local s = scalarOf64(m, spelling)
+    if ptrBits != 64 && (s.kind == KIND_PTR || ((spelling == "usize" || spelling == "isize") && s.kind == KIND_INT)) {
+        s.bits = ptrBits
+    }
+    return s
+}
+
+fn scalarOf64(m: *XlcHirModule, spelling: str) -> Scalar {
     if spelling == "bool" {
         return Scalar { kind: KIND_BOOL, bits: 1, signed: false }
     }

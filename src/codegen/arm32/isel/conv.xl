@@ -1,0 +1,99 @@
+// The calling convention of the arm32 backend: AAPCS32, VFP (hard-float) variant, the one
+// `arm-linux-gnueabihf` uses (https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst,
+// 6.5 "Parameter Passing", 6.1.2.1 the VFP variant).
+//   - a 4-byte or narrower integer, bool, pointer, enum: the next core register r0-r3, else a
+//     4-byte stack slot;
+//   - a 64-bit integer: an even-odd core pair (r0:r1 or r2:r3, the NCRN rounded up to even,
+//     rule C.3), else an 8-aligned stack slot (C.7); never split between registers and stack;
+//   - f32 in the first free single register s0-s15, f64 in the first free double d0-d7; a
+//     skipped single is back-filled by a later f32 until a VFP argument went to the stack;
+//   - a value held in memory (str, slice, array, tuple, struct, class, interface) travels as the
+//     address of a copy the caller made (the xlang convention, as on arm64);
+//   - result: r0, r0:r1, s0 or d0; a memory result is written through an address the caller
+//     passes in r0, and the arguments start at r1 (rule A.4).
+// The stack argument area is 8-aligned; the callee finds argument k at [fp + 8 + offset].
+// Not done (E0714): aggregates by value for `export(c)`/`declare` functions (the C convention
+// passes small composites in core registers).
+from "std" import Vec
+from "../../common/types" import Scalar, KIND_OTHER, KIND_FLOAT
+from "gen" import Gen
+
+export const AC_CORE: u32 = 0     // one core register `reg`
+export const AC_PAIR: u32 = 1     // two core registers `reg`, `reg + 1`
+export const AC_S: u32 = 2        // single register `reg`
+export const AC_D: u32 = 3        // double register `reg`
+export const AC_STACK: u32 = 4    // `size` bytes at stack offset `stack`
+
+export struct ArgLoc {
+    cls: u32
+    reg: u32
+    stack: u32
+    size: u32
+}
+
+/// The allocation state of one argument list.
+export struct Conv {
+    ncrn: u32        // the next core register
+    nsaa: u32        // the next stack offset
+    sUsed: u32       // bit n: single register sn taken
+    vfpStacked: bool // a VFP argument went to the stack: no more back-filling
+}
+
+export fn newConv(sret: bool) -> Conv {
+    return Conv { ncrn: sret ? 1 : 0, nsaa: 0, sUsed: 0, vfpStacked: false }
+}
+
+fn stackSlot(c: *Conv, size: u32, align: u32) -> ArgLoc {
+    c.nsaa = (c.nsaa + align - 1) & ~(align - 1)
+    local at: u32 = c.nsaa
+    c.nsaa += size
+    return ArgLoc { cls: AC_STACK, reg: 0, stack: at, size: size }
+}
+
+/// Where the next argument of type `ty` goes.
+export fn classify(g: *Gen, ty: str, c: *Conv) -> ArgLoc {
+    if g.isMem(ty) {
+        if c.ncrn < 4 {
+            c.ncrn += 1
+            return ArgLoc { cls: AC_CORE, reg: c.ncrn - 1, stack: 0, size: 4 }
+        }
+        return stackSlot(c, 4, 4)
+    }
+    local s: Scalar = g.scalar(ty)
+    if s.kind == KIND_FLOAT {
+        if !c.vfpStacked {
+            if s.bits == 32 {
+                for r in 0..16 as u32 {
+                    if (c.sUsed & ((1 as u32) << r)) == 0 {
+                        c.sUsed |= (1 as u32) << r
+                        return ArgLoc { cls: AC_S, reg: r, stack: 0, size: 4 }
+                    }
+                }
+            } else {
+                for d in 0..8 as u32 {
+                    local mask: u32 = (3 as u32) << (2 * d)
+                    if (c.sUsed & mask) == 0 {
+                        c.sUsed |= mask
+                        return ArgLoc { cls: AC_D, reg: d, stack: 0, size: 8 }
+                    }
+                }
+            }
+        }
+        c.vfpStacked = true
+        return stackSlot(c, s.bits / 8, s.bits / 8)
+    }
+    if s.kind != KIND_OTHER && s.bits == 64 {
+        c.ncrn = (c.ncrn + 1) & ~(1 as u32)
+        if c.ncrn <= 2 {
+            c.ncrn += 2
+            return ArgLoc { cls: AC_PAIR, reg: c.ncrn - 2, stack: 0, size: 8 }
+        }
+        c.ncrn = 4
+        return stackSlot(c, 8, 8)
+    }
+    if c.ncrn < 4 {
+        c.ncrn += 1
+        return ArgLoc { cls: AC_CORE, reg: c.ncrn - 1, stack: 0, size: 4 }
+    }
+    return stackSlot(c, 4, 4)
+}

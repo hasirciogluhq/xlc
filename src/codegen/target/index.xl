@@ -1,0 +1,143 @@
+// The target description: what a triple names, parsed once and read by every part of the build
+// (the `#if` builtins `os`, `arch`, `pointerWidth`, `endian`; the backend choice; the object
+// format; the link step). It knows nothing about code generation itself.
+//
+// A triple is `arch-vendor-os[-env]` (LLVM spelling, https://llvm.org/doxygen/classllvm_1_1Triple.html
+// and https://clang.llvm.org/docs/CrossCompilation.html#target-triple). The vendor may be left out
+// (`aarch64-linux-gnu`, the GNU spelling), so the parser finds the OS by its name, not its position.
+//
+//   arch    aarch64 (arm64, aarch64), arm (arm, armv7, armv7a, armv7l, armv7hl, armhf, thumbv7*),
+//           x86_64 (x86_64, amd64, x64)
+//   os      macos (darwin*, macos*, macosx*), linux, windows (windows, win32, mingw*)
+//   env     gnu, musl, gnueabihf, musleabihf, msvc, android, ... kept as written
+//
+// **The generic OS rule.** A triple with no known OS word (`aarch64-unknown`, `aarch64`,
+// `aarch64-unknown-unknown`) is the generic "unknown" OS. xlc treats it exactly as Linux: ELF
+// objects, the Linux system call convention (the numbers of the generic Linux table,
+// https://github.com/torvalds/linux/blob/master/include/uapi/asm-generic/unistd.h), a `_start` that
+// reads argc/argv/envp from the stack, and a static link with no C library. The sources see
+// `os == "linux"`; `target.generic` records that the OS was not named. Bare-metal `none`
+// (`aarch64-unknown-none`) and the OSes xlc has no runtime for (ios, android, freebsd) are
+// rejected, never guessed.
+from "std" import String, Vec, format
+from "std/str" import toLowerAscii
+
+/// The object file formats.
+export const FMT_MACHO: i32 = 0
+export const FMT_ELF: i32 = 1
+export const FMT_COFF: i32 = 2
+
+export class Target {
+    triple: String
+    arch: String       ///< aarch64, arm, x86_64
+    vendor: String     ///< apple, pc, unknown, ... ("" when left out)
+    os: String         ///< macos, linux, windows
+    env: String        ///< gnu, musl, gnueabihf, msvc, ... ("" when left out)
+    generic: bool      ///< the OS was not named: the generic OS, run as linux
+    format: i32        ///< FMT_MACHO, FMT_ELF, FMT_COFF
+    pointerWidth: i64  ///< 64, or 32 for arm
+    endian: String     ///< little (every supported target)
+
+    fn init(self) {
+        self.triple = String("")
+        self.arch = String("")
+        self.vendor = String("")
+        self.os = String("")
+        self.env = String("")
+        self.generic = false
+        self.format = FMT_ELF
+        self.pointerWidth = 64
+        self.endian = String("little")
+    }
+
+    /// The `arch-os` key the backends and the link step switch on: `aarch64-macos`, `arm-linux`.
+    fn key(self) -> String {
+        return format("{}-{}", self.arch.asStr(), self.os.asStr())
+    }
+}
+
+/// True when `text` starts with `prefix`.
+fn starts(text: str, prefix: str) -> bool {
+    return text.len >= prefix.len && text[0..prefix.len as usize] == prefix
+}
+
+/// The canonical arch of a triple's first word, or "".
+fn archOf(w: str) -> str {
+    if w == "aarch64" || w == "arm64" { return "aarch64" }
+    if w == "x86_64" || w == "amd64" || w == "x64" { return "x86_64" }
+    // 32-bit Arm: every A-profile v7 spelling and `arm` itself (AArch32, little-endian only;
+    // `armeb` big-endian is not supported).
+    if w == "arm" || w == "armhf" || starts(w, "armv7") || starts(w, "thumbv7") { return "arm" }
+    return ""
+}
+
+/// The canonical OS of a triple word, "" when it is not an OS word; "!" when it is an OS xlc
+/// rejects.
+fn osOf(w: str) -> str {
+    if starts(w, "darwin") || starts(w, "macos") { return "macos" }
+    if w == "linux" { return "linux" }
+    if w == "windows" || w == "win32" || starts(w, "mingw") { return "windows" }
+    if w == "none" || starts(w, "ios") || w == "android" || starts(w, "freebsd") || starts(w, "netbsd") ||
+        starts(w, "openbsd") || starts(w, "tvos") || starts(w, "watchos") || starts(w, "wasi") {
+        return "!"
+    }
+    return ""
+}
+
+/// Parses `triple` into `out`; false when the arch or the OS is not supported (see the header).
+export fn parseTarget(triple: str, out: *Target) -> bool {
+    local lower = toLowerAscii(triple)
+    local parts = lower.split("-")
+    if parts.length() == 0 { return false }
+    local arch = archOf(parts.get(0).asStr())
+    if arch.len == 0 { return false }
+    local t = Target()
+    t.arch = String(arch)
+    local osAt: usize = 0
+    for i in 1..parts.length() {
+        local o = osOf(parts.get(i).asStr())
+        if o == "!" { return false }
+        if o.len > 0 {
+            t.os = String(o)
+            osAt = i
+            break
+        }
+    }
+    if osAt == 0 {
+        // No OS word: the generic OS (header). A second word is the vendor.
+        t.os = String("linux")
+        t.generic = true
+        if parts.length() > 1 { t.vendor = parts.get(1).clone() }
+    } else {
+        if osAt >= 2 { t.vendor = parts.get(1).clone() }
+        if osAt + 1 < parts.length() { t.env = parts.get(osAt + 1).clone() }
+    }
+    // 32-bit Arm runs only on linux here: macOS never shipped AArch32 user space, and Windows on
+    // Arm 32-bit (Windows RT) is gone.
+    if arch == "arm" && t.os.asStr() != "linux" { return false }
+    t.format = t.os.asStr() == "macos" ? FMT_MACHO : t.os.asStr() == "windows" ? FMT_COFF : FMT_ELF
+    t.pointerWidth = arch == "arm" ? 32 : 64
+    t.triple = String(triple)
+    *out = t
+    return true
+}
+
+/// The host's target: what `xlc` runs on.
+export fn hostTarget() -> Target {
+    local t = Target()
+#if arch == "aarch64"
+    local arch = "aarch64"
+#elif arch == "arm"
+    local arch = "arm"
+#else
+    local arch = "x86_64"
+#endif
+#if os == "macos"
+    parseTarget(format("{}-apple-darwin", arch).asStr(), &t)
+#elif os == "windows"
+    parseTarget(format("{}-pc-windows-msvc", arch).asStr(), &t)
+#else
+    parseTarget(format("{}-unknown-linux-{}", arch, arch == "arm" ? "gnueabihf" : "gnu").asStr(), &t)
+#endif
+    return t
+}

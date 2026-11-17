@@ -3,7 +3,8 @@
 // constant loaders. The generators are free functions over `*Gen` in expr.xl, call.xl, stmt.xl,
 // func.xl and data.xl.
 //
-// Registers (Apple arm64, AAPCS64 with `x18` reserved, `x29` the frame pointer):
+// Registers (AAPCS64 with `x18` never used, so one register plan serves Apple, where x18 is
+// reserved, and Linux, where it is a temporary; `x29` is always the frame pointer):
 //   x0-x7, d0-d7      arguments and results; with x9-x15 the integer temporary pool
 //   x8                the address of an aggregate result (sret)
 //   x16, x17          scratch of the emit helpers, never allocated
@@ -15,16 +16,18 @@
 from "std" import String, Vec, format
 from "std/collections/hashmap" import HashMap
 from "std/io" import fprint
-from "../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirExpr, XlcHirStmt, view
-from "../arm64" import X0, X16, X17, SP, XZR, movReg64, add64Imm, sub64Imm, adrp, ldr64Imm, str64Imm, ldur64,
+from "../../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirExpr, XlcHirStmt, view
+from "../encode" import X0, X16, X17, SP, XZR, movReg64, add64Imm, sub64Imm, adrp, ldr64Imm, str64Imm, ldur64,
     stur64, bl, b, brk
-from "../arm64/float" import fmovReg, ldrFloat, strFloat
-from "../macho" import MachoObject, TEXT_FLAGS, RELOC_BRANCH26, RELOC_PAGE21, RELOC_PAGEOFF12,
-    RELOC_GOT_PAGE21, RELOC_GOT_PAGEOFF12
+from "../encode/float" import fmovReg, ldrFloat, strFloat
+from "../../obj" import ObjectFile, SEC_TEXT, SEC_CSTRING, SEC_CONST, SEC_DATA, R_BRANCH26, R_PAGE21,
+    R_PAGEOFF12, R_GOT_PAGE21, R_GOT_PAGEOFF12
+from "../../target" import Target
+from "../../common/syms" import Syms
 from "emit" import movConst, addOff, loadTyped, storeTyped, loadFloat, storeFloat
-from "layout" import Layouts, K_INT, K_FLOAT
+from "../../common/layout" import Layouts, K_INT, K_FLOAT
 from "regs" import Frame, LK_REG, LK_SLOT, LK_MEM
-from "types" import Scalar, KIND_BOOL, KIND_FLOAT, KIND_INT, scalarOf
+from "../../common/types" import Scalar, KIND_BOOL, KIND_FLOAT, KIND_INT, scalarOf
 
 /// Pool sizes: x9-x15 then x0-x7 (15 integer temporaries), d16-d31 (16 vector temporaries).
 export const POOL_INT: u32 = 15
@@ -89,56 +92,12 @@ export struct PadRec {
     pad: u32
 }
 
-/// The symbols of the object: interned by name, defined once.
-export class Syms {
-    names: Vec<String>
-    defined: Vec<bool>
-    section: Vec<u32>
-    offset: Vec<u64>
-    fileLocal: Vec<bool>
-    weak: Vec<bool>        // a weak definition: another object's strong one wins at link time
-    index: HashMap<String, u32>
-
-    fn init(self) {
-        self.names = Vec<String>()
-        self.defined = Vec<bool>()
-        self.fileLocal = Vec<bool>()
-        self.weak = Vec<bool>()
-        self.section = Vec<u32>()
-        self.offset = Vec<u64>()
-        self.index = HashMap<String, u32>()
-    }
-
-    /// The id of symbol `name`, created on first use.
-    fn id(self, name: str) -> u32 {
-        local key = String(name)
-        local found = self.index.get(key.clone())
-        if found.isSome() {
-            return *found.unwrap()
-        }
-        local n: u32 = self.names.length() as u32
-        self.names.push(key.clone())
-        self.defined.push(false)
-        self.fileLocal.push(false)
-        self.weak.push(false)
-        self.section.push(0)
-        self.offset.push(0)
-        self.index.put(key, n)
-        return n
-    }
-
-    /// Defines symbol `id` at `offset` of `section`.
-    fn define(self, id: u32, section: u32, offset: u64) {
-        self.defined.set(id as usize, true)
-        self.section.set(id as usize, section)
-        self.offset.set(id as usize, offset)
-    }
-}
 
 export class Gen {
     m: *XlcHirModule
     lay: Layouts
-    o: *MachoObject
+    o: *ObjectFile
+    target: *Target       // the OS decides the syscall convention and the boot code
     hasOnly: bool
     only: String
     text: u32
@@ -177,18 +136,17 @@ export class Gen {
     cabi: bool            // the function follows the C convention (export(c) or declare)
     callHook: CallHook
 
-    fn init(self, m: *XlcHirModule, o: *MachoObject, hasOnly: bool, only: str) {
+    fn init(self, m: *XlcHirModule, o: *ObjectFile, target: *Target, hasOnly: bool, only: str) {
         self.m = m
-        self.lay = Layouts(m)
+        self.lay = Layouts(m, 8)
         self.o = o
+        self.target = target
         self.hasOnly = hasOnly
         self.only = String(only)
-        self.text = o.addSection("__text", TEXT_FLAGS, 2)
-        self.cstr = o.addSection("__cstring", 0x2, 0)
-        self.dconst = o.addSection("__const", 0, 3)
-        o.setSegment(self.dconst, "__DATA")
-        self.ddata = o.addSection("__data", 0, 4)
-        o.setSegment(self.ddata, "__DATA")
+        self.text = o.addSection(SEC_TEXT, 2)
+        self.cstr = o.addSection(SEC_CSTRING, 0)
+        self.dconst = o.addSection(SEC_CONST, 3)
+        self.ddata = o.addSection(SEC_DATA, 4)
         self.code = Vec<u32>()
         self.fixups = Vec<Fixup>()
         self.labelPos = Vec<u32>()
@@ -302,20 +260,20 @@ export class Gen {
     /// `bl sym`.
     fn callSym(self, sym: u32) {
         bl(&self.code, 0)
-        self.relocHere(sym, RELOC_BRANCH26)
+        self.relocHere(sym, R_BRANCH26)
     }
 
     /// `d = &sym`: `adrp` + `add` for a symbol of this image, `adrp` + `ldr` through the GOT for
     /// an imported one (`got`).
     fn symAddr(self, d: u32, sym: u32, got: bool) {
         adrp(&self.code, d, 0)
-        self.relocHere(sym, got ? RELOC_GOT_PAGE21 : RELOC_PAGE21)
+        self.relocHere(sym, got ? R_GOT_PAGE21 : R_PAGE21)
         if got {
             ldr64Imm(&self.code, d, d, 0)
-            self.relocHere(sym, RELOC_GOT_PAGEOFF12)
+            self.relocHere(sym, R_GOT_PAGEOFF12)
         } else {
             add64Imm(&self.code, d, d, 0, false)
-            self.relocHere(sym, RELOC_PAGEOFF12)
+            self.relocHere(sym, R_PAGEOFF12)
         }
     }
 

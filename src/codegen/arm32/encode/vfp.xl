@@ -1,0 +1,59 @@
+// The VFP encoders of the arm32 backend (VFPv3-D16: d0-d15, s0-s31). The selector keeps float
+// values in core registers (f32 in r0, f64 in r0:r1) and moves them into s/d registers only to
+// compute or to pass them (AAPCS32 VFP variant), so only arithmetic, compare, convert and the
+// core<->VFP moves are needed. DDI 0406C, A8.8 (VADD, VSUB, VMUL, VDIV, VNEG, VCMP, VCVT, VMOV,
+// VMRS). Register fields: a double Dn is `D:Vd` with D the top bit (0 for d0-d15); a single Sn
+// is `Vd:D` with D the low bit.
+from "std" import Vec
+
+/// The three-register arithmetic forms: `opc` is the base word of the f32 form.
+fn arith(out: *Vec<u32>, base: u32, dbl: bool, d: u32, n: u32, m: u32) {
+    if dbl {
+        out.push(base | 0x100 | (n << 16) | (d << 12) | m)
+    } else {
+        out.push(base | ((d & 1) << 22) | ((n >> 1) << 16) | ((d >> 1) << 12) | ((n & 1) << 7) | ((m & 1) << 5) | (m >> 1))
+    }
+}
+
+export fn vadd(out: *Vec<u32>, dbl: bool, d: u32, n: u32, m: u32) { arith(out, 0xee300a00, dbl, d, n, m) }
+export fn vsub(out: *Vec<u32>, dbl: bool, d: u32, n: u32, m: u32) { arith(out, 0xee300a40, dbl, d, n, m) }
+export fn vmul(out: *Vec<u32>, dbl: bool, d: u32, n: u32, m: u32) { arith(out, 0xee200a00, dbl, d, n, m) }
+export fn vdiv(out: *Vec<u32>, dbl: bool, d: u32, n: u32, m: u32) { arith(out, 0xee800a00, dbl, d, n, m) }
+
+/// Two-register forms (`vneg`, `vcmp`, `vcvt`): `base` is the f32 word, `dblD`/`dblM` say which
+/// operands are doubles.
+fn two(out: *Vec<u32>, base: u32, dblD: bool, d: u32, dblM: bool, m: u32) {
+    local dd: u32 = dblD ? (d << 12) : ((d & 1) << 22) | ((d >> 1) << 12)
+    local mm: u32 = dblM ? m : ((m & 1) << 5) | (m >> 1)
+    out.push(base | dd | mm)
+}
+
+export fn vneg(out: *Vec<u32>, dbl: bool, d: u32, m: u32) { two(out, dbl ? 0xeeb10b40 : 0xeeb10a40, dbl, d, dbl, m) }
+
+/// `vcmp d, m` then the flags are copied to APSR by `vmrs`.
+export fn vcmp(out: *Vec<u32>, dbl: bool, d: u32, m: u32) { two(out, dbl ? 0xeeb40b40 : 0xeeb40a40, dbl, d, dbl, m) }
+
+/// `vmrs APSR_nzcv, fpscr`.
+export fn vmrs(out: *Vec<u32>) { out.push(0xeef1fa10) }
+
+/// `vcvt.f64.f32 Dd, Sm` and `vcvt.f32.f64 Sd, Dm`.
+export fn vcvtF64F32(out: *Vec<u32>, d: u32, m: u32) { two(out, 0xeeb70ac0, true, d, false, m) }
+export fn vcvtF32F64(out: *Vec<u32>, d: u32, m: u32) { two(out, 0xeeb70bc0, false, d, true, m) }
+
+/// `vcvt.f{32,64}.{s,u}32 d, Sm`: an integer in a single register to a float.
+export fn vcvtFromInt(out: *Vec<u32>, dbl: bool, signed: bool, d: u32, m: u32) {
+    two(out, (dbl ? 0xeeb80b40 : 0xeeb80a40) | (signed ? 0x80 : 0), dbl, d, false, m)
+}
+
+/// `vcvt.{s,u}32.f{32,64} Sd, m`: a float to an integer, rounding toward zero.
+export fn vcvtToInt(out: *Vec<u32>, dbl: bool, signed: bool, d: u32, m: u32) {
+    two(out, (dbl ? 0xeebc0bc0 : 0xeebc0ac0) | (signed ? 0x10000 : 0), false, d, dbl, m)
+}
+
+/// `vmov Dm, rt, rt2` (core pair to double) and `vmov rt, rt2, Dm`.
+export fn vmovToD(out: *Vec<u32>, dm: u32, rt: u32, rt2: u32) { out.push(0xec400b10 | (rt2 << 16) | (rt << 12) | dm) }
+export fn vmovFromD(out: *Vec<u32>, rt: u32, rt2: u32, dm: u32) { out.push(0xec500b10 | (rt2 << 16) | (rt << 12) | dm) }
+
+/// `vmov Sn, rt` and `vmov rt, Sn`.
+export fn vmovToS(out: *Vec<u32>, sn: u32, rt: u32) { out.push(0xee000a10 | ((sn >> 1) << 16) | (rt << 12) | ((sn & 1) << 7)) }
+export fn vmovFromS(out: *Vec<u32>, rt: u32, sn: u32) { out.push(0xee100a10 | ((sn >> 1) << 16) | (rt << 12) | ((sn & 1) << 7)) }

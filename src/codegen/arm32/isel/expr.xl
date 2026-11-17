@@ -1,0 +1,788 @@
+// Expressions of the arm32 selector (value model: gen.xl). `genExpr` leaves a value in r0[:r1]
+// (the address in r0 for a memory type), `genAddr` the address of a place in r0, `genCond`
+// branches on a condition without materializing it.
+//
+// Integer semantics: wrapping arithmetic at the type's width; `<<`/`>>` by the width or more give
+// 0 (the sign fill for a signed `>>`); a checked division by zero panics; i64 multiply is
+// `umull` plus the two cross products, i64 shifts and every division go to the runtime routines
+// of data.xl (ARMv7-A has no integer divide in ARM state before the virtualization extension,
+// and `sdiv`/`udiv` stay optional, so the backend never relies on them).
+// Floats travel as bits in core registers; each operation moves them into d0/d1 (s0/s1), computes
+// with VFP and moves the result back.
+from "std" import String, Vec, format
+from "../../../hir/abi" import XlcHirExpr, XlcHirFieldInit, view, E_INT_CONST, E_FLOAT_CONST, E_BOOL_CONST,
+    E_STR_CONST, E_NIL, E_LOCAL_REF, E_GLOBAL_REF, E_FUNC_REF, E_EXTERNAL, E_UNARY, E_BINARY, E_SELECT, E_CAST,
+    E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL, E_CALL_ITABLE, E_CALL_EXTERNAL, E_SYSCALL, E_FIELD, E_INDEX, E_SLICE,
+    E_DEREF, E_ADDR_OF, E_ARRAY_LIST, E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_NEW, E_TO_INTERFACE,
+    E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG, E_ATOMIC_CAS, E_ATOMIC_ADD, E_FENCE, E_ASM, E_CONSTRUCT,
+    E_MOVE, E_MATERIALIZE, E_RAW_READ, E_UNWIND_PADS, E_UNWIND_PAD_COUNT
+from "../../common/layout" import K_STR, K_SLICE, K_ARRAY, K_INTERFACE
+from "../../common/types" import Scalar, KIND_OTHER, KIND_INT, KIND_BOOL, KIND_PTR, KIND_FLOAT, canonical
+from "../encode" import R0, R1, R2, R3, R11, R12, SP, LR, AL, EQ, NE, CS, CC, MI, LS, HI, GE, LT, GT, LE, OP_AND,
+    OP_EOR, OP_SUB, OP_RSB, OP_ADD, OP_ADC, OP_SBC, OP_RSC, OP_CMP, OP_ORR, OP_MOV, OP_MVN, LSL, LSR, ASR, dpReg,
+    dpImm, dpShiftImm, shiftReg, modImm, movReg, loadConst, addConst, load, store, push, pop, mul, mla, umull,
+    extend, dmbIsh
+from "../encode/vfp" import vadd, vsub, vmul, vdiv, vneg, vcmp, vmrs, vcvtF64F32, vcvtF32F64, vcvtFromInt,
+    vcvtToInt, vmovToD, vmovFromD, vmovToS, vmovFromS
+from "gen" import Gen, RT_UDIV32, RT_UDIV64, RT_LSL64, RT_LSR64, RT_ASR64, RT_STREQ
+
+// Operator codes, decoded once from the spelling in the HIR.
+const OP_PLUS: u32 = 1
+const OP_MINUS: u32 = 2
+const OP_MUL: u32 = 3
+const OP_DIV: u32 = 4
+const OP_MOD: u32 = 5
+const OP_BAND: u32 = 6
+const OP_BOR: u32 = 7
+const OP_BXOR: u32 = 8
+const OP_SHL: u32 = 9
+const OP_SHR: u32 = 10
+const OP_EQ: u32 = 11
+const OP_NE: u32 = 12
+const OP_LT: u32 = 13
+const OP_LE: u32 = 14
+const OP_GT: u32 = 15
+const OP_GE: u32 = 16
+const OP_LAND: u32 = 17
+const OP_LOR: u32 = 18
+
+fn opCode(s: str) -> u32 {
+    if s.len == 0 { return 0 }
+    local c: u8 = s.ptr[0]
+    local c1: u8 = s.len > 1 ? s.ptr[1] : 0
+    if s.len == 1 {
+        return c == b'+' ? OP_PLUS : c == b'-' ? OP_MINUS : c == b'*' ? OP_MUL : c == b'/' ? OP_DIV
+             : c == b'%' ? OP_MOD : c == b'&' ? OP_BAND : c == b'|' ? OP_BOR : c == b'^' ? OP_BXOR
+             : c == b'<' ? OP_LT : c == b'>' ? OP_GT : 0
+    }
+    if c1 == b'=' {
+        return c == b'=' ? OP_EQ : c == b'!' ? OP_NE : c == b'<' ? OP_LE : c == b'>' ? OP_GE : 0
+    }
+    return c == b'<' && c1 == b'<' ? OP_SHL : c == b'>' && c1 == b'>' ? OP_SHR
+         : c == b'&' && c1 == b'&' ? OP_LAND : c == b'|' && c1 == b'|' ? OP_LOR : 0
+}
+
+fn isCompare(op: u32) -> bool {
+    return op >= OP_EQ && op <= OP_GE
+}
+
+export fn node(g: *Gen, i: i32) -> *XlcHirExpr {
+    return &g.m.exprs[i as usize]
+}
+
+export fn arg(g: *Gen, e: *XlcHirExpr, i: usize) -> *XlcHirExpr {
+    return &g.m.exprs[g.m.refs[e.argFirst as usize + i] as usize]
+}
+
+/// True for the kinds call.xl generates.
+fn isCallLike(k: i32) -> bool {
+    return k == E_CALL || k == E_CALL_INDIRECT || k == E_CALL_VIRTUAL || k == E_CALL_ITABLE || k == E_SYSCALL ||
+        k == E_NEW || k == E_CONSTRUCT || k == E_ATOMIC_LOAD || k == E_ATOMIC_STORE || k == E_ATOMIC_XCHG ||
+        k == E_ATOMIC_CAS || k == E_ATOMIC_ADD || k == E_FENCE
+}
+
+fn ty(e: *XlcHirExpr) -> str {
+    return view(e.typeName)
+}
+
+/// r0 = an immediate through `mov`, using `cond`.
+fn movImm(g: *Gen, cond: u32, rd: u32, v: u32) {
+    dpImm(&g.code, cond, OP_MOV, false, rd, 0, modImm(v))
+}
+
+/// Brings r0 into the canonical form of `s` (see gen.xl).
+export fn norm(g: *Gen, s: Scalar) {
+    if s.kind == KIND_BOOL {
+        dpImm(&g.code, AL, OP_AND, false, R0, R0, 1)
+    } else if s.kind == KIND_INT && s.bits < 32 {
+        extend(&g.code, R0, R0, s.bits, s.signed)
+    }
+}
+
+/// `push {r0, r1}`: keeps the current value while another is computed (8 bytes: sp stays aligned).
+export fn save(g: *Gen) {
+    push(&g.code, 0x3)
+}
+
+/// The value computed second into r2:r3 and the saved one back into r0:r1.
+fn restorePair(g: *Gen) {
+    movReg(&g.code, R2, R0)
+    movReg(&g.code, R3, R1)
+    pop(&g.code, 0x3)
+}
+
+/// Stores the zero (`v` false) or one byte of a drop flag local.
+fn setFlag(g: *Gen, id: u32, v: bool) {
+    movImm(g, AL, R2, v ? 1 : 0)
+    store(&g.code, R2, R11, *g.slot.get(id as usize), 1)
+}
+
+// -------------------------------------------------------------------------------------------
+// Places
+
+/// r0 = the address of the place (or value) `e`.
+export fn genAddr(g: *Gen, e: *XlcHirExpr) {
+    local k: i32 = e.kind
+    if k == E_LOCAL_REF {
+        g.localAddr(R0, e.localId)
+    } else if k == E_GLOBAL_REF {
+        local gi: i32 = g.findGlobal(view(e.text))
+        if gi < 0 {
+            g.fail("a reference to an unknown global")
+            return
+        }
+        g.symAddr(R0, g.syms.id(g.globSymbol(gi as u32)))
+    } else if k == E_FIELD {
+        local lhs = node(g, e.lhs)
+        local agg = String()
+        if e.throughPointer != 0 {
+            genExpr(g, lhs)
+            agg = g.lay.elemOf(ty(lhs))
+        } else {
+            genAddr(g, lhs)
+            agg = String(ty(lhs))
+        }
+        addConst(&g.code, R0, R0, g.lay.fieldOff(agg.asStr(), e.index) as i32)
+    } else if k == E_INDEX {
+        indexAddr(g, e)
+    } else if k == E_DEREF || k == E_RAW_READ {
+        genExpr(g, node(g, e.lhs))
+    } else if k == E_MOVE {
+        genAddr(g, node(g, e.lhs))
+        if e.localId != 0 { setFlag(g, e.localId, false) }
+    } else if k == E_MATERIALIZE {
+        genExpr(g, e)
+        g.localAddr(R0, e.localId)
+    } else if g.isMem(ty(e)) {
+        genExpr(g, e)
+    } else {
+        // A scalar rvalue used as a place: stored in a temporary.
+        genExpr(g, e)
+        local t: i32 = g.tempSlot(8, 8)
+        g.storeValue(ty(e), R11, t)
+        addConst(&g.code, R0, R11, t)
+    }
+}
+
+fn log2Exact(v: u64) -> i32 {
+    for k in 0..31 { if v == ((1 as u64) << (k as u64)) { return k as i32 } }
+    return -1
+}
+
+/// r0 = r0 + r2 * es.
+fn scaleAdd(g: *Gen, es: u64) {
+    local sh: i32 = log2Exact(es)
+    if sh >= 0 {
+        dpShiftImm(&g.code, OP_ADD, false, R0, R0, R2, LSL, sh as u32)
+    } else {
+        loadConst(&g.code, R3, es as u32)
+        mla(&g.code, R0, R2, R3, R0)
+    }
+}
+
+/// r0 = the address of `lhs[rhs]`: an array, a `str`/slice view or a pointer, bounds-checked when
+/// the access is checked (an unsigned compare also rejects a negative index).
+fn indexAddr(g: *Gen, e: *XlcHirExpr) {
+    local lhs = node(g, e.lhs)
+    local lk: u32 = g.lay.kind(ty(lhs))
+    local elem: String = g.lay.elemOf(ty(lhs))
+    local es: u64 = lk == K_STR ? 1 : g.sizeOf(elem.asStr())
+    local view_ = lk == K_STR || lk == K_SLICE
+    if lk == K_ARRAY || view_ { genAddr(g, lhs) } else { genExpr(g, lhs) }
+    save(g)
+    genExpr(g, node(g, e.rhs))
+    movReg(&g.code, R2, R0)
+    pop(&g.code, 0x3)
+    if view_ {
+        if e.checked != 0 {
+            load(&g.code, R3, R0, 4, 4, false)
+            dpReg(&g.code, AL, OP_CMP, true, 0, R2, R3)
+            g.branch(CS, g.coldPanic(lk == K_STR ? "str index out of bounds" : "slice index out of bounds"))
+        }
+        load(&g.code, R0, R0, 0, 4, false)
+    } else if lk == K_ARRAY && e.checked != 0 {
+        loadConst(&g.code, R3, g.lay.arrayLen(ty(lhs)) as u32)
+        dpReg(&g.code, AL, OP_CMP, true, 0, R2, R3)
+        g.branch(CS, g.coldPanic("array index out of bounds"))
+    }
+    scaleAdd(g, es)
+}
+
+// -------------------------------------------------------------------------------------------
+// Values
+
+/// r0[:r1] = the value of `e` (r0 = the address of a memory value).
+export fn genExpr(g: *Gen, e: *XlcHirExpr) {
+    local k: i32 = e.kind
+    local t: str = ty(e)
+    if k == E_INT_CONST || k == E_BOOL_CONST || k == E_NIL {
+        local s: Scalar = g.scalar(t)
+        local v: u64 = k == E_BOOL_CONST ? e.boolValue as u64 : k == E_NIL ? 0 : canonical(e.intValue, s)
+        if s.kind == KIND_FLOAT { v = floatBits((e.intValue as i64) as f64, s.bits == 64) }
+        loadConst(&g.code, R0, v as u32)
+        if s.bits == 64 { loadConst(&g.code, R1, (v >> 32) as u32) }
+    } else if k == E_FLOAT_CONST {
+        local s: Scalar = g.scalar(t)
+        local v: u64 = floatBits(e.floatValue, s.bits == 64)
+        loadConst(&g.code, R0, v as u32)
+        if s.bits == 64 { loadConst(&g.code, R1, (v >> 32) as u32) }
+    } else if k == E_STR_CONST {
+        g.symAddr(R0, g.literal(view(e.text)))
+        if t == "str" {
+            local at: i32 = g.tempSlot(8, 4)
+            store(&g.code, R0, R11, at, 4)
+            loadConst(&g.code, R0, view(e.text).len as u32)
+            store(&g.code, R0, R11, at + 4, 4)
+            addConst(&g.code, R0, R11, at)
+        }
+    } else if k == E_LOCAL_REF && !*g.byRef.get(e.localId as usize) {
+        g.loadValue(t, R11, *g.slot.get(e.localId as usize))
+    } else if k == E_LOCAL_REF || k == E_GLOBAL_REF || k == E_FIELD || k == E_INDEX || k == E_DEREF || k == E_RAW_READ {
+        genAddr(g, e)
+        g.loadValue(t, R0, 0)
+    } else if k == E_FUNC_REF {
+        local fi: i32 = g.findFunction(view(e.text))
+        if fi < 0 {
+            g.fail("a reference to an unknown function")
+            return
+        }
+        g.symAddr(R0, g.syms.id(g.fnSymbol(fi as u32)))
+    } else if k == E_ADDR_OF {
+        genAddr(g, node(g, e.lhs))
+    } else if k == E_UNARY {
+        genUnary(g, e)
+    } else if k == E_BINARY {
+        genBinary(g, e)
+    } else if k == E_SELECT {
+        local elseL: u32 = g.newLabel()
+        local endL: u32 = g.newLabel()
+        genCond(g, node(g, e.lhs), elseL, false)
+        genExpr(g, node(g, e.rhs))
+        g.branch(AL, endL)
+        g.bind(elseL)
+        genExpr(g, arg(g, e, 0))
+        g.bind(endL)
+    } else if k == E_CAST {
+        genCast(g, e)
+    } else if k == E_STRUCT_LIT || k == E_TUPLE_LIT || k == E_ARRAY_LIST || k == E_ARRAY_REPEAT ||
+            k == E_TO_INTERFACE || k == E_SLICE {
+        local at: i32 = g.tempSlot(g.sizeOf(t), g.alignOf(t))
+        buildInto(g, e, at)
+        addConst(&g.code, R0, R11, at)
+    } else if k == E_MOVE {
+        genExpr(g, node(g, e.lhs))
+        if e.localId != 0 { setFlag(g, e.localId, false) }
+    } else if k == E_MATERIALIZE {
+        genExpr(g, node(g, e.lhs))
+        local off: i32 = *g.slot.get(e.localId as usize)
+        g.storeValue(t, R11, off)
+        setFlag(g, e.index, true)
+        g.loadValue(t, R11, off)
+    } else if k == E_UNWIND_PADS || k == E_UNWIND_PAD_COUNT {
+        local id: u32 = g.syms.id(k == E_UNWIND_PADS ? "xl$unwindPads" : "xl$unwindPadCount")
+        g.symAddr(R0, id)
+        load(&g.code, R0, R0, 0, 4, false)
+    } else if isCallLike(k) {
+        g.callHook(g, e)
+    } else {
+        g.fail(format("expression kind {} is not supported on arm32 yet", k).asStr())
+    }
+}
+
+fn floatBits(v: f64, dbl: bool) -> u64 {
+    if dbl {
+        local x: f64 = v
+        return *(&x as *u64)
+    }
+    local y: f32 = v as f32
+    return *(&y as *u32) as u64
+}
+
+/// Writes the aggregate literal `e` (struct, tuple, array, interface value, slice) into the frame
+/// slot at fp offset `at`.
+export fn buildInto(g: *Gen, e: *XlcHirExpr, at: i32) {
+    local k: i32 = e.kind
+    local t: str = ty(e)
+    if k == E_STRUCT_LIT {
+        addConst(&g.code, R0, R11, at)
+        g.zero(R0, g.sizeOf(t))
+        storeVptr(g, t, R11, at)
+        for i in 0..e.fieldCount as usize {
+            local f: *XlcHirFieldInit = &g.m.fields[e.fieldFirst as usize + i]
+            if f.value >= 0 {
+                local v = node(g, f.value)
+                genExpr(g, v)
+                g.storeValue(ty(v), R11, at + g.lay.fieldOff(t, f.index) as i32)
+            }
+        }
+    } else if k == E_TUPLE_LIT {
+        for i in 0..e.argCount as usize {
+            local v = arg(g, e, i)
+            genExpr(g, v)
+            g.storeValue(ty(v), R11, at + g.lay.fieldOff(t, i as u32) as i32)
+        }
+    } else if k == E_ARRAY_LIST || k == E_ARRAY_REPEAT {
+        local elem: String = g.lay.elemOf(t)
+        local es: u64 = g.sizeOf(elem.asStr())
+        local n: usize = k == E_ARRAY_LIST ? e.argCount as usize : e.intValue as usize
+        if k == E_ARRAY_REPEAT && n > 16 {
+            // A long repeat: compute the element once into the first slot, then copy it forward.
+            genExpr(g, node(g, e.lhs))
+            g.storeValue(elem.asStr(), R11, at)
+            for i in 1..n {
+                addConst(&g.code, R0, R11, at)
+                addConst(&g.code, R1, R11, at + (es * i as u64) as i32)
+                g.copy(R1, R0, es)
+            }
+            return
+        }
+        for i in 0..n {
+            local v = k == E_ARRAY_LIST ? arg(g, e, i) : node(g, e.lhs)
+            genExpr(g, v)
+            g.storeValue(elem.asStr(), R11, at + (es * i as u64) as i32)
+        }
+    } else if k == E_TO_INTERFACE {
+        // `{ data, itable }`: the object pointer, then the table of the implementation.
+        genExpr(g, node(g, e.lhs))
+        store(&g.code, R0, R11, at, 4)
+        g.symAddr(R0, g.syms.id(format("itable.{}|{}", view(e.text), t).asStr()))
+        store(&g.code, R0, R11, at + 4, 4)
+    } else if k == E_SLICE {
+        genSlice(g, e, at)
+    }
+}
+
+/// Stores the vtable pointer of class `name` at [base + at] (`base` is not r0).
+export fn storeVptr(g: *Gen, name: str, base: u32, at: i32) {
+    local l = g.lay.of(name)
+    if l == nil || !l.hasVptr { return }
+    g.symAddr(R0, g.syms.id(format("vtable.{}", name).asStr()))
+    local a = g.lay.aggregate(name)
+    // An `@repr(c)` class has the Itanium two leading words (offset-to-top, typeinfo) before the
+    // functions; its vptr points past them.
+    if a != nil && a.reprC != 0 { addConst(&g.code, R0, R0, 8) }
+    store(&g.code, R0, base, at, 4)
+}
+
+/// `lhs[lo..hi]` into the slot at `at`: `{ data + lo * step, hi - lo }`, a bound clamped at 0;
+/// checked: panics when `lo > hi` or `hi > len`.
+fn genSlice(g: *Gen, e: *XlcHirExpr, at: i32) {
+    local lhs = node(g, e.lhs)
+    local lk: u32 = g.lay.kind(ty(lhs))
+    local step: u64 = lk == K_STR ? 1 : g.sizeOf(g.lay.elemOf(ty(lhs)).asStr())
+    // The data pointer and the length into the slot first.
+    genAddr(g, lhs)
+    if lk == K_STR || lk == K_SLICE {
+        load(&g.code, R1, R0, 4, 4, false)
+        load(&g.code, R0, R0, 0, 4, false)
+    } else {
+        loadConst(&g.code, R1, g.lay.arrayLen(ty(lhs)) as u32)
+    }
+    store(&g.code, R0, R11, at, 4)
+    store(&g.code, R1, R11, at + 4, 4)
+    // lo, clamped at 0, to the stack; hi, clamped to len.
+    if e.argCount == 0 {
+        movImm(g, AL, R0, 0)
+    } else {
+        genExpr(g, arg(g, e, 0))
+        dpImm(&g.code, AL, OP_CMP, true, 0, R0, 0)
+        movImm(g, LT, R0, 0)
+    }
+    save(g)
+    if e.rhs >= 0 {
+        genExpr(g, node(g, e.rhs))
+        dpImm(&g.code, AL, OP_CMP, true, 0, R0, 0)
+        load(&g.code, R3, R11, at + 4, 4, false)
+        dpReg(&g.code, LT, OP_MOV, false, R0, 0, R3)
+    } else {
+        load(&g.code, R0, R11, at + 4, 4, false)
+    }
+    movReg(&g.code, R3, R0)          // r3 = hi
+    pop(&g.code, 0x3)
+    movReg(&g.code, R2, R0)          // r2 = lo
+    if e.checked != 0 {
+        dpReg(&g.code, AL, OP_CMP, true, 0, R2, R3)
+        g.branch(HI, g.coldPanic("slice start past its end"))
+        load(&g.code, R0, R11, at + 4, 4, false)
+        dpReg(&g.code, AL, OP_CMP, true, 0, R3, R0)
+        g.branch(HI, g.coldPanic("slice end past the length"))
+    }
+    dpReg(&g.code, AL, OP_SUB, false, R3, R3, R2)
+    store(&g.code, R3, R11, at + 4, 4)
+    load(&g.code, R0, R11, at, 4, false)
+    scaleAdd(g, step)
+    store(&g.code, R0, R11, at, 4)
+}
+
+fn genUnary(g: *Gen, e: *XlcHirExpr) {
+    local s: Scalar = g.scalar(ty(e))
+    local c: u8 = view(e.unaryOp).ptr[0]
+    genExpr(g, node(g, e.lhs))
+    if c == b'-' {
+        if s.kind == KIND_FLOAT {
+            floatIn(g, s.bits == 64, 0, R0)
+            vneg(&g.code, s.bits == 64, 0, 0)
+            floatOut(g, s.bits == 64)
+        } else if s.bits == 64 {
+            dpImm(&g.code, AL, OP_RSB, true, R0, R0, 0)
+            dpImm(&g.code, AL, OP_RSC, false, R1, R1, 0)
+        } else {
+            dpImm(&g.code, AL, OP_RSB, false, R0, R0, 0)
+            norm(g, s)
+        }
+    } else {
+        // Bitwise NOT for `!` and `~`; on a bool the normalization keeps bit 0: the logical NOT.
+        dpReg(&g.code, AL, OP_MVN, false, R0, 0, R0)
+        if s.bits == 64 { dpReg(&g.code, AL, OP_MVN, false, R1, 0, R1) }
+        norm(g, s)
+    }
+}
+
+/// Moves the float bits in core registers (`lo` and `lo + 1`) into d`d` or s`2d`.
+fn floatIn(g: *Gen, dbl: bool, d: u32, lo: u32) {
+    if dbl { vmovToD(&g.code, d, lo, lo + 1) } else { vmovToS(&g.code, 2 * d, lo) }
+}
+
+/// The result in d0 (s0) back into r0[:r1].
+fn floatOut(g: *Gen, dbl: bool) {
+    if dbl { vmovFromD(&g.code, R0, R1, 0) } else { vmovFromS(&g.code, R0, 0) }
+}
+
+/// Evaluates both operands of `e`: the left into r0:r1, the right into r2:r3.
+fn operands(g: *Gen, e: *XlcHirExpr) {
+    genExpr(g, node(g, e.lhs))
+    save(g)
+    genExpr(g, node(g, e.rhs))
+    restorePair(g)
+}
+
+/// The condition code of the inverted test.
+fn invert(cond: u32) -> u32 {
+    return cond ^ 1
+}
+
+/// Compares r0[:r1] with r2[:r3] (operands of type `t`) and returns the condition code under
+/// which `op` holds. Floats: an unordered compare is false for every operator but `!=`.
+fn compare(g: *Gen, t: str, op: u32) -> u32 {
+    local s: Scalar = g.scalar(t)
+    if s.kind == KIND_FLOAT {
+        local dbl = s.bits == 64
+        floatIn(g, dbl, 0, R0)
+        floatIn(g, dbl, 1, R2)
+        vcmp(&g.code, dbl, 0, 1)
+        vmrs(&g.code)
+        return op == OP_EQ ? EQ : op == OP_NE ? NE : op == OP_LT ? MI : op == OP_LE ? LS : op == OP_GT ? GT : GE
+    }
+    local signed = s.kind == KIND_INT && s.signed
+    if s.bits == 64 {
+        if op == OP_EQ || op == OP_NE {
+            dpReg(&g.code, AL, OP_CMP, true, 0, R1, R3)
+            dpReg(&g.code, EQ, OP_CMP, true, 0, R0, R2)
+            return op == OP_EQ ? EQ : NE
+        }
+        // a - b through the borrow chain sets N, V (signed) and C (unsigned) of the 64-bit
+        // compare; `>` and `<=` swap the operands.
+        local swap = op == OP_GT || op == OP_LE
+        dpReg(&g.code, AL, OP_SUB, true, R12, swap ? R2 : R0, swap ? R0 : R2)
+        dpReg(&g.code, AL, OP_SBC, true, R12, swap ? R3 : R1, swap ? R1 : R3)
+        local less: bool = op == OP_LT || op == OP_GT
+        return signed ? (less ? LT : GE) : (less ? CC : CS)
+    }
+    dpReg(&g.code, AL, OP_CMP, true, 0, R0, R2)
+    if op == OP_EQ { return EQ }
+    if op == OP_NE { return NE }
+    if signed { return op == OP_LT ? LT : op == OP_LE ? LE : op == OP_GT ? GT : GE }
+    return op == OP_LT ? CC : op == OP_LE ? LS : op == OP_GT ? HI : CS
+}
+
+/// Branches to `label` when the truth of `e` equals `jumpIf`.
+export fn genCond(g: *Gen, e: *XlcHirExpr, label: u32, jumpIf: bool) {
+    if e.kind == E_UNARY && view(e.unaryOp).ptr[0] == b'!' {
+        genCond(g, node(g, e.lhs), label, !jumpIf)
+        return
+    }
+    if e.kind == E_BOOL_CONST {
+        if (e.boolValue != 0) == jumpIf { g.branch(AL, label) }
+        return
+    }
+    if e.kind == E_BINARY {
+        local op: u32 = opCode(view(e.binaryOp))
+        if op == OP_LAND || op == OP_LOR {
+            // `a && b` jumps on false as soon as a is false; `a || b` on true as soon as a is true.
+            local shortOn: bool = op == OP_LOR
+            if jumpIf == shortOn {
+                genCond(g, node(g, e.lhs), label, jumpIf)
+                genCond(g, node(g, e.rhs), label, jumpIf)
+            } else {
+                local skip: u32 = g.newLabel()
+                genCond(g, node(g, e.lhs), skip, shortOn)
+                genCond(g, node(g, e.rhs), label, jumpIf)
+                g.bind(skip)
+            }
+            return
+        }
+        local lt: str = ty(node(g, e.lhs))
+        if isCompare(op) && g.lay.kind(lt) != K_STR {
+            operands(g, e)
+            local cond: u32 = compare(g, lt, op)
+            g.branch(jumpIf ? cond : invert(cond), label)
+            return
+        }
+    }
+    genExpr(g, e)
+    dpImm(&g.code, AL, OP_CMP, true, 0, R0, 0)
+    g.branch(jumpIf ? NE : EQ, label)
+}
+
+/// r0 = 1 when `cond` holds, else 0.
+fn setBool(g: *Gen, cond: u32) {
+    movImm(g, AL, R0, 0)
+    movImm(g, cond, R0, 1)
+}
+
+fn genBinary(g: *Gen, e: *XlcHirExpr) {
+    local op: u32 = opCode(view(e.binaryOp))
+    local lhs = node(g, e.lhs)
+    local lt: str = ty(lhs)
+    if op == OP_LAND || op == OP_LOR {
+        local f: u32 = g.newLabel()
+        local end: u32 = g.newLabel()
+        genCond(g, e, f, false)
+        movImm(g, AL, R0, 1)
+        g.branch(AL, end)
+        g.bind(f)
+        movImm(g, AL, R0, 0)
+        g.bind(end)
+        return
+    }
+    if isCompare(op) && g.lay.kind(lt) == K_STR {
+        // `str == str`: the runtime compares the lengths, then the bytes.
+        genAddr(g, lhs)
+        save(g)
+        genAddr(g, node(g, e.rhs))
+        movReg(&g.code, R1, R0)
+        pop(&g.code, 0x5)   // r0 = the left address, r2 = the dropped r1
+        g.callRt(RT_STREQ)
+        if op == OP_NE { dpImm(&g.code, AL, OP_EOR, false, R0, R0, 1) }
+        return
+    }
+    operands(g, e)
+    if isCompare(op) {
+        setBool(g, compare(g, lt, op))
+        return
+    }
+    local s: Scalar = g.scalar(ty(e))
+    if s.kind == KIND_FLOAT {
+        local dbl = s.bits == 64
+        floatIn(g, dbl, 0, R0)
+        floatIn(g, dbl, 1, R2)
+        if op == OP_PLUS { vadd(&g.code, dbl, 0, 0, 1) }
+        else if op == OP_MINUS { vsub(&g.code, dbl, 0, 0, 1) }
+        else if op == OP_MUL { vmul(&g.code, dbl, 0, 0, 1) }
+        else if op == OP_DIV { vdiv(&g.code, dbl, 0, 0, 1) }
+        else { g.fail("this float operator") }
+        floatOut(g, dbl)
+        return
+    }
+    if s.bits == 64 {
+        wideOp(g, e, op, s)
+    } else {
+        narrowOp(g, e, op, s, g.scalar(ty(node(g, e.rhs))).bits == 64)
+    }
+}
+
+fn wideOp(g: *Gen, e: *XlcHirExpr, op: u32, s: Scalar) {
+    if op == OP_PLUS {
+        dpReg(&g.code, AL, OP_ADD, true, R0, R0, R2)
+        dpReg(&g.code, AL, OP_ADC, false, R1, R1, R3)
+    } else if op == OP_MINUS {
+        dpReg(&g.code, AL, OP_SUB, true, R0, R0, R2)
+        dpReg(&g.code, AL, OP_SBC, false, R1, R1, R3)
+    } else if op == OP_MUL {
+        // (h0:l0) * (h2:l2) mod 2^64 = l0*l2 + ((l0*h2 + h0*l2) << 32).
+        mul(&g.code, R3, R0, R3)
+        mla(&g.code, R3, R1, R2, R3)
+        umull(&g.code, R0, R1, R0, R2)
+        dpReg(&g.code, AL, OP_ADD, false, R1, R1, R3)
+    } else if op == OP_BAND || op == OP_BOR || op == OP_BXOR {
+        local o: u32 = op == OP_BAND ? OP_AND : op == OP_BOR ? OP_ORR : OP_EOR
+        dpReg(&g.code, AL, o, false, R0, R0, R2)
+        dpReg(&g.code, AL, o, false, R1, R1, R3)
+    } else if op == OP_SHL || op == OP_SHR {
+        // The count is the low word of the right operand; a high word that is not 0 means a
+        // count of at least 2^32: as large as any other count >= 64.
+        if g.scalar(ty(node(g, e.rhs))).bits == 64 {
+            dpImm(&g.code, AL, OP_CMP, true, 0, R3, 0)
+            movImm(g, NE, R2, 255)
+        }
+        g.callRt(op == OP_SHL ? RT_LSL64 : s.signed ? RT_ASR64 : RT_LSR64)
+    } else if op == OP_DIV || op == OP_MOD {
+        if e.checked != 0 {
+            dpReg(&g.code, AL, OP_ORR, true, R12, R2, R3)
+            g.branch(EQ, g.coldPanic("division by zero"))
+        }
+        if !s.signed {
+            g.callRt(RT_UDIV64)
+            if op == OP_MOD {
+                movReg(&g.code, R0, R2)
+                movReg(&g.code, R1, R3)
+            }
+            return
+        }
+        // Signed: divide the magnitudes; the quotient is negative when the signs differ, the
+        // remainder takes the dividend's sign (truncating division).
+        dpReg(&g.code, AL, OP_EOR, false, LR, R1, R3)
+        movReg(&g.code, R12, R1)
+        push(&g.code, (1 << 12) | (1 << 14))
+        negateIfNeg(g, R0, R1)
+        negateIfNeg(g, R2, R3)
+        g.callRt(RT_UDIV64)
+        pop(&g.code, (1 << 12) | (1 << 14))
+        if op == OP_MOD {
+            movReg(&g.code, R0, R2)
+            movReg(&g.code, R1, R3)
+            dpImm(&g.code, AL, OP_CMP, true, 0, R12, 0)
+        } else {
+            dpImm(&g.code, AL, OP_CMP, true, 0, LR, 0)
+        }
+        local skip: u32 = g.newLabel()
+        g.branch(GE, skip)
+        dpImm(&g.code, AL, OP_RSB, true, R0, R0, 0)
+        dpImm(&g.code, AL, OP_RSC, false, R1, R1, 0)
+        g.bind(skip)
+    } else {
+        g.fail("this 64-bit operator")
+    }
+}
+
+/// lo:hi = -(lo:hi) when hi is negative.
+fn negateIfNeg(g: *Gen, lo: u32, hi: u32) {
+    local skip: u32 = g.newLabel()
+    dpImm(&g.code, AL, OP_CMP, true, 0, hi, 0)
+    g.branch(GE, skip)
+    dpImm(&g.code, AL, OP_RSB, true, lo, lo, 0)
+    dpImm(&g.code, AL, OP_RSC, false, hi, hi, 0)
+    g.bind(skip)
+}
+
+fn narrowOp(g: *Gen, e: *XlcHirExpr, op: u32, s: Scalar, wideCount: bool) {
+    if op == OP_PLUS { dpReg(&g.code, AL, OP_ADD, false, R0, R0, R2) }
+    else if op == OP_MINUS { dpReg(&g.code, AL, OP_SUB, false, R0, R0, R2) }
+    else if op == OP_MUL { mul(&g.code, R0, R0, R2) }
+    else if op == OP_BAND { dpReg(&g.code, AL, OP_AND, false, R0, R0, R2) }
+    else if op == OP_BOR { dpReg(&g.code, AL, OP_ORR, false, R0, R0, R2) }
+    else if op == OP_BXOR { dpReg(&g.code, AL, OP_EOR, false, R0, R0, R2) }
+    else if op == OP_SHL || op == OP_SHR {
+        // A register shift uses only the count's low byte: clamp to 32 first (32 gives 0 for
+        // LSL/LSR and the sign fill for ASR, what the language defines for a count >= width).
+        if wideCount {
+            dpImm(&g.code, AL, OP_CMP, true, 0, R3, 0)
+            movImm(g, NE, R2, 32)
+        }
+        dpImm(&g.code, AL, OP_CMP, true, 0, R2, 32)
+        movImm(g, CS, R2, 32)
+        shiftReg(&g.code, false, R0, R0, op == OP_SHL ? LSL : s.signed ? ASR : LSR, R2)
+    } else if op == OP_DIV || op == OP_MOD {
+        if e.checked != 0 {
+            dpImm(&g.code, AL, OP_CMP, true, 0, R2, 0)
+            g.branch(EQ, g.coldPanic("division by zero"))
+        }
+        if s.signed {
+            dpReg(&g.code, AL, OP_EOR, false, LR, R0, R2)
+            movReg(&g.code, R12, R0)
+            push(&g.code, (1 << 12) | (1 << 14))
+            dpImm(&g.code, AL, OP_CMP, true, 0, R0, 0)
+            dpImm(&g.code, LT, OP_RSB, false, R0, R0, 0)
+            dpImm(&g.code, AL, OP_CMP, true, 0, R2, 0)
+            dpImm(&g.code, LT, OP_RSB, false, R2, R2, 0)
+        }
+        movReg(&g.code, R1, R2)
+        g.callRt(RT_UDIV32)
+        if op == OP_MOD { movReg(&g.code, R0, R1) }
+        if s.signed {
+            pop(&g.code, (1 << 12) | (1 << 14))
+            dpImm(&g.code, AL, OP_CMP, true, 0, op == OP_MOD ? R12 : LR, 0)
+            dpImm(&g.code, LT, OP_RSB, false, R0, R0, 0)
+        }
+    } else {
+        g.fail("this operator")
+    }
+    norm(g, s)
+}
+
+/// `lhs as T`.
+fn genCast(g: *Gen, e: *XlcHirExpr) {
+    local lhs = node(g, e.lhs)
+    local src: Scalar = g.scalar(ty(lhs))
+    local to: Scalar = g.scalar(ty(e))
+    genExpr(g, lhs)
+    if src.kind == KIND_OTHER || to.kind == KIND_OTHER {
+        return   // a memory value or an identity: the address passes through
+    }
+    if to.kind == KIND_BOOL {
+        if src.kind == KIND_FLOAT {
+            loadConst(&g.code, R2, 0)
+            loadConst(&g.code, R3, 0)
+            setBool(g, compare(g, ty(lhs), OP_NE))
+            return
+        }
+        if src.bits == 64 { dpReg(&g.code, AL, OP_ORR, false, R0, R0, R1) }
+        dpImm(&g.code, AL, OP_CMP, true, 0, R0, 0)
+        movImm(g, NE, R0, 1)
+        return
+    }
+    if src.kind == KIND_FLOAT && to.kind == KIND_FLOAT {
+        if src.bits == to.bits { return }
+        if src.bits == 32 {
+            vmovToS(&g.code, 0, R0)
+            vcvtF64F32(&g.code, 0, 0)
+        } else {
+            vmovToD(&g.code, 0, R0, R1)
+            vcvtF32F64(&g.code, 0, 0)
+        }
+        floatOut(g, to.bits == 64)
+        return
+    }
+    if src.kind == KIND_FLOAT {
+        if to.bits == 64 {
+            g.fail("a float to 64-bit integer conversion (not on arm32 yet)")
+            return
+        }
+        floatIn(g, src.bits == 64, 0, R0)
+        vcvtToInt(&g.code, src.bits == 64, to.signed, 2, 0)   // s2 = the integer
+        vmovFromS(&g.code, R0, 2)
+        norm(g, to)
+        return
+    }
+    local srcSigned = src.kind == KIND_INT && src.signed
+    if to.kind == KIND_FLOAT {
+        local dbl = to.bits == 64
+        if src.bits < 64 {
+            vmovToS(&g.code, 2, R0)
+            vcvtFromInt(&g.code, dbl, srcSigned, 0, 2)
+        } else {
+            // hi * 2^32 + lo, both exact in a double; one rounding for an f64 target.
+            vmovToS(&g.code, 2, R1)
+            vcvtFromInt(&g.code, true, srcSigned, 1, 2)
+            vmovToS(&g.code, 2, R0)
+            vcvtFromInt(&g.code, true, false, 2, 2)
+            loadConst(&g.code, R2, 0)
+            loadConst(&g.code, R3, 0x41f00000)       // 2^32 as an f64
+            vmovToD(&g.code, 3, R2, R3)
+            vmul(&g.code, true, 1, 1, 3)
+            vadd(&g.code, true, 0, 1, 2)
+            if !dbl { vcvtF32F64(&g.code, 0, 0) }
+        }
+        floatOut(g, dbl)
+        return
+    }
+    // Integer to integer (pointers and bools are unsigned integers here).
+    if to.bits == 64 {
+        if src.bits < 64 {
+            if srcSigned { dpShiftImm(&g.code, OP_MOV, false, R1, 0, R0, ASR, 31) } else { movImm(g, AL, R1, 0) }
+        }
+        return
+    }
+    local widens: bool = src.bits < to.bits && (!srcSigned || (to.kind == KIND_INT && to.signed))
+    if !widens { norm(g, to) }
+}

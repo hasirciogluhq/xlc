@@ -1,0 +1,34 @@
+// e2e: three lowering fixes around calls. (1) Overloads interleaved with another overloaded name
+// (`valid`, `skip`, `skip`, `valid`) keep their own candidates (the second `valid` once read
+// `skip`'s signature: E0404 on `jsonValid` in the stdlib). (2) `p[k]` of a `**u8` is a `*u8`.
+// (3) `c ? "a" : "b"` passes as a `*u8`. Lives here because only run.sh compiles with the xlc
+// under test.
+struct Text { n: i32 }
+
+fn valid(p: *u8, n: usize) -> bool { return n > 0 }
+fn skip(p: *u8) -> i32 { return 1 }
+fn skip(p: *u8, n: usize, at: *usize) -> i32 { return 2 }
+fn valid(t: *Text) -> bool { return t.n > 0 }
+
+fn first(p: *u8) -> u8 { return *p }
+
+struct Spec { programs: **u8 }
+
+global letters: [u8; 2] = [65, 0]
+global list: [*u8; 2]
+global spec: Spec
+global text: Text
+
+@entry fn main() -> i32 {
+    text.n = 3
+    if !valid(&text) { return 1 }
+    list[0] = &letters[0]
+    list[1] = nil
+    spec.programs = &list[0]
+    local seen = 0
+    for local k := 0; spec.programs[k] != nil; k++ { seen += first(spec.programs[k]) as i32 }
+    if seen != 65 { return 2 }
+    local yes = true
+    if first(yes ? "Ab" : "Bc") != 65 || first(!yes ? "Ab" : "Bc") != 66 { return 3 }
+    return 0
+}

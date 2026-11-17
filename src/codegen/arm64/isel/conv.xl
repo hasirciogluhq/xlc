@@ -16,9 +16,9 @@
 // the registers, and the Apple packing of stack arguments smaller than 8 bytes.
 // @spec https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms
 // @spec https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
-from "layout" import K_FLOAT, K_STRUCT
+from "../../common/layout" import K_FLOAT, K_STRUCT
 from "gen" import Gen
-from "types" import Scalar, KIND_INT, scalarOf
+from "../../common/types" import Scalar, KIND_INT, scalarOf
 
 /// Where an argument or parameter goes.
 export const AC_X: u32 = 0      // one x register (an integer-class value or the address of a copy)

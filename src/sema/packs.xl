@@ -1,0 +1,248 @@
+// Parameter packs: `fn f(a: T, ..args)` takes any number of trailing arguments of any types.
+//
+// A pack function has no code of its own. A call that picks it makes an instance for the types
+// of its trailing arguments: the declaration with the pack replaced by one ordinary parameter per
+// element, named `args#0`, `args#1`, ... (`#` cannot be written in source, so no user name
+// clashes) and typed with the argument types. The instance is named `f<..i32, str>` and lowered
+// like a generic instance; its body is the pack function's body, shared, never copied. The
+// lowering expands the three uses of the pack while it walks that body (lower/pack.xl):
+//
+//   - `args.len`          the element count, an untyped integer constant,
+//   - `..args`            in a call: the element parameters, in order,
+//   - `for a in args { }` unrolled, one block per element (`for a, i in args` binds the index).
+//
+// Any other use of the pack is reported here, once per declaration, whether or not a call ever
+// instantiates it: E0735 (used as a value, or a member other than `len`), E0737 (`..name` that is
+// not this function's pack, or not a call argument) and E0738 (indexed).
+//
+// Differences from the C++ variadic.cpp this replaces, on purpose:
+// - The C++ pass copied the whole AST body per element count and gave every element a type
+//   parameter (`pack#type#i`) that went through generic inference again. Here the element types
+//   are the argument types themselves and the body is shared, so an instance costs one
+//   declaration record.
+// - The C++ pass instantiated every pack overload of a name before choosing one; here only the
+//   chosen overload is instantiated (an unused instance was lowered and could report errors that
+//   belong to no call).
+// - The C++ pass checked `declare`/`export(c)` on the item but this port had lost the check; the
+//   item flags are checked again (E0736).
+// - The C++ use checker skipped the `init`/`step` of a C-style `for`, `defer` statements and the
+//   values of `switch` cases; this walker visits every statement and expression slot.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XStr, XSpan, XExpr, XStmt, XBlock, XFieldInit, XClosure,
+    XE_NAME, XE_FIELD, XE_INDEX, XE_SPREAD, XE_CALL, XS_FOR_EACH, XS_FOR_PACK, XD_FN
+from "./sema" import Sema, EntityRef
+from "./item" import SDecl, SParam
+from "./instances" import internInstance, spelledForName
+
+/// The param-arena index of the pack parameter of declaration `declIdx`, or -1 without one.
+export fn packParamOf(s: *Sema, declIdx: i32) -> i32 {
+    local d = s.declAt(declIdx as usize)
+    if (*d).kind != XD_FN { return -1 }
+    for i in 0..(*d).paramsCount as usize {
+        local at = (*d).paramsFirst as usize + i
+        if (*s.paramAt(at)).isPack != 0 { return at as i32 }
+    }
+    return -1
+}
+
+/// True when declaration `declIdx` is a pack function (a template, never lowered itself).
+export fn isPackDecl(s: *Sema, declIdx: i32) -> bool {
+    return packParamOf(s, declIdx) >= 0
+}
+
+/// The number of parameters of a pack function before its pack (`self` excluded).
+export fn fixedParamCount(s: *Sema, declIdx: i32) -> usize {
+    local d = s.declAt(declIdx as usize)
+    local n = 0 as usize
+    for i in 0..(*d).paramsCount as usize {
+        local p = s.paramAt((*d).paramsFirst as usize + i)
+        if (*p).isPack != 0 { break }
+        if (*p).isSelf == 0 { n++ }
+    }
+    return n
+}
+
+/// The parameter name of element `i` of pack `pack` in an instance: `args#0`.
+export fn elementName(pack: str, i: usize) -> String {
+    return format("{}#{}", pack, i)
+}
+
+/// The pack an instance declaration expands, as its index in `packInstDecls`; -1 when `d` is no
+/// pack instance.
+export fn packInstanceOf(s: *Sema, d: *SDecl) -> i32 {
+    for i in 0..s.packInstDecls.length() {
+        if s.declAt(*s.packInstDecls.get(i) as usize) == d { return i as i32 }
+    }
+    return -1
+}
+
+/// The instance of pack function `declIdx` (of `s`) for trailing arguments of types `elems`
+/// (types of `s`'s arena). Made once per element type list and queued for the lowering like a
+/// generic instance.
+export fn instantiatePack(s: *Sema, declIdx: i32, elems: *Vec<i32>, at: XSpan) -> EntityRef {
+    local held: SDecl = *s.declAt(declIdx as usize)
+    local base = s.text(held.name)
+    local shown = String("")
+    for i in 0..(*elems).length() {
+        if i != 0 { shown.append(", ") }
+        shown.append(spelledForName(s, *(*elems).get(i)).asStr())
+    }
+    local name = format("{}<..{}>", base, shown.asStr())
+    // Two pack overloads of one name may meet the same element types: the second one carries the
+    // index of its declaration, so neither instance hides the other.
+    local taken = s.find(name.asStr())
+    if taken >= 0 {
+        local found = -1
+        for i in 0..s.packInstDecls.length() {
+            if *s.packInstOrigins.get(i) == declIdx &&
+               s.text((*s.declAt(*s.packInstDecls.get(i) as usize)).name) == name.asStr() {
+                found = i as i32
+            }
+        }
+        if found >= 0 { return refOf(s, taken) }
+        name = format("{}#{}", name.asStr(), declIdx)
+        local again = s.find(name.asStr())
+        if again >= 0 { return refOf(s, again) }
+    }
+    local pack = s.paramAt(packParamOf(s, declIdx) as usize)
+    local packName = String(s.text((*pack).name))
+    local packSpan = (*pack).span
+    // The parameters: the fixed ones as declared, then one per element.
+    local pFirst = s.params.length() as u32
+    for i in 0..held.paramsCount as usize {
+        local p: SParam = *s.paramAt(held.paramsFirst as usize + i)
+        if p.isPack != 0 { break }
+        s.params.push(p)
+    }
+    for i in 0..(*elems).length() {
+        local p: SParam
+        p.name = s.str(elementName(packName.asStr(), i).asStr())
+        p.ty = *(*elems).get(i)
+        p.isSelf = 0
+        p.isPack = 0
+        p.typedSelf = 0
+        p.hasType = 1
+        p.span = packSpan
+        s.params.push(p)
+    }
+    local d: SDecl = held
+    d.name = s.str(name.asStr())
+    d.paramsFirst = pFirst
+    d.paramsCount = s.params.length() as u32 - pFirst
+    d.methodsFirst = 0
+    d.methodsCount = 0
+    s.decls.push(d)
+    local instDecl = (s.decls.length() - 1) as i32
+    s.packInstDecls.push(instDecl)
+    s.packInstOrigins.push(declIdx)
+    s.packInstPacks.push(s.str(packName.asStr()))
+    local item = s.internItemOf(instDecl)
+    local origin = s.qualify(base)
+    local sym = internInstance(s, item, name.asStr(), origin.asStr(), (*elems).clone(), at)
+    return refOf(s, sym)
+}
+
+fn refOf(s: *Sema, sym: i32) -> EntityRef {
+    local r: EntityRef
+    r.owner = s
+    r.sym = sym
+    r.name = *s.symNames.get(sym as usize)
+    r.foundAs = r.name
+    return r
+}
+
+// ----------------------------------------------------------------------- use checks
+
+/// E0735 for the pack used as a value. Shared with the lowering, so the two reports of one
+/// site are one diagnostic (Sema.error deduplicates on code, site and text).
+export fn reportPackValue(s: *Sema, at: XSpan, pack: str) {
+    s.error("E0735", at, format("parameter pack `{}` used as a value", pack).asStr(),
+        format("read `{}.len`, iterate it with `for x in {}`, or spread it as `..{}` in a call", pack, pack, pack).asStr())
+}
+
+/// Checks every use of the pack of declaration `declIdx` in its body.
+export fn checkPackUses(s: *Sema, declIdx: i32) {
+    local p = packParamOf(s, declIdx)
+    if p < 0 { return }
+    local pack = String(s.text((*s.paramAt(p as usize)).name))
+    local d = s.declAt(declIdx as usize)
+    if (*d).hasBody != 0 { usesInBlock(s, pack.asStr(), (*d).body) }
+}
+
+fn isPackName(s: *Sema, idx: i32, pack: str) -> bool {
+    return idx >= 0 && (*s.exprAt(idx)).kind == XE_NAME && s.exprTextAt(idx) == pack
+}
+
+fn usesInBlock(s: *Sema, pack: str, blockIdx: i32) {
+    if blockIdx < 0 { return }
+    local b = s.blockAt(blockIdx)
+    for i in 0..(*b).stmtsCount as usize {
+        usesInStmt(s, pack, s.refAt("stmt", ((*b).stmtsFirst + i as u32) as i32))
+    }
+}
+
+fn usesInStmt(s: *Sema, pack: str, idx: i32) {
+    if idx < 0 { return }
+    local st: XStmt = *s.stmtAt(idx)
+    // `for a in args` / `for a, i in args`: the iterable is the pack itself, which is allowed.
+    local packLoop = (st.kind == XS_FOR_EACH || st.kind == XS_FOR_PACK) && isPackName(s, st.expr, pack)
+    if !packLoop { usesInExpr(s, pack, st.expr, false) }
+    usesInExpr(s, pack, st.target, false)
+    usesInExpr(s, pack, st.expr2, false)
+    usesInStmt(s, pack, st.init)
+    usesInStmt(s, pack, st.step)
+    usesInBlock(s, pack, st.body)
+    usesInBlock(s, pack, st.elseBody)
+    for i in 0..st.casesCount as usize {
+        local c = s.flat.caseAt((st.casesFirst + i as u32) as i32)
+        for v in 0..(*c).valuesCount as usize {
+            usesInExpr(s, pack, s.refAt("expr", ((*c).valuesFirst + v as u32) as i32), false)
+        }
+        usesInBlock(s, pack, (*c).body)
+    }
+}
+
+fn usesInExpr(s: *Sema, pack: str, idx: i32, callArg: bool) {
+    if idx < 0 { return }
+    local e: XExpr = *s.exprAt(idx)
+    if e.kind == XE_NAME {
+        if s.exprTextAt(idx) == pack { reportPackValue(s, e.span, pack) }
+        return
+    }
+    if e.kind == XE_SPREAD {
+        if !callArg || s.exprTextAt(idx) != pack {
+            s.error("E0737", e.span,
+                format("`..{}` is not a spread of this function's parameter pack", s.exprTextAt(idx)).asStr(),
+                "`..name` is valid only as a call argument, where `name` is the pack")
+        }
+        return
+    }
+    if e.kind == XE_FIELD && isPackName(s, e.lhs, pack) {
+        if s.exprTextAt(idx) != "len" {
+            s.error("E0735", e.span,
+                format("parameter pack `{}` has no member `{}`", pack, s.exprTextAt(idx)).asStr(),
+                "the only member of a pack is `len`")
+        }
+        return
+    }
+    if e.kind == XE_INDEX && isPackName(s, e.lhs, pack) {
+        s.error("E0738", e.span, format("parameter pack `{}` cannot be indexed", pack).asStr(),
+            format("iterate it with `for x in {}` instead", pack).asStr())
+        usesInExpr(s, pack, e.rhs, false)
+        return
+    }
+    usesInExpr(s, pack, e.lhs, false)
+    usesInExpr(s, pack, e.rhs, false)
+    for i in 0..e.argsCount as usize {
+        usesInExpr(s, pack, s.refAt("expr", (e.argsFirst + i as u32) as i32), e.kind == XE_CALL)
+    }
+    for i in 0..e.fieldsCount as usize {
+        local f = (s.flat.r.fieldInits as usize + (e.fieldsFirst + i as u32) as usize *
+            sizeOf(XFieldInit)) as *XFieldInit
+        usesInExpr(s, pack, (*f).value, false)
+    }
+    if e.closure >= 0 {
+        local c = (s.flat.r.closures as usize + e.closure as usize * sizeOf(XClosure)) as *XClosure
+        usesInBlock(s, pack, (*c).body)
+    }
+}

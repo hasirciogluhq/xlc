@@ -1,23 +1,39 @@
-// The native backend: the arm64 encoder (arm64), the Mach-O object writer (macho) and the
-// instruction selector from the flat HIR (isel). It is the only code generator of xlc: macOS on
-// arm64 (Apple silicon) is the one supported target.
-from "std" import String
+// The native backend driver: picks the instruction selector of the target's architecture and the
+// writer of its object format, then writes the object file. Layout of src/codegen: codegen.md.
+//
+//   arch     aarch64 -> arm64/isel; arm (32-bit, Linux only) -> arm32/isel; x86_64 none yet (E0714)
+//   format   Mach-O (macos) -> macho/; ELF (linux, the generic OS) -> elf/ (ELF32 for arm);
+//            COFF (windows, aarch64) -> coff/
+from "std" import String, format
 from "std/io" import fprint
 from "std/io/fs" import fsWrite
 from "../../hir/abi" import XlcHirModule
-from "../isel" import select
-from "../macho" import MachoObject, writeObject
+from "../arm64/isel" import select
+from "../arm32/isel" import select as select32
+from "../obj" import ObjectFile
+from "../target" import Target, FMT_MACHO, FMT_ELF, FMT_COFF
+from "../macho" import writeMacho
+from "../coff" import writeCoff
+from "../elf" import writeElf, EM_AARCH64, EM_ARM
 
-/// Writes the Mach-O object of `m` to `output`. With `only` set, only the functions and globals of
-/// the module keyed `only` are defined and every other symbol stays external (the incremental
-/// build); `hasOnly` false defines the whole program and its boot code. False (reported) when the
-/// module uses something the selector does not lower.
-export fn emitNativeObj(m: *XlcHirModule, hasOnly: bool, only: str, output: *String) -> bool {
-    local o = MachoObject()
-    if !select(m, &o, hasOnly, only) {
+/// Writes the object of `m` for `target` to `output`. With `hasOnly` set, only the functions and
+/// globals of the module keyed `only` are defined and every other symbol stays external (the
+/// incremental build); otherwise the whole program and its boot code. False (reported) when the
+/// target has no backend or the module uses something the selector does not lower.
+export fn emitNativeObj(m: *XlcHirModule, target: *Target, hasOnly: bool, only: str, output: *String) -> bool {
+    local arm = target.arch.asStr() == "arm" && target.format == FMT_ELF
+    local a64 = target.arch.asStr() == "aarch64"
+    if !arm && !a64 {
+        fprint(2, format("error[E0714]: native code generation: no backend for the target `{}` yet (aarch64 on macos, linux, windows and the generic OS; arm on linux)\n",
+            target.triple.asStr()).asStr())
         return false
     }
-    local bytes = writeObject(&o)
+    local o = ObjectFile()
+    if !(arm ? select32(m, &o, target, hasOnly, only) : select(m, &o, target, hasOnly, only)) {
+        return false
+    }
+    local bytes = target.format == FMT_MACHO ? writeMacho(&o) : target.format == FMT_COFF ? writeCoff(&o)
+                : writeElf(&o, arm ? EM_ARM : EM_AARCH64)
     if output.asStr() == "-" {
         // `-o -` streams the object to stdout.
         fprint(1, bytes.asStr())

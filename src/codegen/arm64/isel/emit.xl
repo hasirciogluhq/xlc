@@ -9,11 +9,11 @@
 // the loaded register is canonical with no further instruction; a store writes only the width.
 // @spec https://developer.arm.com/documentation/ddi0487/latest (C6.2 LDR/STR immediate, unsigned offset)
 from "std" import Vec
-from "../arm64" import X16, X17, SP, XZR, movReg64, loadConst64, movz64, add64Imm, sub64Imm,
+from "../encode" import X16, X17, SP, XZR, movReg64, loadConst64, movz64, add64Imm, sub64Imm,
     add64Reg, sbfm64, ubfm64, ldr64Imm, str64Imm, ldr32Imm, str32Imm, ldrbImm, strbImm,
     ldrswImm, ldrhImm, strhImm, ldrsbImm, ldrshImm, logicalImm64, orr64Imm
-from "../arm64/float" import ldrFloat, strFloat
-from "types" import Scalar, KIND_INT, KIND_BOOL, KIND_PTR
+from "../encode/float" import ldrFloat, strFloat
+from "../../common/types" import Scalar, KIND_INT, KIND_BOOL, KIND_PTR
 
 /// `rd = rn` re-established as a canonical value of scalar `s`: the sign- or zero-extension of its
 /// low `bits` bits, or bit 0 for a bool. A 64-bit integer and a pointer are already whole.
@@ -80,7 +80,8 @@ export fn addOff(out: *Vec<u32>, rd: u32, rn: u32, off: i64) {
 /// the pair directly when the unsigned scaled 12-bit field reaches, else the address is built in
 /// x17 first. Returns the base register; the immediate is written through `imm`.
 fn legalize(out: *Vec<u32>, base: u32, off: i64, size: u32, imm: *u32) -> u32 {
-    if off >= 0 && off % (size as i64) == 0 && off / (size as i64) < 4096 {
+    // size 0 is a type the selector does not know (an untyped HIR node): never divide by it.
+    if size > 0 && off >= 0 && off % (size as i64) == 0 && off / (size as i64) < 4096 {
         *imm = off as u32
         return base
     }

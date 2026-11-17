@@ -1,0 +1,65 @@
+name: Compiler bug
+description: xlc crashes, builds a wrong program, gives a wrong diagnostic or a wrong output file.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For the `xl` tool, packages or language questions use the xlang repository; for stdlib
+        bugs use xl-std. See SUPPORT.md if unsure.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - Crash, panic or hang of xlc
+        - Wrong program (miscompile)
+        - Wrong or missing diagnostic
+        - Wrong object file, executable or link
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: xlc version
+      description: Output of `xlc --version`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Host and target
+      description: Host OS and CPU, and the `--target` triple if one was given.
+      placeholder: macOS 15 arm64, --target aarch64-unknown-linux-gnu
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Smallest source that shows it
+      description: Without the stdlib when possible.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: Command
+      placeholder: xlc main.xl -o main
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened
+      description: The full output and the exit code.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true

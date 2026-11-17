@@ -1,0 +1,36 @@
+name: Compiler feature
+description: A new target, diagnostic, optimization, output kind or xlc flag.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A new language feature or a change to the language goes to the xlang repository, not
+        here. This form is for the compiler itself.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Target (CPU, OS, object format)
+        - Diagnostic
+        - Code generation or optimization
+        - Command line
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you need and why
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: How it could work. Examples welcome (a flag, an error message, a triple).
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: How you work around it today

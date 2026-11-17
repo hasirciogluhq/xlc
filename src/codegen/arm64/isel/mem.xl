@@ -1,10 +1,10 @@
 // Aggregate memory operations: zeroing and copying a run of bytes between places. Both use 16-byte
 // `stp`/`ldp` pairs for the body and 8/4/2/1-byte accesses for the tail; a run over 128 bytes loops.
 // `x16` and `x17` carry the data of a copy, so a place never names them as its base.
-from "../arm64" import XZR, SP, add64Imm, sub64Imm, cbnz64, stpOff64, ldpOff64, movz64
+from "../encode" import XZR, SP, add64Imm, sub64Imm, cbnz64, stpOff64, ldpOff64, movz64
 from "emit" import addOff, movConst, loadTyped, storeTyped
 from "gen" import Gen, Place
-from "types" import Scalar, KIND_INT
+from "../../common/types" import Scalar, KIND_INT
 
 fn unsigned(bits: u32) -> Scalar {
     return Scalar { kind: KIND_INT, bits: bits, signed: false }

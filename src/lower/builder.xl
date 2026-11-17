@@ -2,7 +2,7 @@
 // flat arenas of hir/abi.xl and materializes the whole `XlcHirModule` at the end. The C++
 // `Lowerer` built shared_ptr trees; the flat form is strictly post-order (children before the
 // parent that indexes them), which the builders here keep.
-from "std" import String, Vec, format
+from "std" import String, Vec, HashSet, format
 from "../util/source" import Span
 from "../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirEnum, XlcHirEnumMember,
     XlcHirAggregate, XlcHirField, XlcHirVtableSlot, XlcHirInterface, XlcHirIfaceMethod,
@@ -35,8 +35,12 @@ export class FnBuild {
     isEntry: bool
     isInit: bool
     isFini: bool
+    declared: bool          ///< a `declare fn`: no body, defined elsewhere
+    importLibrary: String   ///< its `@library("name")`, empty without one
 
     fn init(self, name: str) {
+        self.declared = false
+        self.importLibrary = String("")
         self.name = String(name)
         self.symbol = String("")
         self.ret = String("void")
@@ -80,6 +84,7 @@ export class HirBuilder {
     initFns: Vec<String>
     finiFns: Vec<String>
     glues: Vec<String>   ///< the drop glue functions made so far (own.xl), once per program
+    called: HashSet<String> ///< every function a call or a function value names (lazy methods)
 
     fn init(self) {
         self.fns = Vec<*FnBuild>()
@@ -104,6 +109,7 @@ export class HirBuilder {
         self.initFns = Vec<String>()
         self.finiFns = Vec<String>()
         self.glues = Vec<String>()
+        self.called = HashSet<String>()
     }
 
     /// Interns `text` and returns its view. Each string is its own heap block, kept alive by the
@@ -205,6 +211,7 @@ export class HirBuilder {
     fn funcRef(self, name: str, typeName: str) -> i32 {
         local idx = self.expr(E_FUNC_REF, typeName)
         (*self.exprAt(idx)).text = self.str(name)
+        self.called.add(String(name))
         return idx
     }
 
@@ -249,6 +256,7 @@ export class HirBuilder {
         local idx = self.expr(E_CALL, typeName)
         local e = self.exprAt(idx)
         (*e).text = self.str(name)
+        self.called.add(String(name))
         (*e).argFirst = argFirst
         (*e).argCount = argCount
         return idx
@@ -580,6 +588,8 @@ export class HirBuilder {
             rec.isEntry = (*f).isEntry ? 1 : 0
             rec.isInit = (*f).isInit ? 1 : 0
             rec.isFini = (*f).isFini ? 1 : 0
+            rec.declared = (*f).declared ? 1 : 0
+            rec.importLibrary = self.str((*f).importLibrary.asStr())
             fns.push(rec)
         }
         for i in 0..fns.length() {

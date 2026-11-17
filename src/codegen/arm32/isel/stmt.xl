@@ -1,0 +1,121 @@
+// Statements of the arm32 selector. Loops follow the arm64 layout (`top: cond -> end; body; cont:
+// step; b top; end`; a post-test loop tests after the step); `continue` goes to `cont`, `break` to
+// `end`, `depth` counts the enclosing loops outwards. The temporaries of a statement are released
+// after it. `try` is E0714 on arm32: the unwinder's snapshot layout is arm64-specific (a later step,
+// codegen.md).
+from "../../../hir/abi" import XlcHirExpr, XlcHirStmt, view, S_LOCAL, S_ASSIGN, S_RETURN, S_EXPR, S_IF, S_WHILE,
+    S_CONTINUE, S_BREAK, S_BLOCK, S_TRY, E_LOCAL_REF
+from "../encode" import R0, R1, R3, R11, AL, movReg, addConst, load, push, pop
+from "../encode/vfp" import vmovToD, vmovToS
+from "../../common/types" import Scalar, KIND_FLOAT
+from "expr" import node, genExpr, genAddr, genCond, storeVptr, save
+from "gen" import Gen, LoopRec
+
+export fn genStmts(g: *Gen, first: u32, count: u32) {
+    for i in 0..count as usize { genStmt(g, &g.m.stmts[first as usize + i]) }
+}
+
+fn genLocal(g: *Gen, s: *XlcHirStmt) {
+    local i: u32 = s.localId
+    local ty: str = view(g.f.locals[i as usize].typeName)
+    local off: i32 = *g.slot.get(i as usize)
+    if s.value >= 0 {
+        genExpr(g, node(g, s.value))
+        g.storeValue(ty, R11, off)
+    } else {
+        addConst(&g.code, R1, R11, off)
+        g.zero(R1, g.isMem(ty) ? g.sizeOf(ty) : 8)
+        storeVptr(g, ty, R11, off)
+    }
+}
+
+fn genAssign(g: *Gen, s: *XlcHirStmt) {
+    local target: *XlcHirExpr = node(g, s.target)
+    local ty: str = view(target.typeName)
+    genExpr(g, node(g, s.value))
+    if target.kind == E_LOCAL_REF && !*g.byRef.get(target.localId as usize) {
+        g.storeValue(ty, R11, *g.slot.get(target.localId as usize))
+        return
+    }
+    save(g)
+    genAddr(g, target)
+    movReg(&g.code, R3, R0)
+    pop(&g.code, 0x3)
+    g.storeValue(ty, R3, 0)
+}
+
+fn genReturn(g: *Gen, s: *XlcHirStmt) {
+    if s.value >= 0 {
+        local ty: str = view(g.f.ret)
+        genExpr(g, node(g, s.value))
+        if g.isMem(ty) {
+            load(&g.code, R3, R11, g.sretSlot, 4, false)
+            g.storeValue(ty, R3, 0)
+        } else {
+            local sc: Scalar = g.scalar(ty)
+            if sc.kind == KIND_FLOAT {
+                if sc.bits == 64 { vmovToD(&g.code, 0, R0, R1) } else { vmovToS(&g.code, 0, R0) }
+            }
+        }
+    }
+    g.branch(AL, g.epilog)
+}
+
+fn genWhile(g: *Gen, s: *XlcHirStmt) {
+    local top: u32 = g.newLabel()
+    local cont: u32 = g.newLabel()
+    local end: u32 = g.newLabel()
+    g.bind(top)
+    if s.postTest == 0 { genCond(g, node(g, s.value), end, false) }
+    g.loops.push(LoopRec { cont: cont, brk: end })
+    genStmts(g, s.bodyFirst, s.bodyCount)
+    g.loops.pop()
+    g.bind(cont)
+    // A `break` or `continue` in the step leaves or restarts this loop.
+    g.loops.push(LoopRec { cont: top, brk: end })
+    genStmts(g, s.stepFirst, s.stepCount)
+    g.loops.pop()
+    if s.postTest != 0 {
+        genCond(g, node(g, s.value), top, true)
+    } else {
+        g.branch(AL, top)
+    }
+    g.bind(end)
+}
+
+export fn genStmt(g: *Gen, s: *XlcHirStmt) {
+    local top: u32 = g.tempTop
+    local k: i32 = s.kind
+    if k == S_LOCAL {
+        genLocal(g, s)
+    } else if k == S_ASSIGN {
+        genAssign(g, s)
+    } else if k == S_RETURN {
+        genReturn(g, s)
+    } else if k == S_EXPR {
+        genExpr(g, node(g, s.value))
+    } else if k == S_IF {
+        local elseL: u32 = g.newLabel()
+        genCond(g, node(g, s.value), elseL, false)
+        genStmts(g, s.bodyFirst, s.bodyCount)
+        if s.elseCount > 0 {
+            local endL: u32 = g.newLabel()
+            g.branch(AL, endL)
+            g.bind(elseL)
+            genStmts(g, s.elseFirst, s.elseCount)
+            g.bind(endL)
+        } else {
+            g.bind(elseL)
+        }
+    } else if k == S_WHILE {
+        genWhile(g, s)
+    } else if k == S_CONTINUE || k == S_BREAK {
+        local l: *LoopRec = g.loops.get(g.loops.length() - 1 - s.depth as usize)
+        g.branch(AL, k == S_BREAK ? l.brk : l.cont)
+    } else if k == S_BLOCK {
+        genStmts(g, s.bodyFirst, s.bodyCount)
+    } else if k == S_TRY {
+        g.fail("`try` (not on arm32 yet)")
+    }
+    g.tempTop = top
+}

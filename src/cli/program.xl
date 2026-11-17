@@ -36,7 +36,8 @@ export fn addLinkImports(m: *XlcHirModule, r: *LinkRequest) {
     for i in 0..m.functionCount as usize {
         local f = &m.functions[i]
         if f.declared != 0 && f.importLibrary.len > 0 {
-            r.imports.push(Import(owned(f.importLibrary), owned(f.symbol)))
+            // The link name: the explicit symbol, else the function's own name (as the selector does).
+            r.imports.push(Import(owned(f.importLibrary), owned(f.symbol.len > 0 ? f.symbol : f.name)))
         }
     }
 }

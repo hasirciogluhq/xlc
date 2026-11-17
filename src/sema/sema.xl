@@ -167,6 +167,7 @@ export class Sema {
     methodInstCls: Vec<XStr>
     methodInstClsQ: Vec<XStr>
     pendingMethods: Vec<i32>  ///< indices into `methodInstDecls` not lowered yet
+    methodInstEnvs: Vec<*void> ///< `*TypeEnv` binding each method instance's own type parameters
 
     // Derived entity aliases: `Result<i32, E>$Ok` and the `Tag`/`Data` parts name no symbol of
     // their own; the lookup derives them from the payload enum's instance. Keys are the full
@@ -201,6 +202,12 @@ export class Sema {
     xblocks: Vec<XBlock>
     xexprRefs: Vec<i32>
     xstmtRefs: Vec<i32>
+
+    // Parameter-pack instances (packs.xl), parallel: the SDecl of the instance, the SDecl of the
+    // pack function it was made from, and the name of the pack it expands.
+    packInstDecls: Vec<i32>
+    packInstOrigins: Vec<i32>
+    packInstPacks: Vec<XStr>
 
     fn init(self, flat: *Flat, types: *Types, diag: *DiagnosticEngine) {
         self.flat = flat
@@ -254,6 +261,7 @@ export class Sema {
         self.methodInstCls = Vec<XStr>()
         self.methodInstClsQ = Vec<XStr>()
         self.pendingMethods = Vec<i32>()
+        self.methodInstEnvs = Vec<*void>()
         self.currentInstance = String("")
         self.instanceAliasNames = Vec<XStr>()
         self.instanceAliasRefs = Vec<EntityRef>()
@@ -262,8 +270,27 @@ export class Sema {
         self.xblocks = Vec<XBlock>()
         self.xexprRefs = Vec<i32>()
         self.xstmtRefs = Vec<i32>()
+        self.packInstDecls = Vec<i32>()
+        self.packInstOrigins = Vec<i32>()
+        self.packInstPacks = Vec<XStr>()
         self.moduleKey = String()
         self.rootMangle = String()
+    }
+
+    /// Appends a synthesized expression record and returns its index (above the flat AST's
+    /// count). The arena may move: a `*XExpr` of a synthesized record taken before the push is
+    /// stale after it, so callers copy such a record by value.
+    fn synthExpr(self, e: XExpr) -> i32 {
+        self.xexprs.push(e)
+        return (self.flat.r.exprCount as usize + self.xexprs.length() - 1) as i32
+    }
+
+    /// Appends a run of expression references and returns the index of its first one, in the
+    /// numbering `refAt("expr", ...)` reads.
+    fn synthExprRefs(self, refs: *Vec<i32>) -> u32 {
+        local first = self.flat.r.exprRefCount as usize + self.xexprRefs.length()
+        for i in 0..(*refs).length() { self.xexprRefs.push(*(*refs).get(i)) }
+        return first as u32
     }
 
     // --------------------------------------------------- synthesized-tree accessors
@@ -828,11 +855,21 @@ export class Sema {
         self.overloadRefs.push(item)
     }
 
-    /// adds one overload to symbol `sym`.
+    /// adds one overload to symbol `sym`. A symbol's overloads are one contiguous range of
+    /// `overloadRefs`; when another symbol's list grew since (`f`, `g`, `g`, `f`), the range is
+    /// copied to the end first. Appending in place read the other symbol's items as overloads
+    /// (`jsonValid(*String)` became `jsonSkipRaw`'s signature, E0404).
     fn pushOverload(self, sym: i32, item: i32) {
         local s = self.symbols.get(sym as usize)
+        local first = (*s).overloadsFirst as usize
+        local count = (*s).overloadsCount as usize
+        if first + count != self.overloadRefs.length() {
+            local moved = self.overloadRefs.length() as i32
+            for i in 0..count { self.overloadRefs.push(*self.overloadRefs.get(first + i)) }
+            (*self.symbols.get(sym as usize)).overloadsFirst = moved
+        }
         self.overloadRefs.push(item)
-        (*s).overloadsCount++
+        (*self.symbols.get(sym as usize)).overloadsCount++
     }
 
     /// E0401 with both definition sites.

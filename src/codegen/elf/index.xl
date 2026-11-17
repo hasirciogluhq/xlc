@@ -1,0 +1,366 @@
+// The ELF object writer: serializes an ObjectFile (src/codegen/obj) into a little-endian
+// relocatable object (`ET_REL`) for Linux and the generic OS, in both classes:
+//   ELFCLASS64  aarch64: EM_AARCH64 183, RELA relocations
+//   ELFCLASS32  arm:     EM_ARM 40, REL relocations, e_flags EABI5 | hard float
+// References:
+// - the generic ABI, https://refspecs.linuxfoundation.org/elf/gabi4+/contents.html (header,
+//   section header, symbol, REL and RELA layouts per class, local symbols first);
+// - ELF for the Arm 64-bit Architecture, https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst;
+// - ELF for the Arm Architecture, https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst
+//   (R_ARM_* numbers, mapping symbols `$a`/`$d`, the e_flags ABI version field).
+//
+// File layout: the header (64 or 52 bytes), the section contents (each at its alignment), the
+// relocation tables, the symbol table, the string tables, then the section header table. Section
+// order: 0 null, 1..n the content sections, one `.rela<name>` (64) or `.rel<name>` (32) per section
+// with relocations, `.symtab`, `.strtab`, `.shstrtab`.
+//
+// What the selector never sees:
+// - names are written as in the source (no `_` prefix);
+// - ELF64 RELA carries the addend in the entry: the 8 bytes of a data pointer are read as its
+//   addend and zeroed; ELF32 REL keeps the addend in the patched bytes, as written;
+// - aarch64: the low-12 offset needs one relocation number per access size (ADD, LDST8..LDST128),
+//   read from the patched instruction; a branch is CALL26 for `bl` and JUMP26 for `b`;
+// - arm: a `$a` mapping symbol marks `.text` as A32 code (aaelf32 "Mapping symbols"), and every
+//   data section starts with `$d`, so disassemblers and the linker's veneer logic read it right.
+from "std" import String, Vec
+from "../obj" import ObjectFile, Section, Sym, Reloc, readQuad, readWord, SEC_TEXT, SEC_CSTRING, SEC_CONST,
+    SEC_DATA, R_ABS64, R_BRANCH26, R_PAGE21, R_PAGEOFF12, R_GOT_PAGE21, R_GOT_PAGEOFF12, R_ABS32, R_ARM_CALL,
+    R_ARM_JUMP24, R_MOVW, R_MOVT, BIND_LOCAL, BIND_WEAK
+
+export const EM_ARM: u32 = 40
+export const EM_AARCH64: u32 = 183
+
+// e_flags of an arm object: EF_ARM_EABI_VER5 (0x05000000, the ABI version field
+// EF_ARM_EABIMASK) | EF_ARM_ABI_FLOAT_HARD (0x400): AAPCS32 VFP variant (hard float).
+const ARM_FLAGS: u32 = 0x05000400
+
+const SHT_PROGBITS: u32 = 1
+const SHT_SYMTAB: u32 = 2
+const SHT_STRTAB: u32 = 3
+const SHT_RELA: u32 = 4
+const SHT_REL: u32 = 9
+const SHF_WRITE: u64 = 0x1
+const SHF_ALLOC: u64 = 0x2
+const SHF_EXECINSTR: u64 = 0x4
+const SHF_MERGE: u64 = 0x10
+const SHF_STRINGS: u64 = 0x20
+const SHF_INFO_LINK: u64 = 0x40
+
+const STB_LOCAL: u32 = 0
+const STB_GLOBAL: u32 = 1
+const STB_WEAK: u32 = 2
+const STT_NOTYPE: u32 = 0
+const STT_OBJECT: u32 = 1
+const STT_FUNC: u32 = 2
+
+// aaelf64 relocation numbers.
+const R_AARCH64_ABS64: u64 = 257
+const R_AARCH64_ADR_PREL_PG_HI21: u64 = 275
+const R_AARCH64_ADD_ABS_LO12_NC: u64 = 277
+const R_AARCH64_LDST8_ABS_LO12_NC: u64 = 278
+const R_AARCH64_JUMP26: u64 = 282
+const R_AARCH64_CALL26: u64 = 283
+const R_AARCH64_LDST16_ABS_LO12_NC: u64 = 284
+const R_AARCH64_LDST32_ABS_LO12_NC: u64 = 285
+const R_AARCH64_LDST64_ABS_LO12_NC: u64 = 286
+const R_AARCH64_LDST128_ABS_LO12_NC: u64 = 299
+const R_AARCH64_ADR_GOT_PAGE: u64 = 311
+const R_AARCH64_LD64_GOT_LO12_NC: u64 = 312
+
+// aaelf32 relocation numbers.
+const R_ARM_ABS32_NR: u64 = 2
+const R_ARM_CALL_NR: u64 = 28
+const R_ARM_JUMP24_NR: u64 = 29
+const R_ARM_MOVW_ABS_NC_NR: u64 = 43
+const R_ARM_MOVT_ABS_NR: u64 = 44
+
+fn secName(kind: u32) -> str {
+    return kind == SEC_TEXT ? ".text" : kind == SEC_CSTRING ? ".rodata.str1.1" : kind == SEC_CONST ? ".data.rel.ro" : ".data"
+}
+
+fn secFlags(kind: u32) -> u64 {
+    return kind == SEC_TEXT ? SHF_ALLOC | SHF_EXECINSTR
+         : kind == SEC_CSTRING ? SHF_ALLOC | SHF_MERGE | SHF_STRINGS : SHF_ALLOC | SHF_WRITE
+}
+
+/// The relocation number of `kind`, reading the patched instruction `w` where the kind alone does
+/// not decide it.
+fn elfReloc(kind: u32, w: u32) -> u64 {
+    if kind == R_ABS64 { return R_AARCH64_ABS64 }
+    if kind == R_BRANCH26 { return (w & 0xfc000000) == 0x94000000 ? R_AARCH64_CALL26 : R_AARCH64_JUMP26 }
+    if kind == R_PAGE21 { return R_AARCH64_ADR_PREL_PG_HI21 }
+    if kind == R_GOT_PAGE21 { return R_AARCH64_ADR_GOT_PAGE }
+    if kind == R_GOT_PAGEOFF12 { return R_AARCH64_LD64_GOT_LO12_NC }
+    if kind == R_ABS32 { return R_ARM_ABS32_NR }
+    if kind == R_ARM_CALL { return R_ARM_CALL_NR }
+    if kind == R_ARM_JUMP24 { return R_ARM_JUMP24_NR }
+    if kind == R_MOVW { return R_ARM_MOVW_ABS_NC_NR }
+    if kind == R_MOVT { return R_ARM_MOVT_ABS_NR }
+    // R_PAGEOFF12. Load/store register (unsigned immediate) is `size:2 111 V 01 opc:2 imm12 Rn Rt`
+    // (Arm ARM C4.1.94): size scales the offset, and V=1 with opc<1>=1 is the 128-bit q form.
+    if (w & 0x3b000000) == 0x39000000 {
+        local size: u32 = w >> 30
+        if (w & 0x04000000) != 0 && (w & 0x00800000) != 0 && size == 0 { return R_AARCH64_LDST128_ABS_LO12_NC }
+        return size == 0 ? R_AARCH64_LDST8_ABS_LO12_NC : size == 1 ? R_AARCH64_LDST16_ABS_LO12_NC
+             : size == 2 ? R_AARCH64_LDST32_ABS_LO12_NC : R_AARCH64_LDST64_ABS_LO12_NC
+    }
+    return R_AARCH64_ADD_ABS_LO12_NC
+}
+
+fn put8(out: *String, v: u32) { out.push((v & 0xff) as u8) }
+
+fn put16(out: *String, v: u32) {
+    for k in 0..2 { out.push(((v >> ((k * 8) as u32)) & 0xff) as u8) }
+}
+
+fn put32(out: *String, v: u32) {
+    for k in 0..4 { out.push(((v >> ((k * 8) as u32)) & 0xff) as u8) }
+}
+
+fn put64(out: *String, v: u64) {
+    for k in 0..8 { out.push(((v >> ((k * 8) as u64)) & 0xff) as u8) }
+}
+
+/// An address-sized field: 8 bytes in ELFCLASS64, 4 in ELFCLASS32.
+fn putAddr(out: *String, v: u64, wide: bool) {
+    if wide { put64(out, v) } else { put32(out, v as u32) }
+}
+
+fn padTo(out: *String, align: usize) {
+    while out.length() % align != 0 { out.push(0) }
+}
+
+/// Adds `name` NUL-terminated to the string table `tab` and returns its offset.
+fn intern(tab: *String, name: str) -> u32 {
+    local at: u32 = tab.length() as u32
+    tab.append(name)
+    tab.push(0)
+    return at
+}
+
+/// One section header to write.
+class Shdr {
+    name: u32
+    kind: u32
+    flags: u64
+    offset: u64
+    size: u64
+    link: u32
+    info: u32
+    align: u64
+    entsize: u64
+
+    fn init(self, name: u32, kind: u32, flags: u64) {
+        self.name = name
+        self.kind = kind
+        self.flags = flags
+        self.offset = 0
+        self.size = 0
+        self.link = 0
+        self.info = 0
+        self.align = 1
+        self.entsize = 0
+    }
+}
+
+/// One symbol to write: the object's symbols plus the writer's own mapping symbols.
+struct OutSym {
+    name: u32       // offset in .strtab
+    value: u64
+    info: u32       // bind << 4 | type
+    shndx: u32
+}
+
+/// The table rank of a symbol: locals first (the gABI requires it; `.symtab` sh_info is the
+/// first non-local index), then the defined globals and weaks, then the undefined.
+fn rank(s: *Sym) -> u32 {
+    return !s.defined ? 2 : s.bind == BIND_LOCAL ? 0 : 1
+}
+
+/// Serializes `o` as a relocatable object for `machine` (EM_AARCH64: ELFCLASS64 with RELA;
+/// EM_ARM: ELFCLASS32 with REL).
+export fn writeElf(o: *ObjectFile, machine: u32) -> String {
+    local wide = machine != EM_ARM
+    local ehsize: u64 = wide ? 64 : 52
+    local nsect: usize = o.sections.length()
+    local nsyms: usize = o.syms.length()
+    local shstr = String()
+    shstr.push(0)
+    local strtab = String()
+    strtab.push(0)
+    local headers = Vec<Shdr>()
+    headers.push(Shdr(0, 0, 0))
+
+    // The symbols in written order (index 0 is the null symbol): the mapping symbols of an arm
+    // object, the object's locals, its defined globals, its undefined ones.
+    local syms = Vec<OutSym>()
+    local index = Vec<u32>()
+    for i in 0..nsyms { index.push(0) }
+    if !wide {
+        for i in 0..nsect {
+            local name: str = o.sections.get(i).kind == SEC_TEXT ? "$a" : "$d"
+            syms.push(OutSym { name: intern(&strtab, name), value: 0, info: (STB_LOCAL << 4) | STT_NOTYPE, shndx: (i + 1) as u32 })
+        }
+    }
+    local firstGlobal: u32 = 1
+    for r in 0..3 {
+        if r == 1 { firstGlobal = (syms.length() + 1) as u32 }
+        for i in 0..nsyms {
+            local s: *Sym = o.syms.get(i)
+            if rank(s) != r as u32 { continue }
+            index.set(i, (syms.length() + 1) as u32)
+            local bind: u32 = s.bind == BIND_LOCAL ? STB_LOCAL : s.bind == BIND_WEAK ? STB_WEAK : STB_GLOBAL
+            local symType: u32 = !s.defined ? STT_NOTYPE : o.sections.get(s.section).kind == SEC_TEXT ? STT_FUNC : STT_OBJECT
+            syms.push(OutSym { name: intern(&strtab, s.name.asStr()), value: s.defined ? s.value : 0,
+                info: (bind << 4) | symType, shndx: s.defined ? s.section + 1 : 0 })
+        }
+    }
+
+    // `out` is everything after the header, which is written last and prepended; `at` gives a
+    // file offset and `padFile` aligns by file offset, so the 52-byte ELF32 header needs no care.
+    local out = String()
+
+    for i in 0..nsect {
+        local s: *Section = o.sections.get(i)
+        local h = Shdr(intern(&shstr, secName(s.kind)), SHT_PROGBITS, secFlags(s.kind))
+        h.align = (1 << s.alignLog2) as u64
+        h.entsize = s.kind == SEC_CSTRING ? 1 : 0
+        padFile(&out, h.align, ehsize)
+        h.offset = at(&out, ehsize)
+        h.size = s.code.length() as u64
+        local bytes = s.code.clone()
+        if wide {
+            for r in s.relocs {
+                if r.kind == R_ABS64 {
+                    for k in 0..8 as usize { bytes.set(r.addr as usize + k, 0) }
+                }
+            }
+        }
+        for b in bytes { out.push(*b) }
+        headers.push(h)
+    }
+    local symtabIndex: u32 = (nsect + 1) as u32
+    for i in 0..nsect { if o.sections.get(i).relocs.length() > 0 { symtabIndex += 1 } }
+
+    // Relocation tables. RELA (64): r_offset, r_info (sym << 32 | type), r_addend.
+    // REL (32): r_offset, r_info (sym << 8 | type); the addend is in the patched bytes.
+    for i in 0..nsect {
+        local s: *Section = o.sections.get(i)
+        if s.relocs.length() == 0 { continue }
+        local name = String(wide ? ".rela" : ".rel")
+        name.append(secName(s.kind))
+        local h = Shdr(intern(&shstr, name.asStr()), wide ? SHT_RELA : SHT_REL, SHF_INFO_LINK)
+        h.align = wide ? 8 : 4
+        h.entsize = wide ? 24 : 8
+        h.link = symtabIndex
+        h.info = (i + 1) as u32
+        padFile(&out, h.align, ehsize)
+        h.offset = at(&out, ehsize)
+        for r in s.relocs {
+            local sym: u64 = *index.get(r.sym as usize) as u64
+            local w: u32 = r.kind == R_ABS64 ? 0 : readWord(&s.code, r.addr as usize)
+            if wide {
+                put64(&out, r.addr as u64)
+                put64(&out, (sym << 32) | elfReloc(r.kind, w))
+                put64(&out, r.kind == R_ABS64 ? readQuad(&s.code, r.addr as usize) : 0)
+            } else {
+                put32(&out, r.addr)
+                put32(&out, ((sym << 8) | elfReloc(r.kind, w)) as u32)
+            }
+        }
+        h.size = h.entsize * s.relocs.length() as u64
+        headers.push(h)
+    }
+
+    // .symtab. ELF64 entry: st_name, st_info, st_other, st_shndx, st_value, st_size (24 bytes).
+    // ELF32 entry: st_name, st_value, st_size, st_info, st_other, st_shndx (16 bytes).
+    local symHdr = Shdr(intern(&shstr, ".symtab"), SHT_SYMTAB, 0)
+    symHdr.align = wide ? 8 : 4
+    symHdr.entsize = wide ? 24 : 16
+    symHdr.link = symtabIndex + 1
+    symHdr.info = firstGlobal
+    padFile(&out, symHdr.align, ehsize)
+    symHdr.offset = at(&out, ehsize)
+    for i in 0..symHdr.entsize as usize { out.push(0) }
+    for s in syms {
+        put32(&out, s.name)
+        if wide {
+            put8(&out, s.info)
+            put8(&out, 0)
+            put16(&out, s.shndx)
+            put64(&out, s.value)
+            put64(&out, 0)
+        } else {
+            put32(&out, s.value as u32)
+            put32(&out, 0)
+            put8(&out, s.info)
+            put8(&out, 0)
+            put16(&out, s.shndx)
+        }
+    }
+    symHdr.size = symHdr.entsize * (syms.length() + 1) as u64
+    headers.push(symHdr)
+
+    local strHdr = Shdr(intern(&shstr, ".strtab"), SHT_STRTAB, 0)
+    strHdr.offset = at(&out, ehsize)
+    strHdr.size = strtab.length() as u64
+    out.append(&strtab)
+    headers.push(strHdr)
+
+    local shs = Shdr(intern(&shstr, ".shstrtab"), SHT_STRTAB, 0)
+    shs.offset = at(&out, ehsize)
+    shs.size = shstr.length() as u64
+    out.append(&shstr)
+    headers.push(shs)
+
+    // The section header table: name, type, then flags, addr, offset, size as address-sized
+    // fields, link, info, then addralign and entsize as address-sized fields.
+    padFile(&out, wide ? 8 : 4, ehsize)
+    local shoff: u64 = at(&out, ehsize)
+    for h in headers {
+        put32(&out, h.name)
+        put32(&out, h.kind)
+        putAddr(&out, h.flags, wide)
+        putAddr(&out, 0, wide)          // sh_addr: 0 in a relocatable object
+        putAddr(&out, h.offset, wide)
+        putAddr(&out, h.size, wide)
+        put32(&out, h.link)
+        put32(&out, h.info)
+        putAddr(&out, h.align, wide)
+        putAddr(&out, h.entsize, wide)
+    }
+
+    // The ELF header: e_ident (magic, class, ELFDATA2LSB, EV_CURRENT, ELFOSABI_NONE), e_type
+    // ET_REL, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize,
+    // e_phnum, e_shentsize, e_shnum, e_shstrndx.
+    local hdr = String()
+    for b in [0x7f, 0x45, 0x4c, 0x46] { hdr.push(*b as u8) }
+    hdr.push(wide ? 2 : 1)
+    for b in [1, 1, 0] { hdr.push(*b as u8) }
+    for i in 0..8 { hdr.push(0) }
+    put16(&hdr, 1)
+    put16(&hdr, machine)
+    put32(&hdr, 1)
+    putAddr(&hdr, 0, wide)
+    putAddr(&hdr, 0, wide)
+    putAddr(&hdr, shoff, wide)
+    put32(&hdr, wide ? 0 : ARM_FLAGS)
+    put16(&hdr, ehsize as u32)
+    put16(&hdr, 0)
+    put16(&hdr, 0)
+    put16(&hdr, wide ? 64 : 40)
+    put16(&hdr, headers.length() as u32)
+    put16(&hdr, (headers.length() - 1) as u32)
+    hdr.append(&out)
+    return hdr
+}
+
+/// The file offset of the next byte of `out` (the body after the `ehsize`-byte header).
+fn at(out: *String, ehsize: u64) -> u64 {
+    return out.length() as u64 + ehsize
+}
+
+/// Pads `out` so the next byte sits at a file offset that is a multiple of `align`.
+fn padFile(out: *String, align: u64, ehsize: u64) {
+    while at(out, ehsize) % align != 0 { out.push(0) }
+}

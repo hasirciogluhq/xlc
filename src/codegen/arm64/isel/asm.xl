@@ -12,14 +12,14 @@
 // @spec https://developer.arm.com/documentation/ddi0602/latest (A64 instruction set)
 from "std" import String, Vec, format
 from "std/str" import fromParts
-from "../../hir/abi" import XlcHirExpr, XlcHirAsmOperand, view, E_LOCAL_REF
-from "../arm64" import SP, XZR, movReg64, add64Imm, sub64Imm, add64Reg, sub64Reg, and64Reg, orr64Reg, eor64Reg,
+from "../../../hir/abi" import XlcHirExpr, XlcHirAsmOperand, view, E_LOCAL_REF
+from "../encode" import SP, XZR, movReg64, add64Imm, sub64Imm, add64Reg, sub64Reg, and64Reg, orr64Reg, eor64Reg,
     ldpOff64, stpOff64, ldpOffD, stpOffD, br, blr, svc, brk, ret, nop
 from "emit" import movConst, loadTyped, storeTyped, loadFloat, storeFloat
 from "expr" import genScalar, genPlace
 from "gen" import Gen, Place
 from "conv" import word
-from "types" import scalarOf
+from "../../common/types" import scalarOf
 
 /// A parsed register operand: `n` is the number (-1 = not a register), `cls` 0 = x, 1 = d, 2 = sp,
 /// 3 = xzr.

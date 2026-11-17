@@ -1,0 +1,25 @@
+// e2e: `sizeOf`/`alignOf`/`offsetOf` fold from the resolved type: a type parameter inside a
+// generic instance names its argument (`Holder<Pair>`), and type operands (`*T`, `[]u8`) work.
+// Sizes assume a 64-bit target (every target run.sh builds natively). Lives here because only
+// run.sh compiles with the xlc under test.
+@repr(c)
+struct Pair {
+    a: i32
+    b: i64
+}
+
+class Holder<T> {
+    item: T
+    fn size(self) -> usize { return sizeOf(T) }
+    fn align(self) -> usize { return alignOf(T) }
+}
+
+@entry fn main() -> i32 {
+    local h = Holder<Pair>()
+    if h.size() != 16 || h.align() != 8 { return 1 }
+    local b = Holder<u8>()
+    if b.size() != 1 { return 2 }
+    if offsetOf(Pair, b) != 8 { return 3 }
+    if sizeOf([]u8) != 16 || sizeOf(*Pair) != 8 { return 4 }
+    return 0
+}

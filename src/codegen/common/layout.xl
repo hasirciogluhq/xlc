@@ -1,5 +1,6 @@
-// Memory layout for the native backend: the size and alignment of a type spelling and the byte
-// offset of a field. The flat HIR (hir/abi.xl) carries types as spellings, so the layout is
+// Memory layout for the native backends: the size and alignment of a type spelling and the byte
+// offset of a field, at the pointer size of the target (`Layouts.ptr`: 8 on arm64, 4 on arm32;
+// a vptr, a pointer and each word of `str`/slice/interface take that size). The flat HIR (hir/abi.xl) carries types as spellings, so the layout is
 // computed here from the aggregate table with the same scheme as the semantic phase
 // (src/sema/layout_calc.xl, scheme v1):
 //   - a class with a virtual method, or whose base has one, starts with the vptr (8 bytes);
@@ -15,7 +16,7 @@
 from "std" import String, Vec
 from "std/str" import fromParts
 from "../../hir/abi" import XlcHirModule, XlcHirAggregate, view
-from "types" import Scalar, KIND_OTHER, KIND_BOOL, scalarOf
+from "types" import Scalar, KIND_OTHER, KIND_BOOL, scalarOf, scalarOfW
 
 /// How the selector holds a value of a type.
 export const K_VOID: u32 = 0
@@ -68,10 +69,17 @@ fn alignUp(v: u64, a: u64) -> u64 {
 export class Layouts {
     m: *XlcHirModule
     cache: Vec<AggLayout>
+    ptr: u64      // the pointer size in bytes: 8 on arm64, 4 on arm32
 
-    fn init(self, m: *XlcHirModule) {
+    fn init(self, m: *XlcHirModule, ptr: u64) {
         self.m = m
         self.cache = Vec<AggLayout>()
+        self.ptr = ptr
+    }
+
+    /// The scalar of a spelling at this target's pointer width.
+    fn scalar(self, s: str) -> Scalar {
+        return scalarOfW(self.m, s, (self.ptr * 8) as u32)
     }
 
     fn aggregate(self, name: str) -> *XlcHirAggregate {
@@ -113,7 +121,7 @@ export class Layouts {
         if s.len >= 1 && s.ptr[0] == b'(' {
             return K_TUPLE
         }
-        local sc: Scalar = scalarOf(self.m, s)
+        local sc: Scalar = self.scalar(s)
         if sc.kind == KIND_OTHER {
             if self.aggregate(s) != nil {
                 return K_STRUCT
@@ -194,13 +202,15 @@ export class Layouts {
         *size = 0
         *align = 1
         if k == K_INT || k == K_FLOAT {
-            local sc: Scalar = scalarOf(self.m, s)
+            local sc: Scalar = self.scalar(s)
             local bytes: u64 = sc.kind == KIND_BOOL ? 1 : (sc.bits / 8) as u64
             *size = bytes
+            // AAPCS64 and AAPCS32 both align a scalar to its size, 8-byte types included
+            // (https://github.com/ARM-software/abi-aa/blob/main/aapcs32/aapcs32.rst, 5.1).
             *align = bytes
         } else if k == K_STR || k == K_SLICE || k == K_INTERFACE {
-            *size = 16
-            *align = 8
+            *size = 2 * self.ptr
+            *align = self.ptr
         } else if k == K_ARRAY {
             local elem = String()
             local n: u64 = 0
@@ -266,10 +276,10 @@ export class Layouts {
         if a.vtableCount > 0 {
             out.hasVptr = true
         }
-        if out.hasVptr && cursor < 8 {
-            cursor = 8
-            if align < 8 {
-                align = 8
+        if out.hasVptr && cursor < self.ptr {
+            cursor = self.ptr
+            if align < self.ptr {
+                align = self.ptr
             }
         }
         // Own fields: stable sort by alignment, largest first, unless `@repr(c)` or a union.
@@ -327,7 +337,7 @@ export class Layouts {
     fn fieldOff(self, s: str, index: u32) -> u64 {
         local k: u32 = self.kind(s)
         if k == K_STR || k == K_SLICE || k == K_INTERFACE {
-            return (index as u64) * 8
+            return (index as u64) * self.ptr
         }
         if k == K_TUPLE {
             local elems = self.tupleElems(s)

@@ -24,17 +24,21 @@ from "./state" import Lowerer, ScopeEntry, SE_LOCAL, SE_GLOBAL, SE_FUNCTION, SE_
 from "./overload" import ARG_EXPR, ARG_INT, ARG_FLOAT, ARG_STR, ARG_NIL, PICK_NONE, pickOverload,
     declParamTypes, declRetType
 from "./methods" import findMethod, methodsNamed, classLoc, baseLoc, ClassLoc
-from "./generics" import genericInstance, constructType
+from "./generics" import genericInstance, constructType, genericMethodInstance
 from "./builtins" import isBuiltinName, builtinType
 from "./propagate" import tryType
 from "./interface" import interfaceOf, interfaceCallType
 from "./inherent" import inherentRetType
+from "./pack" import expandSpread, isPackLen, packTarget
+from "../sema/packs" import isPackDecl
 
 /// True for an unsuffixed numeric literal, or `-` of one: it takes the type of the other operand.
 export fn isLiteralExpr(l: *Lowerer, idx: i32) -> bool {
     local e = l.s.exprAt(idx)
     if (*e).kind == XE_INT_LITERAL || (*e).kind == XE_FLOAT_LITERAL { return true }
     if (*e).kind == XE_NAME { return isNumericDefine(l, idx) }
+    // `pack.len` is the element count, an untyped integer constant like a literal.
+    if (*e).kind == XE_FIELD { return isPackLen(l, idx) }
     // Arithmetic of literals, and a ternary whose branches are literals, are literals too.
     if (*e).kind == XE_BINARY {
         local op = (*e).binaryOp
@@ -88,9 +92,23 @@ export fn exprType(l: *Lowerer, idx: i32) -> i32 {
     if k == XE_NAME { return nameType(l, idx) }
     if k == XE_UNARY { return unaryType(l, e) }
     if k == XE_BINARY { return binaryType(l, e) }
-    if k == XE_CALL { return callType(l, e) }
+    if k == XE_CALL {
+        // `f(a, ..pack)` is typed as the call with the pack's elements written out; the copy is
+        // read by value because the synthesized arena may move.
+        local call: XExpr = *l.s.exprAt(expandSpread(l, idx))
+        return callType(l, &call)
+    }
+    if k == XE_FIELD && isPackLen(l, idx) { return l.s.types.makeInt(32, true) }
     if k == XE_INDEX {
-        local base = resolveBase(l, exprType(l, (*e).lhs))
+        // `p[i]` on a pointer to an array, slice or str indexes the pointee; on any other pointer
+        // (`**u8`) it indexes the pointer itself, so `programs[k]` of `**u8` is `*u8`, not `u8`.
+        local base = exprType(l, (*e).lhs)
+        if base < 0 { return -1 }
+        if l.s.types.get(base).kind == T_POINTER {
+            local inner = l.s.types.get(base).elem
+            local ik = inner < 0 ? -1 : l.s.types.get(inner).kind
+            if ik == T_ARRAY || ik == T_SLICE || ik == T_STR { base = inner }
+        }
         local bt = l.s.types.get(base)
         if bt.kind == T_STR { return l.s.types.makeInt(8, false) }
         if bt.kind == T_SLICE || bt.kind == T_POINTER || bt.kind == T_ARRAY { return bt.elem }
@@ -161,7 +179,7 @@ export fn isFloatType(l: *Lowerer, t: i32) -> bool {
 /// integer literal takes a numeric `want`, a float literal a float `want`; anything else has its
 /// type with no context (`exprType`).
 export fn effectiveType(l: *Lowerer, idx: i32, want: i32) -> i32 {
-    if listFits(l, idx, want) { return want }
+    if listFits(l, idx, want) || pointerLiteral(l, idx, want) { return want }
     if want >= 0 && isLiteralExpr(l, idx) {
         if isFloatLiteralExpr(l, idx) {
             if isFloatType(l, want) { return want }
@@ -170,6 +188,23 @@ export fn effectiveType(l: *Lowerer, idx: i32, want: i32) -> i32 {
         }
     }
     return exprType(l, idx)
+}
+
+/// True when `idx` takes the pointer type `want` as a literal does: `nil` (any pointer), a string
+/// literal (`*u8`/`*i8`, the address of its bytes), or a ternary whose branches both do
+/// (`c ? "a" : "b"` passed as `*u8`; the C++ pass typed that ternary `str` and rejected it).
+export fn pointerLiteral(l: *Lowerer, idx: i32, want: i32) -> bool {
+    if want < 0 || idx < 0 || l.s.types.get(want).kind != T_POINTER { return false }
+    local e = l.s.exprAt(idx)
+    if (*e).kind == XE_NAME { return l.s.exprTextAt(idx) == "nil" && l.lookupName("nil") == nil }
+    if (*e).kind == XE_STRING_LITERAL {
+        local elem = l.s.types.get(want).elem
+        return elem >= 0 && l.s.types.get(elem).kind == T_INT && l.s.types.get(elem).bits == 8
+    }
+    if (*e).kind == XE_TERNARY {
+        return pointerLiteral(l, (*e).rhs, want) && pointerLiteral(l, l.s.refAt("expr", (*e).argsFirst as i32), want)
+    }
+    return false
 }
 
 /// True when `idx` is an array list `[a, b, c]` and `want` an array type of that many elements:
@@ -206,6 +241,16 @@ fn nameType(l: *Lowerer, idx: i32) -> i32 {
     if (*entry).kind == SE_CONSTANT {
         local v = evalConst(l.s, idx)
         return v < 0 ? -1 : constType(l, v)
+    }
+    if (*entry).kind == SE_FUNCTION {
+        // A function used as a value is `fn(params) -> ret`; an overloaded or generic one has no
+        // single type (it is picked by the context).
+        local decls = functionDecls(l, entry)
+        if decls.length() != 1 { return -1 }
+        local owner = entryOwner(l, entry)
+        local d = *decls.get(0)
+        if (*owner.declAt(d as usize)).genericCount > 0 { return -1 }
+        return l.s.types.makeFnPtr(declParamsIn(l, owner, d), declRetIn(l, owner, d))
     }
     return -1
 }
@@ -312,6 +357,8 @@ export fn functionDecls(l: *Lowerer, entry: *ScopeEntry) -> Vec<i32> {
     for i in 0..(*entry).overloads.length() {
         local d = owner.declOfItem(*(*entry).overloads.get(i))
         if d < 0 { return Vec<i32>() }
+        // A pack function is a template: `packTarget` (pack.xl) instantiates it per call.
+        if isPackDecl(owner, d) { continue }
         if (*entry).overloads.length() > 1 && (*owner.declAt(d as usize)).genericCount > 0 {
             return Vec<i32>()
         }
@@ -384,7 +431,18 @@ fn callType(l: *Lowerer, e: *XExpr) -> i32 {
         if isBuiltinName(callee) { return builtinType(l, e, callee) }
         local entry = l.lookupName(callee)
         if entry != nil && (*entry).kind == SE_TYPE { return constructType(l, e, entry) }
-        if entry == nil || (*entry).kind != SE_FUNCTION { return -1 }
+        if entry != nil && (*entry).kind != SE_FUNCTION {
+            // A call through a function value (`f(x)` with `f: fn(A) -> R`, or `F` bound to it).
+            local ft = resolve(l.s, exprType(l, (*e).lhs))
+            if ft >= 0 && l.s.types.get(ft).kind == T_FN_PTR { return l.s.types.get(ft).ret }
+            return -1
+        }
+        if entry == nil { return -1 }
+        local pack = packTarget(l, e, entry)
+        if pack.sym >= 0 {
+            local po = pack.owner != nil ? pack.owner : l.s
+            return adoptFrom(l, po, declRetType(po, po.declOf(po.itemOf(pack.sym))))
+        }
         local decls = functionDecls(l, entry)
         local eo = entryOwner(l, entry)
         if decls.length() == 1 && (*eo.declAt(*decls.get(0) as usize)).genericCount > 0 {
@@ -404,7 +462,13 @@ fn callType(l: *Lowerer, e: *XExpr) -> i32 {
         local m = findMethod(l.s, resolveBase(l, recvTy), l.s.exprTextAt((*e).lhs))
         if !(*m).found { return inherentRetType(l, recvTy, l.s.exprTextAt((*e).lhs)) }
         local decls = methodsNamed((*m).owner, (*m).cdecl, l.s.exprTextAt((*e).lhs))
-        return declaredResult(l, (*m).owner, &decls, e)
+        local mo = (*m).owner
+        if decls.length() == 1 && (*mo.declAt(*decls.get(0) as usize)).genericCount > 0 {
+            local inst = genericMethodInstance(l, e, mo, *decls.get(0), (*m).cls.asStr())
+            if inst < 0 { return -1 }
+            return declRetIn(l, mo, *mo.methodInstDecls.get(inst as usize))
+        }
+        return declaredResult(l, mo, &decls, e)
     }
     return -1
 }

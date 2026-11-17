@@ -1,0 +1,413 @@
+// The data, boot code and runtime routines of the arm32 selector. The data follows arm64/isel/data.xl
+// with 4-byte pointers: every address is an R_ARM_ABS32 word whose addend stays in the section
+// bytes (ELF32 REL, aaelf32 5.6.1).
+//
+//   globals        .data or .rodata (`const`): the constant initializer
+//   vtables        `vtable.<class>`; an `@repr(c)` class has two leading words and its vptr
+//                  points past them (expr.xl `storeVptr`)
+//   itables        `itable.<type>|<interface>`
+//   unwind table   `xl$unwindTable`: (function, 0) pairs, `xl$unwindPads`, `xl$unwindPadCount`
+//   boot           `_xl_initAll`, `_xl_finiAll`, the C `main`, the weak `_start`
+//   runtime        the file-local helpers expr.xl calls (gen.xl RT_*), emitted when used
+from "std" import String, Vec, format
+from "../../../hir/abi" import XlcHirExpr, XlcHirFieldInit, XlcHirGlobal, view, E_INT_CONST, E_FLOAT_CONST,
+    E_BOOL_CONST, E_STR_CONST, E_NIL, E_FUNC_REF, E_GLOBAL_REF, E_ADDR_OF, E_FIELD, E_INDEX, E_ARRAY_LIST,
+    E_ARRAY_REPEAT, E_TUPLE_LIT, E_STRUCT_LIT, E_TO_INTERFACE, E_CAST
+from "../encode" import R0, R1, R2, R3, R4, R7, R11, R12, SP, LR, PC, AL, EQ, NE, CS, CC, HI, OP_ADD, OP_ADC,
+    OP_SUB, OP_SBC, OP_RSB, OP_CMP, OP_ORR, OP_MOV, OP_BIC, LSL, LSR, ASR, dpReg, dpImm, dpShiftImm, dpShiftReg,
+    shiftReg, modImm, movReg, loadConst, load, push, pop, bx, svc
+from "../../common/types" import Scalar, KIND_BOOL, KIND_FLOAT, canonical
+from "gen" import Gen, RT_UDIV32, RT_UDIV64, RT_LSL64, RT_LSR64, RT_ASR64, RT_STREQ, RT_COUNT, rtName
+
+fn node(g: *Gen, i: i32) -> *XlcHirExpr {
+    return &g.m.exprs[i as usize]
+}
+
+/// Overwrites `n` bytes at `at` of section `sec` with the little-endian `v`.
+fn patch(g: *Gen, sec: u32, at: u64, v: u64, n: u32) {
+    local s = g.o.sections.get(sec)
+    for k in 0..n as usize { s.code.set(at as usize + k, ((v >> (k * 8) as u64) & 0xff) as u8) }
+}
+
+/// A pointer to `sym` plus `addend` at byte `at` of section `sec`.
+fn pointer(g: *Gen, sec: u32, at: u64, sym: u32, addend: u64) {
+    patch(g, sec, at, addend, 4)
+    g.dataPointer(sec, at, sym)
+}
+
+fn floatBits(v: f64, dbl: bool) -> u64 {
+    if dbl {
+        local x: f64 = v
+        return *(&x as *u64)
+    }
+    local y: f32 = v as f32
+    return *(&y as *u32) as u64
+}
+
+fn storeVtable(g: *Gen, sec: u32, at: u64, name: str) {
+    local l = g.lay.of(name)
+    if l == nil || !l.hasVptr { return }
+    local a = g.lay.aggregate(name)
+    pointer(g, sec, at, g.syms.id(format("vtable.{}", name).asStr()), a != nil && a.reprC != 0 ? 8 : 0)
+}
+
+/// Writes the constant `e` at byte `at` of section `sec`.
+fn writeConst(g: *Gen, sec: u32, at: u64, e: *XlcHirExpr) {
+    local k: i32 = e.kind
+    local ty: str = view(e.typeName)
+    if k == E_INT_CONST || k == E_BOOL_CONST {
+        local sc: Scalar = g.scalar(ty)
+        if sc.kind == KIND_FLOAT {
+            patch(g, sec, at, floatBits((e.intValue as i64) as f64, sc.bits == 64), sc.bits / 8)
+        } else {
+            local v: u64 = k == E_BOOL_CONST ? e.boolValue as u64 : canonical(e.intValue, sc)
+            patch(g, sec, at, v, sc.kind == KIND_BOOL ? 1 : sc.bits / 8)
+        }
+    } else if k == E_FLOAT_CONST {
+        local sc: Scalar = g.scalar(ty)
+        patch(g, sec, at, floatBits(e.floatValue, sc.bits == 64), sc.bits / 8)
+    } else if k == E_NIL {
+        return
+    } else if k == E_STR_CONST {
+        pointer(g, sec, at, g.literal(view(e.text)), 0)
+        if ty == "str" { patch(g, sec, at + 4, view(e.text).len as u64, 4) }
+    } else if k == E_FUNC_REF {
+        local fi: i32 = g.findFunction(view(e.text))
+        if fi < 0 {
+            g.fail("an unknown function in a constant")
+            return
+        }
+        pointer(g, sec, at, g.syms.id(g.fnSymbol(fi as u32)), 0)
+    } else if k == E_ADDR_OF {
+        // `&global`, `&global[const]`, `&global.field`
+        local cur: *XlcHirExpr = node(g, e.lhs)
+        local off: u64 = 0
+        while cur.kind != E_GLOBAL_REF {
+            if cur.kind == E_INDEX {
+                off += g.sizeOf(view(cur.typeName)) * node(g, cur.rhs).intValue
+                cur = node(g, cur.lhs)
+            } else if cur.kind == E_FIELD && cur.throughPointer == 0 {
+                local base: *XlcHirExpr = node(g, cur.lhs)
+                off += g.lay.fieldOff(view(base.typeName), cur.index)
+                cur = base
+            } else {
+                g.fail("an address constant that is not a global, an element or a field")
+                return
+            }
+        }
+        local gi: i32 = g.findGlobal(view(cur.text))
+        if gi < 0 {
+            g.fail("an unknown global in a constant")
+            return
+        }
+        pointer(g, sec, at, g.syms.id(g.globSymbol(gi as u32)), off)
+    } else if k == E_STRUCT_LIT {
+        storeVtable(g, sec, at, ty)
+        for i in 0..e.fieldCount as usize {
+            local f: *XlcHirFieldInit = &g.m.fields[e.fieldFirst as usize + i]
+            if f.value >= 0 { writeConst(g, sec, at + g.lay.fieldOff(ty, f.index), node(g, f.value)) }
+        }
+    } else if k == E_TUPLE_LIT {
+        for i in 0..e.argCount as usize {
+            writeConst(g, sec, at + g.lay.fieldOff(ty, i as u32), &g.m.exprs[g.m.refs[e.argFirst as usize + i] as usize])
+        }
+    } else if k == E_ARRAY_LIST || k == E_ARRAY_REPEAT {
+        local es: u64 = g.sizeOf(g.lay.elemOf(ty).asStr())
+        local n: usize = k == E_ARRAY_LIST ? e.argCount as usize : e.intValue as usize
+        for i in 0..n {
+            local el: *XlcHirExpr = k == E_ARRAY_LIST ? &g.m.exprs[g.m.refs[e.argFirst as usize + i] as usize] : node(g, e.lhs)
+            writeConst(g, sec, at + es * i as u64, el)
+        }
+    } else if k == E_TO_INTERFACE {
+        writeConst(g, sec, at, node(g, e.lhs))
+        pointer(g, sec, at + 4, g.syms.id(format("itable.{}|{}", view(e.text), ty).asStr()), 0)
+    } else if k == E_CAST {
+        local inner: *XlcHirExpr = node(g, e.lhs)
+        if inner.kind == E_INT_CONST {
+            local sc: Scalar = g.scalar(ty)
+            patch(g, sec, at, canonical(inner.intValue, sc), sc.kind == KIND_BOOL ? 1 : sc.bits / 8)
+        } else {
+            writeConst(g, sec, at, inner)
+        }
+    } else {
+        g.fail("a global initializer that is not a constant")
+    }
+}
+
+export fn emitGlobals(g: *Gen) {
+    for gi in 0..g.m.globalCount as usize {
+        local gl: *XlcHirGlobal = &g.m.globals[gi]
+        if gl.declared != 0 || !g.definedHere(view(gl.module)) { continue }
+        local ty: str = view(gl.typeName)
+        local size: u64 = g.sizeOf(ty)
+        local align: u64 = g.alignOf(ty)
+        local sec: u32 = gl.constant != 0 ? g.dconst : g.ddata
+        g.o.padTo(sec, align < 1 ? 1 : align)
+        local at: u64 = g.o.size(sec)
+        g.syms.define(g.syms.id(g.globSymbol(gi as u32)), sec, at)
+        for k in 0..(size == 0 ? 1 : size) { g.o.addByte(sec, 0) }
+        if gl.init >= 0 { writeConst(g, sec, at, node(g, gl.init)) }
+    }
+}
+
+/// A word slot holding the address of function `name` (0 when it is unknown).
+fn functionSlot(g: *Gen, name: str) {
+    local at: u64 = g.o.size(g.dconst)
+    g.o.addWord(g.dconst, 0)
+    local fi: i32 = g.findFunction(name)
+    if fi >= 0 { pointer(g, g.dconst, at, g.syms.id(g.fnSymbol(fi as u32)), 0) }
+}
+
+/// Defines a file-local symbol at the current end of `.rodata`.
+fn tableHere(g: *Gen, name: str) {
+    g.o.padTo(g.dconst, 4)
+    local id: u32 = g.syms.id(name)
+    g.syms.fileLocal.set(id as usize, true)
+    g.syms.define(id, g.dconst, g.o.size(g.dconst))
+}
+
+export fn emitTables(g: *Gen) {
+    for i in 0..g.m.aggregateCount as usize {
+        local a = &g.m.aggregates[i]
+        if a.isClass == 0 || a.vtableCount == 0 { continue }
+        tableHere(g, format("vtable.{}", view(a.name)).asStr())
+        if a.reprC != 0 {
+            g.o.addWord(g.dconst, 0)
+            g.o.addWord(g.dconst, 0)
+        }
+        for s in 0..a.vtableCount as usize { functionSlot(g, view(a.vtable[s].function)) }
+    }
+    for i in 0..g.m.implCount as usize {
+        local im = &g.m.impls[i]
+        tableHere(g, format("itable.{}|{}", view(im.typeName), view(im.interfaceName)).asStr())
+        for s in 0..im.methodCount as usize { functionSlot(g, view(g.m.strings[im.methodFirst as usize + s])) }
+    }
+}
+
+/// The unwind table: a (function, 0) pair per generated function, and the two words that point at
+/// it (`__builtin_unwindPads`, `__builtin_unwindPadCount`).
+export fn emitPadTable(g: *Gen, fns: *Vec<u32>) {
+    tableHere(g, "xl$unwindTable")
+    local table: u32 = g.syms.id("xl$unwindTable")
+    for i in 0..fns.length() {
+        functionSlot(g, view(g.m.functions[*fns.get(i) as usize].name))
+        g.o.addWord(g.dconst, 0)
+    }
+    g.o.padTo(g.ddata, 4)
+    local pads: u32 = g.syms.id("xl$unwindPads")
+    g.syms.fileLocal.set(pads as usize, true)
+    g.syms.define(pads, g.ddata, g.o.size(g.ddata))
+    g.o.addWord(g.ddata, 0)
+    pointer(g, g.ddata, g.o.size(g.ddata) - 4, table, 0)
+    local count: u32 = g.syms.id("xl$unwindPadCount")
+    g.syms.fileLocal.set(count as usize, true)
+    g.syms.define(count, g.ddata, g.o.size(g.ddata))
+    g.o.addWord(g.ddata, fns.length() as u32)
+}
+
+/// Binds a new label here and defines `name` at it.
+fn defineHere(g: *Gen, name: str) -> u32 {
+    local id: u32 = g.syms.id(name)
+    g.syms.define(id, g.text, g.code.length() as u64 * 4)
+    return id
+}
+
+fn hasEntry(g: *Gen) -> bool {
+    for fi in 0..g.m.functionCount as usize {
+        if g.m.functions[fi].isEntry != 0 && g.m.functions[fi].hasBody != 0 { return true }
+    }
+    return false
+}
+
+/// A boot hook: calls the functions named by `m.strings[first .. first + count]` (reversed when
+/// asked); weak when this object has no entry (a library part).
+fn emitHook(g: *Gen, name: str, first: u32, count: u32, reversed: bool) {
+    local id: u32 = defineHere(g, name)
+    push(&g.code, (1 << R11) | (1 << LR))
+    for i in 0..count as usize {
+        local at: usize = reversed ? count as usize - 1 - i : i
+        local fi: i32 = g.findFunction(view(g.m.strings[first as usize + at]))
+        if fi >= 0 { g.callSym(g.syms.id(g.fnSymbol(fi as u32))) }
+    }
+    pop(&g.code, (1 << R11) | (1 << PC))
+    g.syms.weak.set(id as usize, !hasEntry(g))
+}
+
+/// The Linux process entry of a program linked without a C library. The kernel enters with sp at
+/// argc, then the argv pointers (binfmt_elf.c create_elf_tables). fp and lr are cleared so a
+/// backtrace ends here; sp is 8-aligned for `main` (AAPCS32 5.2.1.2); `main`'s result goes to
+/// `exit_group`, 248 in the arm EABI table (arch/arm/tools/syscall.tbl). Weak: a C library's
+/// `crt1.o` `_start` wins under `--crt`.
+fn emitStart(g: *Gen) {
+    local id: u32 = defineHere(g, "_start")
+    dpImm(&g.code, AL, OP_MOV, false, R11, 0, 0)
+    dpImm(&g.code, AL, OP_MOV, false, LR, 0, 0)
+    load(&g.code, R0, SP, 0, 4, false)
+    dpImm(&g.code, AL, OP_ADD, false, R1, SP, 4)
+    dpImm(&g.code, AL, OP_BIC, false, SP, SP, 7)
+    g.callSym(g.syms.id("main"))
+    dpImm(&g.code, AL, OP_MOV, false, R7, 0, modImm(248))
+    svc(&g.code, 0)
+    g.syms.weak.set(id as usize, true)
+}
+
+/// The boot code of a whole-program object: the hooks, `main` and `_start`.
+export fn emitBoot(g: *Gen) {
+    emitHook(g, "_xl_initAll", g.m.initFirst, g.m.initCount, false)
+    emitHook(g, "_xl_finiAll", g.m.finiFirst, g.m.finiCount, true)
+    for fi in 0..g.m.functionCount as usize {
+        local f = &g.m.functions[fi]
+        if f.isEntry == 0 || f.hasBody == 0 { continue }
+        // r4, r5 keep argc/argv, then the result, across the calls (callee-saved).
+        defineHere(g, "main")
+        push(&g.code, (1 << R4) | (1 << 5) | (1 << R11) | (1 << LR))
+        movReg(&g.code, R4, R0)
+        movReg(&g.code, 5, R1)
+        g.callSym(g.syms.id("_xl_initAll"))
+        movReg(&g.code, R0, R4)
+        movReg(&g.code, R1, 5)
+        g.callSym(g.syms.id(g.fnSymbol(fi as u32)))
+        if view(f.ret) == "void" { dpImm(&g.code, AL, OP_MOV, false, R4, 0, 0) } else { movReg(&g.code, R4, R0) }
+        g.callSym(g.syms.id("_xl_finiAll"))
+        movReg(&g.code, R0, R4)
+        pop(&g.code, (1 << R4) | (1 << 5) | (1 << R11) | (1 << PC))
+        emitStart(g)
+        return
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// Runtime routines (leaf functions: arguments and results in r0..r3, `bx lr`)
+
+/// xl$udivmod32: r0 / r1 -> quotient r0, remainder r1, by restoring shift-subtract over 32 bits.
+/// `adcs` catches the remainder's carry out (a divisor above 2^31).
+fn udiv32(g: *Gen) {
+    loadConst(&g.code, R2, 0)
+    loadConst(&g.code, R3, 0)
+    loadConst(&g.code, R12, 32)
+    local top: u32 = g.newLabel()
+    g.bind(top)
+    dpReg(&g.code, AL, OP_ADD, true, R0, R0, R0)      // C = the next dividend bit
+    dpReg(&g.code, AL, OP_ADC, true, R3, R3, R3)      // r = r << 1 | C; C = r's lost top bit
+    dpReg(&g.code, CC, OP_CMP, true, 0, R3, R1)       // no carry out: C = (r >= d)
+    dpReg(&g.code, CS, OP_SUB, false, R3, R3, R1)
+    dpReg(&g.code, AL, OP_ADC, false, R2, R2, R2)     // q = q << 1 | C
+    dpImm(&g.code, AL, OP_SUB, true, R12, R12, 1)
+    g.branch(NE, top)
+    movReg(&g.code, R0, R2)
+    movReg(&g.code, R1, R3)
+    bx(&g.code, LR)
+}
+
+/// xl$udivmod64: r0:r1 / r2:r3 -> quotient r0:r1, remainder r2:r3. The quotient bits shift into
+/// the dividend's low end as its bits shift out; r4:r5 is the remainder, r6 the counter.
+fn udiv64(g: *Gen) {
+    push(&g.code, (1 << 4) | (1 << 5) | (1 << 6) | (1 << LR))
+    loadConst(&g.code, 4, 0)
+    loadConst(&g.code, 5, 0)
+    loadConst(&g.code, 6, 64)
+    local top: u32 = g.newLabel()
+    local sub: u32 = g.newLabel()
+    local skip: u32 = g.newLabel()
+    g.bind(top)
+    dpReg(&g.code, AL, OP_ADD, true, R0, R0, R0)
+    dpReg(&g.code, AL, OP_ADC, true, R1, R1, R1)
+    dpReg(&g.code, AL, OP_ADC, true, 4, 4, 4)
+    dpReg(&g.code, AL, OP_ADC, true, 5, 5, 5)
+    g.branch(CS, sub)
+    dpReg(&g.code, AL, OP_CMP, true, 0, 5, R3)
+    dpReg(&g.code, EQ, OP_CMP, true, 0, 4, R2)
+    g.branch(CC, skip)
+    g.bind(sub)
+    dpReg(&g.code, AL, OP_SUB, true, 4, 4, R2)
+    dpReg(&g.code, AL, OP_SBC, false, 5, 5, R3)
+    dpImm(&g.code, AL, OP_ORR, false, R0, R0, 1)
+    g.bind(skip)
+    dpImm(&g.code, AL, OP_SUB, true, 6, 6, 1)
+    g.branch(NE, top)
+    movReg(&g.code, R2, 4)
+    movReg(&g.code, R3, 5)
+    pop(&g.code, (1 << 4) | (1 << 5) | (1 << 6) | (1 << PC))
+}
+
+/// xl$lsl64 / xl$lsr64: r0:r1 shifted by r2 (a count of 64 or more gives 0). A register shift
+/// uses the count's low byte and gives 0 from 32 up, so the three-term form needs no branch:
+/// hi = hi << n | lo >> (32 - n) | lo << (n - 32), lo = lo << n (mirrored for the right shift).
+fn shift64(g: *Gen, left: bool) {
+    dpImm(&g.code, AL, OP_CMP, true, 0, R2, 64)
+    dpImm(&g.code, CS, OP_MOV, false, R2, 0, 64)
+    dpImm(&g.code, AL, OP_RSB, false, R3, R2, 32)
+    dpImm(&g.code, AL, OP_SUB, false, R12, R2, 32)
+    local hi: u32 = left ? R1 : R0     // the word that receives bits
+    local lo: u32 = left ? R0 : R1     // the word that gives bits
+    local toward: u32 = left ? LSL : LSR
+    local away: u32 = left ? LSR : LSL
+    shiftReg(&g.code, false, hi, hi, toward, R2)
+    dpShiftReg(&g.code, OP_ORR, false, hi, hi, lo, away, R3)
+    dpShiftReg(&g.code, OP_ORR, false, hi, hi, lo, toward, R12)
+    shiftReg(&g.code, false, lo, lo, toward, R2)
+    bx(&g.code, LR)
+}
+
+/// xl$asr64: r0:r1 >> r2 with the sign fill (a count above 63 acts as 63).
+fn asr64(g: *Gen) {
+    local big: u32 = g.newLabel()
+    dpImm(&g.code, AL, OP_CMP, true, 0, R2, 63)
+    dpImm(&g.code, HI, OP_MOV, false, R2, 0, 63)
+    dpImm(&g.code, AL, OP_CMP, true, 0, R2, 32)
+    g.branch(CS, big)
+    dpImm(&g.code, AL, OP_RSB, false, R3, R2, 32)
+    shiftReg(&g.code, false, R0, R0, LSR, R2)
+    dpShiftReg(&g.code, OP_ORR, false, R0, R0, R1, LSL, R3)
+    shiftReg(&g.code, false, R1, R1, ASR, R2)
+    bx(&g.code, LR)
+    g.bind(big)
+    dpImm(&g.code, AL, OP_SUB, false, R2, R2, 32)
+    shiftReg(&g.code, false, R0, R1, ASR, R2)
+    dpShiftImm(&g.code, OP_MOV, false, R1, 0, R1, ASR, 31)
+    bx(&g.code, LR)
+}
+
+/// xl$streq: r0, r1 the addresses of two `str` views -> r0 = 1 when the bytes are equal.
+fn streq(g: *Gen) {
+    local no: u32 = g.newLabel()
+    local yes: u32 = g.newLabel()
+    local top: u32 = g.newLabel()
+    load(&g.code, R2, R0, 4, 4, false)
+    load(&g.code, R3, R1, 4, 4, false)
+    dpReg(&g.code, AL, OP_CMP, true, 0, R2, R3)
+    g.branch(NE, no)
+    load(&g.code, R0, R0, 0, 4, false)
+    load(&g.code, R1, R1, 0, 4, false)
+    g.bind(top)
+    dpImm(&g.code, AL, OP_CMP, true, 0, R2, 0)
+    g.branch(EQ, yes)
+    load(&g.code, R3, R0, 0, 1, false)
+    load(&g.code, R12, R1, 0, 1, false)
+    dpReg(&g.code, AL, OP_CMP, true, 0, R3, R12)
+    g.branch(NE, no)
+    dpImm(&g.code, AL, OP_ADD, false, R0, R0, 1)
+    dpImm(&g.code, AL, OP_ADD, false, R1, R1, 1)
+    dpImm(&g.code, AL, OP_SUB, false, R2, R2, 1)
+    g.branch(AL, top)
+    g.bind(yes)
+    dpImm(&g.code, AL, OP_MOV, false, R0, 0, 1)
+    bx(&g.code, LR)
+    g.bind(no)
+    dpImm(&g.code, AL, OP_MOV, false, R0, 0, 0)
+    bx(&g.code, LR)
+}
+
+/// Emits every runtime routine the generated code called.
+export fn emitRuntime(g: *Gen) {
+    for i in 0..RT_COUNT {
+        if !*g.rtUsed.get(i as usize) { continue }
+        defineHere(g, rtName(i))
+        if i == RT_UDIV32 { udiv32(g) }
+        else if i == RT_UDIV64 { udiv64(g) }
+        else if i == RT_LSL64 { shift64(g, true) }
+        else if i == RT_LSR64 { shift64(g, false) }
+        else if i == RT_ASR64 { asr64(g) }
+        else { streq(g) }
+    }
+}

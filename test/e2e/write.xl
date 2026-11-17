@@ -2,12 +2,15 @@
 // CPU. `write(1, text, length)` puts the text on standard output; run.sh expects it there.
 //   Linux   x86-64: write = 1 (https://man7.org/linux/man-pages/man2/syscall.2.html)
 //   Linux   arm64:  write = 64 (the generic table, include/uapi/asm-generic/unistd.h)
+//   Linux   arm32:  write = 4 (the EABI table, arch/arm/tools/syscall.tbl)
 //   macOS   both:   write = 4 in the Unix class 2 (`0x2000000 | 4`, xnu bsd/kern/syscalls.master)
 // Windows has no stable system call numbers: run.sh does not run this program there.
 #if os == "linux" && arch == "x86_64"
 const sysWrite = 1
 #elif os == "linux" && arch == "aarch64"
 const sysWrite = 64
+#elif os == "linux" && arch == "arm"
+const sysWrite = 4
 #elif os == "macos"
 const sysWrite = 0x2000004
 #else

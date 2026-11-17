@@ -12,7 +12,8 @@ from "../sema/sema" import Sema, EntityRef
 from "../sema/subst" import TypeEnv
 from "../sema/types" import T_NAMED, T_POINTER, T_SLICE, T_ARRAY, T_TUPLE, T_CLASS
 from "../sema/resolve" import resolve
-from "../sema/instances" import instantiate
+from "../sema/instances" import instantiate, instantiateMethod
+from "../sema/item" import SDecl
 from "../sema/conversion" import implicitConversion, C_OK, C_WARN
 from "./state" import Lowerer, ScopeEntry
 from "./typing" import exprType
@@ -87,7 +88,7 @@ fn unify(l: *Lowerer, pat: i32, actual: i32, names: *Vec<String>, env: *TypeEnv)
 
 /// The type of argument `a` before the parameter type is known (C++ `preLowerArgs`): the default
 /// type of a literal, else the expression's own type; -1 when unknown.
-fn preType(l: *Lowerer, a: i32) -> i32 {
+export fn preType(l: *Lowerer, a: i32) -> i32 {
     local e = l.s.exprAt(a)
     if (*e).kind == XE_INT_LITERAL {
         return (*e).intValue > 2147483647 ? l.s.types.makeInt(64, true) : l.s.types.makeInt(32, true)
@@ -119,7 +120,9 @@ export fn genericInstance(l: *Lowerer, e: *XExpr, entry: *ScopeEntry) -> EntityR
     local fixed = Vec<i32>() ///< the parameter types, `self` excluded
     for i in 0..(*d).paramsCount as usize {
         local p = owner.paramAt((*d).paramsFirst as usize + i)
-        if (*p).isSelf == 0 { fixed.push((*p).ty) }
+        // `unify` reads the pattern in this module's arena: an imported generic's parameter
+        // types are adopted first (they were read in the owner's arena, a wrong type there).
+        if (*p).isSelf == 0 { fixed.push(owner == l.s ? (*p).ty : l.s.types.adopt(owner.types, (*p).ty)) }
     }
     if fixed.length() != (*e).argsCount as usize { return none }
     local targs = Vec<i32>()
@@ -157,6 +160,64 @@ export fn genericInstance(l: *Lowerer, e: *XExpr, entry: *ScopeEntry) -> EntityR
         ownerArgs.push(owner == l.s ? *targs.get(i) : owner.types.adopt(l.s.types, *targs.get(i)))
     }
     return instantiate(owner, gref, ownerArgs, (*e).span)
+}
+
+/// The instance of generic method `decl` (an SDecl of `owner`, declared by class `clsQ`) that
+/// call `e` names: an index into `owner.methodInstDecls`, -1 after E0724. The type arguments are
+/// written (`.f<i32>(x)`) or inferred like a generic function's; the instance is made once per
+/// argument list and queued in `owner.pendingMethods` (lowered by lowerPendingMethods).
+export fn genericMethodInstance(l: *Lowerer, e: *XExpr, owner: *Sema, decl: i32, clsQ: str) -> i32 {
+    local d: SDecl = *owner.declAt(decl as usize)
+    local mname = owner.text(d.name)
+    local names = Vec<String>()
+    for i in 0..d.genericCount as usize {
+        names.push(String(owner.text(*owner.types.strs.get(d.genericFirst + i as u32))))
+    }
+    local targs = Vec<i32>()
+    local callee = l.s.exprAt((*e).lhs)
+    if (*callee).genericArgsCount > 0 {
+        if (*callee).genericArgsCount as usize != names.length() {
+            l.err("E0724", (*e).span,
+                format("`{}` takes {} type argument(s), {} given", mname, names.length(),
+                    (*callee).genericArgsCount).asStr(), "write one type per type parameter")
+            return -1
+        }
+        for i in 0..names.length() {
+            local written = l.s.flat.ref(l.s.flat.r.typeRefs, (*callee).genericArgsFirst + i as u32)
+            targs.push(resolve(l.s, l.s.types.internAst(written)))
+        }
+    } else {
+        local env = new TypeEnv()
+        local k = 0 as u32
+        local ok = true
+        for i in 0..d.paramsCount as usize {
+            local p = owner.paramAt(d.paramsFirst as usize + i)
+            if (*p).isSelf != 0 { continue }
+            local pat = owner == l.s ? (*p).ty : l.s.types.adopt(owner.types, (*p).ty)
+            local actual = k < (*e).argsCount ? preType(l, l.s.refAt("expr", ((*e).argsFirst + k) as i32)) : -1
+            k++
+            if actual < 0 || !unify(l, pat, actual, &names, env) { ok = false }
+        }
+        for i in 0..names.length() {
+            local bound = ok ? env.get((*names.get(i)).asStr()) : -1
+            if bound < 0 {
+                l.err("E0724", (*e).span,
+                    format("cannot infer `{}` of `{}`", (*names.get(i)).asStr(), mname).asStr(),
+                    format("write the type arguments: `.{}<...>(...)`", mname).asStr())
+                return -1
+            }
+            targs.push(bound)
+        }
+    }
+    local ownerArgs = Vec<i32>()
+    for i in 0..targs.length() {
+        ownerArgs.push(owner == l.s ? *targs.get(i) : owner.types.adopt(l.s.types, *targs.get(i)))
+    }
+    local cls = clsQ
+    for i in 0..clsQ.len as usize {
+        if clsQ[i] == b':' { cls = clsQ[i + 1..clsQ.len as usize] }
+    }
+    return instantiateMethod(owner, decl, cls, clsQ, ownerArgs)
 }
 
 /// The class type that a construction `T(args)` or `Vec<i32>(args)` names, as a type of this

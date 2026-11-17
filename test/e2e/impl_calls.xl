@@ -1,0 +1,27 @@
+// e2e: a method of `impl I for T` called on the concrete type (`heap.free(p)` on a `Heap`), next
+// to an inherent `impl T` method. Lives here because only run.sh compiles with the xlc under test.
+interface Shape {
+    fn area(self) -> i32
+}
+
+class Square { side: i32 }
+
+impl Shape for Square {
+    fn area(self) -> i32 { return self.side * self.side }
+}
+
+impl Square {
+    fn grow(self: *Square, by: i32) { self.side += by }
+}
+
+global sq: Square
+
+@entry fn main() -> i32 {
+    sq.side = 3
+    if sq.area() != 9 { return 1 }
+    sq.grow(2)
+    if sq.area() != 25 { return 2 }
+    local p = &sq
+    if p.area() != 25 { return 3 }
+    return 0
+}

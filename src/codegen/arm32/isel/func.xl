@@ -1,0 +1,105 @@
+// One function of the arm32 selector.
+//
+//   push {r11, lr}            the frame record; fp (r11) points at it
+//   mov r11, sp
+//   movw ip, #lo; movt ip, #hi   the frame size, patched after the body (8-aligned: AAPCS32 5.2.1.2)
+//   sub sp, sp, ip
+//   ... the result address and the parameters to their slots, the body ...
+// epilog:
+//   mov sp, r11
+//   pop {r11, pc}
+//   cold blocks: `panic(message)` out of line
+// Every local has a frame slot below fp: a scalar 8 bytes, a memory value its own size; a memory
+// parameter's slot holds the address of the caller's copy (`byRef`). Stack parameters start at
+// [fp + 8]. Landing pads are not generated (no `try` on arm32): the pad table lists every function
+// with no pad.
+from "std" import Vec
+from "../../../hir/abi" import XlcHirFunction, view
+from "../encode" import R2, R3, R11, R12, SP, LR, PC, AL, OP_SUB, dpReg, movReg, movw, movt, load, store, push,
+    pop
+from "../encode/vfp" import vmovFromD, vmovFromS
+from "conv" import AC_CORE, AC_PAIR, AC_S, AC_D, AC_STACK, ArgLoc, newConv, classify
+from "gen" import Gen, Cold, LoopRec
+from "stmt" import genStmts
+
+/// Moves the incoming parameters to their slots: the core registers first (the VFP and stack
+/// moves go through r2/r3).
+fn genParams(g: *Gen, f: *XlcHirFunction) {
+    local conv = newConv(g.sretSlot != 0)
+    local locs = Vec<ArgLoc>()
+    for i in 0..f.paramCount {
+        locs.push(classify(g, view(f.locals[i as usize].typeName), &conv))
+    }
+    for i in 0..locs.length() {
+        local l: *ArgLoc = locs.get(i)
+        local off: i32 = *g.slot.get(i)
+        if l.cls == AC_CORE {
+            store(&g.code, l.reg, R11, off, 4)
+        } else if l.cls == AC_PAIR {
+            store(&g.code, l.reg, R11, off, 4)
+            store(&g.code, l.reg + 1, R11, off + 4, 4)
+        }
+    }
+    for i in 0..locs.length() {
+        local l: *ArgLoc = locs.get(i)
+        local off: i32 = *g.slot.get(i)
+        if l.cls == AC_S {
+            vmovFromS(&g.code, R2, l.reg)
+            store(&g.code, R2, R11, off, 4)
+        } else if l.cls == AC_D {
+            vmovFromD(&g.code, R2, R3, l.reg)
+            store(&g.code, R2, R11, off, 4)
+            store(&g.code, R3, R11, off + 4, 4)
+        } else if l.cls == AC_STACK {
+            for w in 0..(l.size / 4) {
+                load(&g.code, R2, R11, (8 + l.stack + w * 4) as i32, 4, false)
+                store(&g.code, R2, R11, off + (w * 4) as i32, 4)
+            }
+        }
+    }
+}
+
+export fn genFunction(g: *Gen, fi: u32) {
+    local f: *XlcHirFunction = &g.m.functions[fi as usize]
+    g.f = f
+    g.frame = 0
+    g.tempTop = 0
+    g.loops = Vec<LoopRec>()
+    g.cold = Vec<Cold>()
+    g.slot = Vec<i32>()
+    g.byRef = Vec<bool>()
+    g.epilog = g.newLabel()
+    for i in 0..f.localCount {
+        local ty: str = view(f.locals[i as usize].typeName)
+        local ref: bool = i < f.paramCount && g.isMem(ty)
+        local mem: bool = !ref && g.isMem(ty)
+        g.slot.push(g.tempSlot(mem ? g.sizeOf(ty) : 8, mem ? g.alignOf(ty) : 8))
+        g.byRef.push(ref)
+    }
+    g.sretSlot = g.isMem(view(f.ret)) ? g.tempSlot(4, 4) : 0
+
+    g.bind(fi)
+    push(&g.code, (1 << R11) | (1 << LR))
+    movReg(&g.code, R11, SP)
+    g.prologAt = g.code.length() as u32
+    movw(&g.code, AL, R12, 0)
+    movt(&g.code, R12, 0)
+    dpReg(&g.code, AL, OP_SUB, false, SP, SP, R12)
+    if g.sretSlot != 0 { store(&g.code, 0, R11, g.sretSlot, 4) }
+    genParams(g, f)
+    genStmts(g, f.bodyFirst, f.bodyCount)
+
+    g.bind(g.epilog)
+    movReg(&g.code, SP, R11)
+    pop(&g.code, (1 << R11) | (1 << PC))
+    for i in 0..g.cold.length() {
+        g.bind(g.cold.get(i).label)
+        g.panicCall(g.cold.get(i).message.asStr())
+    }
+    local total: u32 = (g.frame + 7) & ~(7 as u32)
+    local tmp = Vec<u32>()
+    movw(&tmp, AL, R12, total & 0xffff)
+    movt(&tmp, R12, total >> 16)
+    g.code.set(g.prologAt as usize, *tmp.get(0))
+    g.code.set(g.prologAt as usize + 1, *tmp.get(1))
+}

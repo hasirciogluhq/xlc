@@ -1,0 +1,212 @@
+// Parameter packs in the lowering pass (the model is in sema/packs.xl). Three pieces:
+//
+// - `packTarget`: the call of a name with a pack overload. An overload with a fixed parameter
+//   list wins when it takes the arguments; otherwise the pack overloads compete with their fixed
+//   parameters plus the types of the trailing arguments, and only the chosen one is
+//   instantiated.
+// - `expandSpread`: inside a pack instance, `f(x, ..args)` is lowered and typed as a synthesized
+//   copy of the call with `args#0, args#1, ...` in place of `..args` (made once per call and
+//   function). Every other call path then works unchanged: overloads, generics, methods, packs.
+// - `lowerPackLoop`: `for a in args { body }` and `for a, i in args { body }` unrolled:
+//
+//     whole: do {                         // `break` leaves every element
+//         item: do {                      // `continue` leaves this element
+//             a -> the element parameter itself (no copy; a move of `a` moves the parameter)
+//             local i: usize = 0          // only with the index form
+//             ...body...
+//         } while false
+//         ...one `item` per element...
+//     } while false
+//
+//   The jumps are resolved by `jumpDepth` (function.xl): an element frame is on the loop stack as
+//   `$item:<label>`; an unlabeled `break` and `break label` skip it to reach the whole loop, an
+//   unlabeled `continue` and `continue label` stop at it.
+//
+// Fixed against the C++ variadic.cpp: the index form `for a, i in args` was rejected there (the
+// pack loop required no index name) and is supported here; `break` inside a `switch` inside a
+// pack loop only left the element in the C++ rewrite (it counted the switch as a break target,
+// which the language's switch is not) and leaves the loop here; an argument whose type is unknown
+// gave a bare E0404 there and names the argument here (E0708). A bare `nil` is `*void`, the
+// language's rule for an unbound `nil`, so `f(nil)` instantiates `f<..*void>`.
+from "std" import String, Vec, format
+from "../lang/ast/ast" import XExpr, XStmt, XE_SPREAD, XE_NAME, XE_FIELD
+from "../sema/sema" import Sema, EntityRef
+from "../sema/packs" import isPackDecl, fixedParamCount, instantiatePack, elementName
+from "./state" import Lowerer, ScopeEntry
+from "./typing" import entryOwner, functionDecls, chooseDecl, argSpecs, declParamsIn
+from "./overload" import PICK_NONE, PICK_AMBIGUOUS, pickOverload
+from "./generics" import preType
+from "./function" import lowerBlockInto, bindLocal, addLocal
+
+/// True when expression `idx` is `pack.len` of the pack instance under construction.
+export fn isPackLen(l: *Lowerer, idx: i32) -> bool {
+    if l.packName.length() == 0 { return false }
+    local e = l.s.exprAt(idx)
+    if (*e).kind != XE_FIELD || (*e).lhs < 0 { return false }
+    local lhs = l.s.exprAt((*e).lhs)
+    return (*lhs).kind == XE_NAME && l.s.exprTextAt((*e).lhs) == l.packName.asStr() &&
+        l.s.exprTextAt(idx) == "len"
+}
+
+/// True when expression `idx` names the pack of the instance under construction.
+export fn isPackName(l: *Lowerer, idx: i32) -> bool {
+    if l.packName.length() == 0 || idx < 0 { return false }
+    return (*l.s.exprAt(idx)).kind == XE_NAME && l.s.exprTextAt(idx) == l.packName.asStr()
+}
+
+/// The call `idx` with `..pack` written out as the element parameters, or `idx` itself when it
+/// spreads nothing (or the function has no pack: a stray spread is E0737 from the sema).
+export fn expandSpread(l: *Lowerer, idx: i32) -> i32 {
+    if l.packName.length() == 0 { return idx }
+    local e: XExpr = *l.s.exprAt(idx)
+    local spreads = false
+    for i in 0..e.argsCount as usize {
+        local a = l.s.refAt("expr", (e.argsFirst + i as u32) as i32)
+        if (*l.s.exprAt(a)).kind == XE_SPREAD && l.s.exprTextAt(a) == l.packName.asStr() { spreads = true }
+    }
+    if !spreads { return idx }
+    for i in 0..l.spreadFrom.length() {
+        if *l.spreadFrom.get(i) == idx { return *l.spreadTo.get(i) }
+    }
+    local refs = Vec<i32>()
+    for i in 0..e.argsCount as usize {
+        local a = l.s.refAt("expr", (e.argsFirst + i as u32) as i32)
+        local ae: XExpr = *l.s.exprAt(a)
+        if ae.kind != XE_SPREAD || l.s.exprTextAt(a) != l.packName.asStr() {
+            refs.push(a)
+            continue
+        }
+        for k in 0..l.packLocals.length() {
+            // A name record at the spread's span, its text in the Sema's table.
+            local n: XExpr = ae
+            n.kind = XE_NAME
+            n.text = l.s.str(elementName(l.packName.asStr(), k).asStr())
+            n.lhs = -1
+            n.rhs = -1
+            n.argsCount = 0
+            n.fieldsCount = 0
+            n.genericArgsCount = 0
+            n.closure = -1
+            refs.push(l.s.synthExpr(n))
+        }
+    }
+    local call: XExpr = e
+    call.argsFirst = l.s.synthExprRefs(&refs)
+    call.argsCount = refs.length() as u32
+    local out = l.s.synthExpr(call)
+    l.spreadFrom.push(idx)
+    l.spreadTo.push(out)
+    return out
+}
+
+/// The instance a call of `entry` makes of one of its pack overloads, or an EntityRef with
+/// `sym == -1` when the call is not a pack call (no pack overload, or a fixed overload fits), and
+/// `sym == -2` after a diagnostic.
+export fn packTarget(l: *Lowerer, e: *XExpr, entry: *ScopeEntry) -> EntityRef {
+    local none: EntityRef
+    none.owner = nil
+    none.sym = -1
+    local owner = entryOwner(l, entry)
+    local packs = Vec<i32>()
+    for i in 0..(*entry).overloads.length() {
+        local d = owner.declOfItem(*(*entry).overloads.get(i))
+        if d >= 0 && isPackDecl(owner, d) { packs.push(d) }
+    }
+    if packs.length() == 0 { return none }
+    local specs = argSpecs(l, e)
+    // An overload with fixed parameters that takes the call wins over the pack; an ambiguous one
+    // is reported by the fixed path. A generic one is chosen by the generic path.
+    local fixed = functionDecls(l, entry)
+    for i in 0..fixed.length() {
+        if (*owner.declAt(*fixed.get(i) as usize)).genericCount > 0 { return none }
+    }
+    if fixed.length() > 0 && chooseDecl(l, owner, &fixed, specs) != PICK_NONE { return none }
+    // Each pack overload competes with its fixed parameters followed by the argument types.
+    local argc = (*e).argsCount as usize
+    local cands = Vec<Vec<i32>>()
+    local elemsOf = Vec<Vec<i32>>()
+    local usable = Vec<i32>()
+    for p in 0..packs.length() {
+        local d = *packs.get(p)
+        local nFixed = fixedParamCount(owner, d)
+        if argc < nFixed { continue }
+        local params = declParamsIn(l, owner, d)
+        local cand = Vec<i32>()
+        for k in 0..nFixed { cand.push(*params.get(k)) }
+        local elems = Vec<i32>()
+        local typed = true
+        for k in nFixed..argc {
+            local a = l.s.refAt("expr", ((*e).argsFirst + k as u32) as i32)
+            local t = preType(l, a)
+            if t < 0 {
+                // A `nil` or another expression whose type comes only from its context: the
+                // element has no type to instantiate with.
+                l.err("E0708", (*l.s.exprAt(a)).span,
+                    format("pack argument {} of `{}` has no type of its own", k - nFixed + 1,
+                        l.s.exprTextAt((*e).lhs)).asStr(),
+                    "give it one with `as` (`nil as *T`)")
+                typed = false
+                break
+            }
+            elems.push(t)
+            cand.push(t)
+        }
+        if !typed {
+            none.sym = -2
+            return none
+        }
+        cands.push(cand)
+        elemsOf.push(elems)
+        usable.push(d)
+    }
+    if usable.length() == 0 { return none }
+    local pick = pickOverload(l.s, &cands, &((*specs).kinds), &((*specs).types))
+    if pick == PICK_AMBIGUOUS {
+        l.err("E0403", (*e).span, format("call to `{}` is ambiguous", l.s.exprTextAt((*e).lhs)).asStr(),
+            "write the argument types so one overload is closer")
+        none.sym = -2
+        return none
+    }
+    if pick < 0 { return none }
+    // The instance lives in the module of the pack function: the element types move there.
+    local chosen = elemsOf.get(pick as usize)
+    local ownerElems = Vec<i32>()
+    for i in 0..(*chosen).length() {
+        local t = *(*chosen).get(i)
+        ownerElems.push(owner == l.s ? t : owner.types.adopt(l.s.types, t))
+    }
+    return instantiatePack(owner, *usable.get(pick as usize), &ownerElems, (*e).span)
+}
+
+/// `for a in pack { }` / `for a, i in pack { }` in a pack instance, unrolled (file comment).
+export fn lowerPackLoop(l: *Lowerer, idx: i32, st: *XStmt) -> i32 {
+    local label = String(l.s.flat.strOf((*st).label))
+    local name = String(l.s.stmtTextAt(idx))
+    local indexName = String("")
+    if (*st).namesCount > 0 { indexName = String(l.s.flat.strOf(l.s.flat.pathSeg((*st).namesFirst))) }
+    local body = (*st).body
+    local items = Vec<i32>()
+    l.loops.push(label.clone())
+    l.loopMarks.push(l.defers.length() as i32)
+    for k in 0..l.packLocals.length() {
+        l.loops.push(format("$item:{}", label.asStr()))
+        l.loopMarks.push(l.defers.length() as i32)
+        l.scopes.push()
+        bindLocal(l, name.asStr(), *l.packLocals.get(k), *l.packTypes.get(k))
+        local head = Vec<i32>()
+        if indexName.length() > 0 {
+            local id = addLocal(l, indexName.asStr(), "usize")
+            head.push(l.b.localStmt(id, indexName.asStr(), "usize", l.b.intConst(k as u64, "usize")))
+            bindLocal(l, indexName.asStr(), id, l.s.types.makeInt(0, false))
+        }
+        local inner = lowerBlockInto(l, body)
+        for i in 0..inner.length() { head.push(*inner.get(i)) }
+        l.scopes.pop()
+        l.loopMarks.pop()
+        l.loops.pop()
+        items.push(l.b.whileStmt(l.b.boolConst(false, "bool"), head, true))
+    }
+    l.loopMarks.pop()
+    l.loops.pop()
+    return l.b.whileStmt(l.b.boolConst(false, "bool"), items, true)
+}

@@ -12,7 +12,9 @@ from "../sema/item" import SDecl
 from "../sema/sema" import Sema
 from "../sema/subst" import TypeEnv
 from "../sema/const_eval" import evalConst
-from "../sema/layout_calc" import layoutOfName
+from "../sema/layout_calc" import layoutOf
+from "../sema/module_scope" import exprToType
+from "../sema/resolve" import resolve
 from "./state" import Lowerer
 from "./typing" import arrayLength, hasSideEffects
 
@@ -31,68 +33,42 @@ export fn lowerArrayLen(l: *Lowerer, e: *XExpr, arr: i32) -> i32 {
 }
 
 /// `sizeOf(T)`, `alignOf(T)` and `offsetOf(T, field)`: folded to an integer constant from the
-/// computed layout. Primitives use the fixed table; aggregates go through `layoutOfName`.
+/// computed layout of the resolved type (primitives included, so the target's pointer size holds).
 export fn lowerLayoutQuery(l: *Lowerer, idx: i32, e: *XExpr, which: str) -> i32 {
     if (*e).argsCount == 0 {
         l.err("E0709", (*e).span, format("`{}` needs a type", which).asStr(), "missing argument")
         return -1
     }
     local tyArg = l.s.refAt("expr", (*e).argsFirst as i32)
-    local tyName = l.s.exprTextAt(tyArg)
-    // Inside a generic instance a type parameter names its argument.
-    if l.s.instEnv != nil {
-        local hit = (l.s.instEnv as *TypeEnv).get(tyName)
-        if hit >= 0 { tyName = l.keep(l.s.types.text(hit).asStr()) }
+    // The operand is a type written as an expression (`T`, `a::B`, `*T`, `[]u8`): made a type of
+    // this module and resolved, which applies the instance env first, so `sizeOf(T)` in
+    // `Vec<Route>` is the layout of the argument wherever it is declared.
+    local ty = resolve(l.s, exprToType(l.s, tyArg))
+    if ty < 0 {
+        l.err("E0709", (*e).span, format("no layout for `{}`", l.s.exprTextAt(tyArg)).asStr(),
+            "not a type")
+        return -1
     }
-    local value: u64 = 0
-    if which == "offsetOf" {
-        if (*e).argsCount < 2 {
-            l.err("E0709", (*e).span, "`offsetOf` needs a type and a field", "missing argument")
-            return -1
-        }
-        local fieldArg = l.s.refAt("expr", ((*e).argsFirst + 1 as u32) as i32)
-        local fieldName = l.s.exprTextAt(fieldArg)
-        local li = layoutOfName(l.s, tyName, (*e).span)
-        if li < 0 {
-            l.err("E0709", (*e).span, format("no layout for `{}`", tyName).asStr(),
-                "unknown type")
-            return -1
-        }
-        local lay = *l.s.layoutCache.get(li as usize)
-        for i in 0..(*lay).fields.length() {
-            local f = (*lay).fields.get(i)
-            if (*f).name.asStr() == fieldName {
-                value = (*f).offset
-            }
-        }
-    } else {
-        value = primLayout(tyName, which)
-        if value == 0 {
-            local li = layoutOfName(l.s, tyName, (*e).span)
-            if li < 0 {
-                l.err("E0709", (*e).span, format("no layout for `{}`", tyName).asStr(),
-                    "unknown type")
-                return -1
-            }
-            local lay = *l.s.layoutCache.get(li as usize)
-            value = which == "sizeOf" ? (*lay).size : (*lay).align
-        }
+    local li = layoutOf(l.s, ty, (*e).span)
+    if li < 0 { return -1 } // layoutOf reported why
+    local lay = *l.s.layoutCache.get(li as usize)
+    if which != "offsetOf" {
+        return l.b.intConst(which == "sizeOf" ? (*lay).size : (*lay).align, "usize")
     }
-    return l.b.intConst(value, "usize")
-}
-
-/// The size or alignment of a primitive type by name; 0 when `tyName` is not one.
-fn primLayout(tyName: str, which: str) -> u64 {
-    local size: u64 = 0
-    if tyName == "i8" || tyName == "u8" || tyName == "bool" { size = 1 }
-    else if tyName == "i16" || tyName == "u16" { size = 2 }
-    else if tyName == "f32" { size = 4 }
-    else if tyName == "i32" || tyName == "u32" || tyName == "f32" { size = 4 }
-    else if tyName == "i64" || tyName == "u64" || tyName == "f64" || tyName == "usize" ||
-            tyName == "isize" || tyName == "u128" || tyName == "i128" { size = 8 }
-    else if tyName == "str" { size = 16 }
-    if size == 0 { return 0 }
-    return which == "sizeOf" ? size : size
+    if (*e).argsCount < 2 {
+        l.err("E0709", (*e).span, "`offsetOf` needs a type and a field", "missing argument")
+        return -1
+    }
+    local fieldName = l.s.exprTextAt(l.s.refAt("expr", ((*e).argsFirst + 1 as u32) as i32))
+    for i in 0..(*lay).fields.length() {
+        local f = (*lay).fields.get(i)
+        if (*f).name.asStr() == fieldName { return l.b.intConst((*f).offset, "usize") }
+    }
+    // The C++ pass (and the first port) folded an unknown field to 0 silently.
+    l.err("E0709", (*e).span,
+        format("`{}` has no field `{}`", l.s.types.text(ty).asStr(), fieldName).asStr(),
+        "offsetOf names a field of the type")
+    return -1
 }
 
 /// The value of the member `member` of the enum declared by `d`, numbered as the C++ enumMember

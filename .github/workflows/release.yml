@@ -5,7 +5,8 @@ name: release
 #   v1.2.3        stable release  (latest)
 #   v1.2.3-rc.4   preview release (marked "pre-release", never "latest")
 #
-# The tag must equal the version in xmake.lua. Re-run an existing tag with workflow_dispatch.
+# The tag must equal XLC_VERSION in src/session/session.xl. Re-run an existing tag with
+# workflow_dispatch.
 
 on:
   push:
@@ -24,11 +25,6 @@ permissions:
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
-
-env:
-  # LLVM major version of every build: the Linux builds take it from apt.llvm.org and the Windows builds from conda-forge, macOS
-  # takes Homebrew's newest. 20 is the oldest the code supports.
-  LLVM_VERSION: "23"
 
 jobs:
   meta:
@@ -53,9 +49,9 @@ jobs:
             exit 1
           fi
           version="${TAG#v}"
-          declared="$(sed -n 's/^local xlc_version = "\(.*\)"$/\1/p' xmake.lua)"
+          declared="$(sed -n 's/^export const XLC_VERSION: str = "\(.*\)"$/\1/p' src/session/session.xl)"
           if [ "$declared" != "$version" ]; then
-            echo "error: xmake.lua declares '$declared' but the tag is '$TAG'" >&2
+            echo "error: src/session/session.xl declares '$declared' but the tag is '$TAG'" >&2
             exit 1
           fi
           prerelease=false
@@ -80,22 +76,19 @@ jobs:
           - { runner: macos-15-intel,   os: darwin,  arch: amd64 }
           - { runner: ubuntu-24.04,     os: linux,   arch: amd64 }
           - { runner: ubuntu-24.04-arm, os: linux,   arch: arm64 }
-          # No Windows asset: the released xlc has no lowering for `try` (E0714), so no bootstrap
-          # object can be built there and no binary can be produced until a release with Windows
-          # unwinding.
+          - { runner: windows-2025,     os: windows, arch: amd64 }
     steps:
       - uses: actions/checkout@v7.0.1
         with:
           ref: ${{ needs.meta.outputs.tag }}
       # The toolchain from GitHub releases, exactly as the xl repository installs it
-      # (hasirciogluhq/xlang/.github/actions/toolchain): the `xl` tool binary-only by the
-      # release's install script, the compiler `xlc` and the stdlib, each the newest release.
-      # The released `xlc` compiles the xlang parts of this repository (src/bootstrap.xl,
-      # src/lang/compiler.xl) and is the rung the bootstrap binary is built from.
+      # (hasirciogluhq/xlang/.github/actions/toolchain): the `xl` tool, the released `xlc` and the
+      # stdlib. The released xlc builds this compiler.
       - id: toolchain
         uses: hasirciogluhq/xlang/.github/actions/toolchain@development
 
-      - name: Install dependencies (macOS)
+      # ld.lld, lld-link, llvm-dlltool and llvm-readobj for the cross-target rows of the e2e run.
+      - name: LLVM tools (macOS)
         if: matrix.os == 'darwin'
         shell: bash
         env:
@@ -104,106 +97,40 @@ jobs:
           HOMEBREW_NO_ENV_HINTS: "1"
         run: |
           set -euo pipefail
-          brew install llvm zstd lld
+          brew install llvm lld
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-
-      # apt.llvm.org through the local action (its .deb files are cached; the Ubuntu mirrors are never contacted).
-      - name: Install dependencies (Linux)
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
+      - name: LLVM tools (Linux)
         if: matrix.os == 'linux'
         uses: ./.github/actions/apt-llvm
         with:
-          version: ${{ env.LLVM_VERSION }}
+          version: "23"
 
-      # Windows is a native MSVC-ABI build: Visual Studio's headers, STL and linker, driven by
-      # clang-cl (the code uses `__int128`, which cl.exe does not have). LLVM's static libraries
-      # come from conda-forge, which builds them with MSVC.
-      - name: Install dependencies (Windows)
-        if: matrix.os == 'windows'
-        uses: mamba-org/setup-micromamba@v3.2.1
-        with:
-          environment-name: llvm
-          create-args: >-
-            llvmdev=${{ env.LLVM_VERSION }}
-            zstd-static
-            zlib
-          init-shell: bash
-          cache-environment: true
-
-      - name: Visual Studio environment (Windows)
-        if: matrix.os == 'windows'
-        uses: ilammy/msvc-dev-cmd@v1.13.0
-        with:
-          arch: x64
-
-      - uses: xmake-io/github-action-setup-xmake@v1.2.5
-        with:
-          xmake-version: latest
-          # xmake's own caches, one per OS/CPU: downloaded packages (cli11) and compiled objects.
-          actions-cache-folder: .xmake-cache
-          actions-cache-key: release-${{ matrix.os }}-${{ matrix.arch }}
-          package-cache: true
-          package-cache-key: release-${{ matrix.os }}-${{ matrix.arch }}
-          build-cache: true
-          build-cache-key: release-${{ matrix.os }}-${{ matrix.arch }}
-          project-path: .
-
-      - name: Build (Unix)
-        if: matrix.os != 'windows'
+      - name: Build and test
         shell: bash
-        env:
-          # `xl build` (the wrapper) drives the released compiler and stdlib: `XLC` and
-          # `XLANG_STD` name them (the install script installs the binary only).
-          XLC: ${{ steps.toolchain.outputs.xlc-bin }}
-          XLANG_STD: ${{ steps.toolchain.outputs.std }}
-        run: |
-          set -euo pipefail
-          llvm-config --version
-          xmake f -P . -y -m release --policies=build.ccache:y
-          xmake -P . -y
-          xmake build -P . -y xlc-tests
-          # A release is never built from a failing tree: the unit tests and the e2e run on this OS.
-          xmake run -P . xlc-tests
-          # The binary of this tree, never a fallback: an empty path would test `$XLC`, the
-          # released compiler.
-          bin=$(find build -type f -name xlc | head -n1)
-          [ -n "$bin" ] || { echo "error: the xlc binary was not built" >&2; exit 1; }
-          test/e2e/run.sh "$bin"
-
-      - name: Build (Windows)
-        if: matrix.os == 'windows'
-        shell: bash -el {0}
         env:
           XLC: ${{ steps.toolchain.outputs.xlc-bin }}
           XLANG_STD: ${{ steps.toolchain.outputs.std }}
         run: |
           set -euo pipefail
-          export LLVM_CONFIG="$(cygpath -u "$MAMBA_ROOT_PREFIX/envs/llvm/Library/bin/llvm-config.exe")"
-          "$LLVM_CONFIG" --version
-          xmake f -P . -y -m release --policies=build.ccache:y -p windows -a x64 --toolchain=clang-cl
-          xmake -P . -y
-          xmake build -P . -y xlc-tests
-          xmake run -P . xlc-tests
-          test/e2e/run.sh build/windows/x64/release/xlc.exe
+          exe=build/xlc
+          [ "${{ matrix.os }}" = windows ] && exe=build/xlc.exe
+          xl pkg install
+          xl build src/main.xl -o "$exe"
+          # A release is never built from a failing tree: the e2e run on this OS.
+          [ -x "$exe" ] || { echo "error: the xlc binary was not built" >&2; exit 1; }
+          if [ "${{ matrix.os }}" = darwin ]; then test/native/run.sh; fi
+          test/e2e/run.sh "$exe"
 
-      - name: Package (Unix)
-        if: matrix.os != 'windows'
+      - name: Package
         shell: bash
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
           set -euo pipefail
-          bin="$(find build -type f -name xlc | head -n1)"
-          scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$bin"
-
-      - name: Package (Windows)
-        if: matrix.os == 'windows'
-        shell: bash
-        env:
-          VERSION: ${{ needs.meta.outputs.version }}
-        run: |
-          set -euo pipefail
-          bin="$(find build -type f -name xlc.exe | head -n1)"
-          bash scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$bin"
+          exe=build/xlc
+          [ "${{ matrix.os }}" = windows ] && exe=build/xlc.exe
+          bash scripts/package.sh "$VERSION" "${{ matrix.os }}" "${{ matrix.arch }}" "$exe"
 
       - uses: actions/upload-artifact@v7.0.2
         with:

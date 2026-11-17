@@ -18,16 +18,16 @@
 // The pad table gets one (function address, pad address or 0) entry for every function: the unwinder
 // looks a return address up by the nearest function start below it.
 from "std" import Vec
-from "../../hir/abi" import XlcHirFunction, view
-from "../arm64" import X0, X8, X16, X29, X30, SP, XZR, movReg64, add64Imm, sub64Imm, stp64Pre, ldp64Post, ret, brk
+from "../../../hir/abi" import XlcHirFunction, view
+from "../encode" import X0, X8, X16, X29, X30, SP, XZR, movReg64, add64Imm, sub64Imm, stp64Pre, ldp64Post, ret, brk
 from "call" import callUnwind
 from "conv" import AC_X, AC_D, AC_STACK, AC_XPAIR, AC_HFA, Conv, classify, word, resultClass, hfaCount
 from "emit" import loadTyped, storeTyped, loadFloat, storeFloat, addOff, normalizeReg
 from "gen" import Gen, Cold, PadRec, LoopRec
-from "layout" import K_INT, K_FLOAT
+from "../../common/layout" import K_INT, K_FLOAT
 from "regs" import assignFrame, LK_REG
 from "stmt" import genStmts
-from "types" import scalarOf
+from "../../common/types" import scalarOf
 
 fn alignUp(v: u32, a: u32) -> u32 {
     return (v + a - 1) & ~(a - 1)

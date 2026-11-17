@@ -3,7 +3,7 @@
 // method is found in one class only; the overloads of that name in that class are its candidates
 // (C++ `methodCandidates`). Virtual methods are found too, so the caller can tell them apart.
 // Only the module's own declarations are searched; a base class of another module is a known gap.
-from "std" import String, Vec
+from "std" import String, Vec, format
 from "../sema/sema" import Sema
 from "../sema/module_scope" import lookupEntity, entityByQName
 from "../sema/item" import SDecl
@@ -85,8 +85,12 @@ export class MethodRef {
     cdecl: i32
     cls: String
     isVirtual: bool
+    viaInterface: bool ///< found in an `impl I for T` block (`cls` is `T.I`)
+    ambiguous: bool    ///< two interface impls of the type declare the name (E0403)
 
     fn init(self) {
+        self.viaInterface = false
+        self.ambiguous = false
         self.found = false
         self.owner = nil
         self.decl = -1
@@ -121,33 +125,57 @@ export fn findMethod(s: *Sema, ty: i32, name: str) -> *MethodRef {
     return findInherent(s, ty, name, out)
 }
 
-/// The method `name` of an `impl T { }` block (no interface) whose target is the struct or class
-/// `ty`: such a method is the function `T.name`, `cdecl` is the impl declaration (its methods are
-/// ranged like a class's). The impl lives in the module that declares `T`.
+/// The method `name` of an `impl T { }` or `impl I for T { }` block whose target is the struct or
+/// class `ty`. An inherent method is the function `T.name`, an interface one `T.I.name` (`cls`
+/// carries the prefix); `cdecl` is the impl declaration (its methods are ranged like a class's).
+/// The impl lives in the module that declares `T`. An inherent method wins; the same name in two
+/// interface impls is `ambiguous` (the C++ pass silently took the first impl in item order).
 fn findInherent(s: *Sema, ty: i32, name: str, out: *MethodRef) -> *MethodRef {
     local at = classLoc(s, ty)
     if at.decl < 0 { return out }
     local o = at.owner
     local typeQ = o.qualify(o.text((*o.declAt(at.decl as usize)).name))
     for i in 0..o.items.length() {
-        local item = i as i32
-        local di = o.declOfItem(item)
+        local di = o.declOfItem(i as i32)
         if di < 0 { continue }
         local d = o.declAt(di as usize)
-        if (*d).kind != XD_IMPL || (*d).ifacePathCount > 0 { continue }
+        if (*d).kind != XD_IMPL { continue }
         local target = resolve(o, (*d).implTarget)
         if target < 0 || o.types.pathOf(o.types.get(target)).asStr() != typeQ.asStr() { continue }
         local found = methodsNamed(o, di, name)
         if found.length() == 0 { continue }
+        local isIface = (*d).ifacePathCount > 0
+        if isIface && (*out).found {
+            // An earlier inherent match wins; an earlier interface match makes it ambiguous.
+            if (*out).viaInterface { (*out).ambiguous = true }
+            continue
+        }
+        local cls = typeQ.clone()
+        if isIface {
+            local iface = interfaceQName(o, (*d).ifacePathFirst)
+            if iface.length() == 0 { continue }
+            cls = format("{}.{}", typeQ.asStr(), iface.asStr())
+        }
         (*out).found = true
         (*out).owner = o
         (*out).decl = *found.get(0)
         (*out).cdecl = di
-        (*out).cls = typeQ.clone()
+        (*out).cls = cls
         (*out).isVirtual = false
-        return out
+        (*out).viaInterface = isIface
+        (*out).ambiguous = false
+        if !isIface { return out }
     }
     return out
+}
+
+/// The qualified name of the interface whose first path segment is at `first` in the type
+/// string table of `o`, "" when it names no interface (impls.xl reports that).
+fn interfaceQName(o: *Sema, first: u32) -> String {
+    local ref = lookupEntity(o, o.text(*o.types.strs.get(first)))
+    if ref.sym < 0 { return String("") }
+    local owner = ref.owner != nil ? ref.owner : o
+    return owner.qualify(owner.text(ref.name))
 }
 
 /// The type of `self` in a method of the class `cls` (its qualified name): a pointer to the class.

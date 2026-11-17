@@ -5,11 +5,12 @@
 //
 // Lowered: instances of generic functions, structs, classes and payload enums (their parts).
 // Not lowered yet: generic methods of instances (`pendingMethods`) and generic impls.
-from "std" import String, Vec
+from "std" import String, Vec, format
 from "../sema/sema" import Sema
 from "../sema/subst" import TypeEnv
 from "./state" import Lowerer
-from "./items" import lowerInstanceItem
+from "./items" import lowerInstanceItem, lowerLazyMethods
+from "./function" import lowerFunctionDecl
 
 export fn lowerInstancesTouch() { return }
 
@@ -57,6 +58,49 @@ export fn lowerPendingInstances(l: *Lowerer) -> bool {
             l.s.instEnv = envOf(l.s, inst as usize) as *void
             l.s.currentInstance = String(l.s.text(*l.s.instanceNames.get(inst as usize)))
             lowerInstanceItem(l, item)
+            l.s.instEnv = nil
+            l.s.currentInstance = String("")
+        }
+    }
+    if lowerLazyMethods(l) { any = true }
+    if lowerPendingMethods(l) { any = true }
+    return any
+}
+
+/// Lowers the generic method instances calls requested (`c.streamVia<F>(..)`), each with an env
+/// that binds the method's own parameters and, in a class instance (`Box<i32>.map<U>`), the
+/// class's. The C++ pass lowered them with only the method's env.
+fn lowerPendingMethods(l: *Lowerer) -> bool {
+    local any = false
+    while l.s.pendingMethods.length() > 0 {
+        local batch = l.s.pendingMethods.clone()
+        l.s.pendingMethods = Vec<i32>()
+        for b in 0..batch.length() {
+            any = true
+            local m = *batch.get(b) as usize
+            local env = (*l.s.methodInstEnvs.get(m) as *TypeEnv).clone()
+            local cls = String(l.s.text(*l.s.methodInstCls.get(m)))
+            local clsQ = String(l.s.text(*l.s.methodInstClsQ.get(m)))
+            local key = String(l.s.text(*l.s.methodInstKeys.get(m)))
+            local sym = l.s.find(cls.asStr())
+            local item = sym >= 0 ? l.s.itemOf(sym) : -1
+            local inst = item >= 0 ? l.s.itemInstanceOf(item) : -1
+            l.s.currentInstance = String("")
+            if inst >= 0 {
+                local outer = envOf(l.s, inst as usize)
+                if outer != nil {
+                    for i in 0..outer.names.length() {
+                        local n = (*outer.names.get(i)).asStr()
+                        if env.get(n) < 0 { env.put(n, *outer.tys.get(i)) }
+                    }
+                }
+                l.s.currentInstance = cls.clone()
+            }
+            l.s.instEnv = env as *void
+            local decl = *l.s.methodInstDecls.get(m)
+            local dot = clsQ.length() + 1
+            local localName = format("{}.{}", cls.asStr(), key.asStr()[dot..key.length()])
+            lowerFunctionDecl(l, item, decl, key.asStr(), localName.asStr(), clsQ.asStr())
             l.s.instEnv = nil
             l.s.currentInstance = String("")
         }

@@ -9,27 +9,30 @@
 // from the slots, the stack arguments stored below `sp`, and the call made. The result is moved into
 // the destination register before the live temporaries come back. Conventions: conv.xl.
 //
-// `syscall` (macOS arm64): the number in x16, the arguments in x0.., `svc #0x80`; the kernel
-// reports an error with the carry flag set and the positive errno in x0, which becomes the `-errno`
-// the language returns.
+// `syscall` per OS (codegen.md, "System calls"):
+// - macOS: the number in x16, the arguments in x0..x5, `svc #0x80`; the kernel reports an error
+//   with the carry flag set and the positive errno in x0, which becomes the `-errno` the language
+//   returns.
+// - Linux and the generic OS: the number in x8, the arguments in x0..x5, `svc #0`; x0 already
+//   holds `-errno` on failure (https://man7.org/linux/man-pages/man2/syscall.2.html).
 // Atomics use the LSE instructions of ARMv8.1 (arm64/atomic.xl); every one is sequentially
 // consistent, a weaker `MemoryOrder` is not distinguished.
 // @spec https://github.com/apple-oss-distributions/xnu (bsd/dev/arm/systemcalls.c)
 from "std" import Vec
-from "../../hir/abi" import XlcHirExpr, XlcHirFieldInit, view, E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL,
+from "../../../hir/abi" import XlcHirExpr, XlcHirFieldInit, view, E_CALL, E_CALL_INDIRECT, E_CALL_VIRTUAL,
     E_CALL_ITABLE, E_SYSCALL, E_NEW, E_CONSTRUCT, E_ATOMIC_LOAD, E_ATOMIC_STORE, E_ATOMIC_XCHG, E_ATOMIC_CAS,
     E_ATOMIC_ADD, E_FENCE, E_ASM
-from "../arm64" import X0, X8, X16, SP, XZR, CC, movReg64, add64Imm, sub64Imm, sub64Reg, cbz64, bCond, blr, svc
-from "../arm64/float" import fmovReg
-from "../arm64/atomic" import ldar, stlr, swpal, ldaddal, casal, dmbIsh
+from "../encode" import X0, X8, X16, SP, XZR, CC, movReg64, add64Imm, sub64Imm, sub64Reg, cbz64, bCond, blr, svc
+from "../encode/float" import fmovReg
+from "../encode/atomic" import ldar, stlr, swpal, ldaddal, casal, dmbIsh
 from "asm" import genAsm
 from "conv" import AC_X, AC_D, AC_STACK, AC_XPAIR, AC_HFA, ArgLoc, Conv, classify, hfaCount, hfaMember, resultClass, word
 from "emit" import movConst, addOff, loadTyped, storeTyped, loadFloat, storeFloat, normalizeReg
 from "expr" import genScalar, genFloat, genInto, genPlace, storeAny, storeVptr
 from "gen" import Gen, Place
-from "layout" import K_VOID, K_NEVER, K_INT, K_FLOAT
+from "../../common/layout" import K_VOID, K_NEVER, K_INT, K_FLOAT
 from "mem" import zeroMem, copyMem
-from "types" import Scalar, KIND_BOOL, scalarOf
+from "../../common/types" import Scalar, KIND_BOOL, scalarOf
 
 /// One argument of a call: an expression, or (`e` nil) a word already staged at frame slot `slot`.
 struct ArgSrc {
@@ -215,6 +218,12 @@ fn doCall(g: *Gen, kind: i32, callee: i32, vindex: u32, retTy: str, cabi: bool, 
 /// `d = syscall(number, args...)`.
 fn genSyscall(g: *Gen, e: *XlcHirExpr, d: u32) {
     local n: usize = e.argCount as usize
+    if g.target.os.asStr() == "windows" {
+        // Windows system call numbers change between builds and are not a public interface;
+        // ntdll/kernel32 are (https://learn.microsoft.com/en-us/windows/win32/api/).
+        g.fail("`syscall` is not available on Windows (no stable system call ABI); call the OS through an `@library(\"kernel32\") declare fn` import or the stdlib instead")
+        return
+    }
     if n < 1 || n > 7 {
         g.fail("`syscall` takes a number and up to six arguments")
         return
@@ -231,10 +240,17 @@ fn genSyscall(g: *Gen, e: *XlcHirExpr, d: u32) {
     for i in 1..n {
         loadTyped(&g.code, (i - 1) as u32, SP, *slots.get(i) as i64, word())
     }
-    loadTyped(&g.code, X16, SP, *slots.get(0) as i64, word())
-    svc(&g.code, 0x80)
-    bCond(&g.code, CC, 2)
-    sub64Reg(&g.code, X0, XZR, X0)
+    if g.target.os.asStr() == "macos" {
+        loadTyped(&g.code, X16, SP, *slots.get(0) as i64, word())
+        svc(&g.code, 0x80)
+        // Carry clear: success, skip the negation. Carry set: x0 holds the positive errno.
+        bCond(&g.code, CC, 2)
+        sub64Reg(&g.code, X0, XZR, X0)
+    } else {
+        // Linux and the generic OS: the number in x8, `svc #0`, `-errno` already in x0.
+        loadTyped(&g.code, X8, SP, *slots.get(0) as i64, word())
+        svc(&g.code, 0)
+    }
     if d != X0 {
         movReg64(&g.code, d, X0)
     }

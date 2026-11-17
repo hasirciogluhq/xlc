@@ -1,9 +1,9 @@
 #!/bin/bash
 # End-to-end tests of the compiler binary itself, on the host it runs on: everything that depends on the
-# operating system or the CPU. (The C++ suite in test/unit holds the platform-independent checks.)
+# operating system or the CPU.
 #   test/e2e/run.sh [path/to/xlc]        (default: $XLC, else `xlc` on PATH)
 #
-# 1. The binary starts and reports the version in xmake.lua, and links only against the OS itself: a
+# 1. The binary starts and reports XLC_VERSION (src/session/session.xl), and links only against the OS itself: a
 #    release is copied to machines that have none of the build machine's packages (a Homebrew `libz3.dylib`
 #    that is missing there makes `xlc --version` abort with a dyld error).
 # 2. It builds, links and runs native programs: each *.xl here is compiled with no stdlib and started.
@@ -30,9 +30,9 @@ ok()  { echo "ok   [e2e/$1]"; pass=$((pass + 1)); }
 bad() { echo "FAIL [e2e/$1] $2"; fail=$((fail + 1)); }
 
 # --- 1. the binary --------------------------------------------------------------------------------------
-declared=$(sed -n 's/^local xlc_version = "\(.*\)"$/\1/p' "$here/../../xmake.lua")
+declared=$(sed -n 's/^export const XLC_VERSION: str = "\(.*\)"$/\1/p' "$here/../../src/session/session.xl")
 reported=$("$xlc" --version 2>&1)
-if [ "$reported" = "$declared" ]; then ok "version"; else bad "version" "reports '$reported', xmake.lua declares '$declared'"; fi
+if [ "$reported" = "$declared" ]; then ok "version"; else bad "version" "reports '$reported', src/session/session.xl declares '$declared'"; fi
 
 # Dynamic libraries the binary needs, one per line; empty when the platform tool is missing.
 neededLibraries() {
@@ -70,6 +70,12 @@ programs=(
   "exit|42||1|"
   "write|0|xlc e2e write|0|"
   "syscall_registers|0|xlc e2e registers|0|-O2"
+  "packs|0||1|"
+  "lazy_methods|0||1|"
+  "impl_calls|0||1|"
+  "layout_queries|0||1|"
+  "generic_methods|0||1|"
+  "overloads|0||1|"
 )
 for row in "${programs[@]}"; do
   IFS='|' read -r name code want on_windows flags <<<"$row"
@@ -108,13 +114,86 @@ else
 fi
 
 # --- 3. every target ------------------------------------------------------------------------------------
-for target in aarch64-apple-darwin; do
+for target in aarch64-apple-darwin aarch64-unknown-linux-gnu aarch64-unknown armv7-unknown-linux-gnueabihf armv7-unknown \
+    aarch64-pc-windows-msvc aarch64-windows; do
   if "$xlc" "$here/object.xl" --emit=obj --target "$target" -o "$work/t-$target.o" 2>"$work/t.err" && [ -s "$work/t-$target.o" ]; then
-    ok "object-$target"
+    # A malformed object fails here: llvm-readobj (any format) must read its symbols without an error.
+    if command -v llvm-readobj >/dev/null 2>&1 && ! llvm-readobj --symbols "$work/t-$target.o" >"$work/t.err" 2>&1; then
+      bad "object-$target" "malformed object"; tail -3 "$work/t.err"
+    elif command -v nm >/dev/null 2>&1 && [ "$target" = aarch64-apple-darwin ] && ! nm "$work/t-$target.o" >"$work/t.err" 2>&1; then
+      bad "object-$target" "nm rejects it"; tail -3 "$work/t.err"
+    else
+      ok "object-$target"
+    fi
   else
     bad "object-$target" "no object file"; cat "$work/t.err"
   fi
 done
+# The COFF object must read back as ARM64 with its data relocation.
+if command -v llvm-readobj >/dev/null 2>&1; then
+  if llvm-readobj --file-headers -r "$work/t-aarch64-pc-windows-msvc.o" 2>&1 | grep -q "IMAGE_FILE_MACHINE_ARM64" &&
+     llvm-readobj -r "$work/t-aarch64-pc-windows-msvc.o" 2>&1 | grep -q "IMAGE_REL_ARM64_ADDR64 answer"; then
+    ok "coff-readobj"
+  else
+    bad "coff-readobj" "not an ARM64 COFF object with the ADDR64 relocation of answer"
+  fi
+else
+  echo "skip [e2e/coff-readobj] no llvm-readobj"
+fi
+
+# --- 3c. Windows arm64 from any host --------------------------------------------------------------------
+# `lld-link` links the programs without the CRT (`mainCRTStartup`, kernel32 `ExitProcess` through an import
+# library made by `llvm-dlltool`). The image must be an ARM64 PE that imports ExitProcess. Running it needs
+# Windows on Arm: on Windows the programs run with their exit codes; elsewhere that part is skipped.
+if ! command -v lld-link >/dev/null 2>&1 || ! command -v llvm-dlltool >/dev/null 2>&1; then
+  echo "skip [e2e/windows-arm64] no lld-link or llvm-dlltool"
+else
+  for row in "exit|42" "packs|0"; do
+    IFS='|' read -r name code <<<"$row"
+    bin="$work/win-$name.exe"
+    if ! "$xlc" "$here/$name.xl" --target aarch64-pc-windows-msvc -o "$bin" 2>"$work/w.err"; then
+      bad "aarch64-windows/$name" "build"; cat "$work/w.err"; continue
+    fi
+    if command -v llvm-readobj >/dev/null 2>&1 &&
+       ! { llvm-readobj --file-headers "$bin" | grep -q "IMAGE_FILE_MACHINE_ARM64" &&
+           llvm-readobj --coff-imports "$bin" | grep -q "ExitProcess"; }; then
+      bad "aarch64-windows/$name" "not an ARM64 PE importing ExitProcess"; continue
+    fi
+    if [ "$os" = windows ] && [ "$(uname -m)" = aarch64 -o "$(uname -m)" = arm64 ]; then
+      "$bin"; got=$?
+      if [ "$got" = "$code" ]; then ok "aarch64-windows/$name"; else bad "aarch64-windows/$name" "exit $got, want $code"; fi
+    else
+      ok "aarch64-windows/$name (linked; run skipped: needs Windows on Arm)"
+    fi
+  done
+fi
+
+# --- 3b. Linux arm64 and arm32 from any host -------------------------------------------------------------
+# The Linux and generic-OS targets cross-build static programs (own `_start`, raw syscalls, `ld.lld`)
+# and run them in a linux/arm64 or linux/arm/v7 container. Each binary is the container's command itself: under
+# OrbStack the first exec from a shell inside a fresh bind mount can fail with "not found".
+linux_programs=("exit|42|" "write|0|xlc e2e write" "packs|0|")
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  echo "skip [e2e/linux-arm64] no docker"
+elif ! command -v ld.lld >/dev/null 2>&1; then
+  echo "skip [e2e/linux-arm64] no ld.lld"
+else
+  for target in aarch64-unknown-linux-gnu aarch64-unknown armv7-unknown-linux-gnueabihf armv7-unknown; do
+    platform=linux/arm64
+    case "$target" in armv7*) platform=linux/arm/v7 ;; esac
+    for row in "${linux_programs[@]}"; do
+      IFS='|' read -r name code want <<<"$row"
+      bin="$work/linux-$target-$name"
+      if ! "$xlc" "$here/$name.xl" --target "$target" -o "$bin" 2>"$work/l.err"; then
+        bad "$target/$name" "build"; cat "$work/l.err"; continue
+      fi
+      out=$(docker run --rm --platform "$platform" -v "$work":/w busybox "/w/$(basename "$bin")" 2>&1); got=$?
+      if [ "$got" != "$code" ]; then bad "$target/$name" "exit $got, want $code"; echo "$out"
+      elif [ -n "$want" ] && ! grep -qF "$want" <<<"$out"; then bad "$target/$name" "stdout lacks '$want'"; echo "$out"
+      else ok "$target/$name"; fi
+    done
+  done
+fi
 
 # --- 4. stdout ------------------------------------------------------------------------------------------
 for row in "header|XLANG_OBJECT_H" "obj|answer"; do

@@ -1,23 +1,35 @@
-// The Mach-O object file writer for arm64 (macOS): turns sections of code and data plus a
-// symbol table into a linkable `MH_OBJECT` file. The format reference is Apple's
-// `mach-o/loader.h` and `mach-o/arm64/reloc.h`; the layout mirrors what `clang -c` emits so
-// `ld64` accepts the result without special flags.
+// The Mach-O object writer (macOS, arm64): serializes an ObjectFile (src/codegen/obj) into a
+// linkable `MH_OBJECT` file. References: `mach-o/loader.h`, `mach-o/nlist.h` and
+// `mach-o/arm64/reloc.h` of Apple's cctools/xnu
+// (https://github.com/apple-oss-distributions/xnu/blob/main/EXTERNAL_HEADERS/mach-o/loader.h,
+// https://github.com/apple-oss-distributions/cctools/blob/main/include/mach-o/arm64/reloc.h). The
+// layout mirrors what `clang -c` emits so `ld64` accepts it without special flags.
 //
-// File layout of an object: the 32-byte header, the load commands, the section contents (each
-// aligned to its own alignment), the per-section relocation lists, the symbol table (`nlist_64`
-// entries, 16 bytes each) and the string table. All integers are little-endian.
+// File layout: the 32-byte header, the load commands (LC_SEGMENT_64 with every section,
+// LC_BUILD_VERSION, LC_SYMTAB), the section contents (each aligned to its own alignment), the
+// per-section relocation lists (8 bytes each), the symbol table (`nlist_64`, 16 bytes each) and
+// the string table. All integers little-endian.
+//
+// Mach-O facts the writer owns (not the selector):
+// - every C-visible symbol carries one leading `_` (`main` is `_main`, `_start` is `__start`);
+// - the arm64 PAGEOFF12 relocation infers the load/store scale from the instruction itself, so
+//   one kind covers `add` and every `ldr`/`str` width (ELF needs one number per width);
+// - addends of instruction relocations would need an ARM64_RELOC_ADDEND pair; the selector never
+//   emits one (every instruction relocation targets the symbol itself), the 8-byte data pointers
+//   carry their addend in place.
+// Fix over the first writer: symbols are written locals first, then defined externals, then
+// undefined ones, the order `LC_DYSYMTAB`-aware tools expect, whatever order the selector used.
 from "std" import String, Vec
+from "../obj" import ObjectFile, Section, Sym, Reloc, SEC_TEXT, SEC_CSTRING, SEC_CONST, SEC_DATA,
+    R_ABS64, R_BRANCH26, R_PAGE21, R_PAGEOFF12, R_GOT_PAGE21, R_GOT_PAGEOFF12, BIND_LOCAL, BIND_WEAK
 
-// The arm64 relocation types (mach-o/arm64/reloc.h; the numbers verified against clang's own
-// output).
-export const RELOC_UNSIGNED: u32 = 0     // absolute 32/64-bit word
-export const RELOC_SUBTRACTOR: u32 = 1   // half of a `sym2 - sym1` pair
-export const RELOC_BRANCH26: u32 = 2     // `b`/`bl`: the 26-bit word distance
-export const RELOC_PAGE21: u32 = 3       // `adrp` @page: the 21-bit page distance
-export const RELOC_PAGEOFF12: u32 = 4    // `add`/`ldr` @pageoff: the 12-bit page offset
-export const RELOC_GOT_PAGE21: u32 = 5   // `adrp` of the GOT slot
-export const RELOC_GOT_PAGEOFF12: u32 = 6
-export const RELOC_POINTER_TO_GOT: u32 = 7
+// mach-o/arm64/reloc.h numbers (verified against clang's own output).
+const ARM64_RELOC_UNSIGNED: u32 = 0
+const ARM64_RELOC_BRANCH26: u32 = 2
+const ARM64_RELOC_PAGE21: u32 = 3
+const ARM64_RELOC_PAGEOFF12: u32 = 4
+const ARM64_RELOC_GOT_LOAD_PAGE21: u32 = 5
+const ARM64_RELOC_GOT_LOAD_PAGEOFF12: u32 = 6
 
 const MH_MAGIC_64: u32 = 0xfeedfacf
 const CPU_TYPE_ARM64: u32 = 0x0100000c
@@ -25,391 +37,197 @@ const CPU_SUBTYPE_ARM64_ALL: u32 = 0
 const MH_OBJECT: u32 = 1
 const LC_SEGMENT_64: u32 = 0x19
 const LC_SYMTAB: u32 = 0x2
-const LC_DYSYMTAB: u32 = 0xb
 const LC_BUILD_VERSION: u32 = 0x32
 const PLATFORM_MACOS: u32 = 1
 
-// nlist symbol types (mach-o/nlist.h). A defined symbol is `N_EXT | N_SECT` (a global with its
-// section number), an undefined external is `N_EXT | N_UNDF`.
+// nlist types: a defined global is `N_EXT | N_SECT`, a local `N_SECT`, an undefined `N_EXT | N_UNDF`.
 const N_UNDF: u32 = 0
 const N_EXT: u32 = 0x01
 const N_SECT: u32 = 0x0e
+const N_WEAK_DEF: u32 = 0x80
 
-// The __text section flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS.
-export const TEXT_FLAGS: u32 = 0x80000400
+// Section flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS for code,
+// S_CSTRING_LITERALS for the literal pool.
+const TEXT_FLAGS: u32 = 0x80000400
+const CSTRING_FLAGS: u32 = 0x2
 
-/// One relocation: patch `lengthLog2` bytes at `addr` inside the section from `symIndex`.
-@repr(c)
-export struct MachoReloc {
-    addr: u32
-    symIndex: u32
-    pcrel: bool
-    lengthLog2: u32  // log2 of the patched size: 2 = 4 bytes, 3 = 8 bytes
-    isExtern: bool
-    rtype: u32
+/// The section and segment names of a section kind.
+fn sectName(kind: u32) -> str {
+    return kind == SEC_TEXT ? "__text" : kind == SEC_CSTRING ? "__cstring" : kind == SEC_CONST ? "__const" : "__data"
 }
 
-/// One symbol. `section` is the 1-based section number of a defined symbol, 0 for an undefined
-/// external; `value` is the byte offset inside that section. Defined symbols must be added
-/// before undefined ones: the symbol table is written in that order and `LC_DYSYMTAB` indexes
-/// the two runs.
-export class MachoSym {
-    name: String
-    defined: bool
-    section: u32
-    value: u64
-    external: bool    // false: a file-local symbol (`N_SECT` without `N_EXT`)
-    weak: bool        // `N_WEAK_DEF` in `n_desc`: a strong definition elsewhere replaces it
-
-    fn init(self, name: str, defined: bool, section: u32, value: u64) {
-        self.name = String(name)
-        self.external = true
-        self.weak = false
-        self.defined = defined
-        self.section = section
-        self.value = value
-    }
+fn segName(kind: u32) -> str {
+    return kind == SEC_TEXT || kind == SEC_CSTRING ? "__TEXT" : "__DATA"
 }
 
-/// One section: the contents, the relocations against them, and the header fields.
-export class MachoSection {
-    name: String
-    segname: String   // the segment the linker places the section in: `__TEXT`, `__DATA`
-    flags: u32
-    alignLog2: u32
-    code: Vec<u8>
-    relocs: Vec<MachoReloc>
-
-    fn init(self, name: str, flags: u32, alignLog2: u32) {
-        self.name = String(name)
-        self.segname = String("__TEXT")
-        self.flags = flags
-        self.alignLog2 = alignLog2
-        self.code = Vec<u8>()
-        self.relocs = Vec<MachoReloc>()
-    }
+fn machoReloc(kind: u32) -> u32 {
+    return kind == R_ABS64 ? ARM64_RELOC_UNSIGNED : kind == R_BRANCH26 ? ARM64_RELOC_BRANCH26
+         : kind == R_PAGE21 ? ARM64_RELOC_PAGE21 : kind == R_PAGEOFF12 ? ARM64_RELOC_PAGEOFF12
+         : kind == R_GOT_PAGE21 ? ARM64_RELOC_GOT_LOAD_PAGE21 : ARM64_RELOC_GOT_LOAD_PAGEOFF12
 }
 
-/// The object under construction: sections and symbols, then `writeObject` serializes it.
-/// The Mach-O spelling of a symbol name: every symbol carries one `_` prefix in the object file,
-/// whatever its own spelling (`_start` is `__start`), so two source names never collide.
-fn machoName(name: str) -> String {
-    local out = String("_")
-    out.append(name)
-    return out
-}
-
-export class MachoObject {
-    sections: Vec<MachoSection>
-    syms: Vec<MachoSym>
-
-    fn init(self) {
-        self.sections = Vec<MachoSection>()
-        self.syms = Vec<MachoSym>()
-    }
-
-    /// Adds a section and returns its 0-based index.
-    fn addSection(self, name: str, flags: u32, alignLog2: u32) -> u32 {
-        self.sections.push(MachoSection(name, flags, alignLog2))
-        return (self.sections.length() - 1) as u32
-    }
-
-    /// Appends one instruction word to a code section, little-endian.
-    fn addWord(self, section: u32, w: u32) {
-        local s: *MachoSection = self.sections.get(section)
-        s.code.push((w & 0xff) as u8)
-        s.code.push(((w >> 8) & 0xff) as u8)
-        s.code.push(((w >> 16) & 0xff) as u8)
-        s.code.push(((w >> 24) & 0xff) as u8)
-    }
-
-    /// Appends one raw byte to a section: the bytes of a string literal in `__cstring`.
-    fn addByte(self, section: u32, b: u8) {
-        local s: *MachoSection = self.sections.get(section)
-        s.code.push(b)
-    }
-
-    /// Adds a defined global symbol at `offset` inside `section` (0-based) and returns its
-    /// symbol-table index. The stored value is the offset; `writeObject` turns it into the
-    /// virtual address by adding the section's address.
-    /// Adds a defined symbol at `offset` in `section` and returns its index. The name goes in
-    /// with the Mach-O spelling: the object file prefixes every user symbol with `_` (what the
-    /// LLVM target layer does on the LLVM path), so `add` arrives as `_add`.
-    fn addDefined(self, name: str, section: u32, offset: u64) -> u32 {
-        local spelled = machoName(name)
-        self.syms.push(MachoSym(spelled.asStr(), true, section + 1, offset))
-        return (self.syms.length() - 1) as u32
-    }
-
-    /// Adds a defined weak global symbol and returns its index.
-    fn addWeak(self, name: str, section: u32, offset: u64) -> u32 {
-        local spelled = machoName(name)
-        self.syms.push(MachoSym(spelled.asStr(), true, section + 1, offset))
-        self.syms.get(self.syms.length() - 1).weak = true
-        return (self.syms.length() - 1) as u32
-    }
-
-    /// Adds a defined file-local symbol (not visible to the linker's other inputs) and returns its
-    /// index. The name gets the usual `_` prefix.
-    fn addLocal(self, name: str, section: u32, offset: u64) -> u32 {
-        local spelled = machoName(name)
-        self.syms.push(MachoSym(spelled.asStr(), true, section + 1, offset))
-        self.syms.get(self.syms.length() - 1).external = false
-        return (self.syms.length() - 1) as u32
-    }
-
-    /// Adds an undefined external symbol (resolved by the linker) and returns its index.
-    fn addUndefined(self, name: str) -> u32 {
-        local spelled = machoName(name)
-        self.syms.push(MachoSym(spelled.asStr(), false, 0, 0))
-        return (self.syms.length() - 1) as u32
-    }
-
-    /// The bytes in `section` so far.
-    fn size(self, section: u32) -> u64 {
-        return self.sections.get(section).code.length() as u64
-    }
-
-    /// Pads `section` with zero bytes up to a multiple of `align`.
-    fn padTo(self, section: u32, align: u64) {
-        local s: *MachoSection = self.sections.get(section)
-        while (s.code.length() as u64) % align != 0 {
-            s.code.push(0)
-        }
-    }
-
-    /// Overwrites the 8 bytes at `at` of a data section with `v`.
-    fn patchQuad(self, section: u32, at: u64, v: u64) {
-        local s: *MachoSection = self.sections.get(section)
-        for k in 0..8 as usize {
-            s.code.set((at as usize) + k, ((v >> ((k * 8) as u64)) & 0xff) as u8)
-        }
-    }
-
-    /// Moves `section` into the segment `name` (`__DATA` for writable data).
-    fn setSegment(self, section: u32, name: str) {
-        self.sections.get(section).segname = String(name)
-    }
-
-    /// Appends a little-endian 64-bit value to a data section.
-    fn addQuad(self, section: u32, v: u64) {
-        for k in 0..8 {
-            self.addByte(section, ((v >> ((k * 8) as u64)) & 0xff) as u8)
-        }
-    }
-
-    /// An 8-byte absolute pointer relocation (`ARM64_RELOC_UNSIGNED`) against `symIndex` at byte
-    /// `addr` of a data section; the 8 bytes already there are the addend.
-    fn addDataReloc(self, section: u32, addr: u32, symIndex: u32) {
-        local s: *MachoSection = self.sections.get(section)
-        s.relocs.push(MachoReloc { addr: addr, symIndex: symIndex, pcrel: false, lengthLog2: 3,
-            isExtern: true, rtype: RELOC_UNSIGNED })
-    }
-
-    /// Adds a relocation against `symIndex` at byte `addr` of `section`.
-    fn addReloc(self, section: u32, addr: u32, symIndex: u32, rtype: u32) {
-        local s: *MachoSection = self.sections.get(section)
-        // PC-relative: the branch distances and the `adrp` page distance. `PAGEOFF12` and the
-        // absolute forms patch a plain offset.
-        s.relocs.push(MachoReloc { addr: addr, symIndex: symIndex, pcrel: rtype == RELOC_BRANCH26 || rtype == RELOC_PAGE21 || rtype == RELOC_GOT_PAGE21,
-            lengthLog2: 2, isExtern: true, rtype: rtype })
-    }
-}
-
-/// Appends the little-endian 16-bit value.
 fn put16(out: *String, v: u32) {
-    out.push((v & 0xff) as u8)
-    out.push(((v >> 8) & 0xff) as u8)
+    for k in 0..2 { out.push(((v >> ((k * 8) as u32)) & 0xff) as u8) }
 }
 
-/// Appends the little-endian 32-bit value.
 fn put32(out: *String, v: u32) {
-    out.push((v & 0xff) as u8)
-    out.push(((v >> 8) & 0xff) as u8)
-    out.push(((v >> 16) & 0xff) as u8)
-    out.push(((v >> 24) & 0xff) as u8)
+    for k in 0..4 { out.push(((v >> ((k * 8) as u32)) & 0xff) as u8) }
 }
 
-/// Appends the little-endian 64-bit value.
 fn put64(out: *String, v: u64) {
-    local i: u32 = 0
-    while i < 8 {
-        out.push(((v >> (i * 8)) & 0xff) as u8)
-        i += 1
-    }
+    for k in 0..8 { out.push(((v >> ((k * 8) as u64)) & 0xff) as u8) }
 }
 
 /// Appends `s` as one NUL-padded 16-byte field (`sectname`/`segname`).
 fn putName16(out: *String, s: str) {
-    local i: usize = 0
-    while i < 16 {
-        out.push(i < s.len ? s.ptr[i] : 0)
-        i += 1
-    }
+    for i in 0..16 as usize { out.push(i < s.len ? s.ptr[i] : 0) }
 }
 
-/// Rounds `v` up to the next multiple of `a` (`a` a power of two).
+fn padTo(out: *String, at: usize) {
+    while out.length() < at { out.push(0) }
+}
+
 fn alignUp(v: usize, a: usize) -> usize {
     return (v + a - 1) / a * a
 }
 
-/// Serializes the object to the file bytes. Emits `LC_SEGMENT_64` (all sections in `__TEXT`),
-/// `LC_BUILD_VERSION` (macOS 11.0, SDK 14.0) and `LC_SYMTAB`, in that order, then the section
-/// contents, relocations, symbols and strings.
-export fn writeObject(o: *MachoObject) -> String {
+/// The rank of a symbol in the table: locals, defined externals, undefined.
+fn rank(s: *Sym) -> u32 {
+    return !s.defined ? 2 : s.bind == BIND_LOCAL ? 0 : 1
+}
+
+/// Serializes `o` to the bytes of a Mach-O object file.
+export fn writeMacho(o: *ObjectFile) -> String {
     local nsect: usize = o.sections.length()
     local nsyms: usize = o.syms.length()
 
-    // The string table: byte 0 is the empty name, then every symbol name NUL-terminated.
+    // The written order of the symbols and each symbol's index in it.
+    local order = Vec<u32>()
+    local index = Vec<u32>()
+    for i in 0..nsyms { index.push(0) }
+    for r in 0..3 {
+        for i in 0..nsyms {
+            if rank(o.syms.get(i)) == r as u32 {
+                index.set(i, order.length() as u32)
+                order.push(i as u32)
+            }
+        }
+    }
+
+    // The string table: byte 0 is the empty name, then every `_`-prefixed name NUL-terminated.
     local strsize: usize = 1
-    local strx: Vec<u32> = Vec<u32>()
-    for i in 0..nsyms {
+    local strx = Vec<u32>()
+    for i in order {
         strx.push(strsize as u32)
-        strsize += o.syms.get(i).name.length() + 1
+        strsize += o.syms.get(*i as usize).name.length() + 2
     }
 
     // The load commands: segment (72 bytes + 80 per section), build version (24), symtab (24).
     local sizeofcmds: usize = 72 + 80 * nsect + 24 + 24
     local cursor: usize = 32 + sizeofcmds
 
-    // The virtual addresses of the sections inside the segment: the running, aligned sum.
-    local vmaddr: Vec<u32> = Vec<u32>()
+    // Section addresses inside the one segment, and their file offsets.
+    local vmaddr = Vec<u32>()
+    local dataOff = Vec<u32>()
+    // The file image of the segment mirrors its memory image byte for byte (file offset =
+    // fileoff + vm address), so filesize == vmsize; `nm`/`otool` reject filesize > vmsize, which
+    // separate file and memory padding produced when the two cursors had different alignments.
     local vm: usize = 0
+    local maxAlign: usize = 1
     for i in 0..nsect {
-        local s: *MachoSection = o.sections.get(i)
-        vm = alignUp(vm, (1 << s.alignLog2) as usize)
+        local s: *Section = o.sections.get(i)
+        local a: usize = (1 << s.alignLog2) as usize
+        if a > maxAlign { maxAlign = a }
+        vm = alignUp(vm, a)
         vmaddr.push(vm as u32)
         vm += s.code.length()
     }
-    local vmsize: usize = vm
-
-    // Section data, each aligned to its declared alignment; the segment spans it.
-    local dataOff: Vec<u32> = Vec<u32>()
-    for i in 0..nsect {
-        local s: *MachoSection = o.sections.get(i)
-        cursor = alignUp(cursor, (1 << s.alignLog2) as usize)
-        dataOff.push(cursor as u32)
-        cursor += s.code.length()
-    }
-    local fileoff: usize = nsect > 0 ? (*dataOff.get(0)) as usize : cursor
-    local filesize: usize = cursor - fileoff
-    // Relocation lists, 8-byte entries on an 8-byte boundary.
-    local relocOff: Vec<u32> = Vec<u32>()
+    local fileoff: usize = alignUp(cursor, maxAlign)
+    for i in 0..nsect { dataOff.push((fileoff + *vmaddr.get(i) as usize) as u32) }
+    local filesize: usize = vm
+    cursor = fileoff + vm
+    local relocOff = Vec<u32>()
     for i in 0..nsect {
         cursor = alignUp(cursor, 8)
         relocOff.push(cursor as u32)
         cursor += 8 * o.sections.get(i).relocs.length()
     }
-    // Symbol table, then strings.
     cursor = alignUp(cursor, 8)
     local symoff: u32 = cursor as u32
     cursor += 16 * nsyms
     local stroff: u32 = cursor as u32
 
-    local out: String = String()
+    local out = String()
+    // mach_header_64: magic, cpu, subtype, file type, ncmds, sizeofcmds, flags, reserved.
+    for v in [MH_MAGIC_64, CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, MH_OBJECT, 3, sizeofcmds as u32, 0, 0] {
+        put32(&out, *v)
+    }
 
-    // The header: magic, cpu, file type, load-command count and size, flags, reserved.
-    put32(&out, MH_MAGIC_64)
-    put32(&out, CPU_TYPE_ARM64)
-    put32(&out, CPU_SUBTYPE_ARM64_ALL)
-    put32(&out, MH_OBJECT)
-    put32(&out, 3)
-    put32(&out, sizeofcmds as u32)
-    put32(&out, 0)
-    put32(&out, 0)
-
-    // LC_SEGMENT_64: one `__TEXT` segment covering every section of the object.
+    // LC_SEGMENT_64: one unnamed segment covering every section (what `clang -c` writes).
     put32(&out, LC_SEGMENT_64)
     put32(&out, (72 + 80 * nsect) as u32)
-    putName16(&out, "__TEXT")
-    put64(&out, 0)                  // vmaddr
-    put64(&out, vmsize as u64)
+    putName16(&out, "")
+    put64(&out, 0)
+    put64(&out, vm as u64)
     put64(&out, fileoff as u64)
     put64(&out, filesize as u64)
-    put32(&out, 7)  // maxprot (rwx)
+    put32(&out, 7)  // maxprot rwx
     put32(&out, 7)  // initprot
     put32(&out, nsect as u32)
-    put32(&out, 0)  // flags
+    put32(&out, 0)
     for i in 0..nsect {
-        local s: *MachoSection = o.sections.get(i)
-        putName16(&out, s.name.asStr())  // sectname
-        putName16(&out, s.segname.asStr())  // segname
-        put64(&out, *vmaddr.get(i) as u64)  // the virtual address inside the segment
+        local s: *Section = o.sections.get(i)
+        putName16(&out, sectName(s.kind))
+        putName16(&out, segName(s.kind))
+        put64(&out, *vmaddr.get(i) as u64)
         put64(&out, s.code.length() as u64)
         put32(&out, *dataOff.get(i))
         put32(&out, s.alignLog2)
         put32(&out, *relocOff.get(i))
         put32(&out, s.relocs.length() as u32)
-        put32(&out, s.flags)
-        put32(&out, 0)                   // reserved1
-        put32(&out, 0)                   // reserved2
-        put32(&out, 0)                   // reserved3
+        put32(&out, s.kind == SEC_TEXT ? TEXT_FLAGS : s.kind == SEC_CSTRING ? CSTRING_FLAGS : 0)
+        put32(&out, 0)
+        put32(&out, 0)
+        put32(&out, 0)
     }
 
-    // LC_BUILD_VERSION: platform macOS, minos 11.0, sdk 14.0, no tools.
-    put32(&out, LC_BUILD_VERSION)
-    put32(&out, 24)
-    put32(&out, PLATFORM_MACOS)
-    put32(&out, 0x000b0000)  // minos
-    put32(&out, 0x000e0000)  // sdk
-    put32(&out, 0)           // ntools
+    // LC_BUILD_VERSION: platform macOS, minos 11.0 (the first arm64 macOS), sdk 14.0, no tools.
+    for v in [LC_BUILD_VERSION, 24, PLATFORM_MACOS, 0x000b0000, 0x000e0000, 0] { put32(&out, *v) }
 
     // LC_SYMTAB.
-    put32(&out, LC_SYMTAB)
-    put32(&out, 24)
-    put32(&out, symoff)
-    put32(&out, nsyms as u32)
-    put32(&out, stroff)
-    put32(&out, strsize as u32)
+    for v in [LC_SYMTAB, 24, symoff, nsyms as u32, stroff, strsize as u32] { put32(&out, *v) }
 
-    // The section contents, padded up to each recorded offset.
     for i in 0..nsect {
-        local s: *MachoSection = o.sections.get(i)
-        while out.length() < *dataOff.get(i) as usize {
-            out.push(0)
-        }
-        for k in 0..s.code.length() {
-            out.push(*s.code.get(k))
-        }
+        padTo(&out, *dataOff.get(i) as usize)
+        for b in o.sections.get(i).code { out.push(*b) }
     }
-    // The relocation lists.
     for i in 0..nsect {
-        local s: *MachoSection = o.sections.get(i)
-        while out.length() < *relocOff.get(i) as usize {
-            out.push(0)
-        }
-        for k in 0..s.relocs.length() {
-            local r: *MachoReloc = s.relocs.get(k)
-            // The 8-byte relocation entry packs into one u32: symbol index (24 bits),
-            // then special bits: pcrel, length (2), extern, type (4).
-            local info: u32 = (r.symIndex & 0xffffff) | ((r.pcrel ? 1 : 0) << 24) | (r.lengthLog2 << 25) | ((r.isExtern ? 1 : 0) << 27) | (r.rtype << 28)
+        padTo(&out, *relocOff.get(i) as usize)
+        for r in o.sections.get(i).relocs {
+            // relocation_info: r_address, then symbolnum:24 pcrel:1 length:2 extern:1 type:4.
+            local t: u32 = machoReloc(r.kind)
+            local pcrel: u32 = t == ARM64_RELOC_BRANCH26 || t == ARM64_RELOC_PAGE21 || t == ARM64_RELOC_GOT_LOAD_PAGE21 ? 1 : 0
+            local len: u32 = r.kind == R_ABS64 ? 3 : 2
             put32(&out, r.addr)
-            put32(&out, info)
+            put32(&out, (*index.get(r.sym as usize) & 0xffffff) | (pcrel << 24) | (len << 25) | (1 << 27) | (t << 28))
         }
     }
-    // The symbol table.
-    while out.length() < symoff as usize {
-        out.push(0)
+    padTo(&out, symoff as usize)
+    for k in 0..order.length() {
+        local sym: *Sym = o.syms.get(*order.get(k) as usize)
+        // nlist_64: n_strx, n_type, n_sect (1-based), n_desc, n_value (the section address plus
+        // the offset).
+        put32(&out, *strx.get(k))
+        out.push((sym.defined ? (sym.bind == BIND_LOCAL ? N_SECT : N_EXT | N_SECT) : N_EXT | N_UNDF) as u8)
+        out.push((sym.defined ? sym.section + 1 : 0) as u8)
+        put16(&out, sym.bind == BIND_WEAK ? N_WEAK_DEF : 0)
+        put64(&out, sym.defined ? (*vmaddr.get(sym.section as usize) as u64) + sym.value : 0)
     }
-    for i in 0..nsyms {
-        local sym: *MachoSym = o.syms.get(i)
-        put32(&out, *strx.get(i))
-        out.push((sym.defined ? (sym.external ? N_EXT | N_SECT : N_SECT) : N_EXT | N_UNDF) as u8)
-        out.push((sym.defined ? sym.section : 0) as u8)
-        put16(&out, sym.weak ? 0x80 : 0)  // n_desc: N_WEAK_DEF
-        // A defined symbol's value is its virtual address: the section address plus the offset.
-        put64(&out, sym.defined ? (*vmaddr.get(sym.section - 1) as u64) + sym.value : 0)
-    }
-    // The string table.
-    while out.length() < stroff as usize {
-        out.push(0)
-    }
+    padTo(&out, stroff as usize)
     out.push(0)
-    for i in 0..nsyms {
-        local name: *String = &o.syms.get(i).name
-        for k in 0..name.length() {
-            out.push(name.at(k))
-        }
+    for i in order {
+        out.push(b'_')
+        out.append(&o.syms.get(*i as usize).name)
         out.push(0)
     }
     return out

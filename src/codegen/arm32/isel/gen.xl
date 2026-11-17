@@ -1,0 +1,459 @@
+// The state of the arm32 instruction selector and the helpers every part of it shares: labels and
+// branch fixups, symbols and relocations, frame slots, typed loads and stores, memory copies and
+// the panic path.
+//
+// The value model (simple and always correct, not fast; a register allocator is a later step):
+//   - every HIR local lives in a frame slot below fp (r11); stack parameters stay where the caller
+//     put them, above fp;
+//   - an expression leaves its value in r0 (a 32-bit or narrower integer, bool, pointer, f32
+//     bits) or r0:r1 (i64/u64 low:high, f64 bits); a value held in memory (str, slice, array,
+//     tuple, struct, class, interface) is represented by its address in r0;
+//   - a binary operation keeps the left value on the machine stack (`push {r0, r1}`, 8 bytes,
+//     so sp stays 8-aligned) while the right one is computed;
+//   - r2, r3, r12 (ip) and lr are scratch; r4-r10 are never touched, so nothing but fp and lr is
+//     saved; VFP registers are used only inside one operation or a call sequence (d0-d7).
+// Canonical register form: a value of fewer than 32 bits is sign- or zero-extended to 32 bits
+// (`norm`), a bool is 0 or 1, a 64-bit value uses both registers.
+from "std" import String, Vec, format
+from "std/collections/hashmap" import HashMap
+from "std/io" import fprint
+from "../../../hir/abi" import XlcHirModule, XlcHirFunction, XlcHirGlobal, XlcHirExpr, view
+from "../../obj" import ObjectFile, SEC_TEXT, SEC_CSTRING, SEC_CONST, SEC_DATA, R_ARM_CALL, R_ARM_JUMP24, R_MOVW,
+    R_MOVT, R_ABS32
+from "../../target" import Target
+from "../../common/syms" import Syms
+from "../../common/layout" import Layouts, K_INT, K_FLOAT
+from "../../common/types" import Scalar, KIND_OTHER, KIND_INT, KIND_BOOL, KIND_PTR, KIND_FLOAT
+from "../encode" import R0, R1, R2, R3, R11, R12, SP, LR, AL, OP_ADD, OP_SUB, OP_AND, dpReg, dpImm, movw, movt,
+    loadConst, addConst, load, store, blReloc, bCond, udf, modImm
+
+/// A branch whose target is not known yet: patch the word at `at` to reach `label`.
+@repr(c)
+export struct Fixup {
+    at: u32
+    label: u32
+}
+
+/// A relocation in `.text`: `kind` against symbol id `sym`, at byte `addr`.
+@repr(c)
+export struct Rel {
+    addr: u32
+    sym: u32
+    kind: u32
+}
+
+/// A loop being generated: where `continue` and `break` go.
+@repr(c)
+export struct LoopRec {
+    cont: u32
+    brk: u32
+}
+
+/// An out-of-line panic block.
+export class Cold {
+    label: u32
+    message: String
+
+    fn init(self, label: u32, message: str) {
+        self.label = label
+        self.message = String(message)
+    }
+}
+
+// The runtime routines an object may need (data.xl emits each one used, file-local).
+export const RT_UDIV32: u32 = 0    // xl$udivmod32: r0 / r1 -> q r0, r r1
+export const RT_UDIV64: u32 = 1    // xl$udivmod64: r0:r1 / r2:r3 -> q r0:r1, r r2:r3
+export const RT_LSL64: u32 = 2     // xl$lsl64: r0:r1 << r2
+export const RT_LSR64: u32 = 3     // xl$lsr64
+export const RT_ASR64: u32 = 4     // xl$asr64
+export const RT_STREQ: u32 = 5     // xl$streq: r0, r1 two `str` addresses -> r0 = 1 when equal
+export const RT_COUNT: u32 = 6
+
+export fn rtName(i: u32) -> str {
+    return i == RT_UDIV32 ? "xl$udivmod32" : i == RT_UDIV64 ? "xl$udivmod64" : i == RT_LSL64 ? "xl$lsl64"
+         : i == RT_LSR64 ? "xl$lsr64" : i == RT_ASR64 ? "xl$asr64" : "xl$streq"
+}
+
+/// Generates a call-like expression (a call, `syscall`, `new`, a construction, an atomic) into
+/// r0[:r1], or its result's address for a memory type.
+export type CallHook = fn(*Gen, *XlcHirExpr)
+
+export class Gen {
+    m: *XlcHirModule
+    lay: Layouts
+    o: *ObjectFile
+    target: *Target
+    hasOnly: bool
+    only: String
+    text: u32
+    cstr: u32
+    dconst: u32
+    ddata: u32
+    code: Vec<u32>
+    fixups: Vec<Fixup>
+    labelPos: Vec<u32>
+    labels: u32
+    syms: Syms
+    rels: Vec<Rel>
+    drels: Vec<Rel>        // R_ABS32 words in data sections: `addr` in section `kind`... see addData
+    drelSec: Vec<u32>
+    lits: HashMap<String, u32>
+    cstrLen: u64
+    fnIdx: HashMap<String, u32>
+    globIdx: HashMap<String, u32>
+    cold: Vec<Cold>
+    rtUsed: Vec<bool>
+    failed: bool
+
+    // The function being generated.
+    f: *XlcHirFunction
+    slot: Vec<i32>         // fp offset of each local's slot
+    byRef: Vec<bool>       // the slot holds the address of the value (aggregate parameters)
+    frame: u32             // bytes below fp in use (locals + temporaries), the high-water mark
+    tempTop: u32
+    loops: Vec<LoopRec>
+    epilog: u32
+    prologAt: u32          // the word index of the patched `movw ip, #frame`
+    sretSlot: i32          // fp offset of the saved result address, 0 = none
+    callHook: CallHook     // call.xl's generator of call-like expressions (breaks the import cycle)
+
+    fn init(self, m: *XlcHirModule, o: *ObjectFile, target: *Target, hasOnly: bool, only: str) {
+        self.m = m
+        self.lay = Layouts(m, 4)
+        self.o = o
+        self.target = target
+        self.hasOnly = hasOnly
+        self.only = String(only)
+        self.text = o.addSection(SEC_TEXT, 2)
+        self.cstr = o.addSection(SEC_CSTRING, 0)
+        self.dconst = o.addSection(SEC_CONST, 3)
+        self.ddata = o.addSection(SEC_DATA, 3)
+        self.code = Vec<u32>()
+        self.fixups = Vec<Fixup>()
+        self.labelPos = Vec<u32>()
+        self.labels = m.functionCount
+        self.syms = Syms()
+        self.rels = Vec<Rel>()
+        self.drels = Vec<Rel>()
+        self.drelSec = Vec<u32>()
+        self.lits = HashMap<String, u32>()
+        self.cstrLen = 0
+        self.fnIdx = HashMap<String, u32>()
+        self.globIdx = HashMap<String, u32>()
+        self.cold = Vec<Cold>()
+        self.rtUsed = Vec<bool>()
+        for i in 0..RT_COUNT { self.rtUsed.push(false) }
+        self.failed = false
+        self.f = nil
+        self.slot = Vec<i32>()
+        self.byRef = Vec<bool>()
+        self.frame = 0
+        self.tempTop = 0
+        self.loops = Vec<LoopRec>()
+        self.epilog = 0
+        self.prologAt = 0
+        self.sretSlot = 0
+        self.callHook = nil
+        for i in 0..m.functionCount as usize {
+            self.fnIdx.put(String(view(m.functions[i].name)), i as u32)
+        }
+        for i in 0..m.globalCount as usize {
+            self.globIdx.put(String(view(m.globals[i].name)), i as u32)
+        }
+    }
+
+    /// Reports a construct the selector cannot lower and marks the run failed.
+    fn fail(self, what: str) {
+        self.failed = true
+        local at: str = self.f == nil ? "" : view(self.f.name)
+        fprint(2, format("error[E0714]: native code generation (arm32): {} (in `{}`)\n", what, at).asStr())
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Symbols
+
+    fn fnSymbol(self, i: u32) -> str {
+        local f: *XlcHirFunction = &self.m.functions[i as usize]
+        if f.isEntry != 0 {
+            return "xl$entry"
+        }
+        return view(f.symbol).len > 0 ? view(f.symbol) : view(f.name)
+    }
+
+    fn globSymbol(self, i: u32) -> str {
+        local g: *XlcHirGlobal = &self.m.globals[i as usize]
+        return view(g.symbol).len > 0 ? view(g.symbol) : view(g.name)
+    }
+
+    fn findFunction(self, name: str) -> i32 {
+        local r = self.fnIdx.get(String(name))
+        return r.isSome() ? *r.unwrap() as i32 : -1
+    }
+
+    fn findGlobal(self, name: str) -> i32 {
+        local r = self.globIdx.get(String(name))
+        return r.isSome() ? *r.unwrap() as i32 : -1
+    }
+
+    fn definedHere(self, module: str) -> bool {
+        return !self.hasOnly || self.only.equals(module)
+    }
+
+    /// A relocation against `sym` at the word just appended.
+    fn relocHere(self, sym: u32, kind: u32) {
+        self.rels.push(Rel { addr: ((self.code.length() - 1) as u32) * 4, sym: sym, kind: kind })
+    }
+
+    /// `bl sym`.
+    fn callSym(self, sym: u32) {
+        blReloc(&self.code)
+        self.relocHere(sym, R_ARM_CALL)
+    }
+
+    /// Calls runtime routine `rt` (data.xl emits it).
+    fn callRt(self, rt: u32) {
+        self.rtUsed.set(rt as usize, true)
+        local id: u32 = self.syms.id(rtName(rt))
+        self.syms.fileLocal.set(id as usize, true)
+        self.callSym(id)
+    }
+
+    /// `d = &sym`: `movw` + `movt` with R_ARM_MOVW_ABS_NC / R_ARM_MOVT_ABS (a static, non-PIC
+    /// program: the absolute address is fixed at link time).
+    fn symAddr(self, d: u32, sym: u32) {
+        movw(&self.code, AL, d, 0)
+        self.relocHere(sym, R_MOVW)
+        movt(&self.code, d, 0)
+        self.relocHere(sym, R_MOVT)
+    }
+
+    /// The symbol of the NUL-terminated literal `text`, created on first use.
+    fn literal(self, text: str) -> u32 {
+        local key = String(text)
+        local found = self.lits.get(key.clone())
+        if found.isSome() {
+            return *found.unwrap()
+        }
+        local name = format("xl$str${}", self.lits.length())
+        local id: u32 = self.syms.id(name.asStr())
+        self.syms.fileLocal.set(id as usize, true)
+        self.syms.define(id, self.cstr, self.cstrLen)
+        for k in 0..text.len { self.o.addByte(self.cstr, text.ptr[k]) }
+        self.o.addByte(self.cstr, 0)
+        self.cstrLen += text.len as u64 + 1
+        self.lits.put(key, id)
+        return id
+    }
+
+    /// A 4-byte pointer to `sym` at byte `at` of data section `sec`; the bytes there are the addend.
+    fn dataPointer(self, sec: u32, at: u64, sym: u32) {
+        self.drels.push(Rel { addr: at as u32, sym: sym, kind: R_ABS32 })
+        self.drelSec.push(sec)
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Labels
+
+    fn newLabel(self) -> u32 {
+        local id: u32 = self.labels
+        self.labels += 1
+        return id
+    }
+
+    fn bind(self, label: u32) {
+        while self.labelPos.length() <= label as usize { self.labelPos.push(0) }
+        self.labelPos.set(label as usize, self.code.length() as u32)
+    }
+
+    /// `b{cond} label`.
+    fn branch(self, cond: u32, label: u32) {
+        bCond(&self.code, cond)
+        self.fixups.push(Fixup { at: (self.code.length() - 1) as u32, label: label })
+    }
+
+    /// The byte offset of `label` in `.text` (after binding).
+    fn labelAddr(self, label: u32) -> u64 {
+        return *self.labelPos.get(label as usize) as u64 * 4
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Frame
+
+    /// A frame slot of `size` bytes aligned to `align` (4 or 8); returns its fp offset (negative).
+    fn tempSlot(self, size: u64, align: u64) -> i32 {
+        local a: u32 = align < 4 ? 4 : align as u32
+        local s: u32 = size == 0 ? 4 : size as u32
+        self.tempTop = (self.tempTop + s + a - 1) & ~(a - 1)
+        if self.tempTop > self.frame { self.frame = self.tempTop }
+        return -(self.tempTop as i32)
+    }
+
+    /// d = the address of local `id`'s value.
+    fn localAddr(self, d: u32, id: u32) {
+        local off: i32 = *self.slot.get(id as usize)
+        if *self.byRef.get(id as usize) {
+            load(&self.code, d, R11, off, 4, false)
+        } else {
+            addConst(&self.code, d, R11, off)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Types
+
+    fn scalar(self, ty: str) -> Scalar {
+        return self.lay.scalar(ty)
+    }
+
+    fn sizeOf(self, ty: str) -> u64 {
+        local size: u64 = 0
+        local align: u64 = 1
+        self.lay.sizeAlign(ty, &size, &align)
+        return size
+    }
+
+    fn alignOf(self, ty: str) -> u64 {
+        local size: u64 = 0
+        local align: u64 = 1
+        self.lay.sizeAlign(ty, &size, &align)
+        return align
+    }
+
+    /// True for a type whose value is held in memory (r0 is its address).
+    fn isMem(self, ty: str) -> bool {
+        return self.lay.isMem(ty)
+    }
+
+    /// True for a 64-bit scalar (r0:r1).
+    fn isWide(self, ty: str) -> bool {
+        local s: Scalar = self.scalar(ty)
+        return s.kind != KIND_OTHER && s.bits == 64
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Loads and stores of a value of type `ty` (r0[:r1]) at [base + off]
+
+    /// r0[:r1] = the scalar of type `ty` at [base + off]; for a memory type, r0 = base + off.
+    fn loadValue(self, ty: str, base: u32, off: i32) {
+        if self.isMem(ty) {
+            addConst(&self.code, R0, base, off)
+            return
+        }
+        local s: Scalar = self.scalar(ty)
+        if s.kind == KIND_OTHER {
+            if ty != "void" && ty != "never" { self.fail(format("a value of type `{}`", ty).asStr()) }
+            return
+        }
+        if s.bits == 64 {
+            // Load the high word first when the base is r0, which the low load overwrites.
+            if base == R0 {
+                load(&self.code, R1, base, off + 4, 4, false)
+                load(&self.code, R0, base, off, 4, false)
+            } else {
+                load(&self.code, R0, base, off, 4, false)
+                load(&self.code, R1, base, off + 4, 4, false)
+            }
+            return
+        }
+        local size: u32 = s.kind == KIND_BOOL ? 1 : s.bits / 8
+        load(&self.code, R0, base, off, size, s.kind == KIND_INT && s.signed)
+    }
+
+    /// Stores r0[:r1] (a scalar of type `ty`) at [base + off]; for a memory type, copies the value
+    /// at the address in r0. `base` must not be r0, r1 or ip.
+    fn storeValue(self, ty: str, base: u32, off: i32) {
+        if self.isMem(ty) {
+            addConst(&self.code, R1, base, off)
+            self.copy(R1, R0, self.sizeOf(ty))
+            return
+        }
+        local s: Scalar = self.scalar(ty)
+        if s.kind == KIND_OTHER { return }
+        if s.bits == 64 {
+            store(&self.code, R0, base, off, 4)
+            store(&self.code, R1, base, off + 4, 4)
+            return
+        }
+        store(&self.code, R0, base, off, s.kind == KIND_BOOL ? 1 : s.bits / 8)
+    }
+
+    /// Copies `size` bytes from [src] to [dst]: words, then bytes. Clobbers r2, r3, src and dst.
+    fn copy(self, dst: u32, src: u32, size: u64) {
+        local n: u32 = size as u32
+        local at: i32 = 0
+        // A long copy loops over words; a short one is unrolled.
+        if n >= 64 {
+            loadConst(&self.code, R3, n / 4)
+            local top: u32 = self.newLabel()
+            self.bind(top)
+            load(&self.code, R2, src, 0, 4, false)
+            store(&self.code, R2, dst, 0, 4)
+            dpImm(&self.code, AL, OP_ADD, false, src, src, 4)
+            dpImm(&self.code, AL, OP_ADD, false, dst, dst, 4)
+            dpImm(&self.code, AL, OP_SUB, true, R3, R3, 1)
+            self.branch(1, top)
+            n = n % 4
+        }
+        while n >= 4 {
+            load(&self.code, R2, src, at, 4, false)
+            store(&self.code, R2, dst, at, 4)
+            at += 4
+            n -= 4
+        }
+        while n > 0 {
+            load(&self.code, R2, src, at, 1, false)
+            store(&self.code, R2, dst, at, 1)
+            at += 1
+            n -= 1
+        }
+    }
+
+    /// Zeroes `size` bytes at [dst]. Clobbers r2, r3 and dst.
+    fn zero(self, dst: u32, size: u64) {
+        local n: u32 = size as u32
+        local at: i32 = 0
+        loadConst(&self.code, R2, 0)
+        if n >= 64 {
+            loadConst(&self.code, R3, n / 4)
+            local top: u32 = self.newLabel()
+            self.bind(top)
+            store(&self.code, R2, dst, 0, 4)
+            dpImm(&self.code, AL, OP_ADD, false, dst, dst, 4)
+            dpImm(&self.code, AL, OP_SUB, true, R3, R3, 1)
+            self.branch(1, top)
+            n = n % 4
+        }
+        while n >= 4 {
+            store(&self.code, R2, dst, at, 4)
+            at += 4
+            n -= 4
+        }
+        while n > 0 {
+            store(&self.code, R2, dst, at, 1)
+            at += 1
+            n -= 1
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Checks
+
+    /// `panic(message)` through the registered role, then a trap.
+    fn panicCall(self, message: str) {
+        if view(self.m.panicFunction).len > 0 {
+            local idx: i32 = self.findFunction(view(self.m.panicFunction))
+            if idx >= 0 {
+                self.symAddr(R0, self.literal(message))
+                self.callSym(self.syms.id(self.fnSymbol(idx as u32)))
+            }
+        }
+        udf(&self.code, 1)
+    }
+
+    /// A label whose code (emitted after the function) panics with `message`.
+    fn coldPanic(self, message: str) -> u32 {
+        local l: u32 = self.newLabel()
+        self.cold.push(Cold(l, message))
+        return l
+    }
+}

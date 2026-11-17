@@ -1,0 +1,26 @@
+// e2e: a method of a generic class instance is lowered only when a call names it. `Box<Plain>`
+// never calls `twice`, whose body needs `T.double` that `Plain` lacks, so the program builds;
+// `Box<Num>` calls it and gets the body. Lives here because only run.sh compiles with the xlc under
+// test (see packs.xl).
+class Num {
+    v: i32
+    fn double(self) -> i32 { return self.v * 2 }
+}
+
+class Plain { v: i32 }
+
+class Box<T> {
+    item: T
+    fn get(self) -> *T { return &self.item }
+    fn twice(self) -> i32 { return self.item.double() }
+}
+
+@entry fn main() -> i32 {
+    local p = Box<Plain>()
+    p.item.v = 5
+    if (*p.get()).v != 5 { return 1 }
+    local n = Box<Num>()
+    n.item.v = 21
+    if n.twice() != 42 { return 2 }
+    return 0
+}

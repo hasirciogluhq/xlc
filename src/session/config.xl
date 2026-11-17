@@ -3,7 +3,8 @@
 // (`os`, `arch`, `pointerWidth`, `endian`, `debug`, `optLevel`). The command line fills a
 // `BuildConfig` (src/cli.xl); the compilation, the frontend and the incremental cache key read it.
 from "std" import String, Vec, format
-from "std/str" import toI64, toLowerAscii, compare
+from "std/str" import toI64, compare
+from "../codegen/target" import Target, hostTarget
 
 /// The kinds of a definition's value.
 export const CV_BOOL: i32 = 0
@@ -75,91 +76,8 @@ export fn valueText(v: *ConfigValue) -> String {
     return format("\"{}\"", v.text.asStr())
 }
 
-/// The target of the build: `triple` as given (or the host's), and the parts the sources see.
-export class Target {
-    triple: String
-    os: String      ///< linux, macos, windows
-    arch: String    ///< x86_64, aarch64
-    pointerWidth: i64
-    endian: String
-
-    fn init(self) {
-        self.triple = String("")
-        self.os = String("")
-        self.arch = String("")
-        self.pointerWidth = 64
-        self.endian = String("little")
-    }
-}
-
-/// True when `part` occurs in `text`.
-fn has(text: str, part: str) -> bool {
-    if part.len > text.len {
-        return false
-    }
-    for i in 0..(text.len - part.len + 1) as usize {
-        if text[i..i + part.len as usize] == part {
-            return true
-        }
-    }
-    return false
-}
-
-/// Parses a target triple (`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, ...); false when
-/// the architecture or the OS is not one of x86_64/aarch64 on linux/macos/windows.
-export fn parseTarget(triple: str, out: *Target) -> bool {
-    local lower = toLowerAscii(triple)
-    local text = lower.asStr()
-    local dash = text.len as usize
-    for i in 0..text.len as usize {
-        if text[i] == b'-' {
-            dash = i
-            break
-        }
-    }
-    local archPart = text[0..dash]
-    if archPart == "x86_64" || archPart == "amd64" || archPart == "x64" {
-        out.arch = String("x86_64")
-    } else if archPart == "aarch64" || archPart == "arm64" {
-        out.arch = String("aarch64")
-    } else {
-        return false
-    }
-    if has(text, "darwin") || has(text, "macos") || has(text, "apple") {
-        out.os = String("macos")
-    } else if has(text, "linux") {
-        out.os = String("linux")
-    } else if has(text, "windows") || has(text, "win32") || has(text, "mingw") {
-        out.os = String("windows")
-    } else {
-        return false
-    }
-    out.triple = String(triple)
-    out.pointerWidth = 64
-    out.endian = String("little")
-    return true
-}
-
-/// The host's target: what `xlc` runs on.
-export fn hostTarget() -> Target {
-    local t = Target()
-#if arch == "aarch64"
-    t.arch = String("aarch64")
-#else
-    t.arch = String("x86_64")
-#endif
-#if os == "macos"
-    t.os = String("macos")
-    t.triple = format("{}-apple-darwin", t.arch.asStr())
-#elif os == "windows"
-    t.os = String("windows")
-    t.triple = format("{}-pc-windows-msvc", t.arch.asStr())
-#else
-    t.os = String("linux")
-    t.triple = format("{}-unknown-linux-gnu", t.arch.asStr())
-#endif
-    return t
-}
+// The target (triple parsing, the host's target) is the codegen's target description,
+// src/codegen/target.
 
 /// The builtin definitions, in the order of `resolved`.
 fn builtinName(i: i32) -> str {
